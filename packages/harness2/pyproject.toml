@@ -1,0 +1,10 @@
+[project]
+name = "cognitive-harness2"
+version = "1.0.0"
+description = "System 2 Recursive Optimizer for Cognitive Engine"
+requires-python = ">=3.12"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -1,0 +1,10 @@
+[project]
+name = "cognitive-memory"
+version = "1.0.0"
+description = "Unified SQLite Memory Substrate for Cognitive Engine"
+requires-python = ">=3.12"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

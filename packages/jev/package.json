@@ -1,0 +1,11 @@
+{
+  "name": "@cognitive-engine/jev",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "System 1 Coprocessor for Cognitive Engine",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "bun test"
+  }
+}

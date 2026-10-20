@@ -1,0 +1,30 @@
+# Node / Bun
+node_modules/
+dist/
+build/
+.output/
+.bun/
+
+# Python
+.venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# SQLite
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+
+# OS Artifacts
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log

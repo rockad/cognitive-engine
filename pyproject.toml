@@ -1,0 +1,12 @@
+[project]
+name = "cognitive-engine"
+version = "1.0.0"
+description = "Autonomous Cognitive Substrate: System 1 Coprocessor (Jev), System 2 Recursive Optimizer (Harness²), and Unified SQLite Memory"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv.workspace]
+members = [
+    "packages/harness2",
+    "packages/memory"
+]
