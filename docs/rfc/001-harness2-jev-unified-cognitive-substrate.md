@@ -184,6 +184,7 @@ flowchart LR
     WS1 --> WS3["WS3: Unified SQLite Memory Daemon (memory_*)"]
     WS1 --> WS4["WS4: Harness² & Docker Sandboxes (+ Worktree Fallback)"]
     WS2 & WS3 & WS4 --> WS5["WS5: Tri-Harness Adapters & Rule Cutover"]
+    WS5 --> WS6["WS6: agentic-hub Split & Retirement"]
 ```
 
 | Stream | Scope / File Targets | Description | Suggested Role | Recommended Tier |
@@ -193,10 +194,60 @@ flowchart LR
 | **WS3: Unified Memory Daemon** | `packages/memory/` | Author native SQLite schema (`notes`, `entities`, `fts_transcripts`, `experiences`) and expose unified `:8100/mcp` daemon with clean `memory_*` tools | `code-engineer` | `flash_lite` |
 | **WS4: Harness² & Sandboxes** | `packages/harness2/` | Package Google Harness² with FastMCP tool wrappers, Docker Sandboxes SDK, and `/tmp/` git worktree fallback | `code-engineer` | `flash_lite` |
 | **WS5: Adapters & Rule Cutover** | `adapters/`, `doppelganger/` | Package Antigravity, Claude Code, and OpenCode adapters; cut over agent rules to `memory_*`; clean legacy engine scripts from `doppelganger` | `system-operator` | `flash_lite` |
+| **WS6: agentic-hub Split** | `agentic-hub/` | Rebind consumers, deprecate and surgically retire `plugins/jev` and `plugins/memory` from `agentic-hub`, update manifests, and tag release | `system-operator` | `flash_lite` |
 
 ---
 
-## 6. Targeted Review Requests & Brainstorming Points for [@Doc-Cr](https://github.com/Doc-Cr)
+## 6. Split & Retirement Protocol for `agentic-hub`
+
+To maintain 100% developer continuity and prevent broken environments, the migration adheres to a strict **zero-retirement prerequisite policy**: no files or plugins will be retired from `agentic-hub` until `cognitive-engine` is completely operational, tested, and verified across all three harnesses.
+
+```mermaid
+flowchart TD
+    subgraph Prerequisites ["1. Completion Gates (cognitive-engine)"]
+        G1["All packages/ unit & integration tests pass (Bun + pytest)"]
+        G2["Unified Memory Daemon (:8100/mcp) verified across workspaces"]
+        G3["Docker Sandboxes + worktree fallback verified on live probe"]
+        G4["Antigravity, Claude Code, and OpenCode adapters live"]
+    end
+
+    subgraph Staging ["2. Deprecation & Rebinding"]
+        D1["Add deprecation banners to agentic-hub/plugins/jev and plugins/memory"]
+        D2["Rebind doppelganger and global MCP configs to cognitive-engine"]
+        D3["Verify zero regressions in active pairing sessions"]
+    end
+
+    subgraph Retirement ["3. Surgical Split & Tagging (agentic-hub)"]
+        R1["Tag agentic-hub release: v2.x.x-pre-split (immutable archival pin)"]
+        R2["Delete plugins/jev/ and plugins/memory/ from agentic-hub"]
+        R3["Update agentic-hub marketplace.json and README.md (peripheral registry)"]
+        R4["Commit & push split release to agentic-hub"]
+    end
+
+    Prerequisites --> Staging
+    Staging --> Retirement
+```
+
+### Detailed Split Checklist
+1. **Verification Gate**:
+   - `packages/jev` passes all existing test suites.
+   - `packages/memory` passes SQLite FTS5 search and entity/note round-trip tests.
+   - `packages/harness2` completes a live dual-path probe inside a Docker Sandbox.
+   - Global config `~/.gemini/config/mcp_config.json` points to `cognitive-engine`.
+2. **Deprecation Phase**:
+   - Add warning notice to `agentic-hub/plugins/jev/README.md`: *"Notice: TypeSafe Jev has migrated upstream to rockad/cognitive-engine. This copy is frozen for legacy compatibility."*
+   - Add identical notice to `agentic-hub/plugins/memory/README.md`.
+3. **Consumer Rebinding**:
+   - Update `doppelganger/.mcp.json` and shell aliases (`jev`, `jev-mode`, `memory.sh`) to point to the new engine binaries.
+4. **Surgical Retirement**:
+   - Remove `plugins/jev/` and `plugins/memory/` from `agentic-hub`.
+   - Update `agentic-hub/marketplace.json` to register only peripheral plugins (`chrome-devtools`, `gitea`, `google-workspace`, `local-transcribe`) and standalone skills.
+   - Update `agentic-hub/README.md` positioning it as the community peripheral registry.
+   - Tag commit as `v2.4.0-split` in `agentic-hub`.
+
+---
+
+## 7. Targeted Review Requests & Brainstorming Points for [@Doc-Cr](https://github.com/Doc-Cr)
 
 We specifically invite [@Doc-Cr](https://github.com/Doc-Cr)'s architectural feedback on:
 
@@ -208,3 +259,5 @@ We specifically invite [@Doc-Cr](https://github.com/Doc-Cr)'s architectural feed
    Validating the 2-worker max clamp with 3-second stagger and 15 RPM token bucket for safe OpenRouter free-tier probing.
 4. **Clean-Slate Greenfield Initialization**:
    Validating the pristine `v1.0.0` repository baseline on `rockad/cognitive-engine`, preserving past commit history safely archived in `agentic-hub`.
+5. **Split & Retirement Protocol**:
+   Reviewing the gated 4-step retirement sequence from `agentic-hub` to ensure zero disruption during cross-repo cutover.
