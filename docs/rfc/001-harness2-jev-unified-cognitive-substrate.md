@@ -104,9 +104,11 @@ flowchart TB
 | **3** | **Memory Substrate Engine** | **Consolidated Single-Daemon SQLite Engine** | Retire `basic-memory` Docker container; unify Recall (notes/entities) and Lookup (FTS5 search) into a single native SQLite daemon bound to `127.0.0.1`. Saves ~1GB RAM in WSL2. |
 | **4** | **Probe Execution Isolation** | **Docker Sandboxes** | Isolated agent micro-sandboxes ([Docker Sandboxes](https://www.docker.com/products/docker-sandboxes/)) for secure, zero-risk parallel candidate execution. |
 | **5** | **Sandbox Offline Fallback** | **Fail-Closed by Default (Explicit Opt-In for Diff-Only)** | *Refined*: A silent `/tmp/` worktree fallback gives zero network/user isolation. If Docker is offline, probe fails closed. Worktree is an explicit opt-in in `mkdtemp` that **never executes code** (inspection/diff only). |
-| **6** | **Memory Transition Strategy** | **Under Evaluation (Drop-in Replacement vs. New Feature)** | `plugins/memory` in `agentic-hub` has its own marketplace lifecycle. We are clarifying whether Cognitive Engine provides a drop-in replacement facade (retaining legacy tool names initially) or ships as a distinct new feature requiring agent configuration readjustment. |
-| **7** | **OpenRouter Rate Limits & Quotas** | **Adaptive RPM Clamp + Daily Cap Pre-Flight** | *Refined*: In addition to 15 RPM throttling (2 workers, 3s stagger), the prober pre-flights `free_model_daily_requests` from `GET /api/v1/key`. If daily quota is low, probing skips/aborts. |
+| **6** | **Memory Transition Strategy** | **New Dedicated Feature Entity (`memory_*` on `:8105`)** | Deploy Cognitive Engine's memory daemon as a clean new feature entity binding to `127.0.0.1:8105` with clean `memory_*` schemas. Runs side-by-side with legacy `agentic-hub/plugins/memory` on `:8100` during testing; staged cutover across workspaces once verified. |
+| **7** | **OpenRouter Rate Limits & Quotas** | **Adaptive RPM Clamp + Daily Cap Pre-Flight** | In addition to 15 RPM throttling (2 workers, 3s stagger), the prober pre-flights `free_model_daily_requests` from `GET /api/v1/key`. If daily quota is low, probing skips/aborts. |
 | **8** | **Licensing & Origin Hygiene** | **Explicit Multi-License Attribution** | Root `LICENSE` added: Jev and Memory code are MIT; Harness² is Apache-2.0. Upstream licenses and `third_party/licenses/` preserved; modified files marked. |
+| **9** | **Probing under ZDR Strict** | **ZDR-Compliant Endpoint Routing** | Under `zdr: strict`, candidate probes route strictly to verified Zero Data Retention models (local Ollama or signed commercial ZDR endpoints like Anthropic Direct); never touches `openrouter/free`. |
+| **10** | **Experience Seeding & Storage** | **Sanitized Repo Templates + Out-of-Tree Storage** | Sanitized seed templates in `packages/memory/templates/experiences/` bootstrap `~/.local/share/cognitive-engine/experiences/` on first run. Runtime additions live out-of-tree; cross-machine sync is decoupled to user dotfiles. |
 
 ---
 
@@ -155,11 +157,12 @@ Although Harness² supports mutating 8 harness components, Cognitive Engine defi
 - **Harnessing-Level Recursion (*Continual Learning*)**:
   - Post-task reflection proposes empirical lessons into out-of-tree domain libraries (`~/.local/share/cognitive-engine/experiences/`), requiring human sign-off.
 
-### 4.3 Memory Substrate: Unified Cognitive Memory Daemon (`127.0.0.1:8100/mcp`)
-Replaces the dual-container setup with a single native Python SQLite daemon binding strictly to `127.0.0.1`:
+### 4.3 Memory Substrate: Unified Cognitive Memory Daemon (`127.0.0.1:8105/mcp`)
+Replaces the dual-container setup with a single native Python SQLite daemon binding strictly to `127.0.0.1:8105` during staging to prevent port collisions with legacy Lookup (`:8100`):
 - **`notes` & `entities` tables**: Stores session handoffs (`session-memory:<workspace>`), active goals, and knowledge entities.
 - **`fts_transcripts` & `fts_docs` tables**: Full-text SQLite FTS5 search with BM25 ranking and `documents.visibility` classification.
-- **`experiences` table**: Indexes out-of-tree domain playbooks.
+- **`experiences` table**: Indexes out-of-tree domain playbooks from `~/.local/share/cognitive-engine/experiences/`.
+- **Template Bootstrapping**: Ships sanitized seed templates in `packages/memory/templates/experiences/` to bootstrap empty hosts on first run.
 - **Storage**: Single local database file at `~/.local/share/cognitive-engine/memory.sqlite`.
 
 ---
