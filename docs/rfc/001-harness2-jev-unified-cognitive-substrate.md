@@ -250,8 +250,10 @@ We specifically invite [@Doc-Cr](https://github.com/Doc-Cr)'s architectural feed
 
 1. **Docker Sandboxes Fail-Closed & mkdtemp Fallback**:
    Confirming our adoption of your recommendation: fail closed by default if Docker is down; `mkdtemp` worktrees are an explicit opt-in that only generate inspection diffs and **never execute code**.
-2. **Memory Service: Drop-in Replacement vs. New Feature**:
-   Because `plugins/memory` is a public marketplace entity with its own independent lifecycle, should Cognitive Engine's memory service ship as a 100% drop-in replacement with legacy port/tool facades, or as a distinct feature requiring explicit agent setup/readjustment?
+2. **Pluggable Memory Provider Dependency vs. Monorepo Bundling**:
+   *Research Point*: Rather than forcibly bundling memory inside `cognitive-engine/packages/memory`, should Memory be treated as a **pluggable external dependency (Memory Provider interface over MCP)**?
+   - *Standalone Usability*: Memory plugins (`agentic-hub/plugins/memory`) retain their own independent release cycle and can be used standalone by other agents without needing Jev or Harness².
+   - *Decoupled Engine*: `cognitive-engine` simply declares a requirement for any MCP-compliant Memory Provider (supporting existing `plugins/memory` today, or a lightweight unified SQLite service in the future, with fallback to `.agents/memory.json`).
 3. **Daily Quota Pre-Flight**:
    Confirming our adoption of `GET /api/v1/key` checking `free_model_daily_requests` before probing.
 4. **Data Egress & ZDR Invariants**:
