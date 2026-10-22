@@ -99,12 +99,12 @@ flowchart TB
 
 | # | Architectural Dimension | Clarified Decision | Operational Rationale & @Doc-Cr Guidance |
 |---|---|---|---|
-| **1** | **Monorepo Packaging & Runtime** | **80/20 Pragmatic Stack Unification** | Bun workspaces for TypeScript (Jev, Memory, CLI, Adapters) + `uv` workspace strictly for Harness² (Python 3.12). 80% of our code shares a unified runtime, type system, and toolchain; Python is isolated to Google Research upstream sync. |
+| **1** | **Monorepo Packaging & Runtime** | **Polyglot Workspace Topology (Bun + uv)** | Bun workspaces for TypeScript (`packages/jev`, `cli/`, `adapters/`) + `uv` workspaces for Python 3.12 (`packages/harness2`, `packages/memory`). Maximizes code reuse, zero rewrite debt for Jev or basic-memory, and native performance. |
 | **2** | **Internal Component IPC** | **Standard MCP-to-MCP** | Harness² exposes standard FastMCP tools (`harness2_propose`, `harness2_probe`, `harness2_compose`) consumed by Jev. Standardized, inspectable, decoupled. |
-| **3** | **Memory Substrate Engine** | **Native Hybrid FastMCP Daemon (FTS5 + Local ONNX)** | Retire `basic-memory` Docker container; implement a native FastMCP memory service using SQLite FTS5 (BM25) combined with local `bge-small-en-v1.5` embeddings via ONNX and `sqlite-vec`. Omitting the ballooning cross-encoder reranker keeps resident RAM at **~250–300MB**, well under the **<500MB** ceiling while preserving full semantic recall. |
+| **3** | **Memory Substrate Engine** | **Native Python FastMCP Daemon (Upstream `basic-memory`)** | Retire Docker containers; run the upstream-maintained `basic-memory` package natively in Python via `uv` bound strictly to `127.0.0.1:8105`. Zero rewrite debt (KISS/DRY), leverages existing maintained library with full FastMCP toolset. |
 | **4** | **Probe Execution Isolation** | **Docker Sandboxes** | Isolated agent micro-sandboxes ([Docker Sandboxes](https://www.docker.com/products/docker-sandboxes/)) for secure, zero-risk parallel candidate execution. |
 | **5** | **Sandbox Offline Fallback** | **Fail-Closed by Default (Explicit Opt-In for Diff-Only)** | *Refined*: A silent `/tmp/` worktree fallback gives zero network/user isolation. If Docker is offline, probe fails closed. Worktree is an explicit opt-in in `mkdtemp` that **never executes code** (inspection/diff only). |
-| **6** | **Modular Standalone Packages (Zero Docker Bloat)** | **Standalone-Capable Packages (`packages/memory`, `packages/jev`)** | Both `packages/jev` and `packages/memory` are decoupled, standalone libraries that can run independently as dedicated FastMCP servers or be orchestrated together in the engine. Replaces the 1–2 GB Docker memory bloat of `basic-memory` with a native service consuming ~250–300MB RAM on `127.0.0.1:8105`. |
+| **6** | **Modular Standalone Packages (Zero Docker Bloat)** | **Standalone-Capable Packages (`packages/memory`, `packages/jev`)** | Both `packages/jev` and `packages/memory` are decoupled, standalone libraries that can run independently as dedicated FastMCP servers or be orchestrated together in the engine. Replaces the Docker container with native execution consuming ~730MB–1.2GB RAM on `127.0.0.1:8105`. |
 | **7** | **OpenRouter Rate Limits & Quotas** | **Adaptive RPM Clamp + Daily Cap Pre-Flight** | In addition to 15 RPM throttling (2 workers, 3s stagger), the prober pre-flights `free_model_daily_requests` from `GET /api/v1/key`. If daily quota is low, probing skips/aborts. |
 | **8** | **Licensing & Origin Hygiene** | **Explicit Multi-License Attribution** | Root `LICENSE` added: Jev and Memory code are MIT; Harness² is Apache-2.0. Upstream licenses and `third_party/licenses/` preserved; modified files marked. |
 | **9** | **Probing under ZDR Strict** | **ZDR-Compliant Endpoint Routing** | Under `zdr: strict`, candidate probes route strictly to verified Zero Data Retention models (local Ollama or signed commercial ZDR endpoints like Anthropic Direct); never touches `openrouter/free`. |
@@ -119,7 +119,7 @@ flowchart TB
 | **18** | **Cross-Harness Adapter Packaging** | **Unified Multi-Harness Adapter Package (`adapters/`)** | Single versioned Bun workspace package containing Claude Code, OpenCode, and Antigravity shims. Installed turnkey via `engine install-adapters` to eliminate cross-harness version drift. |
 | **19** | **Python Subprocess & Service Supervision** | **Hybrid Dual-Mode (`Bun.spawn()` + Systemd Unit)** | `engine up` uses native `Bun.spawn()` for single-command interactive dev and graceful SIGTERM teardown; `engine install-services` generates a single user systemd/launchd unit running `engine up --daemon` for background persistence. |
 | **20** | **Harness² Probe Trigger Decoupling** | **Failure-Driven & Command-Driven Triggers** | Decouples probing from routing confidence (`min(subagent, tier)`), which falsely triggered on tier ambiguity. Probes trigger strictly on post-task quality failure (`jev_judge` FAIL or score < 0.50), error retry exhaustion, or explicit on-demand `/probe` command, bounded by daily quota pre-flight (`GET /api/v1/key`). |
-| **21** | **Memory Search & RAM Budget (<500MB)** | **Hybrid Search via Local ONNX (`bge-small`) + SQLite FTS5** | Adopts Option C: local embeddings via `bge-small-en-v1.5` ONNX (~260MB) + SQLite FTS5 with `sqlite-vec`. Omitting the ballooning cross-encoder reranker keeps resident memory at ~250–300MB, comfortably within the soft <500MB budget while providing full semantic recall. |
+| **21** | **Retrieval Pipeline & RAM Budget (<2–3 GB)** | **Full Hybrid Retrieval via Upstream `basic-memory` (BGE-Small + Jina Reranker)** | Adopts Path A: runs upstream `basic-memory` natively via `uv`. Retains full hybrid search (`bge-small-en-v1.5` embeddings + `jina-reranker-v1-tiny-en` cross-encoder). Tuned limits (`RERANKER_CANDIDATES=5–10`, `RERANKER_MAX_DOC_CHARS=500–1000`) keep steady-state resident memory comfortably under **2–3 GB**, preserving proven 9/10 past-context accuracy without Docker. |
 
 ---
 
@@ -172,20 +172,17 @@ Although Harness² supports mutating 8 harness components, Cognitive Engine defi
 - **Harnessing-Level Recursion (*Continual Learning*)**:
   - Post-task reflection proposes empirical lessons into out-of-tree domain libraries (`~/.local/share/cognitive-engine/experiences/`), requiring human sign-off.
 
-### 4.3 Memory Substrate: Native Hybrid FastMCP Daemon (`127.0.0.1:8105/mcp`)
-Replaces the dual-container setup with a single native FastMCP daemon binding strictly to `127.0.0.1:8105` during staging to prevent port collisions with legacy Lookup (`:8100`):
-- **Memory Footprint & Soft Budget (<500MB)**: While a hard <25MB limit is unnecessary, the service maintains a strict <500MB envelope. Profiling in `recall/docs/memory-footprint.md` demonstrated that the `bge-small-en-v1.5` embedder requires ~262 MiB, while the ballooning to 1.2–1.8 GiB was caused entirely by the cross-encoder reranker's ONNX CPU arena. By omitting or strictly capping the cross-encoder reranker, resident memory settles at **~250–300 MiB**.
-- **Hybrid Retrieval Pipeline (Option C)**:
+### 4.3 Memory Substrate: Native Python FastMCP Daemon (Upstream `basic-memory`)
+Runs the upstream-maintained `basic-memory` project natively in Python via `uv` under `packages/memory`, binding strictly to `127.0.0.1:8105` during staging to prevent port collisions with legacy Lookup (`:8100`):
+- **Upstream Code Reuse (Path A — Zero Rewrite Debt)**: Packages `basic-memory` as a native Python workspace member. Avoids rewriting complex embedding and knowledge graph engines from scratch (KISS/DRY), completely eliminates Docker container overhead, and guarantees strict localhost binding (`127.0.0.1`).
+- **Hybrid Retrieval Pipeline & RAM Tuning (<2–3 GB Budget)**:
   - **Lexical Search**: SQLite FTS5 table with BM25 ranking for exact terms, symbols, and identifiers.
-  - **Semantic Vector Search**: Local `bge-small-en-v1.5` ONNX embeddings (384 dimensions) indexed with `sqlite-vec` for conceptual similarity and paraphrase recall.
-  - **Reciprocal Rank Fusion (RRF)**: Merges FTS5 BM25 and vector cosine similarity scores into a unified ranked result set.
-- **Shared Zod Schemas & DTOs**: Shares exact TypeScript interfaces and validation schemas (`MemoryNote`, `DocumentVisibility`, `HandoffState`) with Jev, completely eliminating cross-language DTO duplication.
-- **`notes` & `entities` tables**: Stores session handoffs (`session-memory:<workspace>`), active goals, and knowledge entities.
-- **`fts_transcripts` & `fts_docs` tables**: Full-text SQLite FTS5 search with BM25 ranking and `documents.visibility` classification.
-- **`experiences` table**: Indexes out-of-tree domain playbooks from `~/.local/share/cognitive-engine/experiences/`.
-- **Versioned Migrations**: Ordered schema migrations managed via a lightweight schema runner under `packages/memory/migrations/`.
-- **Template Bootstrapping**: Ships sanitized seed templates in `packages/memory/templates/experiences/` to bootstrap empty hosts on first run.
-- **Storage**: Single local database file at `~/.local/share/cognitive-engine/memory.sqlite`.
+  - **Semantic Vector Search**: Dense vector embeddings via `bge-small-en-v1.5` (fastembed, 384 dimensions).
+  - **Cross-Encoder Reranking**: Re-ranks candidates using `jinaai/jina-reranker-v1-tiny-en`.
+  - **Sized for Accuracy & Bounded Memory**: Configured with `RERANKER_CANDIDATES=5–10` and `RERANKER_MAX_DOC_CHARS=500–1000`. This bounds the ONNX Runtime CPU memory arena to settle resident memory comfortably under **2–3 GB**, preserving the proven **9/10 past-context retrieval accuracy** demonstrated in empirical benchmarking (`eval/past-context-test.md`).
+- **FastMCP Toolset**: Exposes canonical memory tools (`read_note`, `write_note`, `search_notes`, `list_notes`, `delete_note`, `build_context`) alongside drop-in aliases for `search_archive` and `get_document`.
+- **Egress & Visibility Integration**: Preserves `documents.visibility` classification from frontmatter, enforcing classification inheritance so restricted content is protected under `zdr: strict`.
+- **Storage**: State volume stored out-of-tree at `~/.local/share/cognitive-engine/memory/`.
 
 ### 4.4 Engine Multiplexer & Cross-Platform Supervision
 - **Unified CLI (`cli/src/index.ts` -> `bin/engine`)**: High-level multiplexer built with Bun (`bun build --compile cli/src/index.ts --outfile bin/engine`) producing a standalone, zero-dependency executable binary supporting `engine memory`, `engine jev`, `engine up`, and `engine status`.
@@ -215,14 +212,12 @@ cognitive-engine/
 │   │   ├── src/                      # FastMCP server, egress checks, and core logic
 │   │   ├── hooks/                    # Claude Code Pre/PostToolUse lifecycle hooks
 │   │   └── opencode/                 # OpenCode V2 plugin
-│   ├── memory/                       # Unified Memory Daemon (TypeScript / Bun)
-│   │   ├── package.json
-│   │   ├── src/                      # FastMCP service (bun:sqlite + FTS5 + visibility)
-│   │   ├── schemas/                  # Shared Zod schemas & DTOs
-│   │   ├── migrations/               # Versioned TypeScript migrations
+│   ├── memory/                       # Unified Memory Daemon (Python 3.12 / uv)
+│   │   ├── pyproject.toml            # Wraps upstream basic-memory with tuned reranker settings
+│   │   ├── src/                      # FastMCP wrapper (FTS5 + BGE-small + Jina-tiny + visibility)
 │   │   └── templates/                # Sanitized experience templates
 │   └── harness2/                     # System 2: Recursive Optimizer & Prober (Python 3.12 / uv)
-│       ├── pyproject.toml            # Isolated uv workspace for Google Research code
+│       ├── pyproject.toml            # Google Research code workspace member
 │       ├── core/                     # Upstream engine (wrapped from google-research/harness2)
 │       ├── substrate/                # OpenCode & Antigravity substrate adapters
 │       ├── prober/                   # Docker Sandboxes parallel manager (fail-closed + mkdtemp diff-only)
@@ -232,9 +227,9 @@ cognitive-engine/
 │   ├── antigravity/                  # Antigravity sidecar & MCP registrations
 │   ├── claude/                       # Claude Code plugin bundle
 │   └── opencode/                     # OpenCode plugin bundle
-├── package.json                      # Bun workspace manifest (jev, memory, cli, adapters)
+├── package.json                      # Bun workspace manifest (jev, cli, adapters)
 ├── bun.lock
-└── pyproject.toml                    # uv workspace manifest (harness2 only)
+└── pyproject.toml                    # uv workspace manifest (harness2, memory)
 ```
 
 ---
@@ -302,9 +297,9 @@ We specifically invite [@Doc-Cr](https://github.com/Doc-Cr)'s architectural feed
    Reviewing the classification inheritance invariant, `documents.visibility` retention in SQLite, and cross-runtime Python enforcement.
 5. **Out-of-Tree Experience Storage**:
    Confirming the physical separation of runtime experiences to `~/.local/share/cognitive-engine/experiences/` to prevent repository leaks.
-6. **80/20 Pragmatic Stack Unification (TypeScript-Dominant Core + Python Upstream Sandbox)**:
-   Reviewing the consolidation of Jev, Memory, CLI (`bun build --compile`), and Adapters into TypeScript/Bun, leaving Python strictly for `packages/harness2` to maintain 100% upstream sync with `google-research/harness2` while eliminating cross-language DTO duplication.
+6. **Polyglot Monorepo Workspace Boundaries (Bun + uv)**:
+   Reviewing the consolidation of Jev, CLI (`bun build --compile`), and Adapters into TypeScript/Bun workspaces, while running both `packages/harness2` and `packages/memory` in Python 3.12 (`uv` workspaces) to maximize code reuse, eliminate Docker, and preserve upstream library maintenance.
 7. **Harness² Probe Trigger Decoupling**:
    Confirming adoption of Doc's recommendation: probing is decoupled from routing uncertainty and triggers strictly on `jev_judge` post-task failure (score < 0.50), execution retry exhaustion, or explicit on-demand `/probe` command, bounded by daily quota pre-flight (`GET /api/v1/key`).
-8. **Semantic Search via Local ONNX (`bge-small`) under <500MB Ceiling**:
-   Confirming adoption of Option C: our operational RAM ceiling is a comfortable **<500MB** (not a strict <25MB limit). By running local `bge-small-en-v1.5` embeddings via ONNX (~260MB) alongside SQLite FTS5 and omitting the ballooning cross-encoder reranker, resident memory settles at **~250–300MB**, preserving high-quality semantic recall while retiring the 1.2+ GB Docker container.
+8. **Native Execution of Upstream `basic-memory` under <2–3 GB Budget**:
+   Confirming adoption of Path A: running upstream-maintained `basic-memory` natively in Python via `uv` (zero Docker). It uses full hybrid retrieval with `bge-small-en-v1.5` embeddings and the `jina-reranker-v1-tiny-en` cross-encoder. Configured limits (`RERANKER_CANDIDATES=5–10`, `RERANKER_MAX_DOC_CHARS=500–1000`) keep steady-state resident memory comfortably within the 2–3 GB budget, achieving proven 9/10 past-context retrieval accuracy.
