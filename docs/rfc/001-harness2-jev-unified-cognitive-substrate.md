@@ -120,6 +120,10 @@ flowchart TB
 | **19** | **Python Subprocess & Service Supervision** | **Hybrid Dual-Mode (`Bun.spawn()` + Systemd Unit)** | `engine up` uses native `Bun.spawn()` for single-command interactive dev and graceful SIGTERM teardown; `engine install-services` generates a single user systemd/launchd unit running `engine up --daemon` for background persistence. |
 | **20** | **Harness² Probe Trigger Decoupling** | **Failure-Driven & Command-Driven Triggers** | Decouples probing from routing confidence (`min(subagent, tier)`), which falsely triggered on tier ambiguity. Probes trigger strictly on post-task quality failure (`jev_judge` FAIL or score < 0.50), error retry exhaustion, or explicit on-demand `/probe` command, bounded by daily quota pre-flight (`GET /api/v1/key`). |
 | **21** | **Retrieval Pipeline & RAM Budget (<2–3 GB)** | **Full Hybrid Retrieval via Upstream `basic-memory` (BGE-Small + Jina Reranker)** | Adopts Path A: runs upstream `basic-memory` natively via `uv`. Retains full hybrid search (`bge-small-en-v1.5` embeddings + `jina-reranker-v1-tiny-en` cross-encoder). Tuned limits (`BASIC_MEMORY_RERANKER_CANDIDATES=5–10`, `BASIC_MEMORY_RERANKER_MAX_DOCUMENT_CHARS=500–1000`) keep steady-state resident memory comfortably under **2–3 GB**, preserving proven 9/10 past-context accuracy without Docker. |
+| **22** | **Lookup Archive & Transcripts Substrate** | **Dedicated Companion Package (`packages/lookup`)** | Retains Lookup as a dedicated native Python package (`packages/lookup`) in the `uv` workspace, running on `127.0.0.1:8100` alongside `basic-memory` on `:8105`. Both supervised by `engine up`. Preserves FTS5 transcript indexing, mail/document search, and `docs.visibility` (`open`, `gated`, `unstated`, `mixed`). |
+| **23** | **Monorepo Licensing & AGPL Containment** | **Process-Boundary Multi-Licensing** | Monorepo is MIT at root (`packages/jev`, `cli/`, `adapters/`, `packages/lookup`); `packages/harness2` is Apache-2.0; `packages/memory` is AGPL-3.0 (from `basic-memory`). Because `packages/memory` operates across standard MCP process/network boundaries, AGPL-3.0 is cleanly confined to `packages/memory`. |
+| **24** | **Jev Transport Architecture** | **Dual-Mode Transport (Stdio Default + Streamable HTTP)** | Jev executes over stdio by default for direct zero-latency integration with Claude Code, OpenCode, and Antigravity. When orchestrated as a background daemon via `engine up`, it exposes Streamable HTTP on `127.0.0.1:8115/mcp`. |
+| **25** | **Sandbox Execution Scope** | **Strict Local-Only MicroVMs (`sbx`)** | Docker Sandboxes execution is strictly restricted to local microVMs via the standalone `sbx` CLI. Cloud sandboxing is explicitly prohibited, preventing off-machine code or credential movement. |
 
 ---
 
@@ -172,7 +176,7 @@ Although Harness² supports mutating 8 harness components, Cognitive Engine defi
 - **Harnessing-Level Recursion (*Continual Learning*)**:
   - Post-task reflection proposes empirical lessons into out-of-tree domain libraries (`~/.local/share/cognitive-engine/experiences/`), requiring human sign-off.
 
-### 4.3 Memory Substrate: Native Python FastMCP Daemon (Upstream `basic-memory`)
+### 4.3 Memory Substrate: Native Python FastMCP Daemon (Upstream `basic-memory`) & Companion `packages/lookup`
 Runs the upstream-maintained `basic-memory` project natively in Python via `uv` under `packages/memory`, binding strictly to `127.0.0.1:8105` during staging to prevent port collisions with legacy Lookup (`:8100`):
 - **Upstream Code Reuse (Path A — Zero Rewrite Debt)**: Packages `basic-memory` as a native Python workspace member. Avoids rewriting complex embedding and knowledge graph engines from scratch (KISS/DRY), completely eliminates Docker container overhead, and guarantees strict localhost binding (`127.0.0.1`).
 - **Hybrid Retrieval Pipeline & RAM Tuning (<2–3 GB Budget)**:
@@ -180,12 +184,12 @@ Runs the upstream-maintained `basic-memory` project natively in Python via `uv` 
   - **Semantic Vector Search**: Dense vector embeddings via `bge-small-en-v1.5` (fastembed, 384 dimensions).
   - **Cross-Encoder Reranking**: Re-ranks candidates using `jinaai/jina-reranker-v1-tiny-en`.
   - **Sized for Accuracy & Bounded Memory**: Configured with `BASIC_MEMORY_RERANKER_CANDIDATES=5–10` and `BASIC_MEMORY_RERANKER_MAX_DOCUMENT_CHARS=500–1000` (the current agentic-hub compose file already sets 10 and 1000). This bounds the ONNX Runtime CPU memory arena to settle resident memory comfortably under **2–3 GB**, preserving the proven **9/10 past-context retrieval accuracy** demonstrated in empirical benchmarking (`eval/past-context-test.md`).
-- **Toolset**: Exposes `basic-memory`'s own tools under their upstream names (see decision 16). The Lookup tools (`search_archive`, `get_document`, `refresh_index`, `archive_stats`) are not part of `basic-memory`.
-- **Egress & Visibility Integration**: `basic-memory` has no field equivalent to Lookup's `docs.visibility`; classification inheritance under `zdr: strict` needs that label carried into whatever indexes the archive.
-- **Storage**: State volume stored out-of-tree at `~/.local/share/cognitive-engine/memory/`.
+- **Toolset**: Exposes `basic-memory`'s own tools under their upstream names (`read_note`, `write_note`, `search_notes`, `edit_note`, etc.).
+- **Companion Archive & Transcript Package (`packages/lookup`)**: Retained as a dedicated companion package (`packages/lookup`) in the `uv` workspace, running natively on `127.0.0.1:8100`. It preserves the 4 Lookup tools (`search_archive`, `get_document`, `refresh_index`, `archive_stats`), indexes transcripts and external knowledge archives, and enforces `docs.visibility` (`open`, `gated`, `unstated`, `mixed`) for strict classification inheritance under `zdr: strict`.
+- **Storage**: State volume stored out-of-tree at `~/.local/share/cognitive-engine/memory/` and `~/.local/share/cognitive-engine/lookup/`.
 
 ### 4.4 Engine Multiplexer & Cross-Platform Supervision
-- **Unified CLI (`cli/src/index.ts` -> `bin/engine`)**: High-level multiplexer built with Bun (`bun build --compile cli/src/index.ts --outfile bin/engine`) producing a standalone, zero-dependency executable binary supporting `engine memory`, `engine jev`, `engine up`, and `engine status`.
+- **Unified CLI (`cli/src/index.ts` -> `bin/engine`)**: High-level multiplexer built with Bun (`bun build --compile cli/src/index.ts --outfile bin/engine`) producing a standalone, zero-dependency executable binary supporting `engine memory`, `engine lookup`, `engine jev`, `engine up`, and `engine status`.
 - **Cross-Platform Service Installer (`engine install-services`)**: Automatically generates and registers user-level service supervisors:
   - Linux/WSL2: systemd user units (`~/.config/systemd/user/cognitive-engine.service`) with `loginctl enable-linger` to ensure daemons persist across terminal sessions.
   - macOS: launchd agent plist (`~/Library/LaunchAgents/com.cognitive-engine.daemon.plist`).
@@ -197,7 +201,7 @@ Runs the upstream-maintained `basic-memory` project natively in Python via `uv` 
 
 ```text
 cognitive-engine/
-├── LICENSE                           # Root MIT License (Jev; see decision 8 for packages/memory)
+├── LICENSE                           # Root MIT License (Jev, CLI, Adapters, Lookup)
 ├── third_party/
 │   └── licenses/
 │       ├── LICENSE.harness2          # Apache-2.0 License for Google Research code
@@ -210,18 +214,21 @@ cognitive-engine/
 ├── packages/
 │   ├── jev/                          # System 1: Router, Judge, Free-tier coprocessor (TS / Bun)
 │   │   ├── package.json
-│   │   ├── src/                      # FastMCP server, egress checks, and core logic
+│   │   ├── src/                      # FastMCP server, egress checks, and core logic (stdio / HTTP)
 │   │   ├── hooks/                    # Claude Code Pre/PostToolUse lifecycle hooks
 │   │   └── opencode/                 # OpenCode V2 plugin
-│   ├── memory/                       # Unified Memory Daemon (Python 3.12 / uv)
-│   │   ├── pyproject.toml            # Wraps upstream basic-memory with tuned reranker settings
-│   │   ├── src/                      # basic-memory wrapper (FTS5 + BGE-small + Jina-tiny)
+│   ├── memory/                       # Knowledge Graph & Semantic Memory Daemon (Python 3.12 / uv)
+│   │   ├── pyproject.toml            # Wraps upstream basic-memory (AGPL-3.0) with tuned reranker
+│   │   ├── src/                      # basic-memory wrapper (:8105/mcp)
 │   │   └── templates/                # Sanitized experience templates
+│   ├── lookup/                       # Transcript Archive & Document Search Daemon (Python 3.12 / uv)
+│   │   ├── pyproject.toml            # FTS5 search + docs.visibility (:8100/mcp)
+│   │   └── src/lookup/               # Extracted from agentic-hub/plugins/memory/servers/lookup (MIT)
 │   └── harness2/                     # System 2: Recursive Optimizer & Prober (Python 3.12 / uv)
-│       ├── pyproject.toml            # Google Research code workspace member
+│       ├── pyproject.toml            # Google Research code workspace member (Apache-2.0)
 │       ├── core/                     # Upstream engine (wrapped from google-research/harness2)
 │       ├── substrate/                # OpenCode & Antigravity substrate adapters
-│       ├── prober/                   # Docker Sandboxes parallel manager (fail-closed + mkdtemp diff-only)
+│       ├── prober/                   # Docker Sandboxes parallel manager (fail-closed microVMs)
 │       └── composer/                 # Contrastive behavioral synthesizer (human proposal)
 ├── adapters/                         # First-Class Cross-Harness Integrations (TS / Bun)
 │   ├── package.json
@@ -230,7 +237,7 @@ cognitive-engine/
 │   └── opencode/                     # OpenCode plugin bundle
 ├── package.json                      # Bun workspace manifest (jev, cli, adapters)
 ├── bun.lock
-└── pyproject.toml                    # uv workspace manifest (harness2, memory)
+└── pyproject.toml                    # uv workspace manifest (harness2, memory, lookup)
 ```
 
 ---
@@ -304,3 +311,13 @@ We specifically invite [@Doc-Cr](https://github.com/Doc-Cr)'s architectural feed
    Confirming adoption of Doc's recommendation: probing is decoupled from routing uncertainty and triggers strictly on `jev_judge` post-task failure (score < 0.50), execution retry exhaustion, or explicit on-demand `/probe` command, bounded by daily quota pre-flight (`GET /api/v1/key`).
 8. **Native Execution of Upstream `basic-memory` under <2–3 GB Budget**:
    Confirming adoption of Path A: running upstream-maintained `basic-memory` natively in Python via `uv` (zero Docker). It uses full hybrid retrieval with `bge-small-en-v1.5` embeddings and the `jina-reranker-v1-tiny-en` cross-encoder. Configured limits (`BASIC_MEMORY_RERANKER_CANDIDATES=5–10`, `BASIC_MEMORY_RERANKER_MAX_DOCUMENT_CHARS=500–1000`) keep steady-state resident memory comfortably within the 2–3 GB budget, achieving proven 9/10 past-context retrieval accuracy.
+9. **Companion `packages/lookup` for Transcripts & `docs.visibility`**:
+   Confirming retention of Lookup as a dedicated companion package (`packages/lookup`) in the `uv` workspace, running natively on `127.0.0.1:8100`. It provides the 4 Lookup tools (`search_archive`, `get_document`, `refresh_index`, `archive_stats`), indexes transcripts, and enforces `docs.visibility` (`open`, `gated`, `unstated`, `mixed`).
+10. **Process-Boundary AGPL Containment**:
+    Confirming that because `packages/memory` operates as a standalone daemon communicating strictly over MCP process/network boundaries (stdio or HTTP loopback), AGPL-3.0 is legally and architecturally confined to `packages/memory`, while the rest of the monorepo remains MIT and Apache-2.0.
+11. **Dual-Mode Jev Transport**:
+    Confirming that Jev defaults to stdio for zero-latency, direct integration with client harnesses (`agy mcp`, Claude Code, OpenCode), with optional Streamable HTTP on `:8115/mcp` when supervised via `engine up`.
+12. **Strict Local-Only Sandboxing**:
+    Formalizing that microVM execution runs strictly locally via the standalone `sbx` CLI; zero cloud sandboxing or off-host code movement.
+13. **Empirical Measurement Provenance**:
+    Documenting that memory and retrieval figures originate from empirical profiling in `/home/rockad/projects/recall/docs/memory-footprint.md` and `eval/past-context-test.md`.
