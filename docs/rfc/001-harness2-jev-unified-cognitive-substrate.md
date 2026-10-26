@@ -254,14 +254,16 @@ RFC 001 establishes the approved **Umbrella Architecture Baseline**. Detailed im
 | **Umbrella** | **RFC 001** | **Cognitive Engine Architecture** | Polyglot (Bun + uv) | **Approved Baseline** | `main` (PR #1) |
 | **Track 1** | **[RFC 002](002-system1-jev.md)** | **System 1: TypeSafe Jev & Adapters** | TypeScript / Bun *(MIT)* | Proposed | `feat/track1-jev-adapters` |
 | **Track 2** | **[RFC 003](003-memory-lookup.md)** | **Memory & Lookup Substrates** | Python 3.12 / uv *(AGPL + MIT)* | Proposed | `feat/track2-memory-lookup` |
-| **Track 3** | **[RFC 004](004-system2-harness2.md)** | **System 2: Google Harness² Optimizer** | Python 3.12 / uv *(Apache-2.0)* | Proposed | `feat/track3-harness2-sbx` |
-| **Track 4** | **[RFC 005](005-egress-retirement.md)** | **Egress Gates & Retirement Protocol** | Cross-Runtime | Proposed | `feat/track4-egress-cutover` |
+| **Track 3** | **[RFC 004](004-system2-harness2.md)** | **System 2: Google Harness² Optimizer** | Python 3.12 / uv *(Apache-2.0)* | Proposed | `feat/track3-harness2` |
+| **Track 4** | **[RFC 005](005-egress-retirement.md)** | **Egress Gates & Retirement Protocol** | Cross-Runtime | Proposed | `feat/track4-egress-retirement` |
+
+- **Multi-Track Implementation Plan**: [2026-10-26-multi-track-implementation-plan.md](../plans/2026-10-26-multi-track-implementation-plan.md)
 
 ```mermaid
 flowchart LR
     RFC001["RFC 001: Umbrella Baseline (main)"] --> Track1["RFC 002: Track 1 (Jev & Adapters)"]
     RFC001 --> Track2["RFC 003: Track 2 (Memory & Lookup)"]
-    RFC001 --> Track3["RFC 004: Track 3 (Harness² & sbx)"]
+    RFC001 --> Track3["RFC 004: Track 3 (Harness² Optimizer)"]
     Track1 & Track2 & Track3 --> Track4["RFC 005: Track 4 (Egress & Retirement)"]
 ```
 
