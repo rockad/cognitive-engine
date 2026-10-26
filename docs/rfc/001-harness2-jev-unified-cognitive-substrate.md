@@ -124,6 +124,9 @@ flowchart TB
 | **23** | **Monorepo Licensing & AGPL Containment** | **Process-Boundary Multi-Licensing** | Monorepo is MIT at root (`packages/jev`, `cli/`, `adapters/`, `packages/lookup`); `packages/harness2` is Apache-2.0; `packages/memory` is AGPL-3.0 (from `basic-memory`). Because `packages/memory` operates across standard MCP process/network boundaries, AGPL-3.0 is cleanly confined to `packages/memory`. |
 | **24** | **Jev Transport Architecture** | **Dual-Mode Transport (Stdio Default + Streamable HTTP)** | Jev executes over stdio by default for direct zero-latency integration with Claude Code, OpenCode, and Antigravity. When orchestrated as a background daemon via `engine up`, it exposes Streamable HTTP on `127.0.0.1:8115/mcp`. |
 | **25** | **Sandbox Execution Scope** | **Strict Local-Only MicroVMs (`sbx`)** | Docker Sandboxes execution is strictly restricted to local microVMs via the standalone `sbx` CLI. Cloud sandboxing is explicitly prohibited, preventing off-machine code or credential movement. |
+| **26** | **Implementation Track Partitioning** | **4 Modular Child RFCs** | Decomposes execution into four domain tracks: Track 1 (RFC 002: Jev/Adapters), Track 2 (RFC 003: Memory/Lookup), Track 3 (RFC 004: Harness² Optimizer), and Track 4 (RFC 005: Egress/Retirement). Eliminates review fatigue and decouples lifecycles. |
+| **27** | **RFC Baseline Governance** | **Living Umbrella with Status Matrix** | RFC 001 acts as the approved Umbrella Architecture Baseline on `main`, maintaining a live Track Status Matrix linking to child RFCs. Shared security invariants and monorepo topology remain centralized in RFC 001. |
+| **28** | **Branch & PR Integration Model** | **Independent Feature Branches targeting `main`** | Each track develops on its own branch (`feat/trackX-*`) combining its child RFC specification and package code, merging directly to `main` upon review and automated test passing. |
 
 ---
 
@@ -242,25 +245,34 @@ cognitive-engine/
 
 ---
 
-## 6. Implementation Roadmap & Parallel Workstream Breakdown
+## 6. Implementation Roadmap & Track Status Matrix
+
+RFC 001 establishes the approved **Umbrella Architecture Baseline**. Detailed implementation specifications and parallel workstreams are partitioned into 4 modular child RFC tracks:
+
+| Track | Specification | Subsystem / Scope | Runtime & License | Status | Target Branch / PR |
+|---|---|---|---|---|---|
+| **Umbrella** | **RFC 001** | **Cognitive Engine Architecture** | Polyglot (Bun + uv) | **Approved Baseline** | `main` (PR #1) |
+| **Track 1** | **[RFC 002](002-system1-jev.md)** | **System 1: TypeSafe Jev & Adapters** | TypeScript / Bun *(MIT)* | Proposed | `feat/track1-jev-adapters` |
+| **Track 2** | **[RFC 003](003-memory-lookup.md)** | **Memory & Lookup Substrates** | Python 3.12 / uv *(AGPL + MIT)* | Proposed | `feat/track2-memory-lookup` |
+| **Track 3** | **[RFC 004](004-system2-harness2.md)** | **System 2: Google Harness² Optimizer** | Python 3.12 / uv *(Apache-2.0)* | Proposed | `feat/track3-harness2-sbx` |
+| **Track 4** | **[RFC 005](005-egress-retirement.md)** | **Egress Gates & Retirement Protocol** | Cross-Runtime | Proposed | `feat/track4-egress-cutover` |
 
 ```mermaid
 flowchart LR
-    WS1["WS1: Clean-Slate Greenfield Init & Licenses"] --> WS2["WS2: Jev Migration & Egress Guards"]
-    WS1 --> WS3["WS3: Memory Daemon, upstream basic-memory (127.0.0.1:8105)"]
-    WS1 --> WS4["WS4: Harness² & Sandboxes (Fail-Closed + Daily Quota)"]
-    WS2 & WS3 & WS4 --> WS5["WS5: Tri-Harness Adapters & Rule Cutover"]
-    WS5 --> WS6["WS6: agentic-hub Split & Retirement"]
+    RFC001["RFC 001: Umbrella Baseline (main)"] --> Track1["RFC 002: Track 1 (Jev & Adapters)"]
+    RFC001 --> Track2["RFC 003: Track 2 (Memory & Lookup)"]
+    RFC001 --> Track3["RFC 004: Track 3 (Harness² & sbx)"]
+    Track1 & Track2 & Track3 --> Track4["RFC 005: Track 4 (Egress & Retirement)"]
 ```
 
-| Stream | Scope / File Targets | Description | Suggested Role | Recommended Tier |
-|---|---|---|---|---|
-| **WS1: Repo Provisioning** | `cognitive-engine/` (New Repo Root) | Scaffold pristine greenfield repo (`v1.0.0`) with Bun workspaces, `uv` workspaces, and MIT + Apache-2.0 licenses | `system-operator` | `flash_lite` |
-| **WS2: Jev Migration** | `packages/jev/` | Migrate TypeSafe Jev core, FastMCP server, cross-harness hook bindings, and ZDR/egress policy engine | `code-engineer` | `flash_lite` |
-| **WS3: Unified Memory Daemon** | `packages/memory/` | Package upstream `basic-memory` via `uv` (decision 21), bind `127.0.0.1:8105`, out-of-tree storage, reranker limits; carry Lookup's `docs.visibility` into whatever indexes the archive | `code-engineer` | `flash_lite` |
-| **WS4: Harness² & Sandboxes** | `packages/harness2/` | Package Harness² with FastMCP wrappers, Docker Sandboxes SDK (fail-closed + mkdtemp diff fallback), daily quota check, and protected invariant set | `code-engineer` | `flash_lite` |
-| **WS5: Adapters & Rule Cutover** | `adapters/`, `doppelganger/` | Package Antigravity, Claude Code, and OpenCode adapters; bind memory tools; clean legacy engine scripts from `doppelganger` | `system-operator` | `flash_lite` |
-| **WS6: agentic-hub Split** | `agentic-hub/` | Rebind consumers, deprecate and surgically retire `plugins/jev` and `plugins/memory` from `agentic-hub` after all completion gates pass | `system-operator` | `flash_lite` |
+| Stream | Track | Scope / File Targets | Description | Suggested Role | Recommended Tier |
+|---|---|---|---|---|---|
+| **WS1: Repo Provisioning** | Umbrella | `cognitive-engine/` (New Repo Root) | Scaffold greenfield repo (`v0.1-baseline`) with Bun + uv workspaces, and MIT + Apache-2.0 licenses | `system-operator` | `flash_lite` |
+| **WS2: Jev Migration** | Track 1 | `packages/jev/`, `adapters/` | Migrate TypeSafe Jev core, stdio/HTTP transports, and Claude Code / OpenCode / Antigravity adapters | `code-engineer` | `flash_lite` |
+| **WS3: Memory Substrates** | Track 2 | `packages/memory/`, `packages/lookup/` | Package native `basic-memory` (`127.0.0.1:8105`) and companion `lookup` (`127.0.0.1:8100`) with `docs.visibility` | `code-engineer` | `flash_lite` |
+| **WS4: Harness² & Sandboxes** | Track 3 | `packages/harness2/` | Package Harness² with FastMCP wrappers, local `sbx` microVMs, fail-closed prober, and quota checks | `code-engineer` | `flash_lite` |
+| **WS5: Rule Cutover** | Track 4 | `doppelganger/`, `cognitive-engine/` | Integrate cross-runtime Python/TS egress test suites and bind client agent configs | `system-operator` | `flash_lite` |
+| **WS6: agentic-hub Split** | Track 4 | `agentic-hub/` | Rebind consumers, deprecate and surgically retire `plugins/jev` and `plugins/memory` after all gates pass | `system-operator` | `flash_lite` |
 
 ---
 
