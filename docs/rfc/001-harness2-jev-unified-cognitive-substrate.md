@@ -19,7 +19,7 @@ This plan establishes **Cognitive Engine** as a dedicated standalone core platfo
 
 1. **System 1 (TypeSafe Jev)**: Sub-second (~380ms) probabilistic routing, model tier dispatch, free-tier offloading, quality gatekeeping (`jev_judge`), and session ceiling governance.
 2. **System 2 (Google Harness²)**: Contrastive trajectory probing (*Propose–Probe–Compose*) without ground truth, automated harness component mutation across 8 dimensions, and continual learning via `EXPERIENCE.md`.
-3. **Memory Substrate (Unified SQLite Engine)**: Single native daemon on `127.0.0.1:8100/mcp` unifying notes, entities, transcripts, and domain playbooks, retiring the external `basic-memory` Docker container.
+3. **Memory Substrate (Upstream `basic-memory`)**: Native Python daemon on `127.0.0.1:8105/mcp` during staging (Path A, decision 21), holding notes, entities, and domain playbooks, retiring the `basic-memory` Docker container.
 
 ```mermaid
 flowchart TB
@@ -41,8 +41,8 @@ flowchart TB
             H2Reflector["Continual Reflector (Writes to ~/.local/share/)"]
             EgressPy["Egress & ZDR Policy Guard (Python)"]
             
-            MemoryService["Unified Cognitive Memory Daemon (127.0.0.1:8100/mcp)"]
-            SQLiteDB[("~/.local/share/cognitive-engine/memory.sqlite")]
+            MemoryService["Memory Daemon, upstream basic-memory (127.0.0.1:8105/mcp)"]
+            SQLiteDB[("~/.local/share/cognitive-engine/memory/")]
             MemoryService --- SQLiteDB
         end
         
@@ -52,16 +52,16 @@ flowchart TB
     subgraph SandboxLayer ["2. Execution Isolation Layer"]
         DockerSandbox1["Docker Sandbox (Candidate Trajectory A)"]
         DockerSandbox2["Docker Sandbox (Candidate Trajectory B)"]
-        FailClosed["Fail-Closed Gate (Docker Offline -> Abort / mkdtemp Diff-Only)"]
+        FailClosed["Fail-Closed Gate (sbx Unavailable -> Abort / mkdtemp Diff-Only)"]
         
-        H2Engine -.->|Primary (Strict Container Isolation)| DockerSandbox1
-        H2Engine -.->|Primary (Strict Container Isolation)| DockerSandbox2
-        H2Engine -.->|Docker Down| FailClosed
+        H2Engine -.->|Primary (microVM Isolation)| DockerSandbox1
+        H2Engine -.->|Primary (microVM Isolation)| DockerSandbox2
+        H2Engine -.->|sbx Unavailable| FailClosed
     end
 
     subgraph OutOfTree ["3. Host Out-of-Tree State (~/.local/share/cognitive-engine/)"]
         RuntimeExp[("experiences/<domain>/ (EXPERIENCE.md + INDEX.md)")]
-        MemoryDB[("memory.sqlite (FTS5 + Notes + documents.visibility)")]
+        MemoryDB[("memory/ (basic-memory state: notes, FTS5, embeddings)")]
     end
     MemoryService --- OutOfTree
     H2Reflector --- RuntimeExp
@@ -103,23 +103,23 @@ flowchart TB
 | **2** | **Internal Component IPC** | **Standard MCP-to-MCP** | Harness² exposes standard FastMCP tools (`harness2_propose`, `harness2_probe`, `harness2_compose`) consumed by Jev. Standardized, inspectable, decoupled. |
 | **3** | **Memory Substrate Engine** | **Native Python FastMCP Daemon (Upstream `basic-memory`)** | Retire Docker containers; run the upstream-maintained `basic-memory` package natively in Python via `uv` bound strictly to `127.0.0.1:8105`. Zero rewrite debt (KISS/DRY), leverages existing maintained library with full FastMCP toolset. |
 | **4** | **Probe Execution Isolation** | **Docker Sandboxes** | Isolated agent micro-sandboxes ([Docker Sandboxes](https://www.docker.com/products/docker-sandboxes/)) for secure, zero-risk parallel candidate execution. |
-| **5** | **Sandbox Offline Fallback** | **Fail-Closed by Default (Explicit Opt-In for Diff-Only)** | *Refined*: A silent `/tmp/` worktree fallback gives zero network/user isolation. If Docker is offline, probe fails closed. Worktree is an explicit opt-in in `mkdtemp` that **never executes code** (inspection/diff only). |
+| **5** | **Sandbox Offline Fallback** | **Fail-Closed by Default (Explicit Opt-In for Diff-Only)** | *Refined*: A silent `/tmp/` worktree fallback gives zero network/user isolation. If the Docker Sandboxes runtime (`sbx`) is unavailable, probe fails closed. Worktree is an explicit opt-in in `mkdtemp` that **never executes code** (inspection/diff only). |
 | **6** | **Modular Standalone Packages (Zero Docker Bloat)** | **Standalone-Capable Packages (`packages/memory`, `packages/jev`)** | Both `packages/jev` and `packages/memory` are decoupled, standalone libraries that can run independently as dedicated FastMCP servers or be orchestrated together in the engine. Replaces the Docker container with native execution consuming ~730MB–1.2GB RAM on `127.0.0.1:8105`. |
 | **7** | **OpenRouter Rate Limits & Quotas** | **Adaptive RPM Clamp + Daily Cap Pre-Flight** | In addition to 15 RPM throttling (2 workers, 3s stagger), the prober pre-flights `free_model_daily_requests` from `GET /api/v1/key`. If daily quota is low, probing skips/aborts. |
-| **8** | **Licensing & Origin Hygiene** | **Explicit Multi-License Attribution** | Root `LICENSE` added: Jev and Memory code are MIT; Harness² is Apache-2.0. Upstream licenses and `third_party/licenses/` preserved; modified files marked. |
+| **8** | **Licensing & Origin Hygiene** | **Explicit Multi-License Attribution** | Root `LICENSE` added: Jev code is MIT; Harness² is Apache-2.0; `packages/memory` wraps upstream `basic-memory`, which is AGPL-3.0, so its license is preserved and the license of `packages/memory` has to account for it. Upstream licenses and `third_party/licenses/` preserved; modified files marked. |
 | **9** | **Probing under ZDR Strict** | **ZDR-Compliant Endpoint Routing** | Under `zdr: strict`, candidate probes route strictly to verified Zero Data Retention models (local Ollama or signed commercial ZDR endpoints like Anthropic Direct); never touches `openrouter/free`. |
 | **10** | **Experience Seeding & Storage** | **Sanitized Repo Templates + Out-of-Tree Storage** | Sanitized seed templates in `packages/memory/templates/experiences/` bootstrap `~/.local/share/cognitive-engine/experiences/` on first run. Runtime additions live out-of-tree; cross-machine sync is decoupled to user dotfiles. |
 | **11** | **CLI Tooling & Multiplexing** | **Unified `engine` CLI Multiplexer (Compiled Bun Binary)** | A single `engine <command>` CLI entrypoint built via `bun build --compile` yields a standalone zero-dependency executable (`engine memory`, `engine jev`, `engine up`, `engine status`). |
-| **12** | **SQLite Schema & Migrations** | **Typed TypeScript Migrations (Zod + Schema Runner)** | Formal TypeScript models, shared Zod validation schemas, and version-controlled migration scripts under `packages/memory/migrations/` guarantee predictable schema evolutions without Python ORM overhead. |
+| **12** | **SQLite Schema & Migrations** | **Superseded by decision 21** | Under Path A, upstream `basic-memory` owns its schema and migrations; the TypeScript/Zod migration runner no longer applies to `packages/memory`. |
 | **13** | **Cross-Platform Supervision** | **`engine install-services` Installer** | Generates platform-native user-level daemons: systemd user units (`~/.config/systemd/user/`) with `loginctl enable-linger` on Linux/WSL2, launchd agent plists on macOS, and Windows/Docker configurations. |
 | **14** | **Subpackage Distribution & Registry Staging** | **Staged Monorepo Packages (Internal -> Gitea -> Public)** | Build pipelines and versioning configured in `packages/jev` (npm) and `packages/memory` (uv/PyPI). Public registry publishing held during development; private Gitea package registry (`git.bigrockad.com`) used for staging. |
 | **15** | **Client Harness MCP Registration** | **Discrete Standalone MCP Servers with Engine Supervisor** | Client harnesses register discrete FastMCP servers (`memory` at `:8105/mcp`, `jev` at `:8115/mcp`) supervised by `engine up`. Ensures isolated failure domains, zero proxy overhead, and granular `mcp-toggle` context preservation. |
-| **16** | **Memory Backward Compatibility** | **Drop-in Alias Wrappers + Canonical `memory_*` Primitives** | The unified memory daemon exposes canonical `memory_*` tools while providing zero-cost drop-in aliases for legacy names (`read_note`, `write_note`, `search_archive`, `get_document`). Guarantees zero Day 1 disruption to existing skills. |
-| **17** | **TypeScript SQLite & Query Engine** | **Raw `bun:sqlite` with Typed Wrappers & Lightweight Runner** | Uses Bun's built-in C-level SQLite engine with native FTS5, zero npm ORM dependencies, and an internal sequential migration table (`_schema_migrations`). Maximum query speed and leanest footprint. |
+| **16** | **Memory Backward Compatibility** | **Upstream Tool Names + Lookup Tools** | Under Path A, the ten `basic-memory` tools used by the `recall` skill keep their names natively (`read_note`, `write_note`, `search_notes`, `edit_note`, `view_note`, `move_note`, `delete_note`, `build_context`, `recent_activity`, `list_memory_projects`). The four Lookup tools used by the `lookup` and `memory` skills (`search_archive`, `get_document`, `refresh_index`, `archive_stats`) need a backend before they can be served or aliased. |
+| **17** | **TypeScript SQLite & Query Engine** | **Superseded by decision 21** | Under Path A, memory storage and queries are handled by upstream `basic-memory` in Python; the `bun:sqlite` engine no longer applies to `packages/memory`. |
 | **18** | **Cross-Harness Adapter Packaging** | **Unified Multi-Harness Adapter Package (`adapters/`)** | Single versioned Bun workspace package containing Claude Code, OpenCode, and Antigravity shims. Installed turnkey via `engine install-adapters` to eliminate cross-harness version drift. |
 | **19** | **Python Subprocess & Service Supervision** | **Hybrid Dual-Mode (`Bun.spawn()` + Systemd Unit)** | `engine up` uses native `Bun.spawn()` for single-command interactive dev and graceful SIGTERM teardown; `engine install-services` generates a single user systemd/launchd unit running `engine up --daemon` for background persistence. |
 | **20** | **Harness² Probe Trigger Decoupling** | **Failure-Driven & Command-Driven Triggers** | Decouples probing from routing confidence (`min(subagent, tier)`), which falsely triggered on tier ambiguity. Probes trigger strictly on post-task quality failure (`jev_judge` FAIL or score < 0.50), error retry exhaustion, or explicit on-demand `/probe` command, bounded by daily quota pre-flight (`GET /api/v1/key`). |
-| **21** | **Retrieval Pipeline & RAM Budget (<2–3 GB)** | **Full Hybrid Retrieval via Upstream `basic-memory` (BGE-Small + Jina Reranker)** | Adopts Path A: runs upstream `basic-memory` natively via `uv`. Retains full hybrid search (`bge-small-en-v1.5` embeddings + `jina-reranker-v1-tiny-en` cross-encoder). Tuned limits (`RERANKER_CANDIDATES=5–10`, `RERANKER_MAX_DOC_CHARS=500–1000`) keep steady-state resident memory comfortably under **2–3 GB**, preserving proven 9/10 past-context accuracy without Docker. |
+| **21** | **Retrieval Pipeline & RAM Budget (<2–3 GB)** | **Full Hybrid Retrieval via Upstream `basic-memory` (BGE-Small + Jina Reranker)** | Adopts Path A: runs upstream `basic-memory` natively via `uv`. Retains full hybrid search (`bge-small-en-v1.5` embeddings + `jina-reranker-v1-tiny-en` cross-encoder). Tuned limits (`BASIC_MEMORY_RERANKER_CANDIDATES=5–10`, `BASIC_MEMORY_RERANKER_MAX_DOCUMENT_CHARS=500–1000`) keep steady-state resident memory comfortably under **2–3 GB**, preserving proven 9/10 past-context accuracy without Docker. |
 
 ---
 
@@ -130,7 +130,7 @@ To protect private data across pooled workspaces and prevent untrusted self-muta
 ### 3.1 Data Egress & ZDR (Zero Data Retention) Inheritance
 When data is pooled across workspaces in shared memory and experiences, directory-based path checking (`assertEgressAllowed`) is insufficient:
 1. **Classification Inheritance**: Any content derived from memory notes, transcripts, or experiences **inherits the strictest classification of its sources**. A record with no classification is treated as **restricted** by default.
-2. **Lookup Primitive Retention**: Preserve `documents.visibility` (`public`, `internal`, `confidential`, `restricted`) in the new SQLite schema, populated from frontmatter. Both `documents.visibility` and directory paths act as dual security lines.
+2. **Lookup Primitive Retention**: Preserve Lookup's `docs.visibility` (`open`, `gated`, `unstated`, `mixed`; `unstated` is treated as gated), populated from frontmatter, wherever the archive is indexed after the split. Both `docs.visibility` and directory paths act as dual security lines.
 3. **ZDR Strict Enforcement**: Under an active ZDR policy, candidate probes carrying restricted content go **only to ZDR-compliant endpoints or not at all**. Under `zdr: strict`, where Jev already blocks `openrouter/free` (`callOpenRouterFree`), probing must fail closed or route through verified ZDR providers.
 4. **Cross-Language Enforcement**: Egress and ZDR validation must be enforced in both the TypeScript (Jev) and Python (Harness²) runtimes.
 
@@ -168,7 +168,7 @@ Although Harness² supports mutating 8 harness components, Cognitive Engine defi
     3. Explicit on-demand request (`/probe <task>` in chat or `engine probe`).
     4. Guarded by daily quota pre-flight (`free_model_daily_requests` from `GET /api/v1/key`).
   - Probes $k$ candidate modifications across allowed components in parallel isolated Docker Sandboxes.
-  - Fails closed if Docker is down. Optional `mkdtemp` worktree mode for inspection/diff only (no code execution).
+  - Fails closed if the `sbx` runtime is unavailable. Optional `mkdtemp` worktree mode for inspection/diff only (no code execution).
 - **Harnessing-Level Recursion (*Continual Learning*)**:
   - Post-task reflection proposes empirical lessons into out-of-tree domain libraries (`~/.local/share/cognitive-engine/experiences/`), requiring human sign-off.
 
@@ -179,9 +179,9 @@ Runs the upstream-maintained `basic-memory` project natively in Python via `uv` 
   - **Lexical Search**: SQLite FTS5 table with BM25 ranking for exact terms, symbols, and identifiers.
   - **Semantic Vector Search**: Dense vector embeddings via `bge-small-en-v1.5` (fastembed, 384 dimensions).
   - **Cross-Encoder Reranking**: Re-ranks candidates using `jinaai/jina-reranker-v1-tiny-en`.
-  - **Sized for Accuracy & Bounded Memory**: Configured with `RERANKER_CANDIDATES=5–10` and `RERANKER_MAX_DOC_CHARS=500–1000`. This bounds the ONNX Runtime CPU memory arena to settle resident memory comfortably under **2–3 GB**, preserving the proven **9/10 past-context retrieval accuracy** demonstrated in empirical benchmarking (`eval/past-context-test.md`).
-- **FastMCP Toolset**: Exposes canonical memory tools (`read_note`, `write_note`, `search_notes`, `list_notes`, `delete_note`, `build_context`) alongside drop-in aliases for `search_archive` and `get_document`.
-- **Egress & Visibility Integration**: Preserves `documents.visibility` classification from frontmatter, enforcing classification inheritance so restricted content is protected under `zdr: strict`.
+  - **Sized for Accuracy & Bounded Memory**: Configured with `BASIC_MEMORY_RERANKER_CANDIDATES=5–10` and `BASIC_MEMORY_RERANKER_MAX_DOCUMENT_CHARS=500–1000` (the current agentic-hub compose file already sets 10 and 1000). This bounds the ONNX Runtime CPU memory arena to settle resident memory comfortably under **2–3 GB**, preserving the proven **9/10 past-context retrieval accuracy** demonstrated in empirical benchmarking (`eval/past-context-test.md`).
+- **Toolset**: Exposes `basic-memory`'s own tools under their upstream names (see decision 16). The Lookup tools (`search_archive`, `get_document`, `refresh_index`, `archive_stats`) are not part of `basic-memory`.
+- **Egress & Visibility Integration**: `basic-memory` has no field equivalent to Lookup's `docs.visibility`; classification inheritance under `zdr: strict` needs that label carried into whatever indexes the archive.
 - **Storage**: State volume stored out-of-tree at `~/.local/share/cognitive-engine/memory/`.
 
 ### 4.4 Engine Multiplexer & Cross-Platform Supervision
@@ -197,15 +197,16 @@ Runs the upstream-maintained `basic-memory` project natively in Python via `uv` 
 
 ```text
 cognitive-engine/
-├── LICENSE                           # Root MIT License (Jev & Memory)
+├── LICENSE                           # Root MIT License (Jev; see decision 8 for packages/memory)
 ├── third_party/
 │   └── licenses/
-│       └── LICENSE.harness2          # Apache-2.0 License for Google Research code
+│       ├── LICENSE.harness2          # Apache-2.0 License for Google Research code
+│       └── LICENSE.basic-memory      # AGPL-3.0 License for upstream basic-memory
 ├── bin/
 │   └── engine                        # Standalone compiled Bun executable (ELF/Mach-O)
 ├── cli/                              # CLI multiplexer implementation (TypeScript / Bun)
 │   ├── package.json
-│   └── src/                          # Typer-equivalent commander/clipanion in TS
+│   └── src/                          # CLI commands (commander/clipanion in TS)
 ├── packages/
 │   ├── jev/                          # System 1: Router, Judge, Free-tier coprocessor (TS / Bun)
 │   │   ├── package.json
@@ -214,7 +215,7 @@ cognitive-engine/
 │   │   └── opencode/                 # OpenCode V2 plugin
 │   ├── memory/                       # Unified Memory Daemon (Python 3.12 / uv)
 │   │   ├── pyproject.toml            # Wraps upstream basic-memory with tuned reranker settings
-│   │   ├── src/                      # FastMCP wrapper (FTS5 + BGE-small + Jina-tiny + visibility)
+│   │   ├── src/                      # basic-memory wrapper (FTS5 + BGE-small + Jina-tiny)
 │   │   └── templates/                # Sanitized experience templates
 │   └── harness2/                     # System 2: Recursive Optimizer & Prober (Python 3.12 / uv)
 │       ├── pyproject.toml            # Google Research code workspace member
@@ -239,7 +240,7 @@ cognitive-engine/
 ```mermaid
 flowchart LR
     WS1["WS1: Clean-Slate Greenfield Init & Licenses"] --> WS2["WS2: Jev Migration & Egress Guards"]
-    WS1 --> WS3["WS3: Unified Memory Daemon (127.0.0.1 + visibility)"]
+    WS1 --> WS3["WS3: Memory Daemon, upstream basic-memory (127.0.0.1:8105)"]
     WS1 --> WS4["WS4: Harness² & Sandboxes (Fail-Closed + Daily Quota)"]
     WS2 & WS3 & WS4 --> WS5["WS5: Tri-Harness Adapters & Rule Cutover"]
     WS5 --> WS6["WS6: agentic-hub Split & Retirement"]
@@ -249,7 +250,7 @@ flowchart LR
 |---|---|---|---|---|
 | **WS1: Repo Provisioning** | `cognitive-engine/` (New Repo Root) | Scaffold pristine greenfield repo (`v1.0.0`) with Bun workspaces, `uv` workspaces, and MIT + Apache-2.0 licenses | `system-operator` | `flash_lite` |
 | **WS2: Jev Migration** | `packages/jev/` | Migrate TypeSafe Jev core, FastMCP server, cross-harness hook bindings, and ZDR/egress policy engine | `code-engineer` | `flash_lite` |
-| **WS3: Unified Memory Daemon** | `packages/memory/` | Author native SQLite schema (`notes`, `entities`, `fts_transcripts`, `documents.visibility`), bind `127.0.0.1`, out-of-tree storage | `code-engineer` | `flash_lite` |
+| **WS3: Unified Memory Daemon** | `packages/memory/` | Package upstream `basic-memory` via `uv` (decision 21), bind `127.0.0.1:8105`, out-of-tree storage, reranker limits; carry Lookup's `docs.visibility` into whatever indexes the archive | `code-engineer` | `flash_lite` |
 | **WS4: Harness² & Sandboxes** | `packages/harness2/` | Package Harness² with FastMCP wrappers, Docker Sandboxes SDK (fail-closed + mkdtemp diff fallback), daily quota check, and protected invariant set | `code-engineer` | `flash_lite` |
 | **WS5: Adapters & Rule Cutover** | `adapters/`, `doppelganger/` | Package Antigravity, Claude Code, and OpenCode adapters; bind memory tools; clean legacy engine scripts from `doppelganger` | `system-operator` | `flash_lite` |
 | **WS6: agentic-hub Split** | `agentic-hub/` | Rebind consumers, deprecate and surgically retire `plugins/jev` and `plugins/memory` from `agentic-hub` after all completion gates pass | `system-operator` | `flash_lite` |
@@ -265,7 +266,7 @@ To maintain 100% developer continuity and prevent broken environments, the migra
    - `packages/jev` passes all existing test suites.
    - **Egress & ZDR Gates**: Existing egress path rules and ZDR strict mode test suites pass in both TypeScript and Python.
    - **Port Isolation**: The new unified memory daemon runs on a staging port (e.g. `:8105`) and binds strictly to `127.0.0.1` while legacy Lookup still holds `:8100`.
-   - `packages/harness2` completes a live dual-path probe inside a Docker Sandbox with fail-closed behavior verified when Docker is stopped.
+   - `packages/harness2` completes a live dual-path probe inside a Docker Sandbox with fail-closed behavior verified when the `sbx` runtime is unavailable.
    - Global config `~/.gemini/config/mcp_config.json` is updated to point to `cognitive-engine`.
 2. **Deprecation Phase**:
    - Add warning notice to `agentic-hub/plugins/jev/README.md`: *"Notice: TypeSafe Jev has migrated upstream to rockad/cognitive-engine. This copy is frozen for legacy compatibility."*
@@ -285,16 +286,16 @@ To maintain 100% developer continuity and prevent broken environments, the migra
 We specifically invite [@Doc-Cr](https://github.com/Doc-Cr)'s architectural feedback on:
 
 1. **Docker Sandboxes Fail-Closed & mkdtemp Fallback**:
-   Confirming our adoption of your recommendation: fail closed by default if Docker is down; `mkdtemp` worktrees are an explicit opt-in that only generate inspection diffs and **never execute code**.
+   Confirming our adoption of your recommendation: fail closed by default if the `sbx` runtime is unavailable; `mkdtemp` worktrees are an explicit opt-in that only generate inspection diffs and **never execute code**.
 2. **Pluggable & Standalone Subpackages (Zero Docker Bloat & Isolated MCP Registration)**:
    We refined the architecture so both `packages/jev` and `packages/memory` are decoupled, standalone-capable libraries within the monorepo:
    - *Packaging*: Standalone package definitions (`package.json` for npm and `pyproject.toml` for uv/PyPI) with versioning and build pipelines, staged to private Gitea registry (`git.bigrockad.com`) during active development before any public registry publishing.
    - *Client MCP Registration*: Agent harnesses register discrete standalone FastMCP servers (`memory` at `:8105/mcp`, `jev` at `:8115/mcp`) supervised by `engine up`, ensuring isolated failure domains, direct communication without proxy overhead, and granular `mcp-toggle` token control.
-   - *Compatibility*: `packages/memory` exposes canonical `memory_*` tools while providing zero-cost drop-in aliases for legacy names (`read_note`, `write_note`, `search_archive`, `get_document`), guaranteeing zero Day 1 breakage for existing skills (`morning`, `ask-verda`, `session-handoff`).
+   - *Compatibility*: `packages/memory` keeps the upstream `basic-memory` tool names used by the `recall` skill; the four Lookup tools need a backend first (decision 16).
 3. **Daily Quota Pre-Flight**:
    Confirming our adoption of `GET /api/v1/key` checking `free_model_daily_requests` before probing.
 4. **Data Egress & ZDR Invariants**:
-   Reviewing the classification inheritance invariant, `documents.visibility` retention in SQLite, and cross-runtime Python enforcement.
+   Reviewing the classification inheritance invariant, `docs.visibility` retention, and cross-runtime Python enforcement.
 5. **Out-of-Tree Experience Storage**:
    Confirming the physical separation of runtime experiences to `~/.local/share/cognitive-engine/experiences/` to prevent repository leaks.
 6. **Polyglot Monorepo Workspace Boundaries (Bun + uv)**:
@@ -302,4 +303,4 @@ We specifically invite [@Doc-Cr](https://github.com/Doc-Cr)'s architectural feed
 7. **Harness² Probe Trigger Decoupling**:
    Confirming adoption of Doc's recommendation: probing is decoupled from routing uncertainty and triggers strictly on `jev_judge` post-task failure (score < 0.50), execution retry exhaustion, or explicit on-demand `/probe` command, bounded by daily quota pre-flight (`GET /api/v1/key`).
 8. **Native Execution of Upstream `basic-memory` under <2–3 GB Budget**:
-   Confirming adoption of Path A: running upstream-maintained `basic-memory` natively in Python via `uv` (zero Docker). It uses full hybrid retrieval with `bge-small-en-v1.5` embeddings and the `jina-reranker-v1-tiny-en` cross-encoder. Configured limits (`RERANKER_CANDIDATES=5–10`, `RERANKER_MAX_DOC_CHARS=500–1000`) keep steady-state resident memory comfortably within the 2–3 GB budget, achieving proven 9/10 past-context retrieval accuracy.
+   Confirming adoption of Path A: running upstream-maintained `basic-memory` natively in Python via `uv` (zero Docker). It uses full hybrid retrieval with `bge-small-en-v1.5` embeddings and the `jina-reranker-v1-tiny-en` cross-encoder. Configured limits (`BASIC_MEMORY_RERANKER_CANDIDATES=5–10`, `BASIC_MEMORY_RERANKER_MAX_DOCUMENT_CHARS=500–1000`) keep steady-state resident memory comfortably within the 2–3 GB budget, achieving proven 9/10 past-context retrieval accuracy.
