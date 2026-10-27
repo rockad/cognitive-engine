@@ -40,4 +40,8 @@ Set `JEV_LIVE_TEST=1` to include tests that call OpenRouter.
 
 ## Lineage
 
-Ported from `agentic-hub/plugins/jev` v2.3.0. The Claude Code session hooks were not carried over: the Claude adapter ships the MCP server and rules only, per the 2026-10-27 settings consolidation.
+Ported from `agentic-hub/plugins/jev` v2.3.0. Of the Claude Code hooks, only the subagent-ceiling check was kept (see below); the session-start, model-switch and prompt-advice hooks were dropped per the 2026-10-27 settings consolidation.
+
+## Subagent guard hook
+
+`bun src/hook.ts claude|antigravity` is a narrow `PreToolUse` guard (`src/guard.ts`). Claude Code asks before a subagent runs on a model stronger than the session's; Antigravity asks before any `pro` subagent. It is deterministic, makes no network calls, runs only in Jev mode `on`, and fails open on any error.
