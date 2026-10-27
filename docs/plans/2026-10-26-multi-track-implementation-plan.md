@@ -217,3 +217,49 @@ To ensure seamless peer review with collaborator [@Doc-Cr](https://github.com/Do
    - Track 1 and Track 2 PRs can be reviewed and merged independently in Phase 1.
    - Track 3 merges after Phase 1 is validated on `main`.
    - Track 4 executes as the final cutover PR.
+
+---
+
+## 6. Dual-Harness Cross-Delegation (Antigravity + Claude Code Pro)
+
+To maximize development velocity and conserve Gemini Pro quota, implementation leverages a **Dual-Harness Architecture** combining **Claude Code (Sonnet 3.5/3.7 & Opus via prepaid Pro subscription)** and **Google Antigravity (Flash/Medium Orchestrator)**.
+
+### 6.1 Division of Responsibilities
+
+| Subsystem / Concern | Primary Harness | Model Tier | Rationale |
+|---|---|---|---|
+| **Deep Code Implementation** (`packages/jev`, `packages/harness2`, adapters) | **Claude Code** | Claude 3.5/3.7 Sonnet or Opus 3 | High-fidelity multi-file coding, algorithmic prompt synthesis; burns **zero Gemini quota** (prepaid Claude Pro). |
+| **Architectural Governance & Pre-Flight Dispatch** | **Antigravity** | Gemini 3.8 Flash | Session orchestrator, multi-track dependency tracking, invariant enforcement. |
+| **Verification Gates & Quality Acceptance** | **Antigravity** | Gemini 3.8 Flash + `jev_judge` | Runs test suites (`bun test`, `uv run pytest`), diff validation, and binary quality gating. |
+| **Git, PRs & Review Coordination with @Doc-Cr** | **Antigravity** | Gemini 3.8 Flash | Branch checkout, semantic commits, PR management, and GitHub review updates. |
+| **Session State & Cross-Harness Continuity** | **Unified Memory** | Recall (:8110) & Lookup (:8100) | Synchronizes state via `session-handoff:cognitive-engine` across both harnesses. |
+
+### 6.2 Operating Modes
+
+#### Mode A: Concurrent Track Ownership (Parallel Branches)
+- **Claude Code**: Implements **Track 1** (`feat/track1-jev-adapters` in Bun/TS).
+- **Antigravity**: Implements **Track 2** (`feat/track2-memory-lookup` in Python/uv).
+- **Independence**: Both run simultaneously on disjoint feature branches without merge conflicts or context collisions.
+
+#### Mode B: Dual-Harness Ping-Pong (Implement in Claude Code, Verify in Antigravity)
+1. **Briefing Phase (Antigravity)**:
+   - Antigravity scaffolds a self-contained, clipboard-ready **Harness Prompt Brief** specifying:
+     - Target files and exact method/type signatures.
+     - RFC invariants and constraint bounds.
+     - Verification command lines (`bun test`, `pytest`).
+   - Updates `session-handoff:cognitive-engine` in Recall / disk cache.
+2. **Coding Phase (Claude Code)**:
+   - Aleksandr launches Claude Code in `~/projects/cognitive-engine` on the target branch.
+   - Pastes the briefing prompt; Claude Code (Sonnet/Opus) writes the implementation, refactors, and runs local checks.
+3. **Verification & Quality Gate Phase (Antigravity)**:
+   - Aleksandr returns to Antigravity.
+   - Antigravity inspects `git status` and `git diff`.
+   - Runs test suites (`engine test`, `bun test`, `uv run pytest`).
+   - Runs `jev_judge` quality gate on the diff.
+   - Verifies security invariants (ZDR rules, AGPL process boundaries, standalone `sbx` isolation).
+   - Generates semantic commits and pushes the branch for [@Doc-Cr](https://github.com/Doc-Cr) review.
+
+### 6.3 Context & Session Sharing Protocol
+- **Shared Repository Disk State**: Both harnesses operate directly on `~/projects/cognitive-engine`.
+- **Clipboard-Ready Prompt Templates**: Antigravity formats self-contained markdown prompts with embedded schemas so Claude Code has complete context upon session start.
+- **Cross-Harness Memory**: Both harnesses query `session-handoff:cognitive-engine` and search indexed session logs via `lookup` on `127.0.0.1:8100`.
