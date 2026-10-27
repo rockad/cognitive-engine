@@ -6,6 +6,7 @@ import {
   claudeModelRank,
   decideClaudeAgentCall,
   decideAntigravitySubagents,
+  agentDefinitionModel,
   sessionModelFromTranscript,
   evaluateClaude,
   evaluateAntigravity,
@@ -65,8 +66,19 @@ describe('Claude Code ceiling', () => {
     expect(decideClaudeAgentCall({}, 'claude-sonnet-5-5')).toBeNull();
   });
 
-  it('fails open when the session model is unknown', () => {
-    expect(decideClaudeAgentCall({ model: 'opus' }, null)).toBeNull();
+  it('fails closed for strong models when the session model is unknown', () => {
+    expect(decideClaudeAgentCall({ model: 'opus' }, null)?.decision).toBe('ask');
+    expect(decideClaudeAgentCall({ model: 'fable' }, null)?.decision).toBe('ask');
+    expect(decideClaudeAgentCall({ model: 'sonnet' }, null)).toBeNull();
+    expect(decideClaudeAgentCall({ model: 'haiku' }, null)).toBeNull();
+  });
+
+  it('uses the subagent definition model when the call sets none', () => {
+    expect(decideClaudeAgentCall({ subagent_type: 'x' }, 'claude-sonnet-5-5', 'opus')?.decision).toBe('ask');
+    expect(decideClaudeAgentCall({ subagent_type: 'x' }, 'claude-sonnet-5-5', 'haiku')).toBeNull();
+    // an explicit call model wins over the definition, and inherit means the session model
+    expect(decideClaudeAgentCall({ model: 'haiku' }, 'claude-sonnet-5-5', 'opus')).toBeNull();
+    expect(decideClaudeAgentCall({ model: 'inherit' }, 'claude-sonnet-5-5', 'opus')).toBeNull();
   });
 
   it('is not bypassed by the brief text', () => {
@@ -91,6 +103,45 @@ describe('Claude Code ceiling', () => {
     expect(evaluateClaude({ tool_name: 'Task', tool_input: { model: 'opus' }, transcript_path: t })?.decision).toBe('ask');
   });
 
+  it('reads the model from a subagent definition, project before user', () => {
+    const project = path.join(tmp, 'proj');
+    fs.mkdirSync(path.join(project, '.claude', 'agents'), { recursive: true });
+    fs.mkdirSync(path.join(tmp, '.claude', 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(project, '.claude', 'agents', 'deep.md'), '---\nname: deep\nmodel: opus\n---\nbody model: haiku\n');
+    fs.writeFileSync(path.join(tmp, '.claude', 'agents', 'deep.md'), '---\nmodel: haiku\n---\n');
+    fs.writeFileSync(path.join(tmp, '.claude', 'agents', 'quoted.md'), '---\nmodel: "sonnet"\n---\n');
+    fs.writeFileSync(path.join(tmp, '.claude', 'agents', 'plain.md'), '---\nname: plain\n---\n');
+
+    expect(agentDefinitionModel('deep', project)).toBe('opus');
+    expect(agentDefinitionModel('deep', undefined)).toBe('haiku');
+    expect(agentDefinitionModel('quoted', project)).toBe('sonnet');
+    expect(agentDefinitionModel('plain', project)).toBeNull();
+    expect(agentDefinitionModel('missing', project)).toBeNull();
+  });
+
+  it('does not follow path-like subagent names', () => {
+    fs.writeFileSync(path.join(tmp, 'escape.md'), '---\nmodel: opus\n---\n');
+    expect(agentDefinitionModel('../escape', path.join(tmp, 'proj'))).toBeNull();
+    expect(agentDefinitionModel(undefined, tmp)).toBeNull();
+  });
+
+  it('catches a stronger model set only in the subagent definition', () => {
+    const project = path.join(tmp, 'proj');
+    fs.mkdirSync(path.join(project, '.claude', 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(project, '.claude', 'agents', 'deep.md'), '---\nmodel: opus\n---\n');
+    const t = transcript('claude-sonnet-5-5');
+    const base = { tool_name: 'Agent', transcript_path: t, cwd: project };
+
+    expect(evaluateClaude({ ...base, tool_input: { subagent_type: 'deep' } })?.decision).toBe('ask');
+    expect(evaluateClaude({ ...base, tool_input: { subagent_type: 'deep', model: 'haiku' } })).toBeNull();
+    expect(evaluateClaude({ ...base, tool_input: { subagent_type: 'Explore' } })).toBeNull();
+  });
+
+  it('asks for an opus call when the transcript is unreadable', () => {
+    const input = { tool_name: 'Agent', tool_input: { model: 'opus' }, transcript_path: path.join(tmp, 'missing.jsonl') };
+    expect(evaluateClaude(input)?.decision).toBe('ask');
+  });
+
   it('formats the Claude Code PreToolUse ask response', () => {
     const out = JSON.parse(formatVerdict('claude', { decision: 'ask', reason: 'r' }));
     expect(out.hookSpecificOutput).toEqual({ hookEventName: 'PreToolUse', permissionDecision: 'ask', permissionDecisionReason: 'r' });
@@ -102,6 +153,11 @@ describe('Antigravity Pro approval', () => {
     expect(decideAntigravitySubagents([{ Model: 'flash' }, { Model: 'PRO' }])?.decision).toBe('ask');
   });
 
+  it('asks for Pro-class model names, not just the literal pro', () => {
+    expect(decideAntigravitySubagents([{ Model: 'gemini-3.8-pro' }])?.decision).toBe('ask');
+    expect(decideAntigravitySubagents([{ Model: ' Opus ' }])?.decision).toBe('ask');
+  });
+
   it('passes inherit, flash and flash_lite', () => {
     expect(decideAntigravitySubagents([{ Model: 'inherit' }, { Model: 'flash' }, { Model: 'flash_lite' }, {}])).toBeNull();
   });
@@ -110,7 +166,8 @@ describe('Antigravity Pro approval', () => {
     const args = { Subagents: [{ Model: 'pro' }] };
     expect(evaluateAntigravity({ toolCall: { name: 'run_command', args } })).toBeNull();
     expect(evaluateAntigravity({ toolCall: { name: 'invoke_subagent', args } })?.decision).toBe('ask');
-    expect(evaluateAntigravity({ toolCall: { name: 'invoke_subagent', args: {} } })).toBeNull();
+    // a subagent list that cannot be read fails closed
+    expect(evaluateAntigravity({ toolCall: { name: 'invoke_subagent', args: {} } })?.decision).toBe('ask');
   });
 
   it('formats the Antigravity force_ask response', () => {
@@ -145,12 +202,33 @@ describe('hook entrypoint', () => {
     expect(await run('antigravity', JSON.stringify({ toolCall: { name: 'run_command', args: {} } }))).toBeNull();
   });
 
-  it('exits 0 with no output on malformed stdin', () => {
-    const proc = Bun.spawnSync(['bun', path.join(import.meta.dir, '..', 'src', 'hook.ts'), 'claude'], {
-      stdin: new TextEncoder().encode('{ not json'),
-      env: { ...process.env, JEV_CONFIG_FILE: path.join(tmp, 'config.json') }
-    });
-    expect(proc.exitCode).toBe(0);
-    expect(proc.stdout.toString()).toBe('');
+  it('asks instead of passing silently when it cannot evaluate a call in mode on', async () => {
+    setMode('on');
+    const claude = JSON.parse((await run('claude', '{ not json'))!);
+    expect(claude.hookSpecificOutput.permissionDecision).toBe('ask');
+    expect(claude.hookSpecificOutput.permissionDecisionReason).toContain('could not evaluate');
+    expect(JSON.parse((await run('antigravity', '{ not json'))!).decision).toBe('force_ask');
+  });
+
+  it('stays silent on malformed stdin when the mode is not on', async () => {
+    setMode('off');
+    expect(await run('claude', '{ not json')).toBeNull();
+  });
+
+  it('exits 0 and prints the ask on malformed stdin through the real command', () => {
+    setMode('on');
+    const run1 = (mode: string) => {
+      fs.writeFileSync(path.join(tmp, 'config.json'), JSON.stringify({ defaults: { mode } }));
+      return Bun.spawnSync(['bun', path.join(import.meta.dir, '..', 'src', 'hook.ts'), 'claude'], {
+        stdin: new TextEncoder().encode('{ not json'),
+        env: { ...process.env, JEV_CONFIG_FILE: path.join(tmp, 'config.json') }
+      });
+    };
+    const on = run1('on');
+    expect(on.exitCode).toBe(0);
+    expect(JSON.parse(on.stdout.toString()).hookSpecificOutput.permissionDecision).toBe('ask');
+    const off = run1('off');
+    expect(off.exitCode).toBe(0);
+    expect(off.stdout.toString()).toBe('');
   });
 });

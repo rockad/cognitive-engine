@@ -182,51 +182,27 @@ describe('tier ceiling invariants', () => {
   });
 
   it('clamps a Pro recommendation to the parent session ceiling', () => {
-    const out = clampTierToSessionCeiling('pro', 'flash', 'refactor the parser');
+    const out = clampTierToSessionCeiling('pro', 'flash');
     expect(out.wasClamped).toBe(true);
     expect(out.clampedTier).toBe('flash');
   });
 
-  it('is not lifted by phrases in the task text', () => {
-    for (const phrase of ['deep reasoning', 'cross-system architecture', 'manual pro approval', 'claude opus', 'gemini pro']) {
-      // the third argument is the approved tier; prose is not a tier name and is ignored
-      const out = clampTierToSessionCeiling('pro', 'flash', phrase);
-      expect(out.wasClamped).toBe(true);
-      expect(out.clampedTier).toBe('flash');
+  it('accepts no input that lifts the ceiling', () => {
+    // dispatch is advice: the clamp takes only the recommendation and the session model
+    expect(clampTierToSessionCeiling.length).toBe(2);
+    for (const name of ['jev_dispatch', 'jev_batch_dispatch']) {
+      const tool = allTools.find((t) => t.name === name)!;
+      expect(Object.keys(tool.inputSchema.properties ?? {})).not.toContain('approvedTier');
     }
   });
 
-  it('is lifted only up to the approved tier', () => {
-    expect(clampTierToSessionCeiling('pro', 'flash_lite', 'flash').clampedTier).toBe('flash');
-    const out = clampTierToSessionCeiling('pro', 'flash_lite', 'pro');
-    expect(out.wasClamped).toBe(false);
-    expect(out.clampedTier).toBe('pro');
-  });
-
-  it('never lowers the session ceiling', () => {
-    expect(clampTierToSessionCeiling('pro', 'gemini-3.8-pro', 'flash_lite').clampedTier).toBe('pro');
+  it('keeps a Pro session at Pro', () => {
+    expect(clampTierToSessionCeiling('pro', 'gemini-3.8-pro').clampedTier).toBe('pro');
   });
 
   it('leaves a recommendation at or below the ceiling alone', () => {
-    const out = clampTierToSessionCeiling('flash_lite', 'flash', 'refactor the parser');
+    const out = clampTierToSessionCeiling('flash_lite', 'flash');
     expect(out.wasClamped).toBe(false);
     expect(out.clampedTier).toBe('flash_lite');
-  });
-});
-
-describe('collaborator alias rule', () => {
-  it('ships the @Doc -> @Doc-Cr rule in the packaged rules', () => {
-    const rules = fs.readFileSync(path.join(import.meta.dir, '..', 'rules', 'AGENTS.md'), 'utf8');
-    expect(rules).toContain('`@Doc` -> `@Doc-Cr`');
-  });
-});
-
-describe('approvedTier argument', () => {
-  it('is declared on both dispatch tools with the tier enum', () => {
-    for (const name of ['jev_dispatch', 'jev_batch_dispatch']) {
-      const tool = allTools.find((t) => t.name === name)!;
-      const prop = (tool.inputSchema.properties as Record<string, { enum?: string[] }>).approvedTier;
-      expect(prop.enum).toEqual(['openrouter_free', 'flash_lite', 'flash', 'pro']);
-    }
   });
 });

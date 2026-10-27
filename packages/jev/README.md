@@ -19,8 +19,7 @@ System 1 coprocessor for Cognitive Engine (RFC 002). A Bun/TypeScript MCP server
 ## Invariants
 
 - **ZDR**: under `zdr: strict`, `openrouter/free` offloading is refused, and every outbound request is gated by the egress policy in `~/.config/jev/egress.json`.
-- **Tier ceiling**: subagent tiers are clamped to the parent session's model; Pro tier requires manual user approval.
-- **Collaborator alias**: `@Doc` means GitHub `@Doc-Cr` (see `rules/AGENTS.md`).
+- **Tier ceiling**: subagent tiers are clamped to the parent session's model; Pro tier requires manual user approval, enforced by the PreToolUse guard.
 
 ## Configuration
 
@@ -44,4 +43,4 @@ Ported from `agentic-hub/plugins/jev` v2.3.0. Of the Claude Code hooks, only the
 
 ## Subagent guard hook
 
-`bun src/hook.ts claude|antigravity` is a narrow `PreToolUse` guard (`src/guard.ts`). Claude Code asks before a subagent runs on a model stronger than the session's; Antigravity asks before any `pro` subagent. It is deterministic, makes no network calls, runs only in Jev mode `on`, and fails open on any error.
+`bun src/hook.ts claude|antigravity` is a narrow `PreToolUse` guard (`src/guard.ts`). Claude Code asks before a subagent runs on a model stronger than the session's; Antigravity asks before any Pro-class subagent. It is the only enforcement point (`jev_dispatch` and its clamp are advice). It is deterministic, makes no network calls, and runs only in Jev mode `on`; once on, it asks rather than passing silently when it cannot evaluate a call.

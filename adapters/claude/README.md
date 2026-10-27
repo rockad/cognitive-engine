@@ -9,7 +9,9 @@ The hook runs `packages/jev/src/hook.ts claude` before every `Agent` or `Task` c
 - The session model is read from the last assistant turn of the session transcript, so the hook keeps no state.
 - It is deterministic and makes no network call.
 - It is active only when the Jev mode for Claude Code is `on`. In `on-demand` and `off` it stays silent.
-- It fails open: an unreadable transcript, an unknown model or any error produces no output, and the call proceeds.
+- It is the only enforcement point; `jev_dispatch` and its tier clamp are advice. Nothing the agent passes to a tool counts as approval, only your answer to the prompt.
+- It also checks the `model:` in the subagent's definition (`.claude/agents/<name>.md`) when the call sets none.
+- Once on, it fails closed: if it cannot read the call, hits an error, or cannot determine the session model for an `opus`-class request, it asks instead of letting the call through. Weaker requests with an unknown session model proceed.
 
 ## Install
 

@@ -8,9 +8,9 @@ Sidecar integration for Google Antigravity: MCP registration and one narrow `Pre
 
 ## Subagent guard
 
-`jevHooksEntry(engineRoot)` returns a `jev-enforcement` group for a workspace `.agents/hooks.json`. It runs `packages/jev/src/hook.ts antigravity` before every `invoke_subagent` call and answers `force_ask` when any subagent requests `Model: "pro"`, so Pro always needs your approval.
+`jevHooksEntry(engineRoot)` returns a `jev-enforcement` group for a workspace `.agents/hooks.json`. It runs `packages/jev/src/hook.ts antigravity` before every `invoke_subagent` call and answers `force_ask` when any subagent requests a Pro-class model (`Model: "pro"`), so Pro always needs your approval.
 
-- Active only when the Jev mode for Antigravity is `on`; fails open on any error.
+- Active only when the Jev mode for Antigravity is `on`; once on, it asks rather than passing silently when it cannot evaluate a call.
 - It replaces nothing in the engine itself: quota lockouts, the free-tier model guard and the multi-file write guard remain in the consumer workspace's own hook script. Merging into a workspace that already has a `jev-enforcement` group replaces that group, so keep the existing script's other checks if you rely on them.
 
 ## Manual install

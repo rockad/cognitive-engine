@@ -332,7 +332,7 @@ describe('Consolidated Master Plan: Unified Telemetry Logging', () => {
 });
 
 describe('Consolidated Master Plan: Phase 5 (Empirical Calibration & Multi-Agent Orchestration)', () => {
-  it('clamps recommended tier to active session model ceiling unless the user approved a tier', async () => {
+  it('clamps recommended tier to the active session model ceiling', async () => {
     const { clampTierToSessionCeiling } = await import('../src/shared.ts');
 
     // Case 1: Active session is Flash, recommendation is Pro for bounded CLI port -> Clamped to flash
@@ -346,11 +346,10 @@ describe('Consolidated Master Plan: Phase 5 (Empirical Calibration & Multi-Agent
     expect(res2.wasClamped).toBe(false);
     expect(res2.clampedTier).toBe('flash');
 
-    // Case 3: Active session is Flash, but the user approved the pro tier -> Not clamped
-    const res3 = clampTierToSessionCeiling('pro', 'gemini-3.8-flash', 'pro');
-    expect(res3.wasClamped).toBe(false);
-    expect(res3.clampedTier).toBe('pro');
-    expect(res3.ceilingTier).toBe('pro');
+    // Case 3: Task text asking for deep reasoning does not lift the ceiling
+    const res3 = clampTierToSessionCeiling('pro', 'gemini-3.8-flash');
+    expect(res3.wasClamped).toBe(true);
+    expect(res3.clampedTier).toBe('flash');
 
     // Case 4: Active session is Pro -> Pro is permitted
     const res4 = clampTierToSessionCeiling('pro', 'gemini-3.8-pro');

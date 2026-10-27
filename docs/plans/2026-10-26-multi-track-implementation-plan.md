@@ -96,7 +96,6 @@ flowchart TD
     - Turnkey installer `engine install-adapters`: deferred to the `engine` CLI work; adapter READMEs document manual steps.
 - **Invariants & Gates**:
   - Blocks `openrouter/free` offloading when handling private workspaces or under `zdr: strict`.
-  - Enforces `@Doc-Cr` alias routing.
 
 ---
 

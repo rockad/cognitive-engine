@@ -24,13 +24,6 @@ import {
   type BatchDispatchPlan
 } from '../core/index.js';
 
-const APPROVED_TIER_SCHEMA = {
-  type: 'string',
-  enum: ['openrouter_free', 'flash_lite', 'flash', 'pro'],
-  description:
-    'Highest tier the user has explicitly approved for this task. Set by the harness only after the user approves; lifts the session-model ceiling up to this tier. Task text never lifts the ceiling.'
-} as const;
-
 export const dispatchToolDefinition: Tool = {
   name: 'jev_dispatch',
   description: 'Intelligently route a task to the optimal subagent and model tier ("openrouter_free" | "flash_lite" | "flash" | "pro") in a single ~800ms decision call using TypeSafe Jev. "pro" tier models require explicit manual user approval before invocation.',
@@ -38,7 +31,6 @@ export const dispatchToolDefinition: Tool = {
     type: 'object',
     properties: {
       task: { type: 'string', description: 'The task, prompt, or sub-goal to dispatch' },
-      approvedTier: APPROVED_TIER_SCHEMA,
       availableSubagents: {
         type: 'array',
         items: { type: 'string' },
@@ -76,8 +68,7 @@ export const batchDispatchToolDefinition: Tool = {
         type: 'array',
         items: { type: 'string' },
         description: 'Optional list of candidate subagents'
-      },
-      approvedTier: APPROVED_TIER_SCHEMA
+      }
     },
     required: ['tasks']
   }
@@ -85,10 +76,9 @@ export const batchDispatchToolDefinition: Tool = {
 
 export async function handleDispatchTool(args: unknown): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
   const start = performance.now();
-  const { task, availableSubagents, approvedTier } = (args || {}) as {
+  const { task, availableSubagents } = (args || {}) as {
     task: string;
     availableSubagents?: string[];
-    approvedTier?: string;
   };
 
   if (!task) {
@@ -214,7 +204,7 @@ export async function handleDispatchTool(args: unknown): Promise<{ content: Arra
   const recommendedEffort = applyEffortGovernance(rawEffort, quotaView.strategy, recommendedTier);
 
   // Phase 5: Session Model Ceiling Clamping
-  const ceilingClamping = clampTierToSessionCeiling(recommendedTier, quotaView.active_model, approvedTier);
+  const ceilingClamping = clampTierToSessionCeiling(recommendedTier, quotaView.active_model);
   const effectiveTier = ceilingClamping.clampedTier;
   const cognitiveTier = normalizeTier(effectiveTier);
   const harnessModels = getHarnessModels();
@@ -317,10 +307,9 @@ export function matchSubagentByKeywords(
 
 export async function handleBatchDispatchTool(args: unknown): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
   const start = performance.now();
-  const { tasks, availableSubagents, approvedTier } = (args || {}) as {
+  const { tasks, availableSubagents } = (args || {}) as {
     tasks: Array<{ id: string; task: string; dependencies?: string[] }>;
     availableSubagents?: string[];
-    approvedTier?: string;
   };
 
   if (!Array.isArray(tasks) || tasks.length === 0) {
@@ -402,7 +391,7 @@ export async function handleBatchDispatchTool(args: unknown): Promise<{ content:
       rawTier = 'pro';
     }
 
-    const clamped = clampTierToSessionCeiling(rawTier, quotaView.active_model, approvedTier);
+    const clamped = clampTierToSessionCeiling(rawTier, quotaView.active_model);
     const tier = clamped.clampedTier;
     const cognitiveTier = normalizeTier(tier);
     const harnessModels = getHarnessModels();

@@ -317,27 +317,20 @@ export function rankToTierName(rank: number): 'openrouter_free' | 'flash_lite' |
   return 'pro';
 }
 
-const APPROVABLE_TIERS: ReadonlySet<string> = new Set(['openrouter_free', 'flash_lite', 'flash', 'pro']);
-
 /**
- * Clamps a recommended tier to the parent session's tier. Only an `approvedTier` that exactly
- * names a tier lifts the ceiling, and only up to that tier; task text never does. The harness
- * passes it after the user approves, and the PreToolUse guard still asks before a stronger
- * subagent runs, so this argument is not a substitute for that gate.
+ * Clamps a recommended tier to the parent session's tier. Nothing the caller supplies lifts the
+ * ceiling: this is advice for the agent, not enforcement. The only thing that lets a subagent run
+ * above the ceiling is the user approving the PreToolUse guard's prompt (see guard.ts).
  */
 export function clampTierToSessionCeiling(
   recommendedTier: string,
-  activeModel?: string,
-  approvedTier?: string
+  activeModel?: string
 ): { clampedTier: string; wasClamped: boolean; ceilingTier: string } {
   if (!activeModel) {
     return { clampedTier: recommendedTier, wasClamped: false, ceilingTier: 'pro' };
   }
 
-  const sessionRank = modelTierRank(activeModel);
-  const approvedRank =
-    approvedTier && APPROVABLE_TIERS.has(approvedTier) ? modelTierRank(approvedTier) : -1;
-  const ceilingRank = Math.max(sessionRank, approvedRank);
+  const ceilingRank = modelTierRank(activeModel);
   const ceilingTier = rankToTierName(ceilingRank);
   const recRank = modelTierRank(recommendedTier);
 

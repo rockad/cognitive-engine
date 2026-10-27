@@ -42,7 +42,7 @@ Establishes Track 1 of Cognitive Engine: migrating the TypeSafe Jev System 1 cop
   - One `PreToolUse` hook per harness, backed by a single implementation (`packages/jev/src/guard.ts`, entrypoint `src/hook.ts`):
     - Claude Code (matcher `Agent|Task`): returns `ask` when the requested model outranks the session model, read from the last assistant turn of the session transcript.
     - Antigravity (matcher `invoke_subagent`): returns `force_ask` when any subagent requests `Model: "pro"`.
-  - Scope limits: deterministic, no network access, no state files; active only in Jev mode `on`; fail-open on any error. Advice, dispatch and telemetry remain in the MCP tools.
+  - Scope limits: deterministic, no network access, no state files; active only in Jev mode `on`. Once on, it never passes a call it cannot evaluate silently: unreadable input, an internal error, or an unknown session model for an opus-class request produce an `ask`. Advice, dispatch and telemetry remain in the MCP tools and are not enforcement.
   - Out of scope: Antigravity quota lockouts, the free-tier model guard and the multi-file write guard stay in the consumer workspace's hook script.
 
 ---
@@ -51,8 +51,7 @@ Establishes Track 1 of Cognitive Engine: migrating the TypeSafe Jev System 1 cop
 
 - Inherits common invariants from [RFC 001](001-harness2-jev-unified-cognitive-substrate.md):
   - Strictly respects `zdr: strict`, blocking `openrouter/free` offloading when handling restricted content.
-  - Enforces subagent tier ceilings (Pro tier strictly requires manual human approval), by hook on Claude Code and Antigravity (active in Jev mode `on`). Only an explicit `approvedTier` argument on `jev_dispatch` lifts the session-model ceiling; task text never does.
-  - Preserves `@Doc-Cr` alias routing rules.
+  - Enforces subagent tier ceilings (Pro tier strictly requires manual human approval), by hook on Claude Code and Antigravity (active in Jev mode `on`). The hook is the only enforcement point: `jev_dispatch` and its clamp are advice, and nothing an agent passes to a tool counts as approval.
 
 ---
 
