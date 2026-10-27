@@ -222,13 +222,13 @@ To ensure seamless peer review with collaborator [@Doc-Cr](https://github.com/Do
 
 ## 6. Dual-Harness Cross-Delegation (Antigravity + Claude Code Pro)
 
-To maximize development velocity and conserve Gemini Pro quota, implementation leverages a **Dual-Harness Architecture** combining **Claude Code (Sonnet 3.5/3.7 & Opus via prepaid Pro subscription)** and **Google Antigravity (Flash/Medium Orchestrator)**.
+To maximize development velocity and conserve Gemini Pro quota, implementation leverages a **Dual-Harness Architecture** combining **Claude Code (Sonnet 5.5 & Opus 5.5 via prepaid Pro subscription)** and **Google Antigravity (Flash/Medium Orchestrator)**.
 
 ### 6.1 Division of Responsibilities
 
 | Subsystem / Concern | Primary Harness | Model Tier | Rationale |
 |---|---|---|---|
-| **Deep Code Implementation** (`packages/jev`, `packages/harness2`, adapters) | **Claude Code** | Claude 3.5/3.7 Sonnet or Opus 3 | High-fidelity multi-file coding, algorithmic prompt synthesis; burns **zero Gemini quota** (prepaid Claude Pro). |
+| **Deep Code Implementation** (`packages/jev`, `packages/harness2`, adapters) | **Claude Code** | Claude Sonnet 5.5 or Opus 5.5 | High-fidelity multi-file coding, algorithmic prompt synthesis; burns **zero Gemini quota** (prepaid Claude Pro). |
 | **Architectural Governance & Pre-Flight Dispatch** | **Antigravity** | Gemini 3.8 Flash | Session orchestrator, multi-track dependency tracking, invariant enforcement. |
 | **Verification Gates & Quality Acceptance** | **Antigravity** | Gemini 3.8 Flash + `jev_judge` | Runs test suites (`bun test`, `uv run pytest`), diff validation, and binary quality gating. |
 | **Git, PRs & Review Coordination with @Doc-Cr** | **Antigravity** | Gemini 3.8 Flash | Branch checkout, semantic commits, PR management, and GitHub review updates. |
