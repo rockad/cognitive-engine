@@ -52,6 +52,7 @@ This document governs System 1 decision-making, model tier governance, thinking 
 - **Pro Tier Manual Approval Workflow**:
   - Pro tier models (`pro`, `opus`) must NEVER be used automatically.
   - If `jev_dispatch` recommends `pro`, prompt the user for explicit approval. If declined, execute on `flash` or cheaper.
+  - Only after the user approves, re-run `jev_dispatch` with `approvedTier: "pro"` to lift the session-model ceiling to that tier. Task text never lifts the ceiling, and the argument does not replace the PreToolUse approval prompt.
 - **Thinking Effort**:
   - Match reasoning effort to task complexity. High thinking effort should be reserved for ambiguous architectural decisions, while routine transformations run with minimal or zero thinking overhead.
 

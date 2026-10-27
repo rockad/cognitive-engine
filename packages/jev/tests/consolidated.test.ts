@@ -332,29 +332,28 @@ describe('Consolidated Master Plan: Unified Telemetry Logging', () => {
 });
 
 describe('Consolidated Master Plan: Phase 5 (Empirical Calibration & Multi-Agent Orchestration)', () => {
-  it('clamps recommended tier to active session model ceiling unless explicit pro override is present', async () => {
+  it('clamps recommended tier to active session model ceiling unless the user approved a tier', async () => {
     const { clampTierToSessionCeiling } = await import('../src/shared.ts');
 
     // Case 1: Active session is Flash, recommendation is Pro for bounded CLI port -> Clamped to flash
-    const boundedTask = 'Port cloud-ops-verify CLI from Python to Rust';
-    const res1 = clampTierToSessionCeiling('pro', 'gemini-3.8-flash', boundedTask);
+    const res1 = clampTierToSessionCeiling('pro', 'gemini-3.8-flash');
     expect(res1.wasClamped).toBe(true);
     expect(res1.clampedTier).toBe('flash');
     expect(res1.ceilingTier).toBe('flash');
 
     // Case 2: Active session is Flash, recommendation is Flash -> Unchanged
-    const res2 = clampTierToSessionCeiling('flash', 'gemini-3.8-flash', boundedTask);
+    const res2 = clampTierToSessionCeiling('flash', 'gemini-3.8-flash');
     expect(res2.wasClamped).toBe(false);
     expect(res2.clampedTier).toBe('flash');
 
-    // Case 3: Active session is Flash, but prompt explicitly requests deep reasoning override -> Not clamped
-    const archTask = 'Perform deep reasoning and cross-system architecture review';
-    const res3 = clampTierToSessionCeiling('pro', 'gemini-3.8-flash', archTask);
+    // Case 3: Active session is Flash, but the user approved the pro tier -> Not clamped
+    const res3 = clampTierToSessionCeiling('pro', 'gemini-3.8-flash', 'pro');
     expect(res3.wasClamped).toBe(false);
     expect(res3.clampedTier).toBe('pro');
+    expect(res3.ceilingTier).toBe('pro');
 
     // Case 4: Active session is Pro -> Pro is permitted
-    const res4 = clampTierToSessionCeiling('pro', 'gemini-3.8-pro', boundedTask);
+    const res4 = clampTierToSessionCeiling('pro', 'gemini-3.8-pro');
     expect(res4.wasClamped).toBe(false);
     expect(res4.clampedTier).toBe('pro');
   });

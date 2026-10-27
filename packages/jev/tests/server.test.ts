@@ -187,6 +187,26 @@ describe('tier ceiling invariants', () => {
     expect(out.clampedTier).toBe('flash');
   });
 
+  it('is not lifted by phrases in the task text', () => {
+    for (const phrase of ['deep reasoning', 'cross-system architecture', 'manual pro approval', 'claude opus', 'gemini pro']) {
+      // the third argument is the approved tier; prose is not a tier name and is ignored
+      const out = clampTierToSessionCeiling('pro', 'flash', phrase);
+      expect(out.wasClamped).toBe(true);
+      expect(out.clampedTier).toBe('flash');
+    }
+  });
+
+  it('is lifted only up to the approved tier', () => {
+    expect(clampTierToSessionCeiling('pro', 'flash_lite', 'flash').clampedTier).toBe('flash');
+    const out = clampTierToSessionCeiling('pro', 'flash_lite', 'pro');
+    expect(out.wasClamped).toBe(false);
+    expect(out.clampedTier).toBe('pro');
+  });
+
+  it('never lowers the session ceiling', () => {
+    expect(clampTierToSessionCeiling('pro', 'gemini-3.8-pro', 'flash_lite').clampedTier).toBe('pro');
+  });
+
   it('leaves a recommendation at or below the ceiling alone', () => {
     const out = clampTierToSessionCeiling('flash_lite', 'flash', 'refactor the parser');
     expect(out.wasClamped).toBe(false);
@@ -198,5 +218,15 @@ describe('collaborator alias rule', () => {
   it('ships the @Doc -> @Doc-Cr rule in the packaged rules', () => {
     const rules = fs.readFileSync(path.join(import.meta.dir, '..', 'rules', 'AGENTS.md'), 'utf8');
     expect(rules).toContain('`@Doc` -> `@Doc-Cr`');
+  });
+});
+
+describe('approvedTier argument', () => {
+  it('is declared on both dispatch tools with the tier enum', () => {
+    for (const name of ['jev_dispatch', 'jev_batch_dispatch']) {
+      const tool = allTools.find((t) => t.name === name)!;
+      const prop = (tool.inputSchema.properties as Record<string, { enum?: string[] }>).approvedTier;
+      expect(prop.enum).toEqual(['openrouter_free', 'flash_lite', 'flash', 'pro']);
+    }
   });
 });
