@@ -10,6 +10,31 @@
         "typescript": "^5.8.2",
       },
     },
+    "adapters/antigravity": {
+      "name": "@cognitive-engine/adapter-antigravity",
+      "version": "1.0.0",
+      "devDependencies": {
+        "@types/bun": "^1.4.2",
+        "@types/node": "^22.13.9",
+        "typescript": "^5.8.2",
+      },
+    },
+    "adapters/claude": {
+      "name": "@cognitive-engine/adapter-claude",
+      "version": "1.0.0",
+    },
+    "adapters/opencode": {
+      "name": "@cognitive-engine/adapter-opencode",
+      "version": "1.0.0",
+      "dependencies": {
+        "@cognitive-engine/jev": "workspace:*",
+      },
+      "devDependencies": {
+        "@types/bun": "^1.4.2",
+        "@types/node": "^22.13.9",
+        "typescript": "^5.8.2",
+      },
+    },
     "packages/jev": {
       "name": "@cognitive-engine/jev",
       "version": "1.0.0",
@@ -28,6 +53,12 @@
     },
   },
   "packages": {
+    "@cognitive-engine/adapter-antigravity": ["@cognitive-engine/adapter-antigravity@workspace:adapters/antigravity"],
+
+    "@cognitive-engine/adapter-claude": ["@cognitive-engine/adapter-claude@workspace:adapters/claude"],
+
+    "@cognitive-engine/adapter-opencode": ["@cognitive-engine/adapter-opencode@workspace:adapters/opencode"],
+
     "@cognitive-engine/jev": ["@cognitive-engine/jev@workspace:packages/jev"],
 
     "@hono/node-server": ["@hono/node-server@2.1.5", "", { "peerDependencies": { "hono": "^4 || ^5.0.0-0" } }, "sha512-MgP/I06GdvsilDspMk/qmRzpk8LOUStP6jFAbSRi40W09DhoyUn+Mj7eyKICPqeYKybOjVFLVIAQzvu1bfIa7Q=="],
