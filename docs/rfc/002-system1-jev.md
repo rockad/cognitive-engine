@@ -33,10 +33,17 @@ Establishes Track 1 of Cognitive Engine: migrating the TypeSafe Jev System 1 cop
   - Primary: Standard stdio FastMCP transport for zero-latency, direct integration with CLI harnesses (`agy mcp`, Claude Code, OpenCode).
   - Secondary: Streamable HTTP daemon on `127.0.0.1:8115/mcp` when supervised via `engine up`.
 - **Multi-Harness Adapters (`adapters/`)**:
-  - **Antigravity**: Sidecar integration and MCP registration (`~/.gemini/config/mcp_config.json`).
-  - **Claude Code**: Native plugin bundle (`.claude-plugin/plugin.json`) and MCP registration (no custom session hooks, per Oct 27 settings consolidation).
+  - **Antigravity**: Sidecar integration, MCP registration (`~/.gemini/config/mcp_config.json`), and the narrow subagent guard hook (see below).
+  - **Claude Code**: Native plugin bundle (`.claude-plugin/plugin.json`), MCP registration, and the narrow subagent guard hook. No session, prompt or model-switch hooks, per the Oct 27 settings consolidation.
   - **OpenCode**: V2 plugin bundle and event interceptors.
   - **CLI Installer**: Unified `engine install-adapters` command configuring all three environments turnkey.
+- **Narrow Subagent Guard (Claude Code and Antigravity)**:
+  - Rationale: the tier-ceiling and Pro-approval invariants must be enforced, not merely advised. With no hook, a subagent could run on a stronger model than the session without any prompt to the user.
+  - One `PreToolUse` hook per harness, backed by a single implementation (`packages/jev/src/guard.ts`, entrypoint `src/hook.ts`):
+    - Claude Code (matcher `Agent|Task`): returns `ask` when the requested model outranks the session model, read from the last assistant turn of the session transcript.
+    - Antigravity (matcher `invoke_subagent`): returns `force_ask` when any subagent requests `Model: "pro"`.
+  - Scope limits: deterministic, no network access, no state files; active only in Jev mode `on`; fail-open on any error. Advice, dispatch and telemetry remain in the MCP tools.
+  - Out of scope: Antigravity quota lockouts, the free-tier model guard and the multi-file write guard stay in the consumer workspace's hook script.
 
 ---
 
@@ -44,7 +51,7 @@ Establishes Track 1 of Cognitive Engine: migrating the TypeSafe Jev System 1 cop
 
 - Inherits common invariants from [RFC 001](001-harness2-jev-unified-cognitive-substrate.md):
   - Strictly respects `zdr: strict`, blocking `openrouter/free` offloading when handling restricted content.
-  - Enforces subagent tier ceilings (Pro tier strictly requires manual human approval).
+  - Enforces subagent tier ceilings (Pro tier strictly requires manual human approval), by hook on Claude Code and Antigravity and by an in-plugin guard on OpenCode.
   - Preserves `@Doc-Cr` alias routing rules.
 
 ---
