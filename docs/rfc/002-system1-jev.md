@@ -33,8 +33,8 @@ Establishes Track 1 of Cognitive Engine: migrating the TypeSafe Jev System 1 cop
   - Primary: Standard stdio FastMCP transport for zero-latency, direct integration with CLI harnesses (`agy mcp`, Claude Code, OpenCode).
   - Secondary: Streamable HTTP daemon on `127.0.0.1:8115/mcp` when supervised via `engine up`.
 - **Multi-Harness Adapters (`adapters/`)**:
-  - **Antigravity**: Sidecar integration and MCP registration.
-  - **Claude Code**: PreToolUse and PostToolUse lifecycle hook scripts.
+  - **Antigravity**: Sidecar integration and MCP registration (`~/.gemini/config/mcp_config.json`).
+  - **Claude Code**: Native plugin bundle (`.claude-plugin/plugin.json`) and MCP registration (no custom session hooks, per Oct 27 settings consolidation).
   - **OpenCode**: V2 plugin bundle and event interceptors.
   - **CLI Installer**: Unified `engine install-adapters` command configuring all three environments turnkey.
 

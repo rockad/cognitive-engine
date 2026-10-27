@@ -89,8 +89,8 @@ flowchart TD
     - Default: FastMCP stdio transport for zero-latency direct integration with CLI harnesses.
     - Supervised Daemon: Streamable HTTP transport on `127.0.0.1:8115/mcp` managed via `engine up`.
   - **Multi-Harness Adapters (`adapters/`)**:
-    - Google Antigravity sidecar integration and MCP registration.
-    - Claude Code PreToolUse and PostToolUse lifecycle hook scripts.
+    - Google Antigravity sidecar integration and MCP registration (`~/.gemini/config/mcp_config.json`).
+    - Claude Code native plugin package (`.claude-plugin/plugin.json`) and MCP registration (no custom session hooks, aligning with the 2026-10-27 settings consolidation).
     - OpenCode V2 plugin bundle and event interceptors.
     - Turnkey installer command: `engine install-adapters`.
 - **Invariants & Gates**:
