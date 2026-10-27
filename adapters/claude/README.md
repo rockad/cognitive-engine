@@ -24,6 +24,10 @@ claude --plugin-dir "$COGNITIVE_ENGINE_HOME/adapters/claude"
 
 Jev reads its OpenRouter key from `~/.config/zsh/secrets.env` or `~/.config/jev/env`; the bundle holds no credentials.
 
+## Enable the guard
+
+The hook is silent until the Jev mode for Claude Code is `on`. Run `/jev on`, or set `harnesses.claude-code.mode` to `"on"` in `~/.config/jev/config.json`.
+
 ## Validate
 
 ```sh

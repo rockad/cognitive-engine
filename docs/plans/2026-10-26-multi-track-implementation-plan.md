@@ -48,7 +48,7 @@ flowchart TD
 
     subgraph Phase1 ["Phase 1: Substrate Foundations (Parallel Execution)"]
         direction LR
-        Track1["Track 1 (RFC 002)<br/>Branch: feat/track1-jev-adapters<br/>- packages/jev/<br/>- adapters/<br/>- engine install-adapters"]
+        Track1["Track 1 (RFC 002)<br/>Branch: feat/track1-jev-adapters<br/>- packages/jev/<br/>- adapters/<br/>- Claude + Antigravity adapters"]
         Track2["Track 2 (RFC 003)<br/>Branch: feat/track2-memory-lookup<br/>- packages/memory/ (:8105)<br/>- packages/lookup/ (:8100)<br/>- docs.visibility & RAM tuning"]
     end
 
@@ -86,14 +86,14 @@ flowchart TD
     - Free-tier offloading coprocessor (`jev_execute_free`, `jev_agent_free`) saving Gemini/Claude quota.
     - Model tier ceiling governance (clamping subagents to parent tier; strict user gate for Pro tier).
   - **Dual-Mode Transport**:
-    - Default: FastMCP stdio transport for zero-latency direct integration with CLI harnesses.
+    - Default: MCP SDK stdio transport for zero-latency direct integration with CLI harnesses.
     - Supervised Daemon: Streamable HTTP transport on `127.0.0.1:8115/mcp` managed via `engine up`.
   - **Multi-Harness Adapters (`adapters/`)**:
     - Google Antigravity sidecar integration and MCP registration (`~/.gemini/config/mcp_config.json`).
     - Claude Code native plugin package (`.claude-plugin/plugin.json`), MCP registration, and one narrow `PreToolUse` subagent guard (no session, prompt or model-switch hooks, aligning with the 2026-10-27 settings consolidation).
     - Antigravity gets the same narrow guard (`invoke_subagent`, Pro tier needs approval); both share `packages/jev/src/guard.ts`.
-    - OpenCode V2 plugin bundle and event interceptors.
-    - Turnkey installer command: `engine install-adapters`.
+    - OpenCode V2 plugin bundle: deferred (committed, unverified, needs overhaul).
+    - Turnkey installer `engine install-adapters`: deferred to the `engine` CLI work; adapter READMEs document manual steps.
 - **Invariants & Gates**:
   - Blocks `openrouter/free` offloading when handling private workspaces or under `zdr: strict`.
   - Enforces `@Doc-Cr` alias routing.
@@ -188,7 +188,7 @@ flowchart TD
 
 | Stream | Track | Branch | Scope / File Targets | Description | Lead Subagent | Recommended Tier |
 |---|---|---|---|---|---|---|
-| **WS1** | **Track 1** | `feat/track1-jev-adapters` | `packages/jev/`, `adapters/`, `cli/` | Migrate Jev core, stdio/HTTP transports, and Antigravity / Claude / OpenCode adapters | `code-engineer` | `flash_lite` |
+| **WS1** | **Track 1** | `feat/track1-jev-adapters` | `packages/jev/`, `adapters/`, `cli/` | Migrate Jev core, stdio/HTTP transports, and Antigravity / Claude adapters (OpenCode deferred) | `code-engineer` | `flash_lite` |
 | **WS2** | **Track 2** | `feat/track2-memory-lookup` | `packages/memory/`, `packages/lookup/` | Package native `basic-memory` on `:8105` and companion `lookup` on `:8100` with `docs.visibility` | `code-engineer` | `flash_lite` |
 | **WS3** | **Track 3** | `feat/track3-harness2` | `packages/harness2/` | Package Harness² optimizer, local `sbx` microVMs, fail-closed prober, and daily quota pre-flight | `code-engineer` | `flash_lite` |
 | **WS4** | **Track 4** | `feat/track4-egress-retirement` | `cognitive-engine/`, `doppelganger/`, `agentic-hub/` | Cross-runtime egress gates, consumer rebinding, and gated surgical retirement of legacy plugins | `system-operator` | `flash_lite` |

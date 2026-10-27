@@ -1,5 +1,7 @@
 # OpenCode adapter
 
+> **Deferred.** This adapter is committed but unverified against a live OpenCode, the V2 plugin API is beta, and it is expected to need an overhaul. It is not part of the Track 1 review (see RFC 002).
+
 OpenCode V2 plugin for Jev, plus the MCP registration.
 
 ## What the plugin does

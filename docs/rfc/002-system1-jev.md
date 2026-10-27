@@ -30,13 +30,13 @@ Establishes Track 1 of Cognitive Engine: migrating the TypeSafe Jev System 1 cop
   - Free-tier offloading coprocessor (`jev_execute_free`, `jev_agent_free`).
   - Model tier ceiling governance.
 - **Dual-Mode Transport**:
-  - Primary: Standard stdio FastMCP transport for zero-latency, direct integration with CLI harnesses (`agy mcp`, Claude Code, OpenCode).
+  - Primary: Standard stdio MCP (official TypeScript SDK) transport for zero-latency, direct integration with CLI harnesses (`agy mcp`, Claude Code, OpenCode).
   - Secondary: Streamable HTTP daemon on `127.0.0.1:8115/mcp` when supervised via `engine up`.
 - **Multi-Harness Adapters (`adapters/`)**:
   - **Antigravity**: Sidecar integration, MCP registration (`~/.gemini/config/mcp_config.json`), and the narrow subagent guard hook (see below).
   - **Claude Code**: Native plugin bundle (`.claude-plugin/plugin.json`), MCP registration, and the narrow subagent guard hook. No session, prompt or model-switch hooks, per the Oct 27 settings consolidation.
-  - **OpenCode**: V2 plugin bundle and event interceptors.
-  - **CLI Installer**: Unified `engine install-adapters` command configuring all three environments turnkey.
+  - **OpenCode** (deferred): a V2 plugin bundle exists at `adapters/opencode/` but is unverified against a live OpenCode and is expected to need an overhaul; it is not part of the Track 1 review.
+  - **CLI Installer** (deferred): the unified `engine install-adapters` command moves to the `engine` CLI work. Until then each adapter README documents manual install steps.
 - **Narrow Subagent Guard (Claude Code and Antigravity)**:
   - Rationale: the tier-ceiling and Pro-approval invariants must be enforced, not merely advised. With no hook, a subagent could run on a stronger model than the session without any prompt to the user.
   - One `PreToolUse` hook per harness, backed by a single implementation (`packages/jev/src/guard.ts`, entrypoint `src/hook.ts`):
@@ -51,7 +51,7 @@ Establishes Track 1 of Cognitive Engine: migrating the TypeSafe Jev System 1 cop
 
 - Inherits common invariants from [RFC 001](001-harness2-jev-unified-cognitive-substrate.md):
   - Strictly respects `zdr: strict`, blocking `openrouter/free` offloading when handling restricted content.
-  - Enforces subagent tier ceilings (Pro tier strictly requires manual human approval), by hook on Claude Code and Antigravity and by an in-plugin guard on OpenCode.
+  - Enforces subagent tier ceilings (Pro tier strictly requires manual human approval), by hook on Claude Code and Antigravity (active in Jev mode `on`). Only an explicit `approvedTier` argument on `jev_dispatch` lifts the session-model ceiling; task text never does.
   - Preserves `@Doc-Cr` alias routing rules.
 
 ---
@@ -60,6 +60,6 @@ Establishes Track 1 of Cognitive Engine: migrating the TypeSafe Jev System 1 cop
 
 - [ ] `packages/jev` compiles under Bun with 0 TypeScript errors.
 - [ ] Stdio and Streamable HTTP transports (`:8115`) functional.
-- [ ] `adapters/` installs cleanly via `engine install-adapters` across Antigravity, Claude Code, and OpenCode.
+- [ ] Claude Code and Antigravity adapters install following their README steps (`engine install-adapters` and OpenCode are deferred).
 - [ ] All existing Jev unit tests and Decision API schemas pass in `packages/jev`.
 - [ ] Root `LICENSE` (MIT) applied.
