@@ -40,8 +40,8 @@ Establishes Track 1 of Cognitive Engine: migrating the TypeSafe Jev System 1 cop
 - **Narrow Subagent Guard (Claude Code and Antigravity)**:
   - Rationale: the tier-ceiling and Pro-approval invariants must be enforced, not merely advised. With no hook, a subagent could run on a stronger model than the session without any prompt to the user.
   - One `PreToolUse` hook per harness, backed by a single implementation (`packages/jev/src/guard.ts`, entrypoint `src/hook.ts`):
-    - Claude Code (matcher `Agent|Task`): returns `ask` when the requested model outranks the session model, read from the last assistant turn of the session transcript.
-    - Antigravity (matcher `invoke_subagent`): returns `force_ask` when any subagent requests `Model: "pro"`.
+    - Claude Code (matcher `Agent|Task`): returns `ask` when the model the subagent will run on (the call's `model`, else the `model:` in its definition file) outranks the session model, read from the last assistant turn of the session transcript. Verified to fire under `bypassPermissions`.
+    - Antigravity (matcher `invoke_subagent`): returns `force_ask` when any subagent requests a Pro-class model.
   - Scope limits: deterministic, no network access, no state files; active only in Jev mode `on`. Once on, it never passes a call it cannot evaluate silently: unreadable input, an internal error, or an unknown session model for an opus-class request produce an `ask`. Advice, dispatch and telemetry remain in the MCP tools and are not enforcement.
   - Out of scope: Antigravity quota lockouts, the free-tier model guard and the multi-file write guard stay in the consumer workspace's hook script.
 
@@ -57,8 +57,8 @@ Establishes Track 1 of Cognitive Engine: migrating the TypeSafe Jev System 1 cop
 
 ## 4. Acceptance Criteria
 
-- [ ] `packages/jev` compiles under Bun with 0 TypeScript errors.
-- [ ] Stdio and Streamable HTTP transports (`:8115`) functional.
+- [x] `packages/jev` compiles under Bun with 0 TypeScript errors.
+- [x] Stdio and Streamable HTTP transports (`:8115`) functional.
 - [ ] Claude Code and Antigravity adapters install following their README steps (`engine install-adapters` and OpenCode are deferred).
-- [ ] All existing Jev unit tests and Decision API schemas pass in `packages/jev`.
-- [ ] Root `LICENSE` (MIT) applied.
+- [x] All ported Jev unit tests and Decision API schemas pass in `packages/jev` (Claude-hook and commit-script tests were not carried over).
+- [x] Root `LICENSE` (MIT) applied.

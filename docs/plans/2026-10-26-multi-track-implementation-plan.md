@@ -84,18 +84,33 @@ flowchart TD
     - Sub-second probabilistic model tier dispatch (`jev_dispatch`, `jev_route`).
     - Binary quality gatekeeping and diff acceptance (`jev_judge`).
     - Free-tier offloading coprocessor (`jev_execute_free`, `jev_agent_free`) saving Gemini/Claude quota.
-    - Model tier ceiling governance (clamping subagents to parent tier; strict user gate for Pro tier).
+    - Model tier ceiling governance: `jev_dispatch` clamps its advice to the parent tier; enforcement is the hook below, not the tool.
   - **Dual-Mode Transport**:
     - Default: MCP SDK stdio transport for zero-latency direct integration with CLI harnesses.
     - Supervised Daemon: Streamable HTTP transport on `127.0.0.1:8115/mcp` managed via `engine up`.
   - **Multi-Harness Adapters (`adapters/`)**:
     - Google Antigravity sidecar integration and MCP registration (`~/.gemini/config/mcp_config.json`).
     - Claude Code native plugin package (`.claude-plugin/plugin.json`), MCP registration, and one narrow `PreToolUse` subagent guard (no session, prompt or model-switch hooks, aligning with the 2026-10-27 settings consolidation).
-    - Antigravity gets the same narrow guard (`invoke_subagent`, Pro tier needs approval); both share `packages/jev/src/guard.ts`.
+    - Antigravity gets the same narrow guard (`invoke_subagent`, any Pro-class model needs approval); both share `packages/jev/src/guard.ts`. The guard fails closed once Jev mode is `on` and fires under Claude Code `bypassPermissions`.
     - OpenCode V2 plugin bundle: deferred (committed, unverified, needs overhaul).
     - Turnkey installer `engine install-adapters`: deferred to the `engine` CLI work; adapter READMEs document manual steps.
 - **Invariants & Gates**:
   - Blocks `openrouter/free` offloading when handling private workspaces or under `zdr: strict`.
+
+#### 3.1.1 Track 1 implementation findings & refinements (2026-10-27)
+
+Outcomes from building and reviewing `feat/track1-jev-adapters`; they refine the deliverables above.
+
+- **The hook is the only enforcement point.** `jev_dispatch` is a tool the agent calls and the agent chooses every argument, so its tier clamp is advice. An `approvedTier` argument was tried and removed for that reason, and the old prompt-text override phrases ("deep reasoning", "claude opus", …) were removed from the clamp. The only approval is the user answering the hook's prompt.
+- **Guard hardening.** It also reads the `model:` in the subagent's definition file (`.claude/agents/<name>.md`) when the call sets none; treats any Pro-class Antigravity model name as Pro; asks when the session model is unknown for an opus-class request; and asks instead of passing silently on unreadable input or internal errors.
+- **`bypassPermissions` verified.** A hook `ask` is not auto-approved by bypass mode (tested with a throwaway hook under `claude -p`: the call was blocked, same as `deny`). The interactive prompt itself was not observed; confirm once in a live bypass session.
+- **Mode gating stays.** The guard is silent unless Jev mode for the harness is `on`, and an unconfigured install defaults to `off`. Making the invariant independent of mode was considered (separate guard switch, or unconditional) and not chosen; revisit if enforcement-by-default is wanted.
+- **OpenCode deferred.** The lean V2 plugin is committed but unverified against a live OpenCode and is expected to need an overhaul (the old `agentic-hub` plugin was decommissioned). Out of the Track 1 review.
+- **Installer deferred.** No `engine install-adapters` yet; adapter READMEs document manual steps. The Antigravity adapter exposes pure merge functions (`installMcpConfig`, `jevHooksEntry`) for the future CLI.
+- **Transport.** The server uses the official MCP TypeScript SDK (stdio default, stateless streamable HTTP on `127.0.0.1:8115/mcp`, loopback `Host` check), not FastMCP.
+- **Claude plugin shape.** `.claude-plugin/plugin.json` + `.mcp.json` + `hooks/hooks.json`; the MCP command and the hook resolve through `COGNITIVE_ENGINE_HOME`, which has no default so a missing value fails loudly.
+- **Port notes.** Claude session/prompt hooks and the commit script were not carried over. Discovery, mode and egress tests were made independent of the harness running them (they failed inside any Claude Code session). The `@Doc-Cr` alias rule is Antigravity-only and is not part of the engine.
+- **Credentials.** Adapters write no keys; Jev reads `JEV_OPENROUTER_API_KEY` from `~/.config/zsh/secrets.env` or `~/.config/jev/env`.
 
 ---
 
