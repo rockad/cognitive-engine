@@ -1,0 +1,100 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Workflow",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CANARY_HOME\"/canary.sh PreToolUse",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CANARY_HOME\"/canary.sh PreToolUse",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(echo canary-block-test*)",
+            "command": "\"$CANARY_HOME\"/crash.sh",
+            "onFailure": "block",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "if": "Bash(echo canary-open-test*)",
+            "command": "\"$CANARY_HOME\"/crash.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostModelSwitch": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CANARY_HOME\"/canary.sh PostModelSwitch",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreModelSwitch": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CANARY_HOME\"/canary.sh PreModelSwitch",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CANARY_HOME\"/canary.sh SubagentStart",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CANARY_HOME\"/canary.sh SubagentStop",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CANARY_HOME\"/canary.sh SessionStart",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "enableWorkflows": true
+}
