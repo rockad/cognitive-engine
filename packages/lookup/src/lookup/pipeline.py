@@ -117,7 +117,7 @@ def ingest_source(con, src: Source, commit_every: int = 500,
                 if not (d.get("body") or "").strip():
                     continue
                 # Inclusion invariant, re-checked per document.
-                if not src.contains(type(path)(d["path"])):
+                if not src.contains(src.path(d["path"])):
                     res.refused += 1
                     if len(res.problems) < 10:
                         res.problems.append(f"REFUSED (outside root): {d['path']}")
@@ -144,7 +144,7 @@ def ingest_source(con, src: Source, commit_every: int = 500,
                 # extractor that emits per-entry paths, and the ledger joins on
                 # the path that actually lands in the row. db.file_sha256 caches,
                 # so a file yielding 5,660 documents is still hashed once.
-                d["src_sha256"] = db.file_sha256(slot) if slot else None
+                d["src_sha256"] = db.file_sha256(slot, fs=src.fs) if slot else None
                 ordinals[slot] = ordinals.get(slot, -1) + 1
                 key = db.doc_key(d, ordinals[slot])
                 seen.add(key)

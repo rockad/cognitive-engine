@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePath
 
 from . import config
+from .vfs import LOCAL, FileSystem
 
 
 class ManifestError(RuntimeError):
@@ -197,6 +198,9 @@ class Source:
     # Validated in `load()`, so a typo is a loud manifest error rather than a
     # source that quietly reads as unstated.
     visibility: str = VISIBILITY_UNSTATED
+    # The filesystem this source is read through. None means "decide from the manifest"
+    # (today always the local disk); tests and other backends can supply one explicitly.
+    filesystem: FileSystem | None = field(default=None, repr=False, compare=False)
 
     def needs_signoff(self) -> bool:
         """True when a fact from here is not free to reuse as it stands.
@@ -223,8 +227,17 @@ class Source:
         """
         return self.visibility if self.visibility in VISIBILITY_CEILINGS else None
 
+    @property
+    def fs(self) -> FileSystem:
+        """Where this source's bytes come from. Every read of it goes through here."""
+        return self.filesystem or LOCAL
+
+    def path(self, s: str):
+        """A path object for a logical path string, on this source's filesystem."""
+        return self.fs.path(s)
+
     def exists(self) -> bool:
-        return self.root.is_dir()
+        return self.fs.is_dir(self.root)
 
     def addresses(self) -> tuple[str, ...]:
         """The declared aliases, normalised, deduped, order preserved."""
@@ -266,13 +279,9 @@ class Source:
         dev = self.volume.get("device")
         return normalise_address(dev) if dev else None
 
-    def contains(self, p: Path) -> bool:
+    def contains(self, p) -> bool:
         """True only if `p` really resolves inside this source's root."""
-        try:
-            root = self.root.resolve()
-            return p.resolve().is_relative_to(root)
-        except (OSError, ValueError):
-            return False
+        return self.fs.contains(self.root, p)
 
     def files(self):
         """Explicitly included files, deduped and ordered.
@@ -298,12 +307,12 @@ class Source:
         if not self.exists():
             return
         root = self.root
-        out: list[Path] = []
+        fs = self.fs
+        out: list = []
         # Normalised once: a declared `Work/Verda/` or `./Work/Verda` should
         # match the same subtree as `Work/Verda`.
         pruned_paths = {PurePath(p.strip("/")) for p in self.exclude_paths}
-        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-            here = Path(dirpath)
+        for here, dirnames, filenames in fs.walk(root):
             # Prune in place: os.walk honours mutation of `dirnames`, which is
             # what stops it descending at all.
             #
@@ -323,7 +332,7 @@ class Source:
                 rel = p.relative_to(root)
                 if not any(full_match(rel, pat) for pat in self.include):
                     continue
-                if not p.is_file():
+                if not fs.is_file(p):
                     continue
                 if not self.contains(p):
                     continue  # symlink or traversal out of the declared root
