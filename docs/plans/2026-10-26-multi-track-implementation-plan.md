@@ -104,13 +104,32 @@ Outcomes from building and reviewing `feat/track1-jev-adapters`; they refine the
 - **The hook is the only enforcement point.** `jev_dispatch` is a tool the agent calls and the agent chooses every argument, so its tier clamp is advice. An `approvedTier` argument was tried and removed for that reason, and the old prompt-text override phrases ("deep reasoning", "claude opus", …) were removed from the clamp. The only approval is the user answering the hook's prompt.
 - **Guard hardening.** It also reads the `model:` in the subagent's definition file (`.claude/agents/<name>.md`) when the call sets none; treats any Pro-class Antigravity model name as Pro; asks when the session model is unknown for an opus-class request; and asks instead of passing silently on unreadable input or internal errors.
 - **`bypassPermissions` verified.** A hook `ask` is not auto-approved by bypass mode (tested with a throwaway hook under `claude -p`: the call was blocked, same as `deny`). The interactive prompt itself was not observed; confirm once in a live bypass session.
-- **Mode gating stays.** The guard is silent unless Jev mode for the harness is `on`, and an unconfigured install defaults to `off`. Making the invariant independent of mode was considered (separate guard switch, or unconditional) and not chosen; revisit if enforcement-by-default is wanted.
+- **Mode gating updated (2026-10-28 review decision).** The Subagent Tier Ceiling Guard is **ACTIVE in both `on` and `on-demand`** (only disabled when mode is explicitly `off`). Delegations made in `on-demand` do not go unguarded.
+  - **Difference between `on-demand` and `on`**:
+    - **`on-demand` (Passive Safety Coprocessor)**: Tools are available for on-demand invocations; the `PreToolUse` subagent ceiling guard is active (preventing accidental runaway Pro/Opus burns); zero mandatory pre-flight interception or forced judging ceremonies.
+    - **`on` (Aggressive Proactive Enforcement)**: Tier ceiling guard is active; mandatory pre-flight dispatch (`jev_dispatch`) on non-trivial tasks; mandatory `jev_judge` quality gates on diffs; mandatory free-tier offloading for text/summaries to `openrouter/free` ($0 cost); automatic clamping to `flash_lite` when quota <20%.
+    - **`off` (Dormant)**: MCP disabled, zero token overhead, zero hook enforcement.
 - **OpenCode deferred.** The lean V2 plugin is committed but unverified against a live OpenCode and is expected to need an overhaul (the old `agentic-hub` plugin was decommissioned). Out of the Track 1 review.
 - **Installer deferred.** No `engine install-adapters` yet; adapter READMEs document manual steps. The Antigravity adapter exposes pure merge functions (`installMcpConfig`, `jevHooksEntry`) for the future CLI.
 - **Transport.** The server uses the official MCP TypeScript SDK (stdio default, stateless streamable HTTP on `127.0.0.1:8115/mcp`, loopback `Host` check), not FastMCP.
 - **Claude plugin shape.** `.claude-plugin/plugin.json` + `.mcp.json` + `hooks/hooks.json`; the MCP command and the hook resolve through `COGNITIVE_ENGINE_HOME`, which has no default so a missing value fails loudly.
 - **Port notes.** Claude session/prompt hooks and the commit script were not carried over. Discovery, mode and egress tests were made independent of the harness running them (they failed inside any Claude Code session). The `@Doc-Cr` alias rule is Antigravity-only and is not part of the engine.
 - **Credentials.** Adapters write no keys; Jev reads `JEV_OPENROUTER_API_KEY` from `~/.config/zsh/secrets.env` or `~/.config/jev/env`.
+
+#### 3.1.2 PR #3 Review Findings & Remediation Plan (from @Doc-Cr, 2026-10-28)
+
+Adopted from [@Doc-Cr's PR #3 review](https://github.com/rockad/cognitive-engine/pull/3#issuecomment-3456382024):
+
+1. **Remediate Hook Fail-Open on Launch Failure** (`adapters/claude/hooks/hooks.json`):
+   - Wrap hook invocation in a shell check: if `$COGNITIVE_ENGINE_HOME` is unset, invalid, or the entrypoint file does not exist, echo an explicit JSON `ask` (`[jev] guard not found: COGNITIVE_ENGINE_HOME is unset or wrong`) instead of letting `bun` exit 1 (which Claude Code treats as non-blocking fail-open). Add a manifest unit test asserting this behavior.
+2. **Support Plugin Subagents in Definition Lookup** (`guard.ts`):
+   - Enhance `agentDefinitionModel` to parse namespaced plugin agents (`plugin-name:agent`) and resolve the model specification against installed plugin directories rather than returning `null`.
+3. **Quote Antigravity Hook Path** (`adapters/antigravity/src/index.ts`):
+   - Quote `$COGNITIVE_ENGINE_HOME` in the generated Antigravity hook command to prevent execution failure on checkout paths containing spaces.
+4. **Catch Claude Top Tier (`fable`) in Antigravity Guard** (`guard.ts`, `governance.ts`):
+   - Update `guard.ts:120` to also trigger an `ask` when `claudeModelRank(model) >= STRONG_RANK`, ensuring `fable` is not misclassified as flash rank (2).
+5. **Enforce Tier Ceiling in Both `on` and `on-demand` Modes**:
+   - Update `guard.ts` so that the Subagent Tier Ceiling Guard is active whenever Jev mode is `on` or `on-demand`, remaining silent only in `off`.
 
 ---
 
