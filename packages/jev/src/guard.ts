@@ -116,7 +116,14 @@ export function evaluateClaudeWorkflow(input: any): Verdict | null {
 }
 /** Claude Code PreToolUse input -> verdict. */
 export function evaluateClaude(input: any): Verdict | null {
-  if (input?.tool_name === 'Workflow') return evaluateClaudeWorkflow(input);
+  if (typeof input?.tool_name !== 'string') {
+    return {
+      decision: 'ask',
+      reason: '[jev] The hook input has no tool name, so the call could not be evaluated. Approve only if you intended it.',
+      audit: { kind: 'malformed-input' }
+    };
+  }
+  if (input.tool_name === 'Workflow') return evaluateClaudeWorkflow(input);
   if (input?.tool_name !== 'Agent' && input?.tool_name !== 'Task') return null;
   const raw = input.tool_input ?? {};
   if (typeof raw !== 'object' || Array.isArray(raw)) {

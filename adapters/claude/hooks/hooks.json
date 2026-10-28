@@ -7,7 +7,19 @@
           {
             "type": "command",
             "command": "bun \"$COGNITIVE_ENGINE_HOME/packages/jev/src/hook.ts\" claude",
-            "timeout": 5
+            "timeout": 5,
+            "onFailure": "block"
+          }
+        ]
+      },
+      {
+        "matcher": "Workflow",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun \"$COGNITIVE_ENGINE_HOME/packages/jev/src/hook.ts\" claude",
+            "timeout": 5,
+            "onFailure": "block"
           }
         ]
       }

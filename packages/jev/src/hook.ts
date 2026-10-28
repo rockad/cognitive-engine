@@ -8,7 +8,8 @@
  * The matcher in each adapter limits the hook to calls that spawn subagents, so this only prompts
  * on those calls.
  */
-import { readJevMode } from './core/config.js';
+import * as fs from 'node:fs';
+import { JEV_CONFIG_FILE, readJevMode } from './core/config.js';
 import {
   evaluateAntigravity,
   evaluateClaude,
@@ -26,6 +27,21 @@ const HARNESSES: Record<
   claude: { jevHarness: 'claude-code', evaluate: evaluateClaude },
   antigravity: { jevHarness: 'antigravity', evaluate: evaluateAntigravity }
 };
+
+/**
+ * The user config exists but is not valid JSON. The config loader then falls back to its default
+ * mode (`off`); for the guard that would be a silent allow, so a broken config keeps it active.
+ */
+function modeConfigBroken(): boolean {
+  const file = process.env.JEV_CONFIG_FILE || JEV_CONFIG_FILE;
+  try {
+    if (!fs.existsSync(file)) return false;
+    JSON.parse(fs.readFileSync(file, 'utf8'));
+    return false;
+  } catch {
+    return true;
+  }
+}
 
 function auditAsk(verdict: Verdict, stdin: string): void {
   let toolName: unknown;
@@ -46,7 +62,7 @@ export async function run(harnessArg: string | undefined, stdin: string): Promis
 
   let verdict: Verdict | null;
   try {
-    if ((await readJevMode(harness.jevHarness)) === 'off') return null;
+    if ((await readJevMode(harness.jevHarness)) === 'off' && !modeConfigBroken()) return null;
     verdict = harness.evaluate(JSON.parse(stdin));
   } catch (err) {
     verdict = guardErrorVerdict(err);
