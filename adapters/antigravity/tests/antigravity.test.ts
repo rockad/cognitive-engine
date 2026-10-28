@@ -85,10 +85,13 @@ describe('antigravity adapter', () => {
 describe('antigravity hook entry', () => {
   const entry = jevHooksEntry('/opt/cognitive-engine') as any;
 
-  it('guards only invoke_subagent with the shared hook script', () => {
+  it('guards only invoke_subagent with the shared hook script and quotes the path', () => {
     expect(entry.PreToolUse).toHaveLength(1);
     expect(entry.PreToolUse[0].matcher).toBe('invoke_subagent');
-    expect(entry.PreToolUse[0].hooks[0].command).toBe('bun /opt/cognitive-engine/packages/jev/src/hook.ts antigravity');
+    expect(entry.PreToolUse[0].hooks[0].command).toBe('bun "/opt/cognitive-engine/packages/jev/src/hook.ts" antigravity');
+
+    const spaced = jevHooksEntry('/path with spaces/cognitive-engine') as any;
+    expect(spaced.PreToolUse[0].hooks[0].command).toBe('bun "/path with spaces/cognitive-engine/packages/jev/src/hook.ts" antigravity');
   });
 
   it('registers no other hook events', () => {
