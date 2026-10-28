@@ -2,10 +2,11 @@
 /**
  * PreToolUse hook entrypoint: `bun hook.ts claude|antigravity`, hook JSON on stdin.
  *
- * Silent unless the Jev mode for the harness is `on`. Once on, it never lets a call it cannot
- * evaluate through silently: malformed input or an internal error produces an `ask`, so the user
- * decides. The matcher in each adapter limits the hook to subagent calls, so this only prompts
- * on calls that spawn subagents.
+ * Active in Jev modes `on` and `on-demand` for both harnesses, silent only in `off` (plan 3.1.3
+ * review decision of 2026-10-28). Once active it never lets a call it cannot evaluate through
+ * silently: malformed or empty input and internal errors produce an `ask`, so the user decides.
+ * The matcher in each adapter limits the hook to calls that spawn subagents, so this only prompts
+ * on those calls.
  */
 import { readJevMode } from './core/config.js';
 import {
@@ -16,11 +17,28 @@ import {
   type GuardHarness,
   type Verdict
 } from './guard.js';
+import { appendClaudeDecision } from './claude-audit.js';
 
-const HARNESSES: Record<GuardHarness, { jevHarness: 'claude-code' | 'antigravity'; evaluate: (input: any) => Verdict | null }> = {
+const HARNESSES: Record<
+  GuardHarness,
+  { jevHarness: 'claude-code' | 'antigravity'; evaluate: (input: any) => Verdict | null }
+> = {
   claude: { jevHarness: 'claude-code', evaluate: evaluateClaude },
   antigravity: { jevHarness: 'antigravity', evaluate: evaluateAntigravity }
 };
+
+function auditAsk(verdict: Verdict, stdin: string): void {
+  let toolName: unknown;
+  let sessionId: unknown;
+  try {
+    const parsed = JSON.parse(stdin);
+    toolName = parsed?.tool_name;
+    sessionId = parsed?.session_id;
+  } catch {
+    // unparseable input: audit without the tool name
+  }
+  appendClaudeDecision({ event: 'ask', tool_name: toolName, session_id: sessionId, ...verdict.audit, reason: verdict.reason });
+}
 
 export async function run(harnessArg: string | undefined, stdin: string): Promise<string | null> {
   const harness = HARNESSES[harnessArg as GuardHarness];
@@ -28,19 +46,27 @@ export async function run(harnessArg: string | undefined, stdin: string): Promis
 
   let verdict: Verdict | null;
   try {
-    if ((await readJevMode(harness.jevHarness)) !== 'on') return null;
+    if ((await readJevMode(harness.jevHarness)) === 'off') return null;
     verdict = harness.evaluate(JSON.parse(stdin));
   } catch (err) {
     verdict = guardErrorVerdict(err);
+    verdict.audit = { kind: 'guard-error' };
   }
-  return verdict ? formatVerdict(harnessArg as GuardHarness, verdict) : null;
+  if (!verdict) return null;
+  if (harnessArg === 'claude') auditAsk(verdict, stdin);
+  return formatVerdict(harnessArg as GuardHarness, verdict);
 }
 
 if (import.meta.main) {
+  let stdin = '';
   try {
-    const out = await run(process.argv[2], await Bun.stdin.text());
-    if (out) process.stdout.write(`${out}\n`);
+    stdin = await Bun.stdin.text();
   } catch {
-    // stdin could not be read at all: nothing to evaluate
+    // unreadable stdin: run() treats empty input as unevaluable and asks
   }
+  const out = await run(process.argv[2], stdin).catch((err) => {
+    const harness = process.argv[2] === 'antigravity' ? 'antigravity' : 'claude';
+    return formatVerdict(harness, guardErrorVerdict(err));
+  });
+  if (out) process.stdout.write(`${out}\n`);
 }

@@ -7,8 +7,8 @@
  * - a subagent may not run on a stronger model than the session without user approval (Claude Code)
  * - the Pro tier always requires manual user approval (Antigravity)
  *
- * It answers `ask`, never allow: when it cannot decide (unreadable input, unknown session model for
- * a strong tier, an internal error) it asks rather than letting the call through silently.
+ * It answers `ask`, never allow: when it cannot decide (unreadable input, an unknown model, an
+ * unknown session model, an internal error) it asks rather than letting the call through silently.
  *
  * Everything else Jev does for a turn (advice, dispatch, telemetry) is advice from the MCP tools.
  */
@@ -16,27 +16,19 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { modelTierRank } from './core/governance.js';
+import { assessModelRequest } from './models.js';
+import { resolveSessionModel, sessionModelFromTranscript, type SessionModelSource } from './session-model.js';
+
+export { sessionModelFromTranscript };
 
 export interface Verdict {
   decision: 'ask';
   reason: string;
+  /** Facts for the decision audit (tool, models, call sites). Never prompt or script text. */
+  audit?: Record<string, unknown>;
 }
 
 export type GuardHarness = 'claude' | 'antigravity';
-
-const CLAUDE_RANK: ReadonlyArray<readonly [RegExp, number]> = [
-  [/haiku/i, 1],
-  [/sonnet/i, 2],
-  [/opus/i, 3],
-  [/fable/i, 4]
-];
-
-/** Relative strength of a Claude model id or alias; null when unknown or "inherit". */
-export function claudeModelRank(model: string | undefined | null): number | null {
-  if (!model) return null;
-  const hit = CLAUDE_RANK.find(([pattern]) => pattern.test(model));
-  return hit ? hit[1] : null;
-}
 
 export interface AgentCall {
   description?: string;
@@ -45,42 +37,34 @@ export interface AgentCall {
   model?: string;
 }
 
-/** Rank from which a model counts as "strong" (opus and above) when the session model is unknown. */
+/** Rank from which a model counts as Pro tier on Antigravity (opus and above). */
 const STRONG_RANK = 3;
 
 /**
- * Claude Code Agent/Task call: ask when the model the subagent will run on is stronger than the
- * session's. That is the call's own `model`, or, when the call sets none, the `model` in the
- * subagent's definition file. "inherit" runs on the session model, so it passes.
+ * Claude Code Agent/Task call: ask when the model the subagent will run on is above the session's.
+ * That is the call's own `model`, or, when the call sets none, the `model` in the subagent's
+ * definition file. "inherit" or no model runs on the session model, so it passes.
  *
- * When the session model is unknown the two cannot be compared, so the guard fails closed for the
- * strong tiers (opus and above) and lets weaker requests through.
+ * Ranking is version-aware (see models.ts). Equal or lower passes silently. A requested model Jev
+ * cannot rank, or a session model that is unknown, asks.
  */
 export function decideClaudeAgentCall(
   call: AgentCall,
   sessionModel: string | null,
-  definitionModel: string | null = null
+  definitionModel: string | null = null,
+  sessionModelSource: SessionModelSource = 'none'
 ): Verdict | null {
   const model = call.model !== undefined ? call.model : definitionModel;
-  const requested = claudeModelRank(model);
-  if (requested === null) return null;
-
-  const ceiling = claudeModelRank(sessionModel);
-  if (ceiling === null) {
-    if (requested < STRONG_RANK) return null;
-    return {
-      decision: 'ask',
-      reason:
-        `[jev] This delegation runs on model "${model}" and the session model could not be determined. ` +
-        'Approve to run it, or deny and re-run it on a cheaper model.'
-    };
-  }
-  if (requested <= ceiling) return null;
+  const assessment = assessModelRequest(model, sessionModel);
+  if (assessment.kind === 'allowed') return null;
+  const advice =
+    assessment.kind === 'escalation'
+      ? 'Approve to run it on the stronger model, or deny and re-run it on the session model or a cheaper one.'
+      : 'Approve to run it, or deny and re-run it on a model Jev can rank.';
   return {
     decision: 'ask',
-    reason:
-      `[jev] This delegation runs on model "${model}", stronger than the session model "${sessionModel}". ` +
-      'Approve to run it on the stronger model, or deny and re-run it on the session model or a cheaper one.'
+    reason: `[jev] This delegation uses ${assessment.reason}. ${advice}`,
+    audit: { kind: assessment.kind, requested: model ?? null, sessionModel, sessionModelSource }
   };
 }
 
@@ -126,47 +110,26 @@ export function decideAntigravitySubagents(subagents: AntigravitySubagent[]): Ve
   };
 }
 
-/** The model of the most recent assistant turn in a Claude Code transcript, or null. */
-export function sessionModelFromTranscript(transcriptPath: string | undefined): string | null {
-  if (!transcriptPath) return null;
-  try {
-    const TAIL_BYTES = 256 * 1024;
-    const fd = fs.openSync(transcriptPath, 'r');
-    try {
-      const { size } = fs.fstatSync(fd);
-      const start = Math.max(0, size - TAIL_BYTES);
-      const buf = Buffer.alloc(size - start);
-      fs.readSync(fd, buf, 0, buf.length, start);
-      const lines = buf.toString('utf8').split('\n');
-      if (start > 0) lines.shift(); // first line is likely cut mid-record
-      for (let i = lines.length - 1; i >= 0; i--) {
-        if (!lines[i]) continue;
-        try {
-          const entry = JSON.parse(lines[i]);
-          const model = entry?.type === 'assistant' ? entry?.message?.model : undefined;
-          if (typeof model === 'string' && model && !model.startsWith('<')) return model;
-        } catch {
-          // skip partial or non-JSON line
-        }
-      }
-    } finally {
-      fs.closeSync(fd);
-    }
-  } catch {
-    // unreadable transcript: unknown model
-  }
-  return null;
-}
-
 /** Claude Code PreToolUse input -> verdict. */
 export function evaluateClaude(input: any): Verdict | null {
   if (input?.tool_name !== 'Agent' && input?.tool_name !== 'Task') return null;
-  const call: AgentCall = input.tool_input ?? {};
-  return decideClaudeAgentCall(
+  const raw = input.tool_input ?? {};
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    return {
+      decision: 'ask',
+      reason: `[jev] The ${input.tool_name} call's input could not be read. Approve only if you intended it.`,
+      audit: { kind: 'malformed-input', tool_name: input.tool_name }
+    };
+  }
+  const call = raw as AgentCall;
+  const session = resolveSessionModel(input);
+  const verdict = decideClaudeAgentCall(
     call,
-    sessionModelFromTranscript(input.transcript_path),
-    call.model === undefined ? agentDefinitionModel(call.subagent_type, input.cwd) : null
+    session.model,
+    call.model === undefined ? agentDefinitionModel(call.subagent_type, input.cwd) : null,
+    session.source
   );
+  return verdict ? { ...verdict, audit: { ...verdict.audit, tool_name: input.tool_name, session_id: input.session_id } } : null;
 }
 
 /** Antigravity PreToolUse input -> verdict. A malformed subagent list fails closed (ask). */
