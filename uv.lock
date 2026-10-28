@@ -699,6 +699,7 @@ name = "cognitive-engine"
 version = "1.0.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "cognitive-harness2" },
     { name = "cognitive-lookup" },
     { name = "cognitive-memory" },
 ]
@@ -711,6 +712,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cognitive-harness2", editable = "packages/harness2" },
     { name = "cognitive-lookup", editable = "packages/lookup" },
     { name = "cognitive-memory", editable = "packages/memory" },
 ]
@@ -723,8 +725,18 @@ dev = [
 
 [[package]]
 name = "cognitive-harness2"
-version = "1.0.0"
+version = "0.1.0"
 source = { editable = "packages/harness2" }
+dependencies = [
+    { name = "fastmcp" },
+    { name = "httpx" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastmcp", specifier = ">=4.1,<5" },
+    { name = "httpx", specifier = ">=0.28" },
+]
 
 [[package]]
 name = "cognitive-lookup"

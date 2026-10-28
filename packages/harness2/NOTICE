@@ -1,0 +1,9 @@
+cognitive-harness2
+Copyright 2026 Aleksandr Korolev
+
+Licensed under the Apache License, Version 2.0.
+
+This package is an independent implementation of the Propose-Probe-Compose approach that
+RFC 004 calls "Google Harness²". It does not vendor or copy Google Research code: the RFC
+names no upstream package to wrap. The canonical Google Research citation for Harness²
+has not been supplied and must be added here before any release.
