@@ -109,7 +109,7 @@ flowchart TD
   - **`packages/memory` (Native Upstream `basic-memory`, AGPL-3.0)**:
     - Runs upstream-maintained `basic-memory` package natively in Python via `uv` without Docker.
     - Binds strictly to `127.0.0.1:8105/mcp` during staging to avoid port conflicts with legacy daemons.
-    - Exposes upstream FastMCP tools (`read_note`, `write_note`, `search_notes`, `list_notes`, `delete_note`, `build_context`).
+    - Exposes upstream FastMCP tools (`read_note`, `write_note`, `search_notes`, `list_directory`, `delete_note`, `build_context`).
     - Tuned hybrid retrieval parameters:
       - `BASIC_MEMORY_RERANKER_CANDIDATES=5–10`
       - `BASIC_MEMORY_RERANKER_MAX_DOCUMENT_CHARS=500–1000`
@@ -122,6 +122,15 @@ flowchart TD
     - Enforces `docs.visibility` classification (`open`, `gated`, `unstated`, `mixed`) for strict classification inheritance.
   - **Process-Boundary AGPL Containment**:
     - `packages/memory` communicates strictly across standard process/MCP loopback boundaries, cleanly confining AGPL-3.0 to its subpackage.
+
+#### 3.2.1 Track 2 implementation findings & refinements (2026-10-28)
+
+Full list with evidence in [RFC 003 §4](../rfc/003-memory-lookup.md). The ones that change the plan:
+
+- **`packages/memory` is a launcher, not a fork.** It validates settings and `exec`s the pinned upstream `basic-memory mcp`. The reranker is off by default upstream, so the tuned configuration only exists because the launcher forces it; out-of-range bounds are refused, not clamped.
+- **`packages/lookup` is a port of the Docker-era Lookup**, with the transport replaced by FastMCP and the Docker-only SMB mounting removed. Python 3.12 required replacing a 3.13+ stdlib call.
+- **Open follow-up — shares declared in the manifest.** Native Lookup cannot mount network shares. Recommended design: a userspace SMB client (`smbprotocol`) behind a small filesystem seam, so a `[source.volume]` with `host`, `share` and credential *references* is indexed with no host mount, root or FUSE. Keep the mtime+size ledger so unchanged files are never re-read over the wire, and keep the path-escape re-check.
+- **Operational prerequisite for Phase 1 merge:** stop the legacy `lookup-lookup-1` container (it holds `127.0.0.1:8100`) before the native Lookup can take that port.
 
 ---
 

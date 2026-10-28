@@ -26,7 +26,7 @@ Establishes Track 2 of Cognitive Engine: packaging the memory and lookup substra
 
 - **`packages/memory` (Native `basic-memory`, AGPL-3.0)**:
   - Runs upstream `basic-memory` package natively on `127.0.0.1:8105/mcp`.
-  - Exposes upstream FastMCP tools (`read_note`, `write_note`, `search_notes`, `list_notes`, `delete_note`, `build_context`).
+  - Exposes upstream FastMCP tools (`read_note`, `write_note`, `search_notes`, `list_directory`, `delete_note`, `build_context`).
   - Tuned reranker configuration (`BASIC_MEMORY_RERANKER_CANDIDATES=5–10`, `BASIC_MEMORY_RERANKER_MAX_DOCUMENT_CHARS=500–1000`) keeping steady-state RAM comfortably under **2–3 GB**.
   - State volume housed out-of-tree at `~/.local/share/cognitive-engine/memory/`.
 - **`packages/lookup` (Companion Document & Transcript Search, MIT)**:
@@ -41,8 +41,24 @@ Establishes Track 2 of Cognitive Engine: packaging the memory and lookup substra
 
 ## 3. Acceptance Criteria
 
-- [ ] `packages/memory` starts natively via `uv run` on `127.0.0.1:8105` with zero Docker dependencies.
-- [ ] `packages/lookup` starts natively via `uv run` on `127.0.0.1:8100`.
-- [ ] Both services respond to FastMCP ping and tool calls.
-- [ ] Memory footprint stabilizes under 2–3 GB RAM during sustained searches.
-- [ ] `docs.visibility` classification correctly tags and filters restricted documents.
+- [x] `packages/memory` starts natively via `uv run` on `127.0.0.1:8105` with zero Docker dependencies.
+- [x] `packages/lookup` starts natively via `uv run` on `127.0.0.1:8100`. *(Default is 8100; verified end to end on a free port because the legacy Docker Lookup still holds 8100 — see §4.)*
+- [x] Both services respond to tool calls. *(Not to MCP `ping`: both stateless HTTP servers return `Method not found`. Liveness is `tools/list` — see §4.)*
+- [x] Memory footprint stabilizes under 2–3 GB RAM during sustained searches. *(728 MiB RSS after 40 searches with the reranker on.)*
+- [x] `docs.visibility` classification correctly tags and filters restricted documents.
+
+---
+
+## 4. Implementation Findings (Track 2, 2026-10-28)
+
+Corrections to this RFC's assumptions, found by running the code:
+
+1. **Upstream `basic-memory` 0.24.1 does not default to the tuned configuration.** The reranker is *off* by default, `reranker_candidates` defaults to 20 and `reranker_max_document_chars` to 2000 (not 5 and 500), and `auto_update` is on. A bare `basic-memory mcp` therefore runs plain hybrid retrieval. `packages/memory` pins reranker on, 10 candidates, 1000 chars and `auto_update` off, and rejects values outside 5–10 and 500–1000 rather than clamping them.
+2. **`list_notes` does not exist upstream.** The equivalent is `list_directory`. The tool list above is corrected.
+3. **Upstream writes state to `$HOME` on any invocation**, including `--help` (`~/.basic-memory`, `~/basic-memory`), and its dependencies write more (onnxruntime's device-id database, Hugging Face logs, fastmcp's version-check cache). The launcher redirects `BASIC_MEMORY_CONFIG_DIR`, `BASIC_MEMORY_HOME` and both XDG dirs under the memory root and turns the fastmcp update check off; a test runs the daemon under a fake `$HOME` and asserts it stays empty.
+4. **Neither stateless HTTP server answers MCP `ping`.** Use `tools/list` or a TCP connect for liveness.
+5. **Port 8100 is occupied** by the legacy Docker Lookup (`lookup-lookup-1`, `127.0.0.1:8100`) for as long as it runs. Memory's staging port (8105) avoids the legacy `:8110` container; Lookup's spec port does not avoid its legacy twin. The new daemon fails to bind and exits until the container is stopped or `--port` is given.
+6. **Lookup's legacy code was 3.14-only** (`PurePath.full_match` is 3.13+). `lookup.manifest.full_match` replaces it and is checked against the stdlib on 304 pattern/path pairs.
+7. **Network shares are no longer mounted by Lookup.** The Docker version mounted SMB shares from inside its container (`shares.py`, `lookup mounts`, `CAP_SYS_ADMIN`). Native Lookup reads only roots that already resolve on the host; a manifest `[source.volume]` is metadata, and an absent root that declares one is reported as `UNMOUNTED`. Declaring shares in the manifest and indexing them with no host setup is a follow-up (see the bridge document, Turn 4).
+8. **A carried-over filter bug was fixed.** `search_archive(visibility="unstated")` did not return a document that states nothing inside a `mixed` source, although the hit is labelled `unstated`. The filter now resolves through the same `effective_visibility` as the label.
+9. **An unrecognised `visibility` filter is now a tool error** rather than silently answering unfiltered.
