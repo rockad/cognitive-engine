@@ -43,4 +43,4 @@ Ported from `agentic-hub/plugins/jev` v2.3.0. Of the Claude Code hooks, only the
 
 ## Subagent guard hook
 
-`bun src/hook.ts claude|antigravity` is a narrow `PreToolUse` guard (`src/guard.ts`). Claude Code asks before a subagent runs on a model stronger than the session's; Antigravity asks before any Pro-class subagent. It is the only enforcement point (`jev_dispatch` and its clamp are advice). It is deterministic, makes no network calls, and runs only in Jev mode `on`; once on, it asks rather than passing silently when it cannot evaluate a call.
+`bun src/hook.ts claude|antigravity` is a narrow `PreToolUse` guard (`src/guard.ts`). Claude Code asks before a subagent runs on a model above the session's (version-aware ranking, `src/models.ts`); Antigravity asks before any Pro-class subagent. It is the only enforcement point (`jev_dispatch` and its clamp are advice). It is deterministic, makes no network calls, and runs in Jev modes `on` and `on-demand` (not `off`); once active, it asks rather than passing silently when it cannot evaluate a call.

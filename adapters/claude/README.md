@@ -6,13 +6,15 @@ Native Claude Code plugin bundle for Jev: `.claude-plugin/plugin.json` plus `.mc
 
 The hook runs `packages/jev/src/hook.ts claude` before every `Agent` or `Task` call. If the call requests a model stronger than the session's (for example `opus` from a Sonnet session), it returns `permissionDecision: "ask"` and Claude Code prompts you.
 
-- The session model is read from the last assistant turn of the session transcript, so the hook keeps no state.
+- Ranking is version-aware: family first (fable > opus > sonnet > haiku), then version (5.5 > 5 > 4.8). Aliases resolve by the table in `packages/jev/src/models.ts` (`opus`, `sonnet`, `haiku` to 5.5, `fable` to 5.1). Any request strictly above the session model asks; equal or lower passes silently; a model Jev cannot rank asks.
+- The session model comes from a per-session state file written by the `PostModelSwitch` recorder (`record-hook.ts`, log-only and fail-open), falling back to the last assistant turn of the transcript. State lives in `~/.config/jev/claude_sessions/`.
+- Every ask and every observed model change (with its source) is appended to `~/.config/jev/claude_decisions.jsonl`: model names and reasons only, never prompt text. The guard never blocks or alters Claude Code's own model-switch fallbacks.
 - It is deterministic and makes no network call.
-- It is active only when the Jev mode for Claude Code is `on`. In `on-demand` and `off` it stays silent.
+- It is active in Jev modes `on` and `on-demand` and silent only in `off`.
 - It still fires under `--permission-mode bypassPermissions`: a hook `ask` is not auto-approved by bypass mode (checked with `claude -p`, where the call was blocked rather than run).
 - It is the only enforcement point; `jev_dispatch` and its tier clamp are advice. Nothing the agent passes to a tool counts as approval, only your answer to the prompt.
 - It also checks the `model:` in the subagent's definition (`.claude/agents/<name>.md`) when the call sets none.
-- Once on, it fails closed: if it cannot read the call, hits an error, or cannot determine the session model for an `opus`-class request, it asks instead of letting the call through. Weaker requests with an unknown session model proceed.
+- Once active, it fails closed: if it cannot read the call, hits an error, or cannot determine the session model, it asks instead of letting the call through.
 
 ## Install
 
@@ -29,7 +31,7 @@ Jev reads its OpenRouter key from `~/.config/zsh/secrets.env` or `~/.config/jev/
 
 ## Enable the guard
 
-The hook is silent until the Jev mode for Claude Code is `on`. Run `/jev on`, or set `harnesses.claude-code.mode` to `"on"` in `~/.config/jev/config.json`.
+The hook is active in `on` and `on-demand`. Run `/jev on-demand` (or `/jev on`), or set `harnesses.claude-code.mode` in `~/.config/jev/config.json`. Only `off` silences it.
 
 ## Validate
 

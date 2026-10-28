@@ -15,10 +15,12 @@ describe('claude plugin bundle', () => {
     expect(manifest.license).toBe('MIT');
   });
 
-  it('registers exactly one hook: the PreToolUse subagent guard', () => {
+  it('registers the PreToolUse subagent guard and the log-only recorders', () => {
     expect(manifest.hooks).toBe('./hooks/hooks.json');
     const { hooks } = readJson('hooks/hooks.json');
-    expect(Object.keys(hooks)).toEqual(['PreToolUse']);
+    expect(Object.keys(hooks)).toEqual(['PreToolUse', 'SessionStart', 'PostModelSwitch']);
+    expect(hooks.SessionStart[0].hooks[0].command).toContain('record-hook.ts" SessionStart');
+    expect(hooks.PostModelSwitch[0].hooks[0].command).toContain('record-hook.ts" PostModelSwitch');
     expect(hooks.PreToolUse).toHaveLength(1);
     expect(hooks.PreToolUse[0].matcher).toBe('Agent|Task');
     expect(hooks.PreToolUse[0].hooks[0].command).toContain('packages/jev/src/hook.ts" claude');

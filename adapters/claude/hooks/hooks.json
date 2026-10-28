@@ -11,6 +11,28 @@
           }
         ]
       }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun \"$COGNITIVE_ENGINE_HOME/packages/jev/src/record-hook.ts\" SessionStart",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostModelSwitch": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun \"$COGNITIVE_ENGINE_HOME/packages/jev/src/record-hook.ts\" PostModelSwitch",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }
