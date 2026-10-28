@@ -18,6 +18,7 @@ payload per case.
 | `PreToolUse.workflow-script.json` | Workflow, inline form: `tool_input = {script}` |
 | `PreToolUse.workflow-scriptpath.json` | Workflow, file form: `tool_input = {scriptPath, args}` |
 | `PreToolUse.workflow-resume.json` | Workflow, resume form: `tool_input = {scriptPath, resumeFromRunId, args}` |
+| `PreToolUse.workflow-name.synthesized.json` | SYNTHESIZED, not captured: Workflow saved-workflow form `tool_input = {name, args}`, written by hand from the tool schema; carries a `_synthesized` marker field |
 | `PreToolUse.agent.json` | Agent tool (`tool_name` is `Agent`, not `Task`, on 2.1.312) |
 | `SessionStart.json` | `source: "startup"`, no model field |
 | `SessionStart.resume.json` | `source: "resume"`, adds cache and context fields, still no model |

@@ -12,11 +12,10 @@
  *
  * Everything else Jev does for a turn (advice, dispatch, telemetry) is advice from the MCP tools.
  */
-import * as fs from 'node:fs';
-import * as os from 'node:os';
-import * as path from 'node:path';
 import { modelTierRank } from './core/governance.js';
+import { readAgentDefinition } from './agent-definitions.js';
 import { assessModelRequest } from './models.js';
+import { evaluateWorkflowInput } from './workflow-guard.js';
 import { resolveSessionModel, sessionModelFromTranscript, type SessionModelSource } from './session-model.js';
 
 export { sessionModelFromTranscript };
@@ -73,20 +72,7 @@ export function decideClaudeAgentCall(
  * `~/.claude/agents/<name>.md`), or null. The name is restricted to file-name characters.
  */
 export function agentDefinitionModel(subagentType: string | undefined, cwd: string | undefined): string | null {
-  if (!subagentType || !/^[A-Za-z0-9_.-]+$/.test(subagentType)) return null;
-  const dirs = [cwd ? path.join(cwd, '.claude', 'agents') : null, path.join(process.env.HOME || os.homedir(), '.claude', 'agents')];
-  for (const dir of dirs) {
-    if (!dir) continue;
-    try {
-      const text = fs.readFileSync(path.join(dir, `${subagentType}.md`), 'utf8');
-      const front = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text)?.[1];
-      const model = front && /^model:\s*(.+?)\s*$/m.exec(front)?.[1]?.replace(/^["']|["']$/g, '');
-      if (model) return model;
-    } catch {
-      // no definition here
-    }
-  }
-  return null;
+  return readAgentDefinition(subagentType, cwd).model;
 }
 
 export interface AntigravitySubagent {
@@ -110,8 +96,27 @@ export function decideAntigravitySubagents(subagents: AntigravitySubagent[]): Ve
   };
 }
 
+/** Claude Code Workflow call -> verdict (see workflow-guard.ts). Shape mismatches ask and are audited. */
+export function evaluateClaudeWorkflow(input: any): Verdict | null {
+  const session = resolveSessionModel(input);
+  const decision = evaluateWorkflowInput(input.tool_input, input.cwd, session.model);
+  if (decision.decision === 'allow') return null;
+  return {
+    decision: 'ask',
+    reason: decision.message,
+    audit: {
+      kind: 'workflow',
+      tool_name: 'Workflow',
+      session_id: input.session_id,
+      sessionModel: session.model,
+      sessionModelSource: session.source,
+      sites: decision.sites.map((s) => ({ file: s.file, line: s.line, col: s.col, reason: s.reason }))
+    }
+  };
+}
 /** Claude Code PreToolUse input -> verdict. */
 export function evaluateClaude(input: any): Verdict | null {
+  if (input?.tool_name === 'Workflow') return evaluateClaudeWorkflow(input);
   if (input?.tool_name !== 'Agent' && input?.tool_name !== 'Task') return null;
   const raw = input.tool_input ?? {};
   if (typeof raw !== 'object' || Array.isArray(raw)) {
