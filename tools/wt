@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  tools/wt new <name> [--base <ref>]   Create a new linked worktree at ../cognitive-engine-<name>
+  tools/wt list                        List all active worktrees
+  tools/wt remove <name>               Remove worktree at ../cognitive-engine-<name>
+  tools/wt init                        Configure local core.hooksPath=.githooks for this clone
+EOF
+  exit 1
+}
+
+# Locate primary hub worktree root
+get_hub_root() {
+  local common_dir
+  common_dir="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+  if [ -n "$common_dir" ] && [ "$common_dir" != ".git" ]; then
+    # In a linked worktree, common_dir points to <hub>/.git
+    dirname "$(cd "$common_dir" && pwd -P)"
+  else
+    git rev-parse --show-toplevel
+  fi
+}
+
+# Check if primary hub worktree has dirty uncommitted changes
+check_hub_clean() {
+  local hub_root="$1"
+  local dirty
+  dirty="$(git -C "$hub_root" status --porcelain 2>/dev/null || true)"
+  if [ -n "$dirty" ]; then
+    echo "Error: Primary hub worktree at '$hub_root' is dirty." >&2
+    echo "Uncommitted changes detected:" >&2
+    echo "$dirty" >&2
+    echo "Please commit or stash changes in the hub before creating worktrees." >&2
+    exit 1
+  fi
+}
+
+# Check if a branch is already checked out in any worktree
+is_branch_checked_out() {
+  local branch="$1"
+  local line
+  while IFS= read -r line; do
+    if [[ "$line" =~ \[$branch\]$ ]]; then
+      return 0
+    fi
+  done < <(git worktree list 2>/dev/null)
+  return 1
+}
+
+cmd="${1:-}"
+shift || usage
+
+case "$cmd" in
+  new)
+    [ $# -ge 1 ] || usage
+    name="$1"
+    shift
+    base_ref=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --base)
+          base_ref="$2"
+          shift 2
+          ;;
+        *)
+          usage
+          ;;
+      esac
+    done
+
+    hub_root="$(get_hub_root)"
+    check_hub_clean "$hub_root"
+
+    parent_dir="$(dirname "$hub_root")"
+    wt_path="$parent_dir/cognitive-engine-$name"
+
+    if [ -d "$wt_path" ]; then
+      echo "Error: Worktree path '$wt_path' already exists." >&2
+      exit 1
+    fi
+
+    # Branch name is the given name
+    branch="$name"
+    if is_branch_checked_out "$branch"; then
+      echo "Error: Branch '$branch' is already checked out in an active worktree." >&2
+      exit 1
+    fi
+
+    if git show-ref --verify --quiet "refs/heads/$branch"; then
+      git worktree add "$wt_path" "$branch"
+    else
+      if [ -n "$base_ref" ]; then
+        git worktree add -b "$branch" "$wt_path" "$base_ref"
+      else
+        git worktree add -b "$branch" "$wt_path" HEAD
+      fi
+    fi
+    echo "Created worktree: $wt_path (branch: $branch)"
+    ;;
+
+  list)
+    git worktree list
+    ;;
+
+  remove)
+    [ $# -ge 1 ] || usage
+    name="$1"
+    hub_root="$(get_hub_root)"
+    parent_dir="$(dirname "$hub_root")"
+    wt_path="$parent_dir/cognitive-engine-$name"
+
+    if [ ! -d "$wt_path" ]; then
+      echo "Error: Worktree path '$wt_path' does not exist." >&2
+      exit 1
+    fi
+
+    git worktree remove "$wt_path"
+    echo "Removed worktree: $wt_path"
+    ;;
+
+  init)
+    git config --local core.hooksPath .githooks
+    echo "Configured local core.hooksPath=.githooks for this repository clone."
+    ;;
+
+  *)
+    usage
+    ;;
+esac

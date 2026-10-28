@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Allow explicit override via environment variable
+if [ "${CE_ALLOW_HUB:-0}" = "1" ]; then
+  exit 0
+fi
+
+# Detect whether this commit is in the primary worktree
+# In a linked worktree, .git is a file. In the primary worktree, .git is a directory.
+git_dir="$(git rev-parse --git-dir)"
+common_dir="$(git rev-parse --git-common-dir 2>/dev/null || echo "$git_dir")"
+
+git_dir_abs="$(cd "$git_dir" 2>/dev/null && pwd -P || pwd -P)"
+common_dir_abs="$(cd "$common_dir" 2>/dev/null && pwd -P || pwd -P)"
+
+if [ "$git_dir_abs" = "$common_dir_abs" ]; then
+  echo "Error: Commits directly in the primary worktree are rejected by policy." >&2
+  echo "Every agent/stream must operate in a dedicated worktree." >&2
+  echo "Use 'tools/wt new <name>' or set CE_ALLOW_HUB=1 to override." >&2
+  exit 1
+fi
+
+exit 0
