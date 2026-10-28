@@ -6,11 +6,12 @@ import type { AddressInfo } from 'node:net';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { allTools, toolHandlers } from '../src/tools/index.ts';
+import { jevTools } from '../src/tools/index.ts';
 import {
   createJevServer,
   startHttp,
   isLoopbackHost,
+  isAllowedOrigin,
   HTTP_HOST,
   HTTP_PATH,
   HTTP_PORT
@@ -64,21 +65,20 @@ afterEach(() => {
 
 describe('tool registry schema', () => {
   it('registers every RFC 002 tool', () => {
-    const names = allTools.map((t) => t.name);
+    const names = jevTools.map((t) => t.name);
     for (const name of REQUIRED_TOOLS) expect(names).toContain(name);
   });
 
-  it('gives every tool a handler, a description and an object input schema', () => {
-    for (const tool of allTools) {
-      expect(typeof toolHandlers[tool.name]).toBe('function');
-      expect(tool.description?.length ?? 0).toBeGreaterThan(0);
-      expect(tool.inputSchema.type).toBe('object');
+  it('gives every tool a handler, a description and a STRICT object input schema', () => {
+    for (const tool of jevTools) {
+      expect(typeof tool.handler).toBe('function');
+      expect(tool.description.length).toBeGreaterThan(0);
+      expect(tool.input._def.unknownKeys).toBe('strict');
     }
-    expect(Object.keys(toolHandlers).sort()).toEqual(allTools.map((t) => t.name).sort());
   });
 
   it('has unique tool names', () => {
-    const names = allTools.map((t) => t.name);
+    const names = jevTools.map((t) => t.name);
     expect(new Set(names).size).toBe(names.length);
   });
 });
@@ -95,7 +95,16 @@ describe('MCP tool dispatch (in-memory transport)', () => {
   it('lists the registered tools', async () => {
     const client = await connect();
     const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name).sort()).toEqual(allTools.map((t) => t.name).sort());
+    expect(tools.map((t) => t.name).sort()).toEqual(jevTools.map((t) => t.name).sort());
+  });
+
+  it('advertises every input schema as closed (additionalProperties: false)', async () => {
+    const client = await connect();
+    const { tools } = await client.listTools();
+    for (const tool of tools) {
+      expect(tool.inputSchema.type).toBe('object');
+      expect(tool.inputSchema.additionalProperties).toBe(false);
+    }
   });
 
   it('dispatches jev_get_mode through the server', async () => {
@@ -115,7 +124,9 @@ describe('MCP tool dispatch (in-memory transport)', () => {
 
   it('rejects an unknown tool', async () => {
     const client = await connect();
-    await expect(client.callTool({ name: 'jev_nope', arguments: {} })).rejects.toThrow(/Unknown tool/);
+    const res = (await client.callTool({ name: 'jev_nope', arguments: {} })) as { isError?: boolean; content: Array<{ text: string }> };
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toMatch(/not found/i);
   });
 });
 
@@ -132,6 +143,17 @@ describe('Streamable HTTP transport', () => {
     expect(isLoopbackHost('evil.example:8115', 8115)).toBe(false);
     expect(isLoopbackHost('127.0.0.1:9999', 8115)).toBe(false);
     expect(isLoopbackHost(undefined, 8115)).toBe(false);
+  });
+
+  it('only accepts a missing or loopback Origin', () => {
+    expect(isAllowedOrigin(undefined)).toBe(true);
+    expect(isAllowedOrigin('http://127.0.0.1:8115')).toBe(true);
+    expect(isAllowedOrigin('http://localhost:3000')).toBe(true);
+    expect(isAllowedOrigin('http://evil.example')).toBe(false);
+    expect(isAllowedOrigin('https://evil.example:8115')).toBe(false);
+    expect(isAllowedOrigin('http://127.0.0.1.evil.example')).toBe(false);
+    expect(isAllowedOrigin('null')).toBe(false);
+    expect(isAllowedOrigin('not a url')).toBe(false);
   });
 
   it('serves tools/list and tools/call over HTTP', async () => {
@@ -168,6 +190,13 @@ describe('Streamable HTTP transport', () => {
         body: '{}'
       });
       expect(forged.status).toBe(403);
+
+      const foreign = await fetch(`${base}${HTTP_PATH}`, {
+        method: 'POST',
+        headers: { Origin: 'http://evil.example', 'Content-Type': 'application/json' },
+        body: '{}'
+      });
+      expect(foreign.status).toBe(403);
     } finally {
       http.close();
     }
@@ -191,8 +220,10 @@ describe('tier ceiling invariants', () => {
     // dispatch is advice: the clamp takes only the recommendation and the session model
     expect(clampTierToSessionCeiling.length).toBe(2);
     for (const name of ['jev_dispatch', 'jev_batch_dispatch']) {
-      const tool = allTools.find((t) => t.name === name)!;
-      expect(Object.keys(tool.inputSchema.properties ?? {})).not.toContain('approvedTier');
+      const tool = jevTools.find((t) => t.name === name)!;
+      expect(Object.keys(tool.input.shape)).not.toContain('approvedTier');
+      // and, being strict, a caller who passes one anyway is refused rather than ignored
+      expect(tool.input.safeParse({ task: 'x', tasks: [], approvedTier: 'pro' }).success).toBe(false);
     }
   });
 

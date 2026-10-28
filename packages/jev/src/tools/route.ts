@@ -1,4 +1,5 @@
-import type { Tool } from '@modelcontextprotocol/sdk/types.js';
+import { z } from 'zod';
+import { defineTool, type ToolInput, type ToolResult } from './define.js';
 import {
   callJevDecision,
   callJevRouter,
@@ -9,33 +10,23 @@ import {
   logTelemetry
 } from '../core/index.js';
 
-export const routeToolDefinition: Tool = {
-  name: 'jev_route',
-  description: 'Ultra-fast (~800ms) choice selection and classification via OpenRouter native Decisions API (~typesafe/jev-latest). Evaluates candidate options and criteria mapping, returning calibrated probabilities and confidence.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      context: { type: 'string', description: 'The text snippet, note, or prompt to classify' },
-      options: { type: 'array', items: { type: 'string' }, description: 'Candidate categories/options to choose from' },
-      criteria: {
-        type: 'object',
-        additionalProperties: { type: 'string' },
-        description: 'Optional dictionary mapping option keys to descriptive criteria'
-      },
-      instruction: { type: 'string', description: 'Optional instruction or question for classification' }
-    },
-    required: ['context', 'options']
-  }
+const routeShape = {
+  context: z.string().describe('The text snippet, note, or prompt to classify'),
+  options: z.array(z.string()).describe('Candidate categories/options to choose from'),
+  criteria: z.record(z.string()).optional().describe('Optional dictionary mapping option keys to descriptive criteria'),
+  instruction: z.string().optional().describe('Optional instruction or question for classification')
 };
 
-export async function handleRouteTool(args: unknown): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
+export const routeTool = defineTool({
+  name: 'jev_route',
+  description: 'Ultra-fast (~800ms) choice selection and classification via OpenRouter native Decisions API (~typesafe/jev-latest). Evaluates candidate options and criteria mapping, returning calibrated probabilities and confidence.',
+  shape: routeShape,
+  handler: handleRouteTool
+});
+
+export async function handleRouteTool(args: ToolInput<typeof routeShape>): Promise<ToolResult> {
   const start = performance.now();
-  const { context, options, criteria, instruction } = (args || {}) as {
-    context: string;
-    options: string[];
-    criteria?: Record<string, string>;
-    instruction?: string;
-  };
+  const { context, options, criteria, instruction } = args;
 
   if (!context || !Array.isArray(options) || options.length === 0) {
     throw new Error('jev_route requires non-empty "context" and "options" array');

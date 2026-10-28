@@ -1,10 +1,10 @@
-import type { Tool } from '@modelcontextprotocol/sdk/types.js';
+import { z } from 'zod';
+import { defineTool, type ToolInput, type ToolResult } from './define.js';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import {
   type JevMode,
   logTelemetry,
-  readJevMode,
   readJevModeSync,
   detectActiveHarness,
   writeModeState as coreWriteModeState,
@@ -68,33 +68,28 @@ export async function readCurrentMode(): Promise<{ mode: JevMode; updatedAt?: st
   return { mode, raw: cfg };
 }
 
-export const setModeToolDefinition: Tool = {
+const setModeShape = {
+  mode: z.enum(['off', 'on-demand', 'on']).describe('The operating mode to set: "off" (disabled, 0 overhead), "on-demand" (passive coprocessor), or "on" (aggressive System 1 enforcement)')
+};
+
+export const setModeTool = defineTool({
   name: 'jev_set_mode',
   description: 'Switch TypeSafe Jev operating mode ("off" | "on-demand" | "on"). Updates ~/.config/jev/config.json directly in-process.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      mode: {
-        type: 'string',
-        enum: ['off', 'on-demand', 'on'],
-        description: 'The operating mode to set: "off" (disabled, 0 overhead), "on-demand" (passive coprocessor), or "on" (aggressive System 1 enforcement)'
-      }
-    },
-    required: ['mode']
-  }
-};
+  shape: setModeShape,
+  handler: handleSetModeTool
+});
 
-export const getModeToolDefinition: Tool = {
+const getModeShape = {};
+
+export const getModeTool = defineTool({
   name: 'jev_get_mode',
   description: 'Inspect current TypeSafe Jev operating mode, configuration state, and operating characteristics.',
-  inputSchema: {
-    type: 'object',
-    properties: {}
-  }
-};
+  shape: getModeShape,
+  handler: handleGetModeTool
+});
 
-export async function handleSetModeTool(args: unknown): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
-  const { mode } = (args || {}) as { mode: string };
+export async function handleSetModeTool(args: ToolInput<typeof setModeShape>): Promise<ToolResult> {
+  const { mode } = args;
   if (!mode) {
     throw new Error('jev_set_mode requires "mode" ("off" | "on-demand" | "on")');
   }
@@ -138,7 +133,7 @@ export async function handleSetModeTool(args: unknown): Promise<{ content: Array
   };
 }
 
-export async function handleGetModeTool(_args?: unknown): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
+export async function handleGetModeTool(_args?: ToolInput<typeof getModeShape>): Promise<ToolResult> {
   const activeHarness = detectActiveHarness();
   const activeMode = readJevModeSync(activeHarness);
   const cfg = loadJevConfigSync();

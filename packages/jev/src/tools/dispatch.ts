@@ -1,4 +1,5 @@
-import type { Tool } from '@modelcontextprotocol/sdk/types.js';
+import { z } from 'zod';
+import { defineTool, strictObject, type ToolInput, type ToolResult } from './define.js';
 import {
   callJevDecision,
   callJevRouter,
@@ -14,7 +15,6 @@ import {
   loadJevConfigSync,
   normalizeTier,
   getHarnessModels,
-  type CognitiveTier,
   JEV_MODEL,
   FALLBACK_MODEL,
   JEV_INPUT_COST_PER_MILLION,
@@ -24,62 +24,37 @@ import {
   type BatchDispatchPlan
 } from '../core/index.js';
 
-export const dispatchToolDefinition: Tool = {
+const dispatchShape = {
+  task: z.string().describe('The task, prompt, or sub-goal to dispatch'),
+  availableSubagents: z.array(z.string()).optional().describe('Optional candidate subagents (defaults to dynamically discovered workspace agents)')
+};
+
+export const dispatchTool = defineTool({
   name: 'jev_dispatch',
   description: 'Intelligently route a task to the optimal subagent and model tier ("openrouter_free" | "flash_lite" | "flash" | "pro") in a single ~800ms decision call using TypeSafe Jev. "pro" tier models require explicit manual user approval before invocation.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      task: { type: 'string', description: 'The task, prompt, or sub-goal to dispatch' },
-      availableSubagents: {
-        type: 'array',
-        items: { type: 'string' },
-        description: 'Optional candidate subagents (defaults to dynamically discovered workspace agents)'
-      }
-    },
-    required: ['task']
-  }
+  shape: dispatchShape,
+  handler: handleDispatchTool
+});
+
+const batchDispatchShape = {
+  tasks: z.array(strictObject({
+    id: z.string().describe('Unique identifier for the task/phase'),
+    task: z.string().describe('The description of the work'),
+    dependencies: z.array(z.string()).optional().describe('Optional array of task IDs that must complete before this task can start')
+  })).describe('Array of task descriptions or phase items to plan and dispatch in parallel'),
+  availableSubagents: z.array(z.string()).optional().describe('Optional list of candidate subagents')
 };
 
-export const batchDispatchToolDefinition: Tool = {
+export const batchDispatchTool = defineTool({
   name: 'jev_batch_dispatch',
   description: 'Decompose a multi-task roadmap or list of phases into a parallel DAG execution manifest with optimal tier assignments, dependency tracking, concurrency safety (max 10 for openrouter_free), and boilerplate pre-flight flags.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      tasks: {
-        type: 'array',
-        description: 'Array of task descriptions or phase items to plan and dispatch in parallel',
-        items: {
-          type: 'object',
-          properties: {
-            id: { type: 'string', description: 'Unique identifier for the task/phase' },
-            task: { type: 'string', description: 'The description of the work' },
-            dependencies: {
-              type: 'array',
-              items: { type: 'string' },
-              description: 'Optional array of task IDs that must complete before this task can start'
-            }
-          },
-          required: ['id', 'task']
-        }
-      },
-      availableSubagents: {
-        type: 'array',
-        items: { type: 'string' },
-        description: 'Optional list of candidate subagents'
-      }
-    },
-    required: ['tasks']
-  }
-};
+  shape: batchDispatchShape,
+  handler: handleBatchDispatchTool
+});
 
-export async function handleDispatchTool(args: unknown): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
+export async function handleDispatchTool(args: ToolInput<typeof dispatchShape>): Promise<ToolResult> {
   const start = performance.now();
-  const { task, availableSubagents } = (args || {}) as {
-    task: string;
-    availableSubagents?: string[];
-  };
+  const { task, availableSubagents } = args;
 
   if (!task) {
     throw new Error('jev_dispatch requires a non-empty "task" string');
@@ -305,12 +280,9 @@ export function matchSubagentByKeywords(
   return bestScore > 0 ? bestAgent : 'self';
 }
 
-export async function handleBatchDispatchTool(args: unknown): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
+export async function handleBatchDispatchTool(args: ToolInput<typeof batchDispatchShape>): Promise<ToolResult> {
   const start = performance.now();
-  const { tasks, availableSubagents } = (args || {}) as {
-    tasks: Array<{ id: string; task: string; dependencies?: string[] }>;
-    availableSubagents?: string[];
-  };
+  const { tasks, availableSubagents } = args;
 
   if (!Array.isArray(tasks) || tasks.length === 0) {
     throw new Error('jev_batch_dispatch requires a non-empty "tasks" array');

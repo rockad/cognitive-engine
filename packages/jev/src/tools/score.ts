@@ -1,4 +1,5 @@
-import type { Tool } from '@modelcontextprotocol/sdk/types.js';
+import { z } from 'zod';
+import { defineTool, type ToolInput, type ToolResult } from './define.js';
 import {
   callJevDecision,
   callJevRouter,
@@ -9,31 +10,22 @@ import {
   logTelemetry
 } from '../core/index.js';
 
-export const scoreToolDefinition: Tool = {
-  name: 'jev_score',
-  description: 'Rate relevance, quality, or cognitive complexity on an ordinal scale using OpenRouter native Decisions API (question type "score") with criteria buckets.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      context: { type: 'string', description: 'Content to rate' },
-      rubric: { type: 'string', description: 'Rubric or question for rating' },
-      criteria: {
-        type: 'array',
-        items: { type: 'string' },
-        description: 'Optional array of criteria descriptions (defaults to standard 5-point quality scale)'
-      }
-    },
-    required: ['context']
-  }
+const scoreShape = {
+  context: z.string().describe('Content to rate'),
+  rubric: z.string().optional().describe('Rubric or question for rating'),
+  criteria: z.array(z.string()).optional().describe('Optional array of criteria descriptions (defaults to standard 5-point quality scale)')
 };
 
-export async function handleScoreTool(args: unknown): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
+export const scoreTool = defineTool({
+  name: 'jev_score',
+  description: 'Rate relevance, quality, or cognitive complexity on an ordinal scale using OpenRouter native Decisions API (question type "score") with criteria buckets.',
+  shape: scoreShape,
+  handler: handleScoreTool
+});
+
+export async function handleScoreTool(args: ToolInput<typeof scoreShape>): Promise<ToolResult> {
   const start = performance.now();
-  const { context, rubric, criteria } = (args || {}) as {
-    context: string;
-    rubric?: string;
-    criteria?: string[];
-  };
+  const { context, rubric, criteria } = args;
 
   if (!context) {
     throw new Error('jev_score requires "context"');
