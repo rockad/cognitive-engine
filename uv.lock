@@ -706,6 +706,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "cognitive-harness2", extra = ["upstream"] },
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
@@ -719,6 +720,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "cognitive-harness2", extras = ["upstream"], editable = "packages/harness2" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "pytest-asyncio", specifier = ">=1.2.0" },
 ]
@@ -732,11 +734,18 @@ dependencies = [
     { name = "httpx" },
 ]
 
+[package.optional-dependencies]
+upstream = [
+    { name = "harness2" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "fastmcp", specifier = ">=4.1,<5" },
+    { name = "harness2", marker = "extra == 'upstream'", git = "https://github.com/google-research/harness2.git?rev=1cfe254e8d25b15f37048c3730134686abe60335" },
     { name = "httpx", specifier = ">=0.28" },
 ]
+provides-extras = ["upstream"]
 
 [[package]]
 name = "cognitive-lookup"
@@ -1462,6 +1471,11 @@ sdist = { url = "https://files.pythonhosted.org/packages/01/ee/02a2c011bdab74c6f
 wheels = [
     { url = "https://files.pythonhosted.org/packages/04/4b/29cac41a4d98d144bf5f6d33995617b185d14b22401f75ca86f384e87ff1/h11-0.16.0-py3-none-any.whl", hash = "sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86", size = 37515, upload-time = "2025-04-24T03:35:24.344Z" },
 ]
+
+[[package]]
+name = "harness2"
+version = "0.1.0"
+source = { git = "https://github.com/google-research/harness2.git?rev=1cfe254e8d25b15f37048c3730134686abe60335#1cfe254e8d25b15f37048c3730134686abe60335" }
 
 [[package]]
 name = "hf-xet"

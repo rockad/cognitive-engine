@@ -16,6 +16,8 @@ members = [
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=1.2.0",
+    # The pinned upstream google-research/harness2, so `uv run pytest` can smoke-test the import.
+    "cognitive-harness2[upstream]",
 ]
 
 [tool.pytest.ini_options]
