@@ -204,3 +204,7 @@ async def test_the_engine_fails_closed_on_an_unreachable_daemon_even_with_the_di
                                 classification="unstated", dry_run=False))["run_id"]
     with pytest.raises(Refused, match="fail closed|unusable"):
         eng.probe(run_id=run_id, command=["echo", "x"], timeout_s=5, allow_worktree_diff=False)
+
+
+def test_status_reports_rootless_docker_when_sbx_is_absent():
+    assert sandbox.sandbox_status(lambda n: None if n == "sbx" else "/usr/bin/docker") == "rootless-docker"
