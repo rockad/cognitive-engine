@@ -1,0 +1,16 @@
+{
+  "session_id": "<session-id>",
+  "transcript_path": "~/.claude/projects/-~--claude-jobs-JOB-tmp-scratch/<uuid>.jsonl",
+  "cwd": "~/.claude/jobs/JOB/tmp/scratch",
+  "prompt_id": "<prompt-id>",
+  "permission_mode": "bypassPermissions",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Workflow",
+  "tool_input": {
+    "script": "export const meta = { name: 'ok-test', description: 'Single agent replies ok' }\nconst r = await agent('Reply with just the word ok.', {model: 'sonnet'})\nreturn r"
+  },
+  "tool_use_id": "toolu_REDACTED"
+}

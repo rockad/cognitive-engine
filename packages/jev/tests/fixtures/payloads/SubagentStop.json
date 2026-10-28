@@ -1,0 +1,33 @@
+{
+  "session_id": "<session-id>",
+  "transcript_path": "~/.claude/projects/-~--claude-jobs-JOB-tmp-scratch/<uuid>.jsonl",
+  "cwd": "~/.claude/jobs/JOB/tmp/scratch",
+  "prompt_id": "<prompt-id>",
+  "permission_mode": "bypassPermissions",
+  "agent_id": "a4ea8d8f3fc308a69",
+  "agent_type": "general-purpose",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "SubagentStop",
+  "stop_hook_active": false,
+  "agent_transcript_path": "~/.claude/projects/-~--claude-jobs-JOB-tmp-scratch/<uuid>/subagents/agent-a4ea8d8f3fc308a69.jsonl",
+  "last_assistant_message": "ok",
+  "background_tasks": [
+    {
+      "id": "wo514sxno",
+      "type": "workflow",
+      "status": "running",
+      "description": "Single agent replies ok",
+      "name": "ok-test"
+    },
+    {
+      "id": "a4ea8d8f3fc308a69",
+      "type": "subagent",
+      "status": "running",
+      "description": "Reply ok",
+      "agent_type": "general-purpose"
+    }
+  ],
+  "session_crons": []
+}

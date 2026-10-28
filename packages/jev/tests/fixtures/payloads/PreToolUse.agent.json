@@ -1,0 +1,18 @@
+{
+  "session_id": "<session-id>",
+  "transcript_path": "~/.claude/projects/-~--claude-jobs-JOB-tmp-scratch/<uuid>.jsonl",
+  "cwd": "~/.claude/jobs/JOB/tmp/scratch",
+  "prompt_id": "<prompt-id>",
+  "permission_mode": "bypassPermissions",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Agent",
+  "tool_input": {
+    "description": "Reply ok",
+    "prompt": "Reply with just the word ok.",
+    "model": "sonnet"
+  },
+  "tool_use_id": "toolu_REDACTED"
+}

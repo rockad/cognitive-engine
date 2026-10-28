@@ -1,0 +1,9 @@
+{
+  "session_id": "<session-id>",
+  "transcript_path": "~/.claude/projects/-~--claude-jobs-JOB-tmp-scratch/<uuid>.jsonl",
+  "cwd": "~/.claude/jobs/JOB/tmp/scratch",
+  "prompt_id": "<prompt-id>",
+  "agent_id": "a3effa968672af926",
+  "agent_type": "workflow-subagent",
+  "hook_event_name": "SubagentStart"
+}

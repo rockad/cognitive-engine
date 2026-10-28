@@ -1,0 +1,20 @@
+{
+  "session_id": "<session-id>",
+  "transcript_path": "~/.claude/projects/-~--claude-jobs-JOB-tmp-scratch/<uuid>.jsonl",
+  "cwd": "~/.claude/jobs/JOB/tmp/scratch",
+  "prompt_id": "<prompt-id>",
+  "permission_mode": "bypassPermissions",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Workflow",
+  "tool_input": {
+    "args": {
+      "probe": "canary"
+    },
+    "scriptPath": "~/.claude/jobs/JOB/tmp/scratch/wf-path.js",
+    "resumeFromRunId": "wf_b551da16-6a8"
+  },
+  "tool_use_id": "toolu_REDACTED"
+}
