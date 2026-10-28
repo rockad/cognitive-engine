@@ -21,6 +21,9 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
+markers = [
+    "requires_rootless_docker: runs real containers against the host rootless Docker daemon; must run, never skip",
+]
 testpaths = ["packages/memory/tests", "packages/lookup/tests", "packages/harness2/tests", "tools/tests"]
 pythonpath = ["tools"]
 asyncio_mode = "auto"

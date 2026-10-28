@@ -12,8 +12,8 @@ probe need.
 """
 from __future__ import annotations
 
+import asyncio
 import os
-import shutil
 from typing import Annotated, Literal
 
 import httpx
@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from . import __version__, egress, invariants, quota, settings as cfg
 from .engine import Engine, Refused, Target
 from .experience import ExperienceStore
-from .sandbox import default_runner
+from .sandbox import default_runner, sandbox_status
 
 
 class TargetArg(BaseModel):
@@ -77,11 +77,12 @@ def build_server(engine: Engine | None = None, s: cfg.Settings | None = None) ->
                 raise ToolError(str(e)) from e
         return wrapped
 
-    @server.tool(name="harness2_status", description="Read-only readiness report: whether the sbx sandbox is "
-                 "installed, whether an OpenRouter key is configured (never its value), the experience root, "
+    @server.tool(name="harness2_status", description="Read-only readiness report: which local sandbox is usable "
+                 "(sbx, or a verified rootless Docker; otherwise unavailable and fail closed), "
+                 "whether an OpenRouter key is configured (never its value), the experience root, "
                  "and the immutable protected set. Makes no network call unless check_quota is true.")
     async def status(check_quota: bool = False) -> dict:
-        out = {"version": __version__, "sandbox": "sbx" if shutil.which("sbx") else "unavailable (fail closed)",
+        out = {"version": __version__, "sandbox": await asyncio.to_thread(sandbox_status),
                "api_key_configured": _api_key() is not None, "experience_root": str(s.experience_root),
                "mutable_components": sorted(invariants.MUTABLE),
                "protected_components": sorted(invariants.PROTECTED_COMPONENTS),
@@ -106,9 +107,9 @@ def build_server(engine: Engine | None = None, s: cfg.Settings | None = None) ->
         return await guard(eng.propose)(task=task, targets=[Target(t.component, t.content) for t in targets],
                                         n=n, zdr=zdr, classification=classification, dry_run=dry_run)
 
-    @server.tool(name="harness2_probe", description="Run each candidate in a local sbx microVM and collect "
-                 "outputs. With no sbx runtime it fails closed and runs nothing; allow_worktree_diff opts in to "
-                 "static diffs only, which execute no code.")
+    @server.tool(name="harness2_probe", description="Run each candidate in a local sbx microVM, or an ephemeral rootless "
+                 "Docker container when sbx is absent, and collect outputs. With neither it fails closed "
+                 "and runs nothing; allow_worktree_diff opts in to static diffs only, which execute no code.")
     async def probe(
         run_id: str,
         command: Annotated[list[str], Field(min_length=1, description="command to run in the sandbox")],

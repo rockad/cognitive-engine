@@ -160,7 +160,10 @@ class Engine:
             if runner is None:
                 results.append(ProbeResult(c.id, "diff_only", None, "", "", False, diff))
                 continue
-            out = runner.run(SandboxSpec(command=command, files={c.component: c.mutated}, timeout_s=timeout_s))
+            try:
+                out = runner.run(SandboxSpec(command=command, files={c.component: c.mutated}, timeout_s=timeout_s))
+            except SandboxUnavailable as e:  # the runtime vanished mid-probe: still fail closed, never degrade
+                raise Refused(str(e)) from e
             results.append(ProbeResult(c.id, "sandbox", out.exit_code, out.stdout, out.stderr, out.timed_out, ""))
         run.results = results
         return {"run_id": run.id, "mode": results[0].mode if results else "none",
