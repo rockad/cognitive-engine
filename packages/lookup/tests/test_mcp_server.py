@@ -151,6 +151,17 @@ async def test_unrecognised_visibility_filter_is_an_error_not_an_unfiltered_answ
         await search(client, visibility="public")
 
 
+async def test_a_misspelled_argument_is_an_error_not_an_unfiltered_answer(client):
+    # The failure that matters for this server: `visiblity="open"` silently ignored
+    # would return gated documents to a caller who believes they asked for open
+    # ones. The official `MCPServer` (mcp 2.3.0) ignores unknown arguments; FastMCP
+    # rejects them. This pins the property so a library swap cannot lose it.
+    with pytest.raises(ToolError):
+        await client.call_tool("search_archive", {"query": "zebrafish", "visiblity": "open"})
+    with pytest.raises(ToolError):
+        await client.call_tool("search_archive", {"query": "zebrafish", "bogus": 1})
+
+
 async def test_limit_is_bounded_by_the_schema(client):
     with pytest.raises(ToolError):
         await search(client, limit=11)
@@ -266,6 +277,28 @@ async def test_http_daemon_answers_tool_calls_with_visibility_enforced(http_daem
         r = await c.call_tool("search_archive", {"query": "zebrafish", "visibility": "open",
                                                  "limit": 10})
     assert markers(r.content[0].text) == {"openmarker", "mixedopenmarker"}
+
+
+INIT = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+    "protocolVersion": "2025-06-18", "capabilities": {},
+    "clientInfo": {"name": "t", "version": "0"}}}
+JSON_HEADERS = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
+
+
+@pytest.mark.parametrize("headers,status", [
+    ({}, 200),                                          # 127.0.0.1
+    ({"Host": "localhost"}, 200),
+    ({"Host": "evil.example"}, 421),                    # DNS rebinding: forged Host
+    ({"Origin": "http://evil.example"}, 403),           # browser page on another origin
+])
+def test_http_daemon_refuses_forged_host_and_foreign_origin(http_daemon, headers, status):
+    import httpx
+    host = headers.get("Host")
+    if host == "localhost":
+        headers = {**headers, "Host": f"localhost:{http_daemon['port']}"}
+    r = httpx.post(f"http://127.0.0.1:{http_daemon['port']}/mcp", json=INIT,
+                   headers={**JSON_HEADERS, **headers})
+    assert r.status_code == status
 
 
 def test_http_daemon_wrote_nothing_to_home(http_daemon):

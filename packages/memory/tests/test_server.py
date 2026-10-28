@@ -66,6 +66,25 @@ async def test_binds_loopback_only(daemon):
     assert [(a.ip, a.port) for a in listening] == [("127.0.0.1", daemon["port"])]
 
 
+@pytest.mark.parametrize("headers,status", [
+    ({}, 200),
+    ({"Host": "evil.example"}, 421),
+    ({"Origin": "http://evil.example"}, 403),
+])
+async def test_refuses_forged_host_and_foreign_origin(daemon, headers, status):
+    # Upstream passes host_origin_protection="auto"; pinned here because the daemon
+    # can write and delete notes, and a loopback bind alone does not stop a browser
+    # tab from reaching it via DNS rebinding.
+    import httpx
+    init = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-06-18", "capabilities": {},
+        "clientInfo": {"name": "t", "version": "0"}}}
+    r = httpx.post(f"http://127.0.0.1:{daemon['port']}/mcp", json=init, headers={
+        "Accept": "application/json, text/event-stream", "Content-Type": "application/json",
+        **headers})
+    assert r.status_code == status
+
+
 async def test_lists_the_required_tools(daemon):
     async with client(daemon) as c:
         names = {t.name for t in await c.list_tools()}

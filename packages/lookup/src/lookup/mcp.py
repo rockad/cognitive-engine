@@ -667,8 +667,15 @@ def serve_http(port: int = PORT, reingest_interval: int = 300,
                          daemon=True, name="reingest").start()
     sys.stderr.write(f"lookup {VERSION} MCP starting on http://{HOST}:{port}{PATH}\n")
     sys.stderr.flush()
+    # ⚠️ `host_origin_protection="auto"` is NOT the default, and omitting it was a
+    # bug: the daemon accepted a forged `Host` and a foreign `Origin` (HTTP 200),
+    # which is the shape of a DNS-rebinding attack from a browser tab against a
+    # loopback server that returns `gated` documents. With it, both are refused
+    # (421 and 403) while `127.0.0.1` and `localhost` still work. basic-memory
+    # passes the same value for the same reason.
     build_server().run(transport="http", host=HOST, port=port, path=PATH,
-                       stateless_http=True, show_banner=False)
+                       stateless_http=True, show_banner=False,
+                       host_origin_protection="auto")
     return 0
 
 
