@@ -248,3 +248,18 @@ async def test_jev_conforms(tmp_path):
     finally:
         stop(p)
     assert {k: v for k, v in statuses(got).items() if v != mc.PASS} == {}, got
+
+
+async def test_harness2_conforms(tmp_path):
+    port = free_port()
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {**os.environ, "HOME": str(home), "COGNITIVE_HARNESS2_PORT": str(port),
+           "COGNITIVE_HARNESS2_EXPERIENCE_ROOT": str(tmp_path / "experiences")}
+    p = _start_daemon([sys.executable, "-m", "cognitive_harness2.cli", "serve"], env, port, tmp_path)
+    try:
+        got = await check(f"http://127.0.0.1:{port}/mcp", PROBES / "harness2.toml")
+    finally:
+        stop(p)
+    assert {k: v for k, v in statuses(got).items() if v != mc.PASS} == {}, got
+    assert list(home.iterdir()) == [], "the daemon wrote into $HOME"
