@@ -16,6 +16,18 @@ The hook runs `packages/jev/src/hook.ts claude` before every `Agent` or `Task` c
 - It also checks the `model:` in the subagent's definition (`.claude/agents/<name>.md`) when the call sets none.
 - Once active, it fails closed: if it cannot read the call, hits an error, or cannot determine the session model, it asks instead of letting the call through.
 
+## The workflow guard
+
+Agents spawned inside a `Workflow` do not pass through the `Agent|Task` hook (verified on Claude Code 2.1.312: only `SubagentStart`/`SubagentStop` fire for them, and those cannot block), so a second `PreToolUse` entry with matcher `Workflow` runs the same `hook.ts claude`. `packages/jev/src/workflow-guard.ts` reads the script (inline `script`, a `scriptPath` file, or a saved workflow `name` from `.claude/workflows`, plus `workflow()` references one level deep), parses it with acorn and checks every `agent` and `workflow` reference.
+
+- A literal `model` (or an `agentType` whose definition sets one) is ranked against the session model like a direct call. No `model` inherits and is allowed.
+- Anything it cannot read statically asks and names the call site (`file:line:col`): an alias such as `const a = agent`, spread options, computed keys, a model from a variable or `args`, a template with `${}`, member access, `eval`, a parse error, an unreadable or oversized file, a missing agent definition, an unknown `tool_input` shape.
+
+## Requirements
+
+- Claude Code **>= 2.1.295**: the guard entries use `"onFailure": "block"`, so a crashing, timing-out or missing hook blocks the tool call instead of failing open. Older versions ignore the key and fail open.
+- The two recorder hooks (`SessionStart`, `PostModelSwitch`) are log-only and deliberately fail open.
+
 ## Install
 
 Point `COGNITIVE_ENGINE_HOME` at your checkout, then add the plugin from this directory:
