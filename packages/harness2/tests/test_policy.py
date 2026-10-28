@@ -1,4 +1,5 @@
 """Pure policy: protected invariants, probe triggers, egress/ZDR, settings, licensing."""
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -157,5 +158,22 @@ def test_apache_licence_and_notice_are_present():
     lic = (PKG / "LICENSE").read_text()
     assert "Apache License" in lic and "Version 2.0" in lic
     notice = (PKG / "NOTICE").read_text()
-    assert "Apache License, Version 2.0" in notice and "Google Harness" in notice
+    assert "Apache License, Version 2.0" in notice
     assert 'license = { text = "Apache-2.0" }' in (PKG / "pyproject.toml").read_text()
+
+
+def test_notice_cites_upstream_as_primary_and_the_literature_as_related_work_only():
+    notice = (PKG / "NOTICE").read_text()
+    primary, _, related = notice.partition("RELATED WORK")
+    # Upstream is primary: Google, Apache-2.0, the paper, and the exact pinned commit.
+    for needle in ("github.com/google-research/harness2", "Google Research / Google LLC", "Apache-2.0",
+                   "Xu et al., 2026", "arxiv.org/abs/2610.14224"):
+        assert needle in primary
+    pin = tomllib.loads((PKG / "pyproject.toml").read_text())["tool"]["uv"]["sources"]["harness2"]["rev"]
+    assert pin in primary
+    # Promptbreeder and Tool Makers are related work only, never in the primary section.
+    assert "Promptbreeder" in related and "Tool Makers" in related and "2309.16797" in related
+    assert "Promptbreeder" not in primary and "Tool Makers" not in primary
+    # Claims this package must not make.
+    for banned in ("clean-room", "clean room", "DeepMind"):
+        assert banned.lower() not in notice.lower()

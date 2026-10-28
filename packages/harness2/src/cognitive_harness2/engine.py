@@ -13,7 +13,8 @@ testable without a network, a microVM or a model, and the refusals are the point
   * reflect  stages lessons as pending; an agent cannot commit them
 
 The composer here is a heuristic baseline (exit status, timeouts, output, stderr), not a
-learned one. No upstream Harness² package is vendored: RFC 004 names none to wrap.
+learned one. It does not yet call upstream google-research/harness2 (a pinned dependency,
+see NOTICE and the README); binding these stages to upstream is the next step, not done here.
 """
 from __future__ import annotations
 

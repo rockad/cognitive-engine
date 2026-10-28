@@ -1,9 +1,34 @@
 cognitive-harness2
 Copyright 2026 Aleksandr Korolev
 
-Licensed under the Apache License, Version 2.0.
+Licensed under the Apache License, Version 2.0 (see LICENSE).
 
-This package is an independent implementation of the Propose-Probe-Compose approach that
-RFC 004 calls "Google Harness²". It does not vendor or copy Google Research code: the RFC
-names no upstream package to wrap. The canonical Google Research citation for Harness²
-has not been supplied and must be added here before any release.
+PRIMARY UPSTREAM
+This package builds on Harness²: Recursive Agent Harnessing for an Open World.
+
+  Project:   https://github.com/google-research/harness2
+  Authors:   Google Research / Google LLC
+  License:   Apache-2.0
+  Paper:     Xu et al., 2026, https://arxiv.org/abs/2610.14224
+
+Upstream is consumed as a pinned git dependency (commit
+1cfe254e8d25b15f37048c3730134686abe60335), declared in this package's pyproject.toml
+under the `upstream` extra. Its source is not copied or vendored into this repository.
+The policy is to use upstream directly wherever it can be used, to adopt new upstream
+versions by moving the pin, and to carry a minimal fork only if direct use is forced.
+Upstream's own copyright and license notices apply to upstream's code and are not
+altered here.
+
+WHAT THIS PACKAGE ADDS
+A strict loopback MCP server, a protected-invariant set, egress and zero-data-retention
+policy checks, an OpenRouter quota pre-flight, a fail-closed local sandbox (sbx, or an
+ephemeral rootless Docker container), and an out-of-tree experience store with human
+sign-off. These wrap and gate the upstream method; they do not replace it.
+
+RELATED WORK
+The following are cited as related work only. This package is not derived from them.
+
+  Promptbreeder: Self-Referential Self-Improvement Via Prompt Evolution.
+    Fernando et al., 2023, https://arxiv.org/abs/2309.16797
+  Large Language Models as Tool Makers.
+    Cai et al., 2023, https://arxiv.org/abs/2305.17126
