@@ -6,9 +6,9 @@ FastMCP); every argument model forbids extra keys, so a misspelled argument is a
 error rather than a silent default.
 
 Tools: `harness2_propose`, `harness2_probe`, `harness2_compose`, `harness2_reflect` (RFC
-004 §2.7) plus a read-only `harness2_status` that reports sandbox, key and storage
-readiness without a network call, which is what Track 4's Gate 3 and the conformance
-probe need.
+004 §2.7), the read-only pull trigger `harness2_trigger` (advice.py), plus a read-only
+`harness2_status` that reports sandbox, key and storage readiness without a network call,
+which is what Track 4's Gate 3 and the conformance probe need.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import __version__, egress, invariants, quota, settings as cfg
+from . import __version__, advice, egress, invariants, quota, settings as cfg, triggers
 from .engine import Engine, Refused, Target
 from .experience import ExperienceStore
 from .sandbox import default_runner, sandbox_status
@@ -91,6 +91,31 @@ def build_server(engine: Engine | None = None, s: cfg.Settings | None = None) ->
             v = await quota.preflight(_api_key())
             out["quota"] = {"ok": v.ok, "reason": v.reason}
         return out
+
+    @server.tool(name="harness2_trigger", description="Read-only pull check: given a failure or stagnation summary, "
+                 "say whether a System 2 probe is worth suggesting, which trigger fired, whether quota, egress, "
+                 "sandbox and model are ready, the cost class, and that human approval is required. Starts no "
+                 "sandbox, calls no model, writes nothing; run harness2_propose and harness2_probe explicitly to act.")
+    async def trigger(
+        on_demand: Annotated[bool, Field(description="the user or agent explicitly asks for a probe")] = False,
+        judge_passed: Annotated[bool | None, Field(description="jev_judge verdict, if there was one")] = None,
+        judge_score: Annotated[float | None, Field(ge=0, le=1, description="jev_judge score, if any")] = None,
+        consecutive_failures: Annotated[int, Field(ge=0, le=1000, description="failures in a row on this task")] = 0,
+        failure_signatures: Annotated[list[Annotated[str, Field(max_length=200)]], Field(
+            max_length=20, description="short fingerprints of the recent failures, newest last; "
+            "a trailing identical run counts as that many consecutive failures. Not stored.")] = [],
+        attempts_without_progress: Annotated[int, Field(ge=0, le=1000, description="stagnation count")] = 0,
+        zdr: Annotated[Literal["strict", "off"], Field(description="zero-data-retention policy")] = "strict",
+        classification: Annotated[Literal["open", "gated", "unstated", "restricted"], Field(
+            description="classification of the content; unknown is treated as restricted")] = "unstated",
+        check_quota: Annotated[bool, Field(description="run the OpenRouter quota pre-flight (one GET) "
+                                                       "when the endpoint is OpenRouter")] = False,
+    ) -> dict:
+        decision = triggers.should_probe(
+            judge_passed=judge_passed, judge_score=judge_score, consecutive_failures=consecutive_failures,
+            on_demand=on_demand, failure_signatures=failure_signatures,
+            attempts_without_progress=attempts_without_progress)
+        return await advice.advise(eng, decision, zdr=zdr, classification=classification, check_quota=check_quota)
 
     @server.tool(name="harness2_propose", description="Generate mutation candidates for the given components. "
                  "Refuses protected or unknown components and any endpoint the ZDR/classification policy forbids, "

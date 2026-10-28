@@ -34,10 +34,11 @@ async def call(client, name, args):
         return (await c.call_tool(name, args)).structured_content
 
 
-async def test_exposes_the_four_rfc_tools_plus_status(client):
+async def test_exposes_the_four_rfc_tools_plus_status_and_trigger(client):
     async with client as c:
         assert {t.name for t in await c.list_tools()} == {
-            "harness2_propose", "harness2_probe", "harness2_compose", "harness2_reflect", "harness2_status"}
+            "harness2_propose", "harness2_probe", "harness2_compose", "harness2_reflect", "harness2_status",
+            "harness2_trigger"}
 
 
 @pytest.mark.parametrize("mutate", [
