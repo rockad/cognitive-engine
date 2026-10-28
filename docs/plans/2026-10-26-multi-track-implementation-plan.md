@@ -90,7 +90,7 @@ flowchart TD
     - Supervised Daemon: Streamable HTTP transport on `127.0.0.1:8115/mcp` managed via `engine up`.
   - **Multi-Harness Adapters (`adapters/`)**:
     - Google Antigravity sidecar integration and MCP registration (`~/.gemini/config/mcp_config.json`).
-    - Claude Code native plugin package (`.claude-plugin/plugin.json`) and MCP registration (no custom session hooks, aligning with the 2026-10-27 settings consolidation).
+    - Claude Code native plugin package (`.claude-plugin/plugin.json`) and MCP registration. Hooks are not prohibited: Track 1 ships only the narrow subagent guard, and others may be added where a workflow needs one.
     - OpenCode V2 plugin bundle and event interceptors.
     - Turnkey installer command: `engine install-adapters`.
 - **Invariants & Gates**:
