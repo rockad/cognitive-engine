@@ -53,7 +53,9 @@ The upstream tool set is served unchanged, including `read_note`, `write_note`, 
 
 **There is no `list_notes`.** RFC 003 names one; the upstream equivalent is `list_directory` (with `ls` as a shell-style alias). Nothing here renames it.
 
-**`ping` is not answered.** Upstream's stateless HTTP server returns `Method not found` for the MCP `ping` request. Liveness is `tools/list`, or a TCP connect to the port.
+**`ping` is not answered.** The server returns `Method not found` for the MCP `ping` request, and the official SDK says why: ping was removed from the protocol as of 2026-07-28. Liveness is `tools/list`, or a TCP connect to the port.
+
+**Forged `Host` and foreign `Origin` headers are refused** (421 and 403), which is what stops a browser tab reaching a loopback daemon that can write and delete notes. Upstream enables this; `test_server.py` pins it.
 
 ## Upgrading upstream
 

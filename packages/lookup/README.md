@@ -13,7 +13,9 @@ uv run lookup sources             # what the manifest declares
 uv run lookup ingest --all
 ```
 
-The HTTP bind is `127.0.0.1` and there is no `--host` flag: the tools return the text of documents classified `gated`, and nothing authenticates the caller.
+The HTTP bind is `127.0.0.1` and there is no `--host` flag: the tools return the text of documents classified `gated`, and nothing authenticates the caller. A forged `Host` header is refused (421) and so is a foreign `Origin` (403), so a browser tab cannot reach the daemon by DNS rebinding; tests pin both. A misspelled argument such as `visiblity` is a tool error, never silently ignored.
+
+The MCP layer is FastMCP rather than the official SDK's `MCPServer`; both were compared behind the same handlers (RFC 003 §4, item 11). The engine does not import either, so the choice is confined to `mcp.py`.
 
 Tools: `search_archive`, `get_document`, `refresh_index`, `archive_stats`.
 
