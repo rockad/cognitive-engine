@@ -23,6 +23,14 @@ from pathlib import Path, PurePosixPath
 from typing import IO, Protocol, runtime_checkable
 
 
+class SourceUnreachable(OSError):
+    """A remote source could not be listed or read (share down, network gone, auth refused).
+
+    Raised, never swallowed mid-walk: a half-finished listing must not be mistaken for
+    "the other files were deleted". The pipeline keeps the source's rows and moves on.
+    """
+
+
 @dataclass(frozen=True)
 class Stat:
     """The two fields the ledger needs: a cheap change signal that never reads the file."""

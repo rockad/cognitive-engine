@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from . import db, manifest
 from .extract import resolve
 from .manifest import Source
+from .vfs import SourceUnreachable
 
 
 @dataclass
@@ -33,6 +34,10 @@ class Result:
     # longer resolved.
     pruned: int = 0
     refused: int = 0
+    # Reparse points (symlinks, junctions) and unreadable directories a remote walk passed
+    # over. Counted and named in `problems`, but not an error: a link on a share cannot be
+    # proven to stay inside it, so it is never followed.
+    skipped_links: int = 0
     errors: int = 0
     files: int = 0
     seconds: float = 0.0
@@ -48,6 +53,8 @@ class Result:
             d["pruned"] = self.pruned
         if self.refused:
             d["REFUSED"] = self.refused
+        if self.skipped_links:
+            d["skipped_links"] = self.skipped_links
         return d
 
 
@@ -175,6 +182,10 @@ def ingest_source(con, src: Source, commit_every: int = 500,
             db.record_file(cur, src.name, str(path), st.st_mtime, st.st_size,
                            keys_here)
 
+    skipped = list(getattr(src.fs, "skipped", ()))
+    res.skipped_links = len(skipped)
+    res.problems.extend(f"SKIPPED: {s}" for s in skipped[:10])
+
     # Forget documents whose file has gone -- but only on the evidence of a
     # pass that actually read the source.
     #
@@ -246,7 +257,7 @@ def ingest_all(optimize: bool = True, vacuum: bool = False,
     con = db.connect()
     totals = {"added": 0, "updated": 0, "unchanged": 0, "errors": 0,
               "refused": 0, "pruned": 0, "skipped_files": 0,
-              "sources": 0, "skipped": [], "unmounted": [],
+              "sources": 0, "skipped": [], "unreachable": [],
               "dropped": {}, "undeclared": [], "stale": [],
               # Sources whose file ledger was discarded because they were
               # unreachable, so the next pass that finds them re-verifies in
@@ -281,13 +292,10 @@ def ingest_all(optimize: bool = True, vacuum: bool = False,
         for name, src in srcs.items():
             if not src.exists():
                 totals["skipped"].append(name)
-                # ⚠️ A `[source.volume]` used to mean "the container mounts this
-                # share itself". Native Lookup has no container to mount into, so
-                # the table is metadata now and the root must already resolve on
-                # this machine. Say so by name: left unremarked, an unmounted
-                # share is indistinguishable from an empty one.
+                # A declared network share that cannot be reached is named, because
+                # left unremarked it is indistinguishable from an empty one.
                 if src.volume:
-                    totals["unmounted"].append(name)
+                    totals["unreachable"].append(name)
                 # ⚠️ Drop this source's FILE ledger, keeping its documents.
                 #
                 # The documents stay because an unreachable source is not a
@@ -307,7 +315,19 @@ def ingest_all(optimize: bool = True, vacuum: bool = False,
                     totals["reverify"].append(name)
                     con.commit()
                 continue
-            res = ingest_source(con, src, rehash=rehash)
+            try:
+                res = ingest_source(con, src, rehash=rehash)
+            except SourceUnreachable:
+                # The share went away mid-pass. ingest_source raised before its prune
+                # step, so nothing was deleted on partial evidence; keep the rows, drop
+                # the ledger so the next pass re-verifies every file, and carry on with
+                # the other sources instead of letting one flaky share end the run.
+                totals["skipped"].append(name)
+                totals["unreachable"].append(name)
+                if db.forget_files(cur, name, None):
+                    totals["reverify"].append(name)
+                con.commit()
+                continue
             totals["sources"] += 1
             totals["added"] += res.added
             totals["updated"] += res.updated

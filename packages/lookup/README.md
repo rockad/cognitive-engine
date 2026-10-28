@@ -38,9 +38,37 @@ A source declares `visibility = "open" | "gated" | "mixed"`; omitting it means `
 - An unrecognised `visibility` value is a **tool error**. The legacy server dropped it and answered unfiltered; for the filter that keeps gated material out, silence was the wrong failure.
 - Nothing is banned. Provenance decides the ceremony (verify, get sign-off) and not whether the material may be used.
 
+## Network shares
+
+Declare a share in the manifest and it is indexed with nothing configured on the host:
+
+```toml
+[[source]]
+name = "archive"
+root = "/Volumes/knowledge-archive"   # LOGICAL path: stored and shown, never read from disk
+include = ["*.md", "**/*.md"]
+extractor = "docs.markdown"
+visibility = "gated"
+
+[source.volume]
+type = "cifs"                         # or "smb"
+device = "//core/knowledge-archive"   # //host/share
+subpath = "wiki"                      # optional: index only this directory of the share
+port = 445                            # optional
+username = "${SHARE_USER}"            # references only: a literal value is a manifest error
+password = "${SHARE_PASS}"
+```
+
+- **How it reads.** Every source read goes through a `FileSystem` (`vfs.py`); `LocalFS` is the disk and `SmbFS` (`smb.py`, over `smbprotocol`) is the share. A directory listing already carries size, modification time and the reparse flag, so a walk is one round trip per directory and an unchanged file is never opened: the second pass over an unchanged share performs zero reads and zero extra network calls (tested).
+- **Logical paths.** Results show `root/...`, and hits from a share are marked `REMOTE` (use `get_document`, do not open the path). Existing manifests and an index migrated from the Docker version keep their paths.
+- **Credentials.** `${VAR}` references only. A literal value, or an unset variable, fails at manifest load and names the variable. The password is held in memory and never appears in an error, a log line or a `repr`. Authentication is **NTLM only**: Kerberos needs system krb5 libraries, which is the host setup this removes. The old `options = "ro,vers=3.0"` is accepted and ignored.
+- **Safety.** A logical path is mapped onto the share only after every segment is checked: `..`, a backslash (a separator on the wire), `:` (an NTFS alternate data stream) and NUL are refused. Reparse points (symlinks, junctions, mount points) are **never followed**: they are skipped, counted in the ingest result as `skipped_links` and named in its problems.
+- **Failure.** An unreachable share keeps its rows, is named in the refresh report with the reason, and has its file ledger dropped so the next pass re-verifies every file. A listing that fails part-way raises `SourceUnreachable` and deletes nothing, so a dropped connection cannot read as "the other files were deleted"; the other sources still ingest.
+- **Known library behaviour.** `smbprotocol` caches one session per host, port and user for the life of the process, so changing a password needs a restart to be re-validated. Different users on the same host are isolated.
+
 ## Differences from the Docker-era server
 
-- **No network-share mounting.** The container used to mount SMB shares itself (`shares.py`, `lookup mounts`, `CAP_SYS_ADMIN`). A native process has no container to mount into, so a `[source.volume]` table is now metadata only: its `root` must already resolve on this machine. A declared `volume` whose root is absent is reported by name, as `UNMOUNTED`, in the startup log and in `refresh_index`, because an unmounted share is otherwise indistinguishable from an empty one. Declaring shares in the manifest and indexing them with no host setup is a proposed follow-up; see the Track 2 report in `docs/handoffs/antigravity-claude-bridge.md`.
+- **Network shares are read in userspace, not mounted.** The container used to mount SMB shares itself (`shares.py`, `lookup mounts`, `CAP_SYS_ADMIN`). Native Lookup reads a declared share over SMB directly, with no host mount, root or FUSE. See [Network shares](#network-shares).
 - **Python 3.12.** The old package required 3.14, mostly for `PurePath.full_match` (3.13+). `lookup.manifest.full_match` replaces it and is tested against the stdlib reference.
 - **FastMCP** replaces the hand-written JSON-RPC and HTTP server. `GET /healthz` went with it.
 

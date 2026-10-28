@@ -135,6 +135,9 @@ class TestInclusion(unittest.TestCase):
 # under test is the manifest's content (no forbidden root, every extractor
 # resolves), not whether those directories exist here.
 _ENV_FOR_REAL_MANIFEST = {
+    # The example declares a network share, whose credential references are checked at load.
+    "SHARE_USER": "test-user",
+    "SHARE_PASS": "test-pass",
     "LOOKUP_HOME": "/tmp/lookup-home",
     "ARCHIVE_TAKEOUT": "/tmp/t",
     "ARCHIVE_SOURCES": "/tmp/s",

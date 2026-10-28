@@ -531,12 +531,12 @@ def t_refresh(_a: dict) -> str:
                    + ", ".join(r["stale"]))
     if r["skipped"]:
         out.append("Skipped, root absent: " + ", ".join(r["skipped"]))
-    if r["unmounted"]:
-        out.append("⚠️ Declare a network `volume` that native Lookup does not mount: "
-                   + ", ".join(r["unmounted"])
-                   + ". Their roots must already resolve on this machine — mount the "
-                     "share on the host and point `root` at it. Until then they are "
-                     "not indexed, which is not the same as empty.")
+    if r["unreachable"]:
+        out.append("⚠️ Network share unreachable this pass: "
+                   + ", ".join(r["unreachable"])
+                   + ". Their rows are KEPT and the next pass re-verifies every file; "
+                     "check the host, the share name and the credentials. An unreachable "
+                     "share is not the same as an empty one.")
     return "\n".join(out)
 
 
@@ -591,8 +591,8 @@ def _startup_ingest() -> None:
                 f"{k} {v}" for k, v in sorted(r["dropped"].items()))
             ) if r["dropped"] else ""
             stale = ("  stale (rows kept): " + ", ".join(r["stale"])) if r["stale"] else ""
-            unmounted = ("  UNMOUNTED network volume (not indexed): "
-                         + ", ".join(r["unmounted"])) if r["unmounted"] else ""
+            unmounted = ("  UNREACHABLE network share (rows kept): "
+                         + ", ".join(r["unreachable"])) if r["unreachable"] else ""
             sys.stderr.write("startup ingest: %d docs, %.1f MB, %.1fs%s%s%s\n"
                              % (r["docs"], r["db_bytes"] / 1048576,
                                 time.time() - t0, dropped, stale, unmounted))

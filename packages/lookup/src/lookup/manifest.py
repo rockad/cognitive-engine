@@ -230,7 +230,13 @@ class Source:
     @property
     def fs(self) -> FileSystem:
         """Where this source's bytes come from. Every read of it goes through here."""
-        return self.filesystem or LOCAL
+        if self.filesystem is not None:
+            return self.filesystem
+        from . import smb  # lazy: a local-only manifest never imports it
+        try:
+            return smb.for_source(self) or LOCAL
+        except smb.SmbConfigError as e:
+            raise ManifestError(str(e)) from None
 
     def path(self, s: str):
         """A path object for a logical path string, on this source's filesystem."""
@@ -448,7 +454,7 @@ def load(path: Path | None = None) -> dict[str, Source]:
                 f"for a DM, a private channel or a permission-restricted page. "
                 f"Omit the key to leave it unstated, which is reported as such "
                 f"and handled as gated.")
-        out[name] = Source(
+        src = Source(
             name=name,
             description=" ".join((e.get("description") or "").split()),
             root=_expand(e["root"]),
@@ -460,6 +466,11 @@ def load(path: Path | None = None) -> dict[str, Source]:
             aliases=tuple(e.get("aliases") or e.get("addresses") or ()),
             visibility=vis,
         )
+        # A network source with a bad or unset credential reference fails HERE, loudly and
+        # naming the variable, in the same way an unset ${VAR} in a root does. Nothing is
+        # connected to; this only checks the declaration.
+        src.fs
+        out[name] = src
     return out
 
 

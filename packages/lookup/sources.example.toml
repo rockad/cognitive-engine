@@ -52,26 +52,27 @@ include = ["*.md", "**/*.md"]
 exclude_names = [".git", ".obsidian", "node_modules"]
 extractor = "docs.markdown"
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# A source on a network share, read over SMB and never copied.
+# A source on a network share, read over SMB in userspace and never copied.
 # ─────────────────────────────────────────────────────────────────────────────
+# No mount, no root and no FUSE on this machine: Lookup talks SMB itself
+# (`smbprotocol`, NTLM). The share is listed once per directory, and a file whose
+# size and modification time are unchanged is not opened at all.
 [[source]]
 name = "share"
 description = """A share on another machine. Nothing is mirrored locally, so
 nothing goes stale and nothing has to travel but the index itself."""
-# The path the share is mounted at INSIDE the container. Set it to the path you
-# mount the same share at on this machine, and a path in a search result opens
-# on both sides.
+# The LOGICAL path. It is what is stored and shown in results, and it is NOT read
+# from disk: the share is addressed through `[source.volume]` below. Pick any
+# absolute path; if you also mount the share there on this machine, a path in a
+# result opens on both sides. Hits from this source are marked REMOTE.
 root = "/Volumes/share"
 # This one holds material from restricted places, so a fact from it needs
 # verification and sign-off before it is reused anywhere else.
 visibility = "gated"
 # One location, written several ways. Purely declarative: document identity is
-# address-independent already, so an alias changes nothing about what is
-# indexed. What it buys is a check — `mounts --write` accepts any address on
-# this list, normalises it to the //host/share form the kernel wants, and
-# REFUSES one that is not listed, so a mistyped host cannot quietly mount a
-# different share under a source name that already holds documents.
+# address-independent already, so an alias changes nothing about what is indexed.
 aliases = [
   "smb://fileserver/share",
   "smb://fileserver.lan/share",
@@ -81,34 +82,28 @@ include = ["*.md", "**/*.md", "*.txt", "**/*.txt"]
 exclude_names = [".git"]
 extractor = "docs.markdown"
 
-# How this source is mounted — declared HERE, not named in the compose file.
-# The volume name is derived from the source name (`src_share`), so the stack
-# contains no per-corpus name and nothing has to be taught about a particular
-# kind of material. Docker mounts this inside its VM, so only SMB is in the
-# read path; bind-mounting your own SMB mount instead pays SMB *and* the
-# host-to-VM filesystem bridge, which measured 34 s against 3 s for one walk.
+# Where the bytes really come from.
 #
-# ⚠️ Credentials are ${...} REFERENCES, never values. `mounts --write` emits
-# them verbatim for `docker compose` to interpolate from .env at `up` time, so
-# a password never lands in a generated file. Name the variables whatever you
-# like — nothing in the tool invents or expects a particular name.
-#
-# ⚠️ Renaming this source orphans its volume: the old `src_<oldname>` is left
-# behind and a new one created. Nothing is lost when the volume is a network
-# share, because it holds no data — it *is* the share — but `docker volume rm`
-# is needed to tidy up. The same applies to changing `device`: a named volume's
-# options are fixed when it is created, so compose reuses the existing one and
-# reports success until it is removed.
+# ⚠️ Credentials are ${...} REFERENCES to environment variables, never values. A literal
+# value, or an unset variable, is a manifest error that names the variable, in the same
+# way an unset ${VAR} in a `root` is. Name the variables whatever you like.
 [source.volume]
-type = "cifs"
-device = "//192.168.1.50/share"
-options = "ro,vers=3.0,nounix,noserverino"
+type = "cifs"                     # "cifs" and "smb" are the same thing here
+device = "//192.168.1.50/share"   # //host/share
+# subpath = "wiki"                # optional: index only a directory inside the share
+# port = 445                      # optional
 username = "${SHARE_USER}"
 password = "${SHARE_PASS}"
+# `options = "ro,vers=3.0,..."` from the old Docker-era manifests is accepted and
+# ignored: it configured a kernel mount, and nothing is mounted any more.
 
-# ⚠️ A source that is declared but unreachable KEEPS its documents: away from
-# the network it reports MISSING, the index keeps answering from what it last
-# saw, and results whose paths cannot be opened are marked. Its file ledger is
-# discarded, so the next pass that finds it re-reads and re-hashes everything
-# rather than trusting a pre-gap mtime. A source removed from this file loses
-# its documents — that is the deliberate way to forget one.
+# ⚠️ Reparse points (symlinks, junctions, mount points) on a share are NEVER followed:
+# one cannot be proven to stay inside the share. They are skipped, counted and named in
+# the ingest report.
+#
+# ⚠️ A source that is declared but unreachable KEEPS its documents: the index keeps
+# answering from what it last saw, and the share is named in the refresh report. A listing
+# that fails part-way never deletes anything, so a dropped connection cannot read as "the
+# other files were deleted". Its file ledger is discarded, so the next pass that reaches it
+# re-reads and re-hashes everything rather than trusting a pre-gap mtime. A source removed
+# from this file loses its documents — that is the deliberate way to forget one.
