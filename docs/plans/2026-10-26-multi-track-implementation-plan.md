@@ -97,6 +97,19 @@ flowchart TD
   - Blocks `openrouter/free` offloading when handling private workspaces or under `zdr: strict`.
   - Enforces `@Doc-Cr` alias routing.
 
+#### 3.1.3 Workflow Guard Seam: Option A Dual-Hook Strategy (2026-10-28)
+
+Empirical testing confirmed that Claude Code workflow-spawned subagents bypass the standard `Agent|Task` hook matcher. To enforce model tier ceilings without restricting workflow agility, Track 1 codifies the **Option A Dual-Hook Strategy**:
+- **Dual-Hook Architecture**:
+  - Primary Subagent Hook: `PreToolUse` on `Agent|Task` catches direct CLI subagent delegations.
+  - Secondary Workflow Hook: `PreToolUse` on `Workflow` in `adapters/claude/hooks/hooks.json` intercepts workflow script execution.
+- **Static AST Inspection (`packages/jev/src/workflow-guard.ts`)**:
+  - Parses the workflow script AST before launch, scanning for model overrides (`opus`, `fable`, `pro`).
+  - Evaluates requested subagent model tiers against the active session tier ceiling.
+- **Fail-Closed Policy on Dynamic Expressions**:
+  - Statically verifiable model requests exceeding the ceiling trigger an interactive `ask` prompt or rejection.
+  - Dynamic model expressions (e.g. variables, function returns, or unresolvable arguments) fail closed (`ask` prompt to the user) to prevent unmonitored model escalation.
+
 ---
 
 ### 3.2 Track 2 (RFC 003): Memory & Lookup Substrates
@@ -172,6 +185,25 @@ Full list with evidence in [RFC 003 §4](../rfc/003-memory-lookup.md). The ones 
     - Proposes reflection entries into out-of-tree domain libraries at `~/.local/share/cognitive-engine/experiences/<domain>/`.
     - Requires human sign-off before committing to permanent storage.
 
+#### 3.3.1 Track 3 Status & Refinements: Slice 1 Verification & Slice 2 Roadmap (2026-10-28)
+
+- **Slice 1 Completed (`feat/track3-harness2`)**:
+  - Implemented FastMCP server on `127.0.0.1:8120` with `host_origin_protection="auto"` from the first commit.
+  - Verified 12/12 on the black-box MCP conformance runner (`tools/mcp_conformance.py`).
+  - Added read-only offline `harness2_status` tool and `dry_run` support on `harness2_propose`.
+  - 129 package tests passing cleanly.
+- **Option A Dual-Engine Isolation (Slice 2)**:
+  - Primary Sandbox: Probing trajectories execute in local sandboxes using native `sbx` when available on `$PATH`.
+  - Fallback Sandbox: If `sbx` is unavailable, prober falls back to an ephemeral, rootless Docker container sandbox (`--network none`, `--read-only`, zero off-host egress) rather than aborting or generating static diffs only.
+  - Fail-Closed: If neither `sbx` nor rootless Docker is accessible, prober fails closed without running untrusted code.
+- **Option A Citation Lineage Contract**:
+  - `packages/harness2/NOTICE` and `README.md` must formally cite foundational Google DeepMind prompt optimization literature (*Promptbreeder* [arXiv:2309.16797], *LLMs as Tool Makers* [arXiv:2305.17126]).
+  - Explicitly document our clean-room, dual-harness heuristic implementation under Apache-2.0.
+- **Slice 2 Next Steps**:
+  - Implement ephemeral rootless Docker sandbox runner in `packages/harness2/prober/`.
+  - Wire failure-driven probe triggers (`jev_judge` < 0.50, retry exhaustion, `/probe`).
+  - Update `packages/harness2/NOTICE` with the formal Google DeepMind citation.
+
 ---
 
 ### 3.4 Track 4 (RFC 005): Cross-Runtime Egress Gates & agentic-hub Retirement Protocol
@@ -245,14 +277,17 @@ WS5 and WS6 are independent. **WS6 is done and committed on `feat/track1-jev-ada
 
 ## 4. Workstream Summary & Execution Matrix
 
-| Stream | Track | Branch | Scope / File Targets | Description | Lead Subagent | Recommended Tier |
+| Stream | Track | Branch | Scope / File Targets | Description | Lead Harness & Role | Recommended Tier |
 |---|---|---|---|---|---|---|
-| **WS1** | **Track 1** | `feat/track1-jev-adapters` | `packages/jev/`, `adapters/`, `cli/` | Migrate Jev core, stdio/HTTP transports, and Antigravity / Claude / OpenCode adapters | `code-engineer` | `flash_lite` |
-| **WS2** | **Track 2** | `feat/track2-memory-lookup` | `packages/memory/`, `packages/lookup/` | Package native `basic-memory` on `:8105` and companion `lookup` on `:8100` with `docs.visibility` | `code-engineer` | `flash_lite` |
-| **WS3** | **Track 3** | `feat/track3-harness2` | `packages/harness2/` | Package Harness² optimizer, local `sbx` microVMs, fail-closed prober, and daily quota pre-flight | `code-engineer` | `flash_lite` |
-| **WS4** | **Track 4** | `feat/track4-egress-retirement` | `cognitive-engine/`, `doppelganger/`, `agentic-hub/` | Cross-runtime egress gates, consumer rebinding, and gated surgical retirement of legacy plugins | `system-operator` | `flash_lite` |
-| **WS5** | **Cross-cutting** | `feat/mcp-conformance` (from `feat/track2-memory-lookup`) | `tools/` | Black-box MCP conformance runner and per-server probe specs ([§3.5](#35-cross-cutting-mcp-selection--server-contract-2026-10-28)) | `qa-engineer` | `flash` |
-| **WS6** | **Track 1 follow-up** | `feat/track1-jev-adapters` | `packages/jev/` | Strict `registerTool` migration for all 12 tools plus the `Origin` check ([§3.5](#35-cross-cutting-mcp-selection--server-contract-2026-10-28)) | `code-engineer` | `flash` |
+| **WS1** | **Track 1** | `feat/track1-jev-adapters` | `packages/jev/`, `adapters/`, `cli/` | Migrate Jev core, stdio/HTTP transports, and Antigravity / Claude / OpenCode adapters | Claude Code (`code-engineer`) | `flash` |
+| **WS2** | **Track 2** | `feat/track2-memory-lookup` | `packages/memory/`, `packages/lookup/` | Package native `basic-memory` on `:8105` and companion `lookup` on `:8100` with `docs.visibility` | Antigravity (`code-engineer`) | `flash_lite` |
+| **WS3** | **Track 3 (Slice 1)** | `feat/track3-harness2` | `packages/harness2/` | FastMCP daemon on `:8120`, read-only `harness2_status`, conformance 12/12, quota check, 129 tests | Claude Code (`code-engineer`) | `flash` |
+| **WS4** | **Track 4** | `feat/track4-egress-retirement` | `cognitive-engine/`, `doppelganger/`, `agentic-hub/` | Cross-runtime egress gates, consumer rebinding, and gated surgical retirement of legacy plugins | Antigravity (`system-operator`) | `flash_lite` |
+| **WS5** | **Cross-cutting** | `feat/mcp-conformance` | `tools/` | Black-box MCP conformance runner and per-server probe specs (12/12 verified across all daemons) | Claude Code (`qa-engineer`) | `flash` |
+| **WS6** | **Track 1 follow-up** | `feat/track1-jev-adapters` | `packages/jev/` | Strict `registerTool` migration for all 12 tools plus the `Origin` check (PR #3) | Claude Code (`code-engineer`) | `flash` |
+| **WS7** | **Track 1 seam** | `feat/track1-jev-adapters` | `adapters/claude/hooks/`, `packages/jev/src/workflow-guard.ts` | Workflow Guard static AST inspector on `Workflow` tool closing subagent bypass hole | Claude Code (`code-engineer`) | `flash` |
+| **WS8** | **Track 3 (Slice 2)** | `feat/track3-harness2` | `packages/harness2/prober/`, `NOTICE` | Ephemeral rootless Docker fallback (`--network none`, `--read-only`), failure triggers, DeepMind citation | Claude Code (`code-engineer`) | `flash` |
+| **WS9** | **Track 1 review** | `feat/track1-jev-adapters` | `packages/jev/`, `adapters/` | PR #3 remediation, review coordination, and test suite verification | Antigravity (`code-engineer`) | `flash_lite` |
 
 ---
 
@@ -260,8 +295,12 @@ WS5 and WS6 are independent. **WS6 is done and committed on `feat/track1-jev-ada
 
 To ensure seamless peer review with collaborator [@Doc-Cr](https://github.com/Doc-Cr) on GitHub:
 
-1. **Branch Hygiene**:
-   - Feature branches must branch directly from `origin/main` (`git checkout -b feat/trackX-... origin/main`).
+1. **Branch & Dedicated Worktree Hygiene**:
+   - Feature branches must branch directly from `origin/main` (or stacked base branch when explicitly specified).
+   - **Mandatory Git Worktree Isolation**:
+     - When multiple agent harnesses (Antigravity and Claude Code) operate concurrently on the repository, each harness **MUST** execute strictly inside its own dedicated git worktree (e.g. `/home/rockad/projects/cognitive-engine-track1`, etc.).
+     - Prevents index locking (`.git/index.lock`), dirty state interference, and branch checkout collisions.
+     - Never run `git checkout` across active branches in a worktree owned by another harness.
    - Keep commits atomic and semantic (`feat:`, `fix:`, `refactor:`, `docs:`, `test:`).
 2. **Pull Request Protocol**:
    - Open PRs against `main` on GitHub (`rockad/cognitive-engine`).
@@ -274,6 +313,7 @@ To ensure seamless peer review with collaborator [@Doc-Cr](https://github.com/Do
    - Prior to requesting review or merging, ensure local tests pass:
      - Bun workspace: `bun test` (0 errors).
      - Python workspace: `uv run pytest` (0 errors).
+     - Conformance suite: `uv run tools/mcp_conformance.py <target>` (12/12 passed).
      - Egress test suite: `bun run test:egress` and `uv run pytest tests/test_egress.py`.
 4. **Merge Sequencing**:
    - Track 1 and Track 2 PRs can be reviewed and merged independently in Phase 1.
@@ -286,40 +326,41 @@ To ensure seamless peer review with collaborator [@Doc-Cr](https://github.com/Do
 
 To maximize development velocity and conserve Gemini Pro quota, implementation leverages a **Dual-Harness Architecture** combining **Claude Code (Sonnet 5.5 & Opus 5.5 via prepaid Pro subscription)** and **Google Antigravity (Flash/Medium Orchestrator)**.
 
-### 6.1 Division of Responsibilities
+### 6.1 Parallel Specialization Split
 
-| Subsystem / Concern | Primary Harness | Model Tier | Rationale |
-|---|---|---|---|
-| **Deep Code Implementation** (`packages/jev`, `packages/harness2`, adapters) | **Claude Code** | Claude Sonnet 5.5 or Opus 5.5 | High-fidelity multi-file coding, algorithmic prompt synthesis; burns **zero Gemini quota** (prepaid Claude Pro). |
-| **Architectural Governance & Pre-Flight Dispatch** | **Antigravity** | Gemini 3.8 Flash | Session orchestrator, multi-track dependency tracking, invariant enforcement. |
-| **Verification Gates & Quality Acceptance** | **Antigravity** | Gemini 3.8 Flash + `jev_judge` | Runs test suites (`bun test`, `uv run pytest`), diff validation, and binary quality gating. |
-| **Git, PRs & Review Coordination with @Doc-Cr** | **Antigravity** | Gemini 3.8 Flash | Branch checkout, semantic commits, PR management, and GitHub review updates. |
-| **Session State & Cross-Harness Continuity** | **Unified Memory** | Recall (:8110) & Lookup (:8100) | Synchronizes state via `session-handoff:cognitive-engine` across both harnesses. |
+Following the approved architectural clarification, work is partitioned by specialized operational lanes:
 
-### 6.2 Operating Modes
+| Subsystem / Concern | Primary Harness | Model Tier | Working Directory / Worktree | Rationale & Active Scope |
+|---|---|---|---|---|
+| **Deep Algorithmic Coding & AST Parsers** | **Claude Code** | Claude Sonnet 5.5 | Dedicated Worktree (`feat/track3-harness2` or Track 1) | Implements Workflow Guard static AST inspector (WS7) and Track 3 Slice 2 Docker fallback + triggers (WS8). Burns zero Gemini quota. |
+| **Architectural Governance & PR Remediation** | **Antigravity** | Gemini 3.8 Flash | Dedicated Worktree (`/home/rockad/projects/cognitive-engine-track1`) | Coordinates PR #3 review remediations (WS9), multi-track dependency tracking, RFC alignment. |
+| **Verification Gates & Quality Acceptance** | **Antigravity** | Gemini 3.8 Flash + `jev_judge` | Assigned Worktree | Runs test suites (`bun test`, `uv run pytest`), diff validation, and binary quality gating. |
+| **Git, PRs & Review Coordination with @Doc-Cr** | **Antigravity** | Gemini 3.8 Flash | Assigned Worktree | Branch checkout, semantic commits, PR management, and GitHub review updates. |
+| **Session State & Cross-Harness Continuity** | **Unified Memory** | Recall (:8110) & Lookup (:8100) | Bridge Document | Synchronizes state via `docs/handoffs/antigravity-claude-bridge.md` across both harnesses. |
 
-#### Mode A: Concurrent Track Ownership (Parallel Branches)
-- **Claude Code**: Implements **Track 1** (`feat/track1-jev-adapters` in Bun/TS).
-- **Antigravity**: Implements **Track 2** (`feat/track2-memory-lookup` in Python/uv).
+### 6.2 Dedicated Worktree Protocol
+
+To guarantee zero race conditions between Antigravity and Claude Code:
+- **Dedicated Directory Assignment**: Each harness works in an isolated worktree path on disk:
+  - Antigravity Track 1 Worktree: `/home/rockad/projects/cognitive-engine-track1`
+  - Claude Code Working Directory: Dedicated worktree created via `git worktree add ../cognitive-engine-<track> <branch>`
+- **No Shared Working Trees**: Never run parallel edits or branch switches in the same worktree directory.
+- **Git Push Coordination**: Push feature branches cleanly and notify the other harness via `antigravity-claude-bridge.md` before initiating dependent work.
+
+### 6.3 Operating Modes
+
+#### Mode A: Concurrent Track Ownership (Parallel Worktrees)
+- **Claude Code**: Implements WS7 (Workflow Guard) and WS8 (Track 3 Slice 2) in its dedicated worktree.
+- **Antigravity**: Implements WS9 (Track 1 PR #3 review remediation) in `/home/rockad/projects/cognitive-engine-track1`.
 - **Independence**: Both run simultaneously on disjoint feature branches without merge conflicts or context collisions.
 
 #### Mode B: Dual-Harness Ping-Pong (Implement in Claude Code, Verify in Antigravity)
 1. **Briefing Phase (Antigravity)**:
-   - Antigravity scaffolds a self-contained, clipboard-ready **Harness Prompt Brief** specifying:
-     - Target files and exact method/type signatures.
-     - RFC invariants and constraint bounds.
-     - Verification command lines (`bun test`, `pytest`).
-   - Updates `session-handoff:cognitive-engine` in Recall / disk cache.
+   - Antigravity scaffolds a self-contained, clipboard-ready **Harness Prompt Brief** in `antigravity-claude-bridge.md` specifying target files, invariants, and tests.
 2. **Coding Phase (Claude Code)**:
-   - Aleksandr launches Claude Code in `~/projects/cognitive-engine` on the target branch.
-   - Pastes the briefing prompt; Claude Code (Sonnet/Opus) writes the implementation, refactors, and runs local checks.
+   - Claude Code launches in its dedicated worktree, implements the brief, runs local checks, and commits.
 3. **Verification & Quality Gate Phase (Antigravity)**:
-   - Aleksandr returns to Antigravity.
-   - Antigravity inspects `git status` and `git diff`.
-   - Runs test suites (`engine test`, `bun test`, `uv run pytest`).
-   - Runs `jev_judge` quality gate on the diff.
-   - Verifies security invariants (ZDR rules, AGPL process boundaries, standalone `sbx` isolation).
-   - Generates semantic commits and pushes the branch for [@Doc-Cr](https://github.com/Doc-Cr) review.
+   - Antigravity inspects diffs, runs test suites, executes `jev_judge`, and coordinates PR review with [@Doc-Cr](https://github.com/Doc-Cr).
 
 ### 6.3 Context & Session Sharing Protocol
 - **Shared Repository Disk State**: Both harnesses operate directly on `~/projects/cognitive-engine`.
