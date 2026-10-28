@@ -47,6 +47,7 @@ Establishes Track 1 of Cognitive Engine: migrating the TypeSafe Jev System 1 cop
     - Claude Code (matcher `Agent|Task`): returns `ask` when the model the subagent will run on (the call's `model`, else the `model:` in its definition file) outranks the session model, read from the last assistant turn of the session transcript. Verified to fire under `bypassPermissions`.
     - Antigravity (matcher `invoke_subagent`): returns `force_ask` when any subagent requests a Pro-class model.
   - Scope limits: deterministic, no network access, no state files; active only in Jev mode `on`. Once on, it never passes a call it cannot evaluate silently: unreadable input, an internal error, or an unknown session model for an opus-class request produce an `ask`. Advice, dispatch and telemetry remain in the MCP tools and are not enforcement.
+  - **Known gap (probe, 2026-10-28): workflow-spawned agents bypass this hook.** The `Agent|Task` matcher does not fire for `agent()` calls made by Claude Code's Workflow tool. A workflow agent that requested `model: "opus"` in a Sonnet 5.5 session ran on `claude-opus-5-5` with no prompt and no block, and the hook's decisions log recorded no `PreToolUse` entry for the run, while direct `Agent` calls were logged normally. Observed with the legacy Jev plugin hook, which uses the same matcher as the guard shipped here; the headless `claude -p` child session has no Workflow tool, so the shipped guard itself could not be run against a workflow. Until a second seam covers workflows (for example a `PreToolUse` hook on the `Workflow` tool; not yet designed or built), the tier ceiling is **not enforced** for workflow agents.
   - Out of scope: Antigravity quota lockouts, the free-tier model guard and the multi-file write guard stay in the consumer workspace's hook script.
 
 ---
@@ -55,7 +56,7 @@ Establishes Track 1 of Cognitive Engine: migrating the TypeSafe Jev System 1 cop
 
 - Inherits common invariants from [RFC 001](001-harness2-jev-unified-cognitive-substrate.md):
   - Strictly respects `zdr: strict`, blocking `openrouter/free` offloading when handling restricted content.
-  - Enforces subagent tier ceilings (Pro tier strictly requires manual human approval), by hook on Claude Code and Antigravity (active in Jev mode `on`). The hook is the only enforcement point: `jev_dispatch` and its clamp are advice, and nothing an agent passes to a tool counts as approval.
+  - Enforces subagent tier ceilings (Pro tier strictly requires manual human approval), by hook on Claude Code and Antigravity (active in Jev mode `on`). The hook is the only enforcement point: `jev_dispatch` and its clamp are advice, and nothing an agent passes to a tool counts as approval. It covers direct `Agent` and `Task` calls only; workflow-spawned agents are not covered (see the known gap above).
 
 ---
 
