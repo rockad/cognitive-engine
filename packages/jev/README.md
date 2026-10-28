@@ -39,7 +39,7 @@ Set `JEV_LIVE_TEST=1` to include tests that call OpenRouter.
 
 ## Lineage
 
-Ported from `agentic-hub/plugins/jev` v2.3.0. Of the Claude Code hooks, only the subagent-ceiling check was kept (see below); the session-start, model-switch and prompt-advice hooks were dropped per the 2026-10-27 settings consolidation.
+Ported from `agentic-hub/plugins/jev` v2.3.0. Of the Claude Code hooks, only the subagent-ceiling check was kept (see below); the session-start, model-switch and prompt-advice hooks were not ported in Track 1 because nothing in it needed them. Hooks are not prohibited: add one wherever a workflow or process needs it.
 
 ## Subagent guard hook
 

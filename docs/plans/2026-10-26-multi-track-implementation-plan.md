@@ -90,7 +90,7 @@ flowchart TD
     - Supervised Daemon: Streamable HTTP transport on `127.0.0.1:8115/mcp` managed via `engine up`.
   - **Multi-Harness Adapters (`adapters/`)**:
     - Google Antigravity sidecar integration and MCP registration (`~/.gemini/config/mcp_config.json`).
-    - Claude Code native plugin package (`.claude-plugin/plugin.json`), MCP registration, and one narrow `PreToolUse` subagent guard (no session, prompt or model-switch hooks, aligning with the 2026-10-27 settings consolidation).
+    - Claude Code native plugin package (`.claude-plugin/plugin.json`), MCP registration, and one narrow `PreToolUse` subagent guard (the other `agentic-hub` hooks were not ported; hooks are not prohibited and may be added where a workflow needs one).
     - Antigravity gets the same narrow guard (`invoke_subagent`, any Pro-class model needs approval); both share `packages/jev/src/guard.ts`. The guard fails closed once Jev mode is `on` and fires under Claude Code `bypassPermissions`.
     - OpenCode V2 plugin bundle: deferred (committed, unverified, needs overhaul).
     - Turnkey installer `engine install-adapters`: deferred to the `engine` CLI work; adapter READMEs document manual steps.

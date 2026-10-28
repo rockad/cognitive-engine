@@ -38,7 +38,7 @@ Establishes Track 1 of Cognitive Engine: migrating the TypeSafe Jev System 1 cop
   - Behaviour changes: `jev_set_mode` accepts only `off`, `on-demand` or `on` (the handler used to also accept synonyms the schema never advertised); `jev_select_model` candidates require `tier`, as the type and description always said.
 - **Multi-Harness Adapters (`adapters/`)**:
   - **Antigravity**: Sidecar integration, MCP registration (`~/.gemini/config/mcp_config.json`), and the narrow subagent guard hook (see below).
-  - **Claude Code**: Native plugin bundle (`.claude-plugin/plugin.json`), MCP registration, and the narrow subagent guard hook. No session, prompt or model-switch hooks, per the Oct 27 settings consolidation.
+  - **Claude Code**: Native plugin bundle (`.claude-plugin/plugin.json`), MCP registration, and the narrow subagent guard hook. Only the guard hook ships in Track 1; the session-start, model-switch and prompt-advice hooks from `agentic-hub` were not ported because nothing here needed them. Hooks are not prohibited, and further ones may be added wherever a workflow or process requires one.
   - **OpenCode** (deferred): a V2 plugin bundle exists at `adapters/opencode/` but is unverified against a live OpenCode and is expected to need an overhaul; it is not part of the Track 1 review.
   - **CLI Installer** (deferred): the unified `engine install-adapters` command moves to the `engine` CLI work. Until then each adapter README documents manual install steps.
 - **Narrow Subagent Guard (Claude Code and Antigravity)**:

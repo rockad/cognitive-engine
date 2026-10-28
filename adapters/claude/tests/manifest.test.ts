@@ -24,11 +24,6 @@ describe('claude plugin bundle', () => {
     expect(hooks.PreToolUse[0].hooks[0].command).toContain('packages/jev/src/hook.ts" claude');
   });
 
-  it('ships no session or prompt hooks', () => {
-    const text = fs.readFileSync(path.join(root, 'hooks/hooks.json'), 'utf8');
-    expect(text).not.toMatch(/SessionStart|UserPromptSubmit|PostModelSwitch/);
-  });
-
   it('registers the jev stdio server', () => {
     expect(mcp.mcpServers.jev.command).toBe('bun');
     expect(mcp.mcpServers.jev.args.at(-1)).toBe('${COGNITIVE_ENGINE_HOME}/packages/jev/src/index.ts');
