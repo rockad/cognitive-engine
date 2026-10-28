@@ -1,0 +1,16 @@
+# Probe for tools/tests/toy_server.py (used only by the runner's own tests).
+name = "toy"
+
+[ok]
+tool = "noop"
+
+[strict]
+tool = "echo"
+args = { text = "hi" }
+unknown_key = "txt"
+wrong_type = { field = "n", value = "x" }
+bad_enum = { field = "mode", value = "z" }
+missing_required = "text"
+
+[argless]
+tool = "noop"

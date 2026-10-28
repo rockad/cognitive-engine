@@ -46,7 +46,7 @@ Establishes Track 2 of Cognitive Engine: packaging the memory and lookup substra
 - [x] Both services respond to tool calls. *(Not to MCP `ping`, which the protocol removed as of 2026-07-28. Liveness is `tools/list` — see §4 item 4.)*
 - [x] Memory footprint stabilizes under 2–3 GB RAM during sustained searches. *(728 MiB RSS after 40 searches with the reranker on.)*
 - [x] `docs.visibility` classification correctly tags and filters restricted documents.
-- [ ] Both daemons pass the MCP conformance runner (RFC 001 D30; plan §3.5).
+- [x] Both daemons pass the MCP conformance runner (RFC 001 D30; plan §3.5): 12/12 checks each, `tools/mcp_conformance.py` on `feat/mcp-conformance`.
 - [ ] Lookup indexes a manifest-declared network share with no host mount (RFC 001 D31; plan §3.2.1).
 - [ ] Lookup rebinds from `:8101` to `:8100` at Track 4 cutover, after the legacy container is stopped and share-source parity is verified.
 
