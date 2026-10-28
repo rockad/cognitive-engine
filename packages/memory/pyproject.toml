@@ -1,10 +1,20 @@
-[project]
-name = "cognitive-memory"
-version = "1.0.0"
-description = "Unified SQLite Memory Substrate for Cognitive Engine"
-requires-python = ">=3.12"
-dependencies = []
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[project]
+name = "cognitive-memory"
+version = "1.0.0"
+description = "Native basic-memory wrapper for Cognitive Engine: loopback MCP on :8105, tuned reranker, out-of-tree state"
+requires-python = ">=3.12"
+license = { text = "AGPL-3.0-or-later" }
+# Upstream is pinned exactly. Retrieval quality (bge-small + jina-reranker-v1-tiny)
+# and the env var names below are properties of a specific release, so an upgrade
+# is a deliberate change that re-runs the recall check, never a resolver decision.
+dependencies = ["basic-memory==0.24.1"]
+
+[project.scripts]
+cognitive-memory = "cognitive_memory.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cognitive_memory"]

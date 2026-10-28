@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cognitive-lookup"
+version = "0.8.0"
+description = "Search over declared user corpora: an FTS5 index, its extractors, and docs.visibility enforcement, served over MCP"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+# The engine (db, manifest, pipeline, extractors) is stdlib only, deliberately.
+# FastMCP is the transport layer and nothing else imports it.
+dependencies = ["fastmcp>=4.1,<5"]
+
+[project.scripts]
+lookup = "lookup.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+lookup = ["schema.sql"]
