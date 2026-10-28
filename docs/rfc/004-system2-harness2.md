@@ -110,13 +110,27 @@ The optimizer is strictly barred from modifying:
 
 ## 4. Acceptance Criteria
 
-- [ ] `packages/harness2` installs and runs cleanly under Python 3.12 with `uv sync`.
-- [ ] FastMCP server initializes and exposes all 4 `harness2_*` tools.
-- [ ] The server passes the MCP conformance runner (RFC 001 D30), including forged Host / foreign Origin refusal and strict arguments.
-- [ ] Probing triggers execute successfully upon simulated `jev_judge` failure and `/probe` command.
-- [ ] Local `sbx` microVM sandbox executes candidate trajectories in complete isolation.
-- [ ] Missing `sbx` runtime triggers clean fail-closed abort without executing code.
-- [ ] `GET /api/v1/key` pre-flight prevents execution when quota limits are reached.
-- [ ] Experience reflections write exclusively to `~/.local/share/cognitive-engine/experiences/`.
-- [ ] Protected invariants are verified immutable by automated mutation rejection tests.
-- [ ] Apache-2.0 license file and Google Research notice attributes applied.
+- [x] `packages/harness2` installs and runs cleanly under Python 3.12 with `uv sync`.
+- [x] FastMCP server initializes and exposes all 4 `harness2_*` tools (plus a read-only `harness2_status`, see §5).
+- [x] The server passes the MCP conformance runner (RFC 001 D30), including forged Host / foreign Origin refusal and strict arguments: 12/12 on the real daemon.
+- [ ] Probing triggers execute successfully upon simulated `jev_judge` failure and `/probe` command. *(The decision logic is done and tested as a pure function; wiring it to `jev_judge` events and a `/probe` command is not built.)*
+- [ ] Local `sbx` microVM sandbox executes candidate trajectories in complete isolation. *(`sbx` is not installed on the development host; `SbxRunner`'s command line is an unverified assumption.)*
+- [x] Missing `sbx` runtime triggers clean fail-closed abort without executing code.
+- [x] `GET /api/v1/key` pre-flight prevents execution when quota limits are reached. *(Tested against mocked responses; the live field names are unverified.)*
+- [x] Experience reflections write exclusively to `~/.local/share/cognitive-engine/experiences/`. *(Staged lessons are pending until a human approves them through the CLI.)*
+- [x] Protected invariants are verified immutable by automated mutation rejection tests. *(Components are refused and wired; the protected-path rule is tested but not yet used, since this slice mutates components, not files.)*
+- [ ] Apache-2.0 license file and Google Research notice attributes applied. *(LICENSE and NOTICE are present; the canonical Google Research citation has not been supplied.)*
+
+---
+
+## 5. Implementation Notes (Track 3 slice 1, 2026-10-28)
+
+Decisions the RFC left open, made explicitly:
+
+1. **Port `8120`.** RFC 004 assigns none; `8120` is clear of 8100/8105/8110/8115 and overridable with `COGNITIVE_HARNESS2_PORT`. Registered with the conformance runner via `tools/probes/harness2.toml`.
+2. **A fifth tool, `harness2_status`.** Read-only and offline: sandbox availability, whether a key is configured (never its value), storage root, the protected set. Track 4's Gate 3 needs a way to ask "is sbx there, is the quota ok" without running a probe, and the conformance runner needs a harmless valid call.
+3. **`dry_run` on `harness2_propose`.** Reports the egress and quota verdict without calling a model, so a caller can see a refusal before committing to a run.
+4. **Only four components are mutable.** RFC 001 says Harness² mutates 8 components; this RFC names four. Anything else, and every unknown name, is refused until someone edits `MUTABLE` deliberately.
+5. **Human sign-off is a CLI step, not a tool.** An agent can stage a lesson with `harness2_reflect` but cannot commit it.
+6. **No upstream package is wrapped.** The RFC names none, so this is an independent baseline of the four stages with a heuristic composer.
+7. **Bug found while testing:** the protected-path check stripped leading `../` and `/` before testing for escapes, so `../../escape` and `/etc/passwd` passed. Fixed, with tests.

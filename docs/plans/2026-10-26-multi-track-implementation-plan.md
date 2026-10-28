@@ -171,6 +171,14 @@ Full list with evidence in [RFC 003 §4](../rfc/003-memory-lookup.md). The ones 
     - Proposes reflection entries into out-of-tree domain libraries at `~/.local/share/cognitive-engine/experiences/<domain>/`.
     - Requires human sign-off before committing to permanent storage.
 
+#### 3.3.1 Track 3 status (2026-10-28, slice 1, branch `feat/track3-harness2`)
+
+Stacked on `feat/mcp-conformance` rather than cut from `main`, because the conformance runner Track 3 must pass lives there. Rebase onto `main` once Tracks 2 and WS5 merge.
+
+- **Done:** FastMCP server with `host_origin_protection="auto"` from the first commit (conformance 12/12 on the real daemon); the four RFC tools plus a read-only `harness2_status`; protected-invariant set (default-deny, four mutable components); failure-driven triggers; ZDR/classification egress gate that runs before any request exists; OpenRouter quota pre-flight (fail closed); `sbx` fail-closed gate with an explicit static-diff opt-in; out-of-tree experience store with a human-only sign-off step. 129 package tests.
+- **Not done, and why:** real microVM isolation (`sbx` is not installed here, and its command line is unverified); wiring triggers to `jev_judge` events and `/probe`; the canonical Google Research citation in `NOTICE`; no upstream Harness² package exists to wrap, so the composer is a heuristic baseline.
+- Decisions the RFC left open (port `8120`, the fifth tool, `dry_run`) are in RFC 004 §5.
+
 ---
 
 ### 3.4 Track 4 (RFC 005): Cross-Runtime Egress Gates & agentic-hub Retirement Protocol
