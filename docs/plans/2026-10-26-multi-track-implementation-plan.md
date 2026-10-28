@@ -84,13 +84,13 @@ flowchart TD
     - Sub-second probabilistic model tier dispatch (`jev_dispatch`, `jev_route`).
     - Binary quality gatekeeping and diff acceptance (`jev_judge`).
     - Free-tier offloading coprocessor (`jev_execute_free`, `jev_agent_free`) saving Gemini/Claude quota.
-    - Model tier ceiling governance (clamping subagents to parent tier; strict user gate for Pro tier).
+    - Model tier ceiling governance: subagent guard asks on ANY escalation above the session model (the earlier Claude Code subagent model rule was temporary and is not encoded as permanent).
   - **Dual-Mode Transport**:
     - Default: stdio transport (official TypeScript SDK; FastMCP is a Python library) for zero-latency direct integration with CLI harnesses. Tool arguments are strictly validated per [§3.5](#35-cross-cutting-mcp-selection--server-contract-2026-10-28).
     - Supervised Daemon: Streamable HTTP transport on `127.0.0.1:8115/mcp` managed via `engine up`.
   - **Multi-Harness Adapters (`adapters/`)**:
     - Google Antigravity sidecar integration and MCP registration (`~/.gemini/config/mcp_config.json`).
-    - Claude Code native plugin package (`.claude-plugin/plugin.json`) and MCP registration. Hooks are not prohibited: Track 1 ships only the narrow subagent guard, and others may be added where a workflow needs one.
+    - Claude Code native plugin package (`.claude-plugin/plugin.json`), MCP registration, and lifecycle hooks (`hooks/hooks.json`).
     - OpenCode V2 plugin bundle and event interceptors.
     - Turnkey installer command: `engine install-adapters`.
 - **Invariants & Gates**:
@@ -103,12 +103,25 @@ Empirical testing confirmed that Claude Code workflow-spawned subagents bypass t
 - **Dual-Hook Architecture**:
   - Primary Subagent Hook: `PreToolUse` on `Agent|Task` catches direct CLI subagent delegations.
   - Secondary Workflow Hook: `PreToolUse` on `Workflow` in `adapters/claude/hooks/hooks.json` intercepts workflow script execution.
-- **Static AST Inspection (`packages/jev/src/workflow-guard.ts`)**:
-  - Parses the workflow script AST before launch, scanning for model overrides (`opus`, `fable`, `pro`).
-  - Evaluates requested subagent model tiers against the active session tier ceiling.
-- **Fail-Closed Policy on Dynamic Expressions**:
-  - Statically verifiable model requests exceeding the ceiling trigger an interactive `ask` prompt or rejection.
-  - Dynamic model expressions (e.g. variables, function returns, or unresolvable arguments) fail closed (`ask` prompt to the user) to prevent unmonitored model escalation.
+- **Version-Aware Ranking & Model Tracking**:
+  - Models ranked by `(family, version)` tuple. Aliases resolved deterministically (`opus` -> 5.5, `sonnet` -> 5.5, `fable` -> 5.1).
+  - Session model tracked via `PostModelSwitch` state file with transcript-tail fallback.
+  - Unknown models prompt (`ask`). Every `ask` and safety fallback is audited in `~/.config/jev/claude_decisions.jsonl`.
+  - Never block Claude Code's "switch models when a message is flagged" safety fallbacks.
+- **Workflow AST Parser (`packages/jev/src/workflow-guard.ts`)**:
+  - Acorn JavaScript AST parser with a fail-closed visitor.
+  - Statically resolves `script`, `scriptPath`, `name`, nested `workflow()`, and `agentType`.
+  - Model omitted = inherits session model (allowed).
+  - Aliases, spread arguments, computed keys, template literals with expressions, dynamic/unparseable model expressions, and parse errors all fail closed with `ask` naming the exact call site.
+- **Verification Fixtures & Canary Protocol**:
+  - Capture live payloads (`PreToolUse[Workflow]`, `PostModelSwitch`, `SubagentStart`) with a log-only canary hook.
+  - Commit real payloads as test fixtures before implementing production logic.
+- **Native Hook Failure Policy**:
+  - Guard hooks use native `"onFailure": "block"` (Claude Code >= 2.1.295). Log-only hooks stay fail-open.
+  - Unit test kills the hook process to assert a block.
+- **Implementation Ownership Division**:
+  - Claude Code owns: `hooks.json`, `guard.ts` (fail-open shell wrapper, fable rank / version-aware, active in `on` and `on-demand`), and `packages/jev/src/workflow-guard.ts`.
+  - Antigravity owns: plugin agent definitions (`agentDefinitionModel`) and Antigravity hook path quoting (`adapters/antigravity/src/index.ts`).
 
 ---
 
@@ -147,7 +160,8 @@ Full list with evidence in [RFC 003 §4](../rfc/003-memory-lookup.md). The ones 
   - **Path model:** `root` stays the *logical* mount path that is stored and shown (hits are marked `REMOTE`); an optional `subpath` selects a directory inside the share. Existing manifests and any migrated index keep working.
   - **Dependency:** `smbprotocol` (MIT, pure Python) is a core dependency of `cognitive-lookup`, imported lazily. **NTLM only**: Kerberos needs system krb5 libraries, which is the host setup this feature removes.
   - **Reused as-is:** the `[source.volume]` schema and `${ENV}` credential references (never inline values); an unreachable share still lets the daemon start, with rows kept and marked stale; reparse points are not followed and every document path is re-checked against its root.
-  - **S2–S5 status (2026-10-28, done on `feat/lookup-smb-sources`, after S1):** `smb.py` adds `SmbFS` over `smbprotocol` (core dependency, imported lazily; NTLM only). Size, mtime and the reparse flag come from one listing per directory, so an unchanged share costs zero reads and zero extra network calls; reparse points are skipped and counted (`skipped_links`); unsafe path segments (`..`, backslash, `:`, NUL) are refused before any network call; a failed listing raises `SourceUnreachable` and deletes nothing, while the other sources still ingest. Credentials are `${VAR}` references checked at manifest load (a literal value or an unset variable names the problem; the value never appears in an error). **24 SMB tests against a real SMB server** plus a fake client, 271 repo-wide, README and RFC 003 updated. Findings: a dev-only dependency (impacket) shadowed the production `smbclient` import under `uv run pytest` and a broad `except Exception` disguised that as "share unreachable" (impacket now runs only in an isolated environment, handlers narrowed); `smbprotocol` caches sessions per host, port and user. **Not yet done:** a run against the production `core` share (needs the real credentials) and performance measurement over a real network. The conformance runner is unaffected (no MCP surface change).
+  - **S2–S5 status (2026-10-28, done on `feat/lookup-smb-sources`, after S1):** `smb.py` adds `SmbFS` over `smbprotocol` (core dependency, imported lazily; NTLM only). Size, mtime and the reparse flag come from one listing per directory, so an unchanged share costs zero reads and zero extra network calls; reparse points are skipped and counted (`skipped_links`); unsafe path segments (`..`, backslash, `:`, NUL) are refused before any network call; a failed listing raises `SourceUnreachable` and deletes nothing, while the other sources still ingest. Credentials are `${VAR}` references checked at manifest load (a literal value or an unset variable names the problem; the value never appears in an error). **24 SMB tests against a real SMB server** plus a fake client, 271 repo-wide, README and RFC 003 updated. Findings: a dev-only dependency (impacket) shadowed the production `smbclient` import under `uv run pytest` and a broad `except Exception` disguised that as "share unreachable" (impacket now runs only in an isolated environment, handlers narrowed); `smbprotocol` caches sessions per host, port and user.
+  - **Real-Samba check on host `core`**: Optional live check using dedicated read-only account `ce-lookup-ro`, password generated and kept on core (0600), fetched into process env per run, never logged; needs the user's go. Status: not started.
   - **S1 status (2026-10-28, done on `feat/lookup-smb-sources`):** `lookup/vfs.py` adds the `FileSystem` protocol, `LocalFS` (today's behaviour moved verbatim) and a duck-typed `VPath`; `Source.fs` routes `exists`, `contains` and `files()`, and the pipeline's containment check and content digest, through it. **All 197 existing Lookup tests pass unedited.** An in-memory backend ingests the same tree identically after the real tree is deleted, and a second pass over an unchanged tree performs zero reads (mutation-checked: severing the digest routing fails the parity test). Extractors needed no change. S2 (`SmbFS`) is next.
   - **Streams** (S-prefixed to avoid clashing with the matrix): S1 introduce the seam with `LocalFS` only, a pure refactor that keeps all existing Lookup tests green unedited and blocks the rest; S2 `SmbFS`; S3 manifest schema (`subpath`, `type` accepts `cifs`/`smb`) and loud errors on unset credential references; S4 tests (an in-memory `FakeFS`, the ledger/escape/visibility tests parametrized over both backends, one in-process SMB server integration test); S5 docs.
   - **Acceptance:** a second pass over an unchanged share performs zero file opens; the existing core `[source.volume]` block indexes from an SMB server with no host mount; `..`, absolute paths and reparse points are refused and counted; no credential appears in any log or error string; and the server passes the §3.5 conformance runner.
@@ -162,21 +176,25 @@ Full list with evidence in [RFC 003 §4](../rfc/003-memory-lookup.md). The ones 
 - **Runtime & License**: Python 3.12 / uv | Apache-2.0
 - **Target Directories**: `packages/harness2/`
 - **Key Deliverables**:
+  - **Upstream Consumption Invariant**:
+    - Consumes upstream `google-research/harness2` directly as much as possible; adopts new upstream versions as they are released; uses its source only where direct use fails. Never rewritten or custom reimplemented.
+    - Upstream is primary: Google Research / Google LLC, Apache-2.0; Xu et al. 2026, [arXiv:2610.14224](https://arxiv.org/abs/2610.14224). Foundational prompt evolution literature (*Promptbreeder*, *LLMs as Tool Makers*) are cited as related work only.
+    - Consumes upstream as a pinned git dependency (commit SHA) in `pyproject.toml`, with a minimal fork only if forced.
   - **Task-Level Recursion (*Propose–Probe–Compose*)**:
     - Proposes candidate prompt/tool/context mutations across allowed dimensions without ground truth.
     - Behavioral contrast composer synthesizes candidate outputs into human-reviewable proposals.
-  - **Strict Local MicroVM Execution (`sbx`)**:
-    - Parallel candidate execution runs exclusively inside local Docker Sandboxes via standalone `sbx` CLI.
-    - Zero cloud sandboxing; zero off-host code or credential movement.
+  - **Dual-Engine Execution Isolation**:
+    - Primary: Parallel candidate execution runs exclusively inside local Docker Sandboxes via standalone `sbx` CLI.
+    - Fallback: Ephemeral rootless Docker container sandbox (`--network none`, `--read-only`, zero off-host egress) when `sbx` is not installed.
+    - Host prerequisite: Rootless Docker on this host is a host-setup prerequisite owned by the user (`sudo`), status: **not started**. Slice 2 stays blocked on it.
   - **Fail-Closed Sandbox Fallback**:
-    - If the `sbx` runtime is unavailable, candidate probing fails closed immediately.
+    - If neither `sbx` nor Docker is available, candidate probing fails closed immediately.
     - Optional `mkdtemp` worktree mode generates diffs for inspection only and never executes untrusted code.
   - **Decoupled Probe Triggers**:
     - Probing is completely decoupled from routing confidence metrics.
-    - Fires strictly on:
-      - Post-task verification failure (`jev_judge` returns `FAIL` or score < 0.50).
-      - Execution retry limit exhausted in the agent loop.
-      - Explicit on-demand request (`/probe <task>` or `engine probe`).
+    - Fires via:
+      - Advisory push via hook: Post-task verification failure (`jev_judge` returns `FAIL` or score < 0.50), or execution retry limit exhausted in the agent loop.
+      - Explicit pull tool / command: On-demand request (`/probe <task>` in chat, `engine probe`, or `harness2_trigger` tool).
   - **Daily Quota Pre-Flight Check**:
     - Pre-flights `free_model_daily_requests` from `GET /api/v1/key` before triggering candidate sweeps.
     - Throttles or skips sweeps when OpenRouter daily quota is constrained.
@@ -196,14 +214,16 @@ Full list with evidence in [RFC 003 §4](../rfc/003-memory-lookup.md). The ones 
 - **Option A Dual-Engine Isolation (Slice 2)**:
   - Primary Sandbox: Probing trajectories execute in local sandboxes using native `sbx` when available on `$PATH`.
   - Fallback Sandbox: If `sbx` is unavailable, prober falls back to an ephemeral, rootless Docker container sandbox (`--network none`, `--read-only`, zero off-host egress) rather than aborting or generating static diffs only.
+  - Host Prerequisite: Rootless Docker on host is a user-owned `sudo` prerequisite, status: **not started**; Slice 2 stays blocked on it.
   - Fail-Closed: If neither `sbx` nor rootless Docker is accessible, prober fails closed without running untrusted code.
-- **Option A Citation Lineage Contract**:
-  - `packages/harness2/NOTICE` and `README.md` must formally cite foundational Google DeepMind prompt optimization literature (*Promptbreeder* [arXiv:2309.16797], *LLMs as Tool Makers* [arXiv:2305.17126]).
-  - Explicitly document our clean-room, dual-harness heuristic implementation under Apache-2.0.
+- **Upstream Citation Lineage Contract**:
+  - `packages/harness2/NOTICE` and `README.md` must formally cite upstream Google Research Harness² (Xu et al. 2026, [arXiv:2610.14224](https://arxiv.org/abs/2610.14224)) as primary, with Promptbreeder and Tool Makers as related work.
+  - Document that `packages/harness2` consumes upstream as a pinned git dependency, with a minimal fork only if forced, and preserves Apache-2.0.
 - **Slice 2 Next Steps**:
+  - User completes rootless Docker host prerequisite.
   - Implement ephemeral rootless Docker sandbox runner in `packages/harness2/prober/`.
-  - Wire failure-driven probe triggers (`jev_judge` < 0.50, retry exhaustion, `/probe`).
-  - Update `packages/harness2/NOTICE` with the formal Google DeepMind citation.
+  - Wire advisory push hooks (`jev_judge` < 0.50, retry exhaustion) and explicit pull tools (`harness2_trigger` / `/probe`).
+  - Update `packages/harness2/NOTICE` with the upstream Google Research citation.
 
 ---
 
@@ -287,7 +307,7 @@ WS5 and WS6 are independent. **WS6 is done and committed on `feat/track1-jev-ada
 | **WS5** | **Cross-cutting** | `feat/mcp-conformance` | `tools/` | Black-box MCP conformance runner and per-server probe specs (12/12 verified across all daemons) | Claude Code (`qa-engineer`) | `flash` |
 | **WS6** | **Track 1 follow-up** | `feat/track1-jev-adapters` | `packages/jev/` | Strict `registerTool` migration for all 12 tools plus the `Origin` check (PR #3) | Claude Code (`code-engineer`) | `flash` |
 | **WS7** | **Track 1 seam** | `feat/track1-jev-adapters` | `adapters/claude/hooks/`, `packages/jev/src/workflow-guard.ts` | Workflow Guard static AST inspector on `Workflow` tool closing subagent bypass hole | Claude Code (`code-engineer`) | `flash` |
-| **WS8** | **Track 3 (Slice 2)** | `feat/track3-harness2` | `packages/harness2/prober/`, `NOTICE` | Ephemeral rootless Docker fallback (`--network none`, `--read-only`), failure triggers, DeepMind citation | Claude Code (`code-engineer`) | `flash` |
+| **WS8** | **Track 3 (Slice 2)** | `feat/track3-harness2` | `packages/harness2/prober/`, `NOTICE` | Ephemeral rootless Docker fallback (`--network none`, `--read-only`), failure triggers, upstream citation | Claude Code (`code-engineer`) | `flash` |
 | **WS9** | **Track 1 review** | `feat/track1-jev-adapters` | `packages/jev/`, `adapters/` | PR #3 remediation, review coordination, and test suite verification | Antigravity (`code-engineer`) | `flash_lite` |
 
 ---
@@ -296,29 +316,37 @@ WS5 and WS6 are independent. **WS6 is done and committed on `feat/track1-jev-ada
 
 To ensure seamless peer review with collaborator [@Doc-Cr](https://github.com/Doc-Cr) on GitHub:
 
-1. **Branch & Dedicated Worktree Hygiene**:
-   - Feature branches must branch directly from `origin/main` (or stacked base branch when explicitly specified).
-   - **Mandatory Git Worktree Isolation**:
-     - When multiple agent harnesses (Antigravity and Claude Code) operate concurrently on the repository, each harness **MUST** execute strictly inside its own dedicated git worktree (e.g. `/home/rockad/projects/cognitive-engine-track1`, etc.).
-     - Prevents index locking (`.git/index.lock`), dirty state interference, and branch checkout collisions.
-     - Never run `git checkout` across active branches in a worktree owned by another harness.
+1. **Branch Hygiene & Stacked PR Delivery Strategy**:
+   - Deliver via **Stacked PRs, bottom-up, using MERGE COMMITS (never squash)** to preserve granular commit history:
+     - `feat/track2-memory-lookup` -> `main`
+     - `feat/mcp-conformance` and `feat/lookup-smb-sources` -> `feat/track2-memory-lookup`
+     - `feat/track3-harness2` -> `feat/mcp-conformance`
+     - The guard branch (`feat/jev-workflow-guard`, stacked on `feat/track1-jev-adapters`) merges INTO the PR #3 branch first, then PR #3 -> `main`.
+     - Retarget children to `main` after each upstream merge.
    - Keep commits atomic and semantic (`feat:`, `fix:`, `refactor:`, `docs:`, `test:`).
-2. **Pull Request Protocol**:
-   - Open PRs against `main` on GitHub (`rockad/cognitive-engine`).
+2. **Planned Worktree Protocol (Repository-Local Automation)**:
+   - *Note*: Planned tooling for this repository only (nothing machine-wide or user-scope):
+     - `AGENTS.md` repository rule: "never work in the hub; one agent, one worktree".
+     - Standalone helper script `tools/wt` supporting `new`, `list`, `remove`, and `init` operations (refuses a dirty hub or a branch checked out elsewhere).
+     - Local `.githooks/pre-commit` rejecting commits attempted directly in the primary worktree unless explicitly overridden with `CE_ALLOW_HUB=1`.
+     - Git `core.hooksPath` configured per clone by `tools/wt init`.
+     - *Status*: Documented as planned tooling; not yet implemented.
+3. **Pull Request Protocol**:
+   - Open PRs against designated target branches on GitHub (`rockad/cognitive-engine`).
    - Title format: `feat(trackX): <short summary> [RFC 00X]` (e.g. `feat(track1): migrate typesafe jev and multi-harness adapters [RFC 002]`).
    - Mention `@Doc-Cr` in the PR description with:
      - Reference to the corresponding child RFC and implementation plan section.
      - Summary of changes and test execution output.
      - Specific architectural verification questions.
-3. **Automated Verification Gates**:
+4. **Automated Verification Gates**:
    - Prior to requesting review or merging, ensure local tests pass:
      - Bun workspace: `bun test` (0 errors).
      - Python workspace: `uv run pytest` (0 errors).
      - Conformance suite: `uv run tools/mcp_conformance.py <target>` (12/12 passed).
      - Egress test suite: `bun run test:egress` and `uv run pytest tests/test_egress.py`.
-4. **Merge Sequencing**:
-   - Track 1 and Track 2 PRs can be reviewed and merged independently in Phase 1.
-   - Track 3 merges after Phase 1 is validated on `main`.
+5. **Merge Sequencing**:
+   - Follow bottom-up stacked PR sequence with merge commits.
+   - Retarget child branches cleanly as each parent merges.
    - Track 4 executes as the final cutover PR.
 
 ---

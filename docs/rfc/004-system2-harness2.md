@@ -48,7 +48,8 @@ flowchart TD
 ```
 
 ### 2.1 Recursive Reasoning Core (`packages/harness2/core/`)
-- Wraps upstream Google Research Harness² algorithms.
+- Consumes upstream `google-research/harness2` directly as much as possible; adopts new upstream versions as they are released; uses its source only where direct use fails. Never rewritten or reimplemented.
+- Consumed as a pinned git dependency (commit SHA) in `pyproject.toml`, with a minimal fork only if forced.
 - Supports mutation across permissible harness dimensions (prompts, tool descriptions, context assembly, decomposition strategies).
 - Integrates with OpenRouter API for candidate generation using calibrated sampling profiles.
 
@@ -62,16 +63,19 @@ Probing trajectories require strict local execution isolation to protect host st
     - `--network none` (strict network isolation, zero egress)
     - `--read-only` (read-only root filesystem, scratch in tmpfs only)
     - Zero off-host credential or environment leakage
-  - Preserves automated candidate execution on developer machines where `sbx` is not yet installed, rather than blocking the optimizer loop.
+  - Preserves automated candidate execution on developer machines where `sbx` is not yet installed.
+  - **Prerequisite**: Rootless Docker on this host is a host-setup prerequisite owned by the user (`sudo`), status: **not started**. Track 3 Slice 2 stays blocked on it.
 - **Fail-Closed Fallback Gate**:
   - If neither `sbx` nor Docker is available, the prober fails closed by default and refuses to run candidate code.
   - Worktree fallback is an explicit user opt-in (`--allow-worktree-diff`) using `mkdtemp` that **only generates diffs for static inspection and never executes code**.
 
 ### 2.3 Decoupled Probe Triggers
-Probing is completely decoupled from System 1 routing confidence metrics. Probing triggers strictly on:
-- **Verification Failure**: Post-task `jev_judge` returns `FAIL` or score < 0.50.
-- **Error Retry Exhaustion**: Client harness agent loop exceeds recovery attempts ($N \ge 3$) on the same task.
-- **Explicit On-Demand Request**: User or agent invokes `/probe <task>` in chat or runs `engine probe`.
+Probing is completely decoupled from System 1 routing confidence metrics. Probing triggers via:
+- **Advisory Push via Hook**:
+  - Post-task verification failure: `jev_judge` returns `FAIL` or score < 0.50.
+  - Error retry exhaustion: Client harness agent loop exceeds recovery attempts ($N \ge 3$) on the same task.
+- **Explicit Pull Tool / Command**:
+  - Explicit on-demand request: User or agent invokes `/probe <task>` in chat or runs `engine probe` / `harness2_trigger`.
 
 ### 2.4 Quota Pre-Flight Check
 - Pre-flights daily quota via OpenRouter API (`GET /api/v1/key`) before starting probe sweeps.
@@ -100,14 +104,11 @@ Probing is completely decoupled from System 1 routing confidence metrics. Probin
 
 The server uses FastMCP and meets the project-wide MCP contract (RFC 001 D29–D30): loopback bind only, `host_origin_protection="auto"` (forged Host and foreign Origin refused), strict argument validation (an unknown, mistyped or missing argument is a tool error), stateless HTTP, and liveness via `tools/list`. The `host_origin_protection` argument is off by default in FastMCP and must be set from the first commit.
 
-### 2.8 Citation Lineage Contract (Google DeepMind Prompt Optimization)
-The `NOTICE` and `README.md` files must formally cite foundational Google DeepMind prompt optimization literature:
-- *Promptbreeder: Self-Referential Self-Improvement Via Prompt Evolution* (Fernando et al., 2023, [arXiv:2309.16797](https://arxiv.org/abs/2309.16797)).
-- *Large Language Models as Tool Makers* (Cai et al., 2023, [arXiv:2305.17126](https://arxiv.org/abs/2305.17126)).
-
-The documentation must explicitly document our clean-room, dual-harness heuristic implementation:
-- Acknowledge the theoretical lineage and algorithmic inspiration from Google DeepMind prompt evolution research.
-- Explicitly state that the code in `packages/harness2` is an independent, clean-room implementation tailored for multi-harness agent architectures (Antigravity, Claude Code, OpenCode).
+### 2.8 Citation Lineage Contract (Upstream Google Research Harness²)
+The `NOTICE` and `README.md` files must formally cite upstream Google Research Harness² as primary:
+- **Primary Source & Citation**: Google Research / Google LLC, Apache-2.0; Xu et al. 2026, [arXiv:2610.14224](https://arxiv.org/abs/2610.14224).
+- **Related Work Only**: Foundational prompt evolution literature (*Promptbreeder*, Fernando et al., 2023, [arXiv:2309.16797](https://arxiv.org/abs/2309.16797); *Large Language Models as Tool Makers*, Cai et al., 2023, [arXiv:2305.17126](https://arxiv.org/abs/2305.17126)) are cited strictly as related work.
+- **Consumption Invariant**: `packages/harness2` uses upstream `google-research/harness2` directly as much as possible, adopting new upstream versions as they are released. It consumes upstream as a pinned git dependency (commit SHA) in `pyproject.toml`, using a minimal fork only if forced, and using its source only where direct use fails. Never claimed as a rewrite or custom reimplementation.
 - Preserve the Apache-2.0 license boundary for `packages/harness2`.
 
 ---
@@ -133,13 +134,13 @@ The optimizer is strictly barred from modifying:
 - [x] `packages/harness2` installs and runs cleanly under Python 3.12 with `uv sync`.
 - [x] FastMCP server initializes and exposes all 4 `harness2_*` tools (plus a read-only `harness2_status`, see §5).
 - [x] The server passes the MCP conformance runner (RFC 001 D30), including forged Host / foreign Origin refusal and strict arguments: 12/12 on the real daemon.
-- [ ] Probing triggers execute successfully upon simulated `jev_judge` failure and `/probe` command. *(The decision logic is done and tested as a pure function; wiring it to `jev_judge` events and a `/probe` command is not built.)*
-- [ ] Option A Dual-Engine sandbox isolation executes candidate trajectories: native local `sbx` microVMs as primary, or ephemeral rootless Docker container (`--network none`, `--read-only`, zero egress) when `sbx` is unavailable.
+- [ ] Probing triggers execute successfully: advisory push via hook (`jev_judge` < 0.50, retry exhaustion) plus explicit pull tool (`harness2_trigger` / `/probe`). *(The decision logic is done and tested as a pure function; wiring it to `jev_judge` events and a `/probe` command is not built.)*
+- [ ] Option A Dual-Engine sandbox isolation executes candidate trajectories: native local `sbx` microVMs as primary, or ephemeral rootless Docker container (`--network none`, `--read-only`, zero egress) when `sbx` is unavailable. *(Rootless Docker on host is a user-owned sudo prerequisite, status: not started; Slice 2 stays blocked on it.)*
 - [x] Missing sandbox runtime (neither `sbx` nor Docker available) triggers clean fail-closed abort without executing code.
 - [x] `GET /api/v1/key` pre-flight prevents execution when quota limits are reached. *(Tested against mocked responses; the live field names are unverified.)*
 - [x] Experience reflections write exclusively to `~/.local/share/cognitive-engine/experiences/`. *(Staged lessons are pending until a human approves them through the CLI.)*
 - [x] Protected invariants are verified immutable by automated mutation rejection tests. *(Components are refused and wired; the protected-path rule is tested but not yet used, since this slice mutates components, not files.)*
-- [ ] Apache-2.0 license file and Google DeepMind prompt optimization literature citations (Promptbreeder [arXiv:2309.16797], LLMs as Tool Makers [arXiv:2305.17126]) applied in `NOTICE` and `README.md` with clean-room provenance notice.
+- [ ] Apache-2.0 license file and upstream Google Research Harness² citations (Xu et al. 2026, arXiv:2610.14224; Promptbreeder and Tool Makers as related work) applied in `NOTICE` and `README.md`.
 
 ---
 
@@ -152,5 +153,5 @@ Decisions the RFC left open, made explicitly:
 3. **`dry_run` on `harness2_propose`.** Reports the egress and quota verdict without calling a model, so a caller can see a refusal before committing to a run.
 4. **Only four components are mutable.** RFC 001 says Harness² mutates 8 components; this RFC names four. Anything else, and every unknown name, is refused until someone edits `MUTABLE` deliberately.
 5. **Human sign-off is a CLI step, not a tool.** An agent can stage a lesson with `harness2_reflect` but cannot commit it.
-6. **No upstream package is wrapped.** The RFC names none, so this is an independent baseline of the four stages with a heuristic composer.
+6. **Upstream consumption.** Consumes upstream `google-research/harness2` directly as a pinned git dependency (commit SHA), wrapping its core optimizer and providing the FastMCP and Dual-Engine sandbox adapters rather than reimplementing the algorithmic core.
 7. **Bug found while testing:** the protected-path check stripped leading `../` and `/` before testing for escapes, so `../../escape` and `/etc/passwd` passed. Fixed, with tests.
