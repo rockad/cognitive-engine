@@ -113,6 +113,7 @@ To ensure 100% developer continuity, migration executes through four distinct ph
 - Add prominent deprecation banners to both directories directing users to `rockad/cognitive-engine`.
 
 ### Phase 3: Consumer Rebinding
+- Note: until retirement, the legacy Recall container publishes `0.0.0.0:8110` (compose starts `basic-memory` with `--host 0.0.0.0`), and upstream states that mode has **no authentication**, so its notes can be read, changed or deleted by anything that can reach the port. Whether other machines can reach it depends on the WSL2 and Windows firewall setup and has not been tested. The whole legacy setup is retired at cutover, which ends the exposure; the native daemons bind `127.0.0.1` only.
 - Stop the legacy Lookup container (`lookup-lookup-1`, `:8100`) and rebind native Lookup from `:8101` to `:8100`. This happens only after the share-source parity gate above; stopping the container earlier would drop the network-share sources.
 - Update `doppelganger/.mcp.json` to point to native `cognitive-engine` MCP servers.
 - Update user shell aliases and helper scripts (`jev`, `jev-mode`, `memory.sh`) to invoke `bin/engine`.

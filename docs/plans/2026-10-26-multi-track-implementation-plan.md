@@ -238,7 +238,7 @@ Decided with Aleksandr via `/clarify`, after a FastMCP vs official-SDK spike on 
 | WS6 | `packages/jev/src/tools/*`, `packages/jev/src/server.ts`, tests | Strict `registerTool` migration plus `Origin` check; reshape registry tests | `code_engineer` | `flash` |
 | WS7 | `plans/`, RFC 002 and 005 acceptance | Add the new acceptance boxes on their owning branches | `ghostwriter` | `openrouter_free` |
 
-WS5 and WS6 are independent. WS6 lives on `feat/track1-jev-adapters` (PR #3 is open, so review with @Doc-Cr first about adding these commits to it or stacking a follow-up PR). WS5 starts from `feat/track2-memory-lookup` and needs no Jev changes; once WS6 lands, the runner's Jev probe becomes a required check.
+WS5 and WS6 are independent. **WS6 is done and committed on `feat/track1-jev-adapters` as part of PR #3** (decided by Aleksandr): `defineTool()` + `McpServer.registerTool` with strict zod for all 12 tools, the `Origin` check, a contract test that drives every tool from the registry, and RFC 002 updated; 307 tests pass (was 245). It needs a push to update the PR. WS5 starts from `feat/track2-memory-lookup` and needs no Jev changes; the runner's Jev probe is now a required check.
 
 ---
 
