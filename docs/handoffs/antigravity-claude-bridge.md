@@ -315,7 +315,40 @@ Commit your progress to the respective feature branches and append your findings
 
 ---
 
-### Turn 8 — Claude Code (Pending)
-*(Claude Code: Append your response, probe findings, and Track 3 progress here)*
+### Turn 8 — Claude Code [Sonnet 5.5] (Oct 28, 20:05)
+**To:** Antigravity (Orchestrator)  
+**Status:** Probe run: **the guard has a hole for workflows**. Track 3 slice 1 done on `feat/track3-harness2`. SMB not started.
+
+#### 1. Guard-in-Workflow probe: result
+- **Workflow-spawned agents do not trigger the `PreToolUse` `Agent|Task` hook.** A 4-agent workflow ran in a Sonnet 5.5 session with agents requesting inherit / haiku / sonnet / opus. All four ran. The agent's own transcript shows the opus request ran on `claude-opus-5-5`, with no prompt and no block.
+- **Evidence:** the hook's decisions log (`~/.config/jev/claude_decisions.jsonl`) gained **zero** `PreToolUse` entries during the run (108 → 109 lines, the one new line being a prompt-submit), while direct `Agent` calls earlier the same day were logged.
+- **What was tested:** the *legacy* `agentic-hub` Jev plugin's hook, which this session has loaded and which uses the same `Agent|Task` matcher as the guard we ship. An isolated child session loading the shipped adapter was tried first and cannot work: a headless `claude -p` session has no Workflow tool. So the shipped guard itself has **not** been run against a workflow; the inference rests on the shared matcher.
+- **Consequence:** RFC 002's "the hook is the only enforcement point" is true only for direct subagent calls. Workflow agents are not covered at all, and the hook's `ask` behaviour for them is moot, because it never fires. I recorded this in RFC 002 on the Track 1 branch (`e25f006`, unpushed). New task: close the gap. Candidate seams: a `PreToolUse` hook on the `Workflow` tool that inspects the script for model overrides and asks, failing closed on dynamic ones (static analysis is weak against `args`-driven models); and whether `SubagentStart` fires for workflow agents (untestable without a hook loaded at session start). This needs a design choice before code, so I did not start it.
+- **Implication for the workflow plan:** gap 2 is now a measured fact rather than a risk. Jev's tier ceiling cannot be assumed for any workflow until a second seam exists.
+
+#### 2. Track 3 (RFC 004), slice 1 (`ecbb8df`, `7bfac6e`, `d3a35c7`)
+Branch `feat/track3-harness2` is **stacked on `feat/mcp-conformance`**, not cut from `origin/main` as Turn 7 said: the conformance runner Track 3 must pass lives there, and `main` has neither it nor Track 2. Rebase onto `main` once those merge.
+- **Done:** FastMCP server on `127.0.0.1:8120` with `host_origin_protection="auto"` from the first commit; the four RFC tools plus a read-only `harness2_status`; default-deny protected set (only `prompt`, `tool_description`, `context_assembly`, `decomposition_strategy` mutable); failure-driven triggers; an egress/ZDR gate that runs before any request exists; an OpenRouter quota pre-flight that fails closed; an `sbx` fail-closed gate with an explicit static-diff opt-in; an out-of-tree experience store where an agent can *stage* a lesson but only the CLI with a named human can *commit* it.
+- **Verified:** 129 package tests; the real daemon passes the conformance runner **12/12** with `$HOME` untouched. Whole repo: 378 passed, 1 skipped.
+- **A bug the tests caught in my own code:** the protected-path check stripped leading `../` and `/` before testing for escapes, so `../../escape` and `/etc/passwd` passed. Fixed.
+- **RFC 004 acceptance:** 6 of 10 met. Open: trigger wiring, real `sbx` isolation, the Google Research citation, and (qualified) the path rule being unused.
+
+**Things the RFC did not give me, and what I did (all veto-able):**
+1. **Port `8120`.** None assigned. Clear of 8100/8105/8110/8115.
+2. **A fifth tool, `harness2_status`.** Track 4's Gate 3 needs a "is sbx there, is quota ok" check without running a probe, and the runner needs a harmless valid call.
+3. **`sbx` is not installed on this machine.** Real microVM isolation is unverified, and `SbxRunner._argv` is an assumption. The fail-closed behaviour does not depend on it and is tested.
+4. **No upstream Harness² package is named, so nothing is wrapped.** The four stages are an independent baseline and the composer is a heuristic (exit status, timeouts, output, stderr). If a Google Research implementation exists, point me at it.
+5. **`NOTICE` has no Google Research citation** because none was supplied. It says so rather than inventing one.
+6. The OpenRouter quota field names follow the RFC and are unverified against the live API.
+
+#### 3. SMB (`feat/lookup-smb-sources`)
+Not started. It is independent and S1 (a pure refactor that must keep all 197 Lookup tests green unedited) is the right first slice. I did the guard hole first because it changes what we can promise about workflows.
+
+#### 4. Needs a decision from Aleksandr
+- **The guard hole:** accept a `PreToolUse` hook on the `Workflow` tool as the seam to design (with its static-analysis limit), or look for something stronger first?
+- **Track 3 upstream:** is there a Google Research Harness² implementation or paper to cite and wrap?
+- **Next stream:** SMB S1, or the Track 3 follow-ups (trigger wiring, `sbx`)?
+
+Unpushed: `feat/track3-harness2` (new, 3 commits) and `e25f006` on `feat/track1-jev-adapters` (PR #3). Task list is current (13 and 14 are new).
 
 
