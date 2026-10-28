@@ -136,7 +136,7 @@ Full list with evidence in [RFC 003 §4](../rfc/003-memory-lookup.md). The ones 
   - **Reused as-is:** the `[source.volume]` schema and `${ENV}` credential references (never inline values); an unreachable share still lets the daemon start, with rows kept and marked stale; reparse points are not followed and every document path is re-checked against its root.
   - **Streams** (S-prefixed to avoid clashing with the matrix): S1 introduce the seam with `LocalFS` only, a pure refactor that keeps all existing Lookup tests green unedited and blocks the rest; S2 `SmbFS`; S3 manifest schema (`subpath`, `type` accepts `cifs`/`smb`) and loud errors on unset credential references; S4 tests (an in-memory `FakeFS`, the ledger/escape/visibility tests parametrized over both backends, one in-process SMB server integration test); S5 docs.
   - **Acceptance:** a second pass over an unchanged share performs zero file opens; the existing core `[source.volume]` block indexes from an SMB server with no host mount; `..`, absolute paths and reparse points are refused and counted; no credential appears in any log or error string; and the server passes the §3.5 conformance runner.
-- **Operational prerequisite for Phase 1 merge:** stop the legacy `lookup-lookup-1` container (it holds `127.0.0.1:8100`) before the native Lookup can take that port.
+- **Port policy (resolves a contradiction in RFCs 001/003/005):** the legacy `lookup-lookup-1` container holds `127.0.0.1:8100` and serves the network-share sources that native Lookup cannot read yet, and the zero-retirement policy forbids stopping it first. So native Lookup **stages on `:8101`** (`lookup mcp --http --port 8101`) and rebinds to `:8100` at Track 4 cutover, after the legacy container is stopped and per-source document-count parity is verified.
 
 ---
 
@@ -186,8 +186,9 @@ Full list with evidence in [RFC 003 §4](../rfc/003-memory-lookup.md). The ones 
   - **Pre-Retirement Verification Gates**:
     - All unit, integration, schema, and latency test suites pass across Tracks 1, 2, and 3.
     - Memory footprint stays verified under 2–3 GB RAM under sustained query load.
-    - Dual port binding verified (`:8105` and `:8100` on `127.0.0.1`).
-    - MCP server contract verified on every daemon (`:8105`, `:8100`, `:8115`, Harness²) by the black-box conformance runner ([§3.5](#35-cross-cutting-mcp-selection--server-contract-2026-10-28)).
+    - Dual port binding verified on `127.0.0.1` (`:8105`, and Lookup on `:8101` staging, `:8100` after cutover).
+    - Share-source parity: native Lookup indexes the same network-share sources as the legacy container before it is stopped.
+    - MCP server contract verified on every daemon (`:8105`, `:8101`, `:8115`, Harness²) by the black-box conformance runner ([§3.5](#35-cross-cutting-mcp-selection--server-contract-2026-10-28)).
     - Local `sbx` probe isolation and fail-closed behavior verified.
     - Client configuration updated in `~/.gemini/config/mcp_config.json`.
   - **Phased agentic-hub Retirement Protocol**:
@@ -225,7 +226,7 @@ Decided with Aleksandr via `/clarify`, after a FastMCP vs official-SDK spike on 
 - **Track 1 (Jev).** Migrate all 12 tools to `registerTool` with strict zod objects, via a small `defineTool()` helper that always applies `.strict()` (the raw-shape form silently drops unknown keys). Add the missing `Origin` check to the hand-written HTTP handler. Reshape the registry tests (`allTools` / `toolHandlers`) to read from the server; keep the `approvedTier`-absent assertion. RFC 002 acceptance gains "strict arguments" and "Origin refused" boxes on that branch.
 - **Track 2.** Lookup already passes `host_origin_protection="auto"` and has tests pinning forged Host/Origin and misspelled-argument rejection; Memory's tests pin Host/Origin. Both are the runner's first two targets.
 - **Track 3 (Harness²).** FastMCP, `host_origin_protection="auto"` from the first commit, and the runner in its tests.
-- **Track 4.** The "client MCP configurations validated" gate runs the conformance runner against `:8105`, `:8100`, `:8115` and Harness² before any `agentic-hub` retirement.
+- **Track 4.** The "client MCP configurations validated" gate runs the conformance runner against `:8105`, Lookup (`:8101` staging, `:8100` after cutover), `:8115` and Harness² before any `agentic-hub` retirement.
 
 **The runner.** Python, official client plus `httpx`, runnable as `uv run tools/mcp_conformance.py <url | stdio command> --probe <spec>`. Each server supplies a small probe spec: one valid call, plus the argument and enum it should reject. It fails closed: a check it cannot perform is a failure, not a skip. Each package's test suite runs it against a daemon it starts on a free port.
 

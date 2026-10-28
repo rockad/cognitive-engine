@@ -42,10 +42,10 @@ flowchart TD
     subgraph VerificationGates ["2. Gated Cutover Verification"]
         direction TB
         GateJev["Gate 1: packages/jev Tests Pass"]
-        GateMem["Gate 2: Memory & Lookup Healthy (<2-3 GB RAM, :8105/:8100)"]
+        GateMem["Gate 2: Memory & Lookup Healthy (<2-3 GB RAM, :8105 / Lookup :8101 staging, :8100 after cutover)"]
         GateH2["Gate 3: Harness² sbx Sandboxes & Fail-Closed Verified"]
         GateEgress["Gate 4: Egress & ZDR Test Suites Pass (TS & Py)"]
-        GateConfig["Gate 5: Client Harness MCP Configurations Validated"]
+        GateConfig["Gate 5: Client Harness MCP Configurations Validated & Conformance Runner Passes"]
         
         GateJev --> GateMem --> GateH2 --> GateEgress --> GateConfig
     end
@@ -101,7 +101,9 @@ To ensure 100% developer continuity, migration executes through four distinct ph
 ### Phase 1: Substrate Verification Gates (All Must Pass)
 - [ ] `packages/jev` passes unit test suite (`bun test`) and schema validations with 0 errors.
 - [ ] `packages/memory` runs natively on `127.0.0.1:8105/mcp` with resident memory verified under 2–3 GB RAM during sustained hybrid queries.
-- [ ] `packages/lookup` runs natively on `127.0.0.1:8100/mcp` and correctly filters search results by `docs.visibility`.
+- [ ] `packages/lookup` runs natively on `127.0.0.1:8101/mcp` (staging; the legacy container holds `:8100`) and correctly filters search results by `docs.visibility`.
+- [ ] `packages/lookup` indexes the same network-share sources as the legacy container with no host mount (RFC 001 D31), verified by document-count parity per source.
+- [ ] Every daemon (`:8105`, `:8101`, `:8115`, Harness²) passes `tools/mcp_conformance.py` (RFC 001 D30): loopback only, forged Host and foreign Origin refused, strict arguments, stateless.
 - [ ] `packages/harness2` completes candidate probing inside local `sbx` microVMs and confirms fail-closed behavior when `sbx` is stopped.
 - [ ] Cross-runtime egress test suites pass identically under Bun and Python.
 - [ ] Global configuration `~/.gemini/config/mcp_config.json` successfully registers `cognitive-engine` endpoints.
@@ -111,7 +113,8 @@ To ensure 100% developer continuity, migration executes through four distinct ph
 - Add prominent deprecation banners to both directories directing users to `rockad/cognitive-engine`.
 
 ### Phase 3: Consumer Rebinding
-- Update `doppelganger/.mcp.json` to point to native `cognitive-engine` FastMCP servers.
+- Stop the legacy Lookup container (`lookup-lookup-1`, `:8100`) and rebind native Lookup from `:8101` to `:8100`. This happens only after the share-source parity gate above; stopping the container earlier would drop the network-share sources.
+- Update `doppelganger/.mcp.json` to point to native `cognitive-engine` MCP servers.
 - Update user shell aliases and helper scripts (`jev`, `jev-mode`, `memory.sh`) to invoke `bin/engine`.
 - Validate that daily operations in `doppelganger` function without Docker containers running.
 

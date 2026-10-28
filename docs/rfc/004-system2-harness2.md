@@ -88,6 +88,8 @@ Probing is completely decoupled from System 1 routing confidence metrics. Probin
 - `harness2_compose`: Contrasts outputs and generates a synthesized patch.
 - `harness2_reflect`: Extracts generalizable lessons for domain experience storage.
 
+The server uses FastMCP and meets the project-wide MCP contract (RFC 001 D29–D30): loopback bind only, `host_origin_protection="auto"` (forged Host and foreign Origin refused), strict argument validation (an unknown, mistyped or missing argument is a tool error), stateless HTTP, and liveness via `tools/list`. The `host_origin_protection` argument is off by default in FastMCP and must be set from the first commit.
+
 ---
 
 ## 3. Invariants & Security Protections
@@ -110,6 +112,7 @@ The optimizer is strictly barred from modifying:
 
 - [ ] `packages/harness2` installs and runs cleanly under Python 3.12 with `uv sync`.
 - [ ] FastMCP server initializes and exposes all 4 `harness2_*` tools.
+- [ ] The server passes the MCP conformance runner (RFC 001 D30), including forged Host / foreign Origin refusal and strict arguments.
 - [ ] Probing triggers execute successfully upon simulated `jev_judge` failure and `/probe` command.
 - [ ] Local `sbx` microVM sandbox executes candidate trajectories in complete isolation.
 - [ ] Missing `sbx` runtime triggers clean fail-closed abort without executing code.
