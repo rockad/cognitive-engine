@@ -32,7 +32,7 @@ inference. `invariants.assert_mutable` is consulted on every call, so removing a
 
 Nothing here imports upstream: a spec is read by duck typing, so this module imports (and its
 refusals work) without the `upstream` extra. Importing `harness2.substrate` would run
-`harness2.config`, which reads `$CWD/.env` into `os.environ`.
+`harness2.config`, which reads `<clone>/.env` into `os.environ` (for a source clone).
 """
 from __future__ import annotations
 
