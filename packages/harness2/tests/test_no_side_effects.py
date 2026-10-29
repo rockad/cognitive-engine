@@ -13,6 +13,7 @@ quota check. Both are shown below to be the ONLY places, and to reach the trap w
 from __future__ import annotations
 
 import asyncio
+import builtins
 import http.client
 import json
 import os
@@ -30,7 +31,7 @@ import pytest
 
 from h2_profiles import PROFILE
 
-from cognitive_harness2 import sweep_plan
+from cognitive_harness2 import channels, settings, sweep_plan
 from cognitive_harness2.invariants import InvariantViolation
 from cognitive_harness2.quota import QuotaVerdict
 from cognitive_harness2.substrate import CognitiveSubstrate, PreflightError, StagedInstall, openrouter_quota_check
@@ -317,7 +318,7 @@ def test_a_refused_preflight_leaves_the_daemon_alone_afterwards(monkeypatch, sur
 IMPORT_PROBE = textwrap.dedent("""
     import json, os, sys
     from types import SimpleNamespace
-    import cognitive_harness2.upstream_surface, cognitive_harness2.upstream_egress
+    import cognitive_harness2.upstream_surface, cognitive_harness2.upstream_egress, cognitive_harness2.channels
     import cognitive_harness2.substrate, cognitive_harness2.sweep_plan
     from cognitive_harness2.upstream_surface import check_surface
     spec = SimpleNamespace(name="x", always_on=("systemprompt.md",), skill_dir="skills", plugin_dir=None, hooks_file=None)
@@ -351,3 +352,106 @@ def test_canary_upstreams_substrate_import_does_read_dotenv_from_the_cwd(dotenv_
     got = _probe("import os, harness2.substrate; print(__import__('json').dumps({'upstream': [], 'dotenv': os.environ.get('H2_DOTENV_SENTINEL')}))",
                  dotenv_cwd)
     assert got["dotenv"] == "loaded"
+
+
+# ── the channel profile: the only file access is the pinned reader, and it only reads ──
+
+PROFILE_TOML = textwrap.dedent('''
+    workspace_roots = ["/tmp/work"]
+    [channels.local]
+    kind = "opencode"
+    provider = "ollama"
+    endpoint = "http://127.0.0.1:11434/v1"
+    model = "ollama/qwen3:30b"
+    retention = "local"
+    max_classification = "restricted"
+    approval = "per-sweep"
+    [channels.local.caps]
+    sessions = 30
+    wall_s = 3600
+    cost_usd = 5.0
+''')
+
+
+@pytest.fixture
+def file_traps(monkeypatch):
+    """Records every file the code opens and traps every way of writing, creating or removing one."""
+    rec = SimpleNamespace(opened=[], writes=[])
+    real_open, real_os_open = builtins.open, os.open
+    write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+
+    def guarded_open(file, mode="r", *a, **k):
+        if any(c in mode for c in "wax+"):
+            rec.writes.append(f"open({mode})")
+            raise SideEffectAttempted("open-for-write")
+        rec.opened.append(os.fspath(file))
+        return real_open(file, mode, *a, **k)
+
+    def guarded_os_open(path, flags, *a, **k):
+        if flags & write_flags:
+            rec.writes.append("os.open(write)")
+            raise SideEffectAttempted("os.open-for-write")
+        rec.opened.append(os.fspath(path))
+        return real_os_open(path, flags, *a, **k)
+
+    def trap(name):
+        def t(*a, **k):
+            rec.writes.append(name)
+            raise SideEffectAttempted(name)
+        return t
+
+    monkeypatch.setattr(builtins, "open", guarded_open)
+    monkeypatch.setattr(os, "open", guarded_os_open)
+    for mod, names in ((os, ("mkdir", "makedirs", "rename", "replace", "remove", "unlink", "rmdir", "symlink", "link",
+                             "chmod", "truncate", "mkfifo")),
+                       (Path, ("write_text", "write_bytes", "mkdir", "touch", "unlink", "rename", "symlink_to"))):
+        for n in names:
+            if hasattr(mod, n):
+                monkeypatch.setattr(mod, n, trap(f"{getattr(mod, '__name__', 'Path')}.{n}"))
+    return rec
+
+
+@pytest.fixture
+def profile_file(tmp_path_factory):
+    f = tmp_path_factory.mktemp("pf") / "channels.toml"
+    f.write_text(PROFILE_TOML)
+    return f
+
+
+def test_the_file_traps_are_real(tmp_path, file_traps):
+    for probe in (lambda: open(tmp_path / "x", "w"), lambda: open(tmp_path / "x", "a"), lambda: open(tmp_path / "x", "r+"),
+                  lambda: os.open(tmp_path / "x", os.O_WRONLY | os.O_CREAT), lambda: (tmp_path / "y").write_text("z"),
+                  lambda: os.mkdir(tmp_path / "d"), lambda: os.unlink(tmp_path / "nope"), lambda: (tmp_path / "t").touch()):
+        with pytest.raises(SideEffectAttempted):
+            probe()
+    assert len(file_traps.writes) == 8
+
+
+def test_the_channel_modules_read_only_the_profile_and_write_nothing(traps, profile_file, surface, monkeypatch, file_traps):
+    readers = []
+    real = channels._read_capped
+    monkeypatch.setattr(channels, "_read_capped", lambda p, *a: (readers.append(p), real(p, *a))[1])
+
+    profile = channels.load_profile({settings.ENV_CHANNELS_FILE: str(profile_file)})
+    assert profile.declared and "local" in profile.channels
+    env = {"PATH": "/usr/bin"}
+    cfg = {"kind": "opencode", "model": "ollama/qwen3:30b", "base_url": LOCAL, "env": env, "cwd": "/tmp/work"}
+    d = check_proposer(cfg, profile=profile, channel="local", classification="open")
+    assert d.allowed
+    for bad in ({**cfg, "model": "ollama/other"}, {**cfg, "base_url": "https://x.example"}):
+        assert not check_proposer(bad, profile=profile, channel="local", classification="open").allowed
+    assert not check_proposer(cfg, profile=profile, channel="undeclared").allowed
+    assert not check_proposer(cfg, profile=profile, channel="local", classification="restricted", zdr="x").allowed
+    assert channels.decide(profile.channels["local"], zdr="strict", classification=None).allowed
+    plan_sweep(surface=surface, candidates=[SweepCandidate("sp", "systemprompt.md")], k=1, n_tasks=1, max_sessions=3,
+               max_wall_seconds=600, max_cost_or_tokens=CostCap("tokens", 100_000), proposer=d, readiness=READY,
+               profile=profile, channel="local", classification="open")
+    # malformed profiles are refused loudly, through the same reader, without writing anything
+    with pytest.raises(channels.ChannelProfileError):
+        channels.load_profile({settings.ENV_CHANNELS_FILE: str(profile_file.parent / "missing.toml")})
+    with pytest.raises(channels.ChannelProfileError):
+        channels.parse_text("channels = 5", source="x")
+
+    assert readers == [str(profile_file), str(profile_file.parent / "missing.toml")]      # only the pinned reader
+    assert file_traps.opened == [str(profile_file)]                                       # one read, of that file only
+    assert file_traps.writes == [] and traps.attempts == []

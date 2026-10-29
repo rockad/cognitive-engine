@@ -104,19 +104,104 @@ Four safety seams sit between this engine and upstream's `Substrate` and `Propos
 | module | guards |
 | --- | --- |
 | `upstream_surface.py` | Maps upstream's `SurfaceSpec` components c1..c8 onto `invariants.MUTABLE`. Mutable: c1 system prompt (`prompt`), c3 memory (`context_assembly`), c4 tool guidance (`tool_description`), c5 subagents (`decomposition_strategy`). Denied: c2 guardrails (protected), c6 skills (undecided), c7 scripts (executable code), c8 plugins and hooks (protected), codex's single `AGENTS.md` (it folds in the guardrails), and every unknown slot. `check_surface(spec, request=, tree=)` raises `InvariantViolation` for any slot or path outside that set, or failing the path rules (traversal, absolute, case variants, unicode look-alikes, symlink-looking names, protected prefixes). |
-| `upstream_egress.py` | `check_proposer(config, settings)` decides, before any session exists, whether an upstream Proposer may be created. Returns a `Decision` (allowed, reasons, warnings, redacted view). Refuses Vertex and any hosted cloud route, an endpoint that cannot be determined (upstream's Proposer has none: it must be declared), any endpoint that is not loopback or ZDR-listed, a hosted provider behind a loopback address, inherited credential-like env vars (by name only), non-approved `*_BASE_URL` and proxy vars, credential flags on the command line, unsafe working directories, and a `claude` CLI proposer unless `COGNITIVE_HARNESS2_ALLOW_CLAUDE_PROPOSER=1` (`settings.allow_claude_cli_proposer`), which is necessary and not sufficient. No secret value ever reaches a reason or the view. |
+| `upstream_egress.py` | `check_proposer(config, profile=, channel=, zdr=, classification=)` decides, before any session exists, whether an upstream Proposer may be created. Returns a `Decision` (allowed, reasons, warnings, redacted view). The Proposer configuration must match a channel declared in the profile exactly (kind, provider, endpoint host and port, model), and that channel must be allowed by the zdr mode and the sweep's classification (see **Channel profile**). Also refuses Vertex and any hosted cloud route, an endpoint that cannot be determined (upstream's Proposer has none: it must be declared), a hosted provider behind a `local` channel, inherited credential-like env vars (by name only), `*_BASE_URL` and proxy vars that are not a declared endpoint, credential flags on the command line, and unsafe working directories. Every reason names the channel and the rule that fired. No secret value ever reaches a reason or the view. |
 | `substrate.py` | `CognitiveSubstrate` implements upstream's `Substrate` Protocol. `surface`, `materialise` (read-only staging through `DockerRunner`'s key rules; no symlinks, UTF-8 only, capped) and `preflight` (`require_rootless_docker`, then a quota check only if the caller passes `quota_check=`) work and start nothing. `execute` and `read_trajectory` raise `NotImplementedError("slice 3b, not enabled")`. |
-| `sweep_plan.py` | `plan_sweep(...)` returns an immutable `SweepPlan` (candidates, hard caps, upstream's ledger budget P = 3k and R = 4k, `advice.cost_class`, readiness, `requires_human_approval: true`) or raises `SweepRefused` listing every cause: a missing, zero, negative, infinite or oversized cap, a plan over its own cap, a candidate off the mutable surface, a known readiness blocker or quota refusal, or a Proposer decision that is not allowed. It starts no sweep. |
+| `sweep_plan.py` | `plan_sweep(...)` returns an immutable `SweepPlan` (candidates, hard caps, upstream's ledger budget P = 3k and R = 4k, `advice.cost_class`, readiness, `requires_human_approval: true`) or raises `SweepRefused` listing every cause: a missing, zero, negative, infinite or oversized cap, a plan over its own cap, a candidate off the mutable surface, a known readiness blocker or quota refusal, or a Proposer decision that is not allowed or was made for another channel, classification or zdr mode. It takes the channel profile, the channel name, an explicit classification (missing is restricted) and the zdr mode, re-checks the channel policy, and caps the plan at the minimum of the requested and the channel caps. It starts no sweep. |
 
 `tests/test_no_side_effects.py` is the proof: it traps subprocess, `os.system`, the exec and spawn family, asyncio subprocesses, sockets, DNS, urllib, http.client and httpx, runs every seam's happy and refusal paths, and asserts nothing was attempted. It also shows the Docker daemon is asked only by `preflight`, with pinned read-only `info` and `image inspect`.
 
 Things worth knowing:
 
-- Importing `harness2.substrate`, `harness2.config` or `harness2.core.proposer` runs upstream's `config.py`, which reads `$CWD/.env` into `os.environ`. The seams avoid those imports (a canary test pins this). `harness2.core.tree` and `harness2.core.ledger` are stdlib-only and safe.
+- Importing `harness2.substrate`, `harness2.config` or `harness2.core.proposer` runs upstream's `config.py`, which reads `.env` from the clone directory (or the working directory for a wheel install) into `os.environ`. The seams avoid those imports (a canary test pins this). `harness2.core.tree` and `harness2.core.ledger` are stdlib-only and safe.
 - Even an allowed Proposer decision carries warnings: upstream's sessions run agent tools (shell, files) on the host, and `HOME` file credentials (gcloud, `~/.claude`, `~/.aws`) cannot be listed by an environment check. Isolating the proposer session is a slice 3b question.
 - Upstream is inconsistent about c-numbers (its README makes guardrails c2, its prompt tables call `guardrails.md` c6). The seams bind to paths.
 
 **The 3b gate.** Slice 3b (`DockerRunner` as `Substrate.execute`, one capped dry run, a hard budget cap, `requires_human_approval` kept) is not started and runs only on the user's separate go. Slice 3a is subject to independent review before that.
+
+## Channel profile
+
+Which proposer channels may carry content is declared in one TOML file, under one policy. The channels are local models (`opencode` to Ollama on loopback), the agent's own provider (`claude_cli`, `agy_cli`) and OpenRouter. The file lives at `COGNITIVE_HARNESS2_CHANNELS_FILE`, else `~/.config/cognitive-engine/harness2-channels.toml`.
+
+```toml
+# Directories a Proposer session may use as its working directory (absolute, normalised).
+workspace_roots = ["/home/me/h2-workspaces"]
+
+# A local model on loopback: content never leaves this machine.
+[channels.local-ollama]
+kind = "opencode"                      # opencode | claude_cli | agy_cli
+provider = "ollama"                    # for opencode: the model id's prefix
+endpoint = "http://127.0.0.1:11434/v1" # opencode takes one `endpoint`
+model = "ollama/qwen3:30b"
+retention = "local"                    # local | zdr-attested | unknown
+max_classification = "restricted"      # open < gated < restricted
+approval = "per-sweep"                 # the only value: a human approves each sweep
+[channels.local-ollama.caps]           # hard per-sweep caps; all three required, > 0
+sessions = 30
+wall_s = 3600
+cost_usd = 1.0
+
+# OpenRouter, with zero data retention that YOU have arranged and attest to.
+[channels.openrouter]
+kind = "opencode"
+provider = "openrouter"
+endpoint = "https://openrouter.ai/api/v1"
+model = "openrouter/anthropic/claude-sonnet-4"
+retention = "zdr-attested"
+max_classification = "gated"
+approval = "per-sweep"
+[channels.openrouter.caps]
+sessions = 20
+wall_s = 1800
+cost_usd = 5.0
+
+# The agent's own subscription: retention unknown, so open content only.
+[channels.claude-harness]
+kind = "claude_cli"
+provider = "anthropic"
+endpoints = ["https://api.anthropic.com"]  # the vendor CLIs take a list `endpoints`
+model = "claude-sonnet-5-5"
+retention = "unknown"
+max_classification = "open"
+approval = "per-sweep"
+[channels.claude-harness.caps]
+sessions = 10
+wall_s = 1200
+cost_usd = 2.5
+
+[channels.antigravity]
+kind = "agy_cli"
+provider = "google"
+endpoints = ["https://generativelanguage.googleapis.com"]
+model = "gemini-3-pro"
+retention = "unknown"
+max_classification = "open"
+approval = "per-sweep"
+[channels.antigravity.caps]
+sessions = 10
+wall_s = 1200
+cost_usd = 2.5
+```
+
+**The rule.** A channel is allowed only if both hold:
+
+- its `retention` satisfies the zdr mode: `strict` (the default) allows only `local` and `zdr-attested`; `off` also allows `unknown`;
+- the sweep's classification is within the channel's `max_classification`, and a channel with `retention = "unknown"` carries `open` content only.
+
+The sweep's classification is the strictest of its sources (`channels.sweep_classification`); unclassified is `restricted`. A channel that is not in the file is denied, and the Proposer configuration must match the declared one on kind, provider, endpoint host and port, and model.
+
+**ZDR is declared, not verified.** `zdr-attested` records what you say about an agreement or account setting. Nothing in this package contacts a provider or checks it. Subscription channels default to `unknown` for that reason, and `unknown` with a `max_classification` above `open` is refused as malformed.
+
+**Loud failure.** A profile grants egress, so a bad one is refused whole with `ChannelProfileError`, naming the file and every problem, never repaired and never partly used. The validator rejects:
+
+- invalid TOML, a non-table top level, unknown keys (a near miss gets a hint: `retenion` -> did you mean `retention`; `channel` -> `channels`), wrong types, bad `kind`, `retention`, `max_classification` and `approval` values, missing required fields, duplicate channel names (case-insensitive);
+- `endpoint` where the kind takes `endpoints` and the reverse, URLs that are not http(s), or carry userinfo, a query or a fragment;
+- caps that are missing, zero, negative, NaN or infinite, boolean, or above the sanity ceilings;
+- model ids with whitespace, control or shell characters, or a leading dash;
+- `retention = "unknown"` with `max_classification` above `open`; `retention = "local"` with a non-loopback endpoint;
+- a file over 1 MB, not UTF-8, a symlink pointing nowhere, a symlink loop, a directory or FIFO;
+- the env var set but empty, relative, or naming a file that does not exist.
+
+`retention = "zdr-attested"` on a loopback endpoint is accepted with a warning, since a loopback gateway can forward content off the machine. With the env var unset and no default file, no channel is declared: everything is denied, and the message says how to create the file. That is not an error.
 
 ## Configuration
 
@@ -125,8 +210,8 @@ Things worth knowing:
 | `COGNITIVE_HARNESS2_PORT` | `8120` (not in RFC 004; chosen clear of 8100/8105/8110/8115) |
 | `COGNITIVE_HARNESS2_BASE_URL` | `http://127.0.0.1:11434/v1` (local Ollama) |
 | `COGNITIVE_HARNESS2_MODEL` | unset: a real `propose` refuses until a model is configured |
-| `COGNITIVE_HARNESS2_ZDR_ENDPOINTS` | unset: comma-separated hosts you attest are zero-retention |
-| `COGNITIVE_HARNESS2_ALLOW_CLAUDE_PROPOSER` | unset (off): `1`/`true` lets `upstream_egress` consider a `claude` CLI proposer, which spends Claude subscription quota |
+| `COGNITIVE_HARNESS2_ZDR_ENDPOINTS` | unset: comma-separated hosts you attest are zero-retention, for the slice 1 probe path only (the Proposer gate reads the channel profile instead) |
+| `COGNITIVE_HARNESS2_CHANNELS_FILE` | unset: `~/.config/cognitive-engine/harness2-channels.toml`. The channel profile (see **Channel profile**); no file means no channel is declared and everything is denied. Set to a missing file: malformed, refused loudly |
 | `COGNITIVE_HARNESS2_EXPERIENCE_ROOT` | `~/.local/share/cognitive-engine/experiences` |
 
 The API key is read from `JEV_OPENROUTER_API_KEY` or `OPENROUTER_API_KEY` and is never returned or logged.

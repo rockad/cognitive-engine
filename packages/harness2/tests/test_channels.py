@@ -602,3 +602,14 @@ def test_unknown_retention_is_only_ever_usable_for_open_content_with_zdr_off():
     ok = [(z, c) for z in ("strict", "off") for c in ("open", "gated", "restricted")
           if channels.decide(make_channel("unknown", "open"), zdr=z, classification=c).allowed]
     assert ok == [("off", "open")]
+
+
+def test_the_readme_worked_example_is_a_valid_profile():
+    import re
+    from pathlib import Path
+    readme = (Path(__file__).parent.parent / "README.md").read_text()
+    block = re.search(r"## Channel profile.*?```toml\n(.*?)```", readme, re.S)
+    assert block, "the README has no worked example"
+    p = channels.parse_text(block.group(1), source="README.md")
+    assert set(p.channels) == {"local-ollama", "openrouter", "claude-harness", "antigravity"}
+    assert p.channels["claude-harness"].retention == "unknown" and p.channels["claude-harness"].max_classification == "open"
