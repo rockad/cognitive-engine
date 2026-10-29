@@ -29,7 +29,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from h2_profiles import PROFILE
+from h2_profiles import PROFILE, WORK, WORKSPACE_ROOT
 
 from cognitive_harness2 import channels, settings, sweep_plan
 from cognitive_harness2.invariants import InvariantViolation
@@ -187,7 +187,7 @@ def exercise_every_seam(surface, tmp_path, profile) -> dict[str, int]:
     def propose(raw, channel="local", **kw):
         return check_proposer(raw, profile=profile, channel=channel, classification="open", **kw)
 
-    ok = propose({"kind": "opencode", "model": "ollama/qwen3:30b", "base_url": LOCAL, "env": env, "cwd": "/tmp/work"})
+    ok = propose({"kind": "opencode", "model": "ollama/qwen3:30b", "base_url": LOCAL, "env": env, "cwd": WORK})
     assert ok.allowed
     done["happy"] += 1
     for raw in (
@@ -356,8 +356,8 @@ def test_canary_upstreams_substrate_import_does_read_dotenv_from_the_cwd(dotenv_
 
 # ── the channel profile: the only file access is the pinned reader, and it only reads ──
 
-PROFILE_TOML = textwrap.dedent('''
-    workspace_roots = ["/tmp/work"]
+PROFILE_TOML = textwrap.dedent(f'''
+    workspace_roots = ["{WORKSPACE_ROOT}"]
     [channels.local]
     kind = "opencode"
     provider = "ollama"
@@ -435,7 +435,7 @@ def test_the_channel_modules_read_only_the_profile_and_write_nothing(traps, prof
     profile = channels.load_profile({settings.ENV_CHANNELS_FILE: str(profile_file)})
     assert profile.declared and "local" in profile.channels
     env = {"PATH": "/usr/bin"}
-    cfg = {"kind": "opencode", "model": "ollama/qwen3:30b", "base_url": LOCAL, "env": env, "cwd": "/tmp/work"}
+    cfg = {"kind": "opencode", "model": "ollama/qwen3:30b", "base_url": LOCAL, "env": env, "cwd": WORK}
     d = check_proposer(cfg, profile=profile, channel="local", classification="open")
     assert d.allowed
     for bad in ({**cfg, "model": "ollama/other"}, {**cfg, "base_url": "https://x.example"}):

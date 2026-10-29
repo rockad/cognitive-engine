@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from h2_profiles import CAPS, LOCAL, PROFILE, make_profile
+from h2_profiles import CAPS, LOCAL, PROFILE, WORK, make_profile
 
 from cognitive_harness2 import channels, upstream_egress
 from cognitive_harness2.upstream_egress import (
@@ -22,12 +22,12 @@ from cognitive_harness2.upstream_egress import (
 
 SENTINEL = "SENTINEL-do-not-leak-7f3a"
 CLEAN_ENV = {"PATH": "/usr/bin", "LANG": "C.UTF-8", "HOME": "/tmp/h"}
-ARGV = ("bun", "run", "--cwd", "/x", "src/index.ts", "run", f"PROMPT {SENTINEL}", "--dir", "/tmp/work",
+ARGV = ("bun", "run", "--cwd", "/x", "src/index.ts", "run", f"PROMPT {SENTINEL}", "--dir", WORK,
         "--model", "ollama/qwen3:30b", "--format", "json")
 
 
 def cfg(**over) -> ProposerConfig:
-    base = dict(kind="opencode", model="ollama/qwen3:30b", base_url=LOCAL, env=dict(CLEAN_ENV), cwd="/tmp/work")
+    base = dict(kind="opencode", model="ollama/qwen3:30b", base_url=LOCAL, env=dict(CLEAN_ENV), cwd=WORK)
     base.update(over)
     return ProposerConfig(**base)
 
@@ -424,11 +424,12 @@ def test_a_bad_working_directory_is_refused(cwd):
 
 def test_home_and_its_ancestors_are_not_a_working_directory(monkeypatch, tmp_path):
     home = tmp_path / "u" / "home"
-    home.mkdir(parents=True)
+    (home / "ws" / "work").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
+    p = make_profile(roots=[str(home / "ws")])
     for bad in (home, home.parent, tmp_path):
-        refused(chk(cfg(cwd=str(bad))), "working directory")
-    assert chk(cfg(cwd=str(home / "work"))).allowed
+        refused(chk(cfg(cwd=str(bad)), profile=p), "working directory")
+    assert chk(cfg(cwd=str(home / "ws" / "work")), profile=p).allowed
 
 
 def test_no_working_directory_means_the_fresh_temp_dir_upstream_makes():
@@ -473,7 +474,7 @@ def test_parse_config_raises_where_check_proposer_refuses():
 
 def test_a_mapping_is_accepted_like_a_config():
     d = chk({"kind": "opencode", "model": "ollama/qwen3:30b", "base_url": LOCAL, "env": CLEAN_ENV,
-             "cwd": "/tmp/work", "command": list(ARGV)})
+             "cwd": WORK, "command": list(ARGV)})
     assert d.allowed
 
 
@@ -494,7 +495,7 @@ def test_no_secret_value_appears_anywhere_in_any_decision():
         env={**CLEAN_ENV, "OPENROUTER_API_KEY": SENTINEL, "HTTPS_PROXY": f"http://u:{SENTINEL}@p.example",
              "OPENAI_BASE_URL": f"https://evil.example/{SENTINEL}", "ANTHROPIC_AUTH_TOKEN": SENTINEL},
         command=("claude", "--api-key", SENTINEL, f"--token={SENTINEL}", f"prompt {SENTINEL}"),
-        cwd="/tmp/work",
+        cwd=WORK,
         project="p",
     )
     d = chk(hostile)
@@ -546,7 +547,7 @@ def test_a_real_upstream_proposer_is_read_without_starting_a_session():
     from harness2.core.spec import ChannelSpec
 
     p = Proposer(ChannelSpec("opencode", "ollama/qwen3:30b"), project="a-project", region="global")
-    c = from_upstream(p, base_url=LOCAL, cwd="/tmp/work")
+    c = from_upstream(p, base_url=LOCAL, cwd=WORK)
     assert (c.kind, c.model, c.project) == ("opencode", "ollama/qwen3:30b", "a-project")
     d = chk(p, environ={})
     # upstream's own env() adds GOOGLE_VERTEX_PROJECT whatever the model: refused until the caller scrubs it
@@ -568,7 +569,7 @@ def test_from_upstream_takes_the_env_the_caller_will_really_pass():
     from harness2.core.spec import ChannelSpec
 
     p = Proposer(ChannelSpec("opencode", "ollama/qwen3:30b"), project="", region="global")
-    c = from_upstream(p, base_url=LOCAL, cwd="/tmp/work", env=dict(CLEAN_ENV))
+    c = from_upstream(p, base_url=LOCAL, cwd=WORK, env=dict(CLEAN_ENV))
     assert chk(c).allowed
 
 

@@ -9,7 +9,7 @@ outside the expected shape is refused.
 from __future__ import annotations
 
 import pytest
-from h2_profiles import LOCAL, PROFILE
+from h2_profiles import LOCAL, PROFILE, WORK
 
 from cognitive_harness2 import upstream_egress
 from cognitive_harness2.upstream_egress import COMMAND_SHAPES, check_proposer
@@ -17,7 +17,7 @@ from cognitive_harness2.upstream_egress import COMMAND_SHAPES, check_proposer
 SENTINEL = "SENTINEL-cmd-4d2b"
 ENV = {"PATH": "/usr/bin", "HOME": "/tmp/h"}
 OC = ("bun", "run", "--cwd", "/opt/oc/packages/opencode", "--conditions=browser", "src/index.ts", "run",
-      "Read MISSION.md first. Do what it asks.", "--dir", "/tmp/work", "--model", "ollama/qwen3:30b",
+      "Read MISSION.md first. Do what it asks.", "--dir", WORK, "--model", "ollama/qwen3:30b",
       "--format", "json")
 OC_BARE = ("opencode", "run", "Read MISSION.md first.", "--model", "ollama/qwen3:30b")
 CL = ("claude", "--dangerously-skip-permissions", "-p", "--output-format", "json", "--effort", "high",
@@ -25,7 +25,7 @@ CL = ("claude", "--dangerously-skip-permissions", "-p", "--output-format", "json
 
 
 def oc(command, **over):
-    c = dict(kind="opencode", model="ollama/qwen3:30b", base_url=LOCAL, env=ENV, cwd="/tmp/work", command=tuple(command))
+    c = dict(kind="opencode", model="ollama/qwen3:30b", base_url=LOCAL, env=ENV, cwd=WORK, command=tuple(command))
     c.update(over)
     return check_proposer(c, profile=PROFILE, channel="local", classification="open")
 
@@ -252,14 +252,14 @@ def test_claude_takes_no_positionals_the_prompt_arrives_on_stdin():
 # ── the executable and the kind ───────────────────────────────────────────────────
 
 def test_the_shape_is_the_one_for_the_declared_kind():
-    d = check_proposer(dict(kind="opencode", model="ollama/qwen3:30b", base_url=LOCAL, env=ENV, cwd="/tmp/work",
+    d = check_proposer(dict(kind="opencode", model="ollama/qwen3:30b", base_url=LOCAL, env=ENV, cwd=WORK,
                             command=CL), profile=PROFILE, channel="local", classification="open")
     assert not d.allowed
     assert any("does not match" in r for r in d.reasons)
 
 
 def test_no_command_at_all_is_not_a_shape_problem():
-    d = check_proposer(dict(kind="opencode", model="ollama/qwen3:30b", base_url=LOCAL, env=ENV, cwd="/tmp/work"),
+    d = check_proposer(dict(kind="opencode", model="ollama/qwen3:30b", base_url=LOCAL, env=ENV, cwd=WORK),
                        profile=PROFILE, channel="local", classification="open")
     assert d.allowed and not shaped(d)
 

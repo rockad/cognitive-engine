@@ -1,11 +1,16 @@
 """Shared channel-profile fixtures for the seam 2 and sweep plan tests (a plain module, imported by name)."""
 from __future__ import annotations
 
+import os
+import tempfile
+
 from cognitive_harness2 import channels
 
 LOCAL = "http://127.0.0.1:11434/v1"
 CAPS = {"sessions": 30, "wall_s": 3600, "cost_usd": 5.0}
-WORKSPACE_ROOT = "/tmp/work"
+WORKSPACE_ROOT = os.path.join(tempfile.gettempdir(), "h2ws-tests")   # a real, empty directory
+WORK = os.path.join(WORKSPACE_ROOT, "work")
+os.makedirs(WORK, exist_ok=True)
 
 CHANNELS = {
     "local": dict(kind="opencode", provider="ollama", endpoint=LOCAL, model="ollama/qwen3:30b",

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from h2_profiles import PROFILE, make_profile
+from h2_profiles import PROFILE, WORK, make_profile
 
 from cognitive_harness2.quota import QuotaVerdict
 from cognitive_harness2.sweep_plan import (
@@ -36,7 +36,7 @@ def surface():
 
 
 LOCAL_CFG = {"kind": "opencode", "model": "ollama/qwen3:30b", "base_url": LOCAL, "env": CLEAN_ENV,
-             "cwd": "/tmp/work"}
+             "cwd": WORK}
 
 
 def decide(config=LOCAL_CFG, channel="local", *, profile=PROFILE, classification="open", **kw):

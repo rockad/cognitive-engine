@@ -41,7 +41,6 @@ import re
 import unicodedata
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
-from pathlib import PurePosixPath
 from types import MappingProxyType
 from typing import Any
 from urllib.parse import urlparse
@@ -194,19 +193,35 @@ def _split_url(raw: Any) -> tuple[str | None, str | None, bool, str]:
     return host, f"{p.scheme}://{shown}" + (f":{port}" if port else ""), creds, ""
 
 
-def _bad_cwd(cwd: str) -> str | None:
-    if not cwd.strip():
-        return "is empty"
-    if any(unicodedata.category(c) in ("Cc", "Cf", "Cs", "Co", "Cn") for c in cwd):
-        return "contains control or invisible characters"
-    if not os.path.isabs(cwd):
-        return "is not an absolute path"
-    path = PurePosixPath(os.path.normpath(cwd))
-    home = PurePosixPath(os.path.normpath(os.path.expanduser("~")))
-    if path == PurePosixPath("/") or path == home or path in home.parents:
-        return "is the filesystem root, the home directory or one of its ancestors"
-    return None
+def _cwd_problem(cwd: str, profile: Any) -> str | None:
+    """Why `cwd` cannot be a Proposer working directory, or None. Reads the filesystem (stat only).
 
+    The text rules (absolute, no control characters, not the root, home or an ancestor, and the protected-path
+    rules of `invariants.assert_path_unprotected` on the normalised path) apply to the path as given AND to what
+    it resolves to through symlinks; and the resolved directory must sit under a workspace root declared in the
+    profile. Undeclared roots mean no explicit working directory is accepted.
+    """
+    if (why := channels.bad_directory(cwd)) is not None:
+        return why
+    roots = profile.workspace_roots if isinstance(profile, ChannelProfile) else ()
+    if not roots:
+        return "cannot be accepted: the channel profile declares no workspace_roots"
+    try:
+        real = os.path.realpath(cwd, strict=True)
+    except (OSError, ValueError):
+        return "does not exist or cannot be resolved"
+    if not os.path.isdir(real):
+        return "is not a directory"
+    if (why := channels.bad_directory(real)) is not None:
+        return f"resolves to {ascii(real[:120])}, which {why}"
+    for root in roots:
+        try:
+            resolved = os.path.realpath(root, strict=True)
+        except (OSError, ValueError):
+            continue
+        if os.path.commonpath([real, resolved]) == resolved:
+            return None
+    return "resolves outside every declared workspace root"
 
 
 # ── the command line: ALLOW-LISTED per kind ───────────────────────────────────────
@@ -497,8 +512,9 @@ def _evaluate(c: ProposerConfig, profile: Any, channel_name: Any, zdr: str, clas
     if c.cwd is None:
         cwd_view = "fresh temporary directory (upstream default)"
     else:
-        cwd_view = c.cwd if not _bad_cwd(c.cwd) and len(c.cwd) < 512 else None
-        if (why := _bad_cwd(c.cwd)) is not None:
+        why = _cwd_problem(c.cwd, profile)
+        cwd_view = c.cwd if why is None and len(c.cwd) < 512 else None
+        if why is not None:
             refuse("working-directory", f"the working directory {why}")
 
     warnings.append("the session runs agent tools (shell and file access) on this host in its working directory; "
