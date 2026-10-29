@@ -82,12 +82,6 @@ async def test_repeated_identical_failure(tmp_path):
     assert out["advise"] and out["trigger"] == triggers.RETRIES_EXHAUSTED and "identical" in out["reason"]
 
 
-async def test_stagnation(tmp_path):
-    client, _, _ = make(tmp_path)
-    out = await ask(client, attempts_without_progress=3)
-    assert out["advise"] and out["trigger"] == triggers.STAGNATION
-
-
 async def test_judge_failure_and_low_score_and_explicit(tmp_path):
     client, _, _ = make(tmp_path)
     assert (await ask(client, judge_passed=False))["trigger"] == triggers.JUDGE_FAILED
@@ -174,6 +168,8 @@ async def test_ready_advice_points_at_the_explicit_tools(tmp_path):
 @pytest.mark.parametrize("args", [
     {"consecutive_failurez": 3},                  # unknown argument
     {"routing_confidence": 0.1},                  # not an input: routing never triggers
+    {"attempts_without_progress": 3},             # stagnation is not an RFC 004 §2.3 trigger: old callers are rejected
+    {"attempts_without_progress": 0},
     {"consecutive_failures": "three"},            # wrong type
     {"consecutive_failures": -1},                 # out of range
     {"consecutive_failures": 1001},
@@ -200,7 +196,7 @@ async def test_the_input_schema_is_closed_and_exposes_no_free_form_text(tmp_path
         tool = next(t for t in await c.list_tools() if t.name == "harness2_trigger")
     props = tool.input_schema["properties"]
     assert set(props) == {"on_demand", "judge_passed", "judge_score", "consecutive_failures", "failure_signatures",
-                          "attempts_without_progress", "zdr", "classification", "check_quota"}
+                          "zdr", "classification", "check_quota"}
     assert tool.input_schema.get("required", []) == []
     assert tool.input_schema.get("additionalProperties") is False
 
@@ -210,7 +206,7 @@ async def test_the_input_schema_is_closed_and_exposes_no_free_form_text(tmp_path
 async def test_nothing_executes_even_when_everything_fires_and_is_ready(tmp_path):
     client, probes, eng = make(tmp_path)
     for args in ({"on_demand": True}, {"consecutive_failures": 9}, {"judge_passed": False},
-                 {"attempts_without_progress": 9}, {"failure_signatures": ["E"] * 5}):
+                 {"failure_signatures": ["E"] * 5}):
         assert (await ask(client, **args))["advise"] is True
     assert probes.runner.runs == []                 # no sandbox command, ever
     assert eng.runs == {}                           # no run was created

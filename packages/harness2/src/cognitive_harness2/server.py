@@ -92,7 +92,7 @@ def build_server(engine: Engine | None = None, s: cfg.Settings | None = None) ->
             out["quota"] = {"ok": v.ok, "reason": v.reason}
         return out
 
-    @server.tool(name="harness2_trigger", description="Read-only pull check: given a failure or stagnation summary, "
+    @server.tool(name="harness2_trigger", description="Read-only pull check: given a failure summary, "
                  "say whether a System 2 probe is worth suggesting, which trigger fired, whether quota, egress, "
                  "sandbox and model are ready, the cost class, and that human approval is required. Starts no "
                  "sandbox, calls no model, writes nothing; run harness2_propose and harness2_probe explicitly to act.")
@@ -104,7 +104,6 @@ def build_server(engine: Engine | None = None, s: cfg.Settings | None = None) ->
         failure_signatures: Annotated[list[Annotated[str, Field(max_length=200)]], Field(
             max_length=20, description="short fingerprints of the recent failures, newest last; "
             "a trailing identical run counts as that many consecutive failures. Not stored.")] = [],
-        attempts_without_progress: Annotated[int, Field(ge=0, le=1000, description="stagnation count")] = 0,
         zdr: Annotated[Literal["strict", "off"], Field(description="zero-data-retention policy")] = "strict",
         classification: Annotated[Literal["open", "gated", "unstated", "restricted"], Field(
             description="classification of the content; unknown is treated as restricted")] = "unstated",
@@ -113,8 +112,7 @@ def build_server(engine: Engine | None = None, s: cfg.Settings | None = None) ->
     ) -> dict:
         decision = triggers.should_probe(
             judge_passed=judge_passed, judge_score=judge_score, consecutive_failures=consecutive_failures,
-            on_demand=on_demand, failure_signatures=failure_signatures,
-            attempts_without_progress=attempts_without_progress)
+            on_demand=on_demand, failure_signatures=failure_signatures)
         return await advice.advise(eng, decision, zdr=zdr, classification=classification, check_quota=check_quota)
 
     @server.tool(name="harness2_propose", description="Generate mutation candidates for the given components. "

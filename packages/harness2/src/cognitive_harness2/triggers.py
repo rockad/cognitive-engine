@@ -4,8 +4,11 @@ Probing is failure-driven and decoupled from System 1 routing. It starts on exac
 
   * a failed verification  (`jev_judge` FAIL, or a score below 0.50)
   * retry exhaustion       (3 or more consecutive failures on the same task)
-  * stagnation             (3 or more attempts with no progress; NOT in RFC 004, see below)
   * an explicit request    (`/probe <task>` or `engine probe`)
+
+These are exactly the RFC 004 §2.3 triggers. There is no stagnation trigger: an earlier
+extension ("3 or more attempts without progress") was dropped by decision, and the closed
+`harness2_trigger` schema now rejects its old `attempts_without_progress` argument.
 
 `routing_confidence` is accepted and deliberately IGNORED. Routing uncertainty used to
 trigger probes, which fired on tier ambiguity that says nothing about task failure;
@@ -19,10 +22,7 @@ Slice 2 additions to the slice 1 function (`should_probe` keeps its old behaviou
   * `Decision.trigger` names which rule fired (a stable machine-readable id);
   * `failure_signatures`: recent failure fingerprints, newest last. A trailing run of
     identical signatures counts as that many consecutive failures, so a caller that sends
-    signatures and no count still reaches retry exhaustion;
-  * `attempts_without_progress` (stagnation) at the same limit. RFC 004 lists only the
-    judge and retry triggers; stagnation is an extension the brief asked for and is the
-    first thing to drop if the RFC is held strictly.
+    signatures and no count still reaches retry exhaustion.
 """
 from __future__ import annotations
 
@@ -31,13 +31,11 @@ from dataclasses import dataclass
 
 SCORE_THRESHOLD = 0.50
 RETRY_LIMIT = 3
-STAGNATION_LIMIT = RETRY_LIMIT
 
 EXPLICIT = "explicit"
 JUDGE_FAILED = "judge_failed"
 JUDGE_SCORE = "judge_score"
 RETRIES_EXHAUSTED = "retries_exhausted"
-STAGNATION = "stagnation"
 
 
 @dataclass(frozen=True)
@@ -66,7 +64,6 @@ def should_probe(
     consecutive_failures: int = 0,
     on_demand: bool = False,
     failure_signatures: Sequence[str] = (),
-    attempts_without_progress: int = 0,
     routing_confidence: float | None = None,  # noqa: ARG001 - ignored on purpose, see module docstring
 ) -> Decision:
     if on_demand:
@@ -80,7 +77,4 @@ def should_probe(
     if failures >= RETRY_LIMIT:
         same = f", {repeated} identical in a row" if repeated >= RETRY_LIMIT else ""
         return Decision(True, f"retries exhausted ({failures} >= {RETRY_LIMIT}{same})", RETRIES_EXHAUSTED)
-    if attempts_without_progress >= STAGNATION_LIMIT:
-        return Decision(True, f"stagnation ({attempts_without_progress} attempts without progress "
-                              f">= {STAGNATION_LIMIT})", STAGNATION)
     return Decision(False, "no failure, retry exhaustion or explicit request")

@@ -1,4 +1,6 @@
-"""Trigger evaluation edge cases (pure): thresholds, identical failures, stagnation, precedence."""
+"""Trigger evaluation edge cases (pure): thresholds, identical failures, precedence."""
+import inspect
+
 import pytest
 
 from cognitive_harness2 import triggers
@@ -41,23 +43,21 @@ def test_explicit_count_and_signatures_take_the_larger():
     assert should_probe(consecutive_failures=0, failure_signatures=["a"] * 5).probe
 
 
-@pytest.mark.parametrize("n,fires", [(0, False), (2, False), (3, True), (9, True)])
-def test_stagnation_below_at_above_the_limit(n, fires):
-    d = should_probe(attempts_without_progress=n)
-    assert d.probe is fires
-    assert d.trigger == (triggers.STAGNATION if fires else None)
-
-
-def test_stagnation_limit_tracks_the_retry_limit():
-    assert triggers.STAGNATION_LIMIT == triggers.RETRY_LIMIT == 3
+def test_there_is_no_stagnation_trigger():
+    # RFC 004 §2.3 lists exactly: judge FAIL or score < 0.50, 3+ consecutive failures, explicit request.
+    assert not hasattr(triggers, "STAGNATION") and not hasattr(triggers, "STAGNATION_LIMIT")
+    assert "attempts_without_progress" not in inspect.signature(should_probe).parameters
+    with pytest.raises(TypeError):
+        should_probe(attempts_without_progress=9)  # type: ignore[call-arg]
+    assert {triggers.EXPLICIT, triggers.JUDGE_FAILED, triggers.JUDGE_SCORE, triggers.RETRIES_EXHAUSTED} == {
+        v for k, v in vars(triggers).items() if k.isupper() and isinstance(v, str)}
 
 
 @pytest.mark.parametrize("kwargs,expected", [
     ({"on_demand": True, "judge_passed": False, "consecutive_failures": 9}, triggers.EXPLICIT),
     ({"judge_passed": False, "judge_score": 0.1, "consecutive_failures": 9}, triggers.JUDGE_FAILED),
-    ({"judge_score": 0.1, "consecutive_failures": 9, "attempts_without_progress": 9}, triggers.JUDGE_SCORE),
-    ({"consecutive_failures": 3, "attempts_without_progress": 9}, triggers.RETRIES_EXHAUSTED),
-    ({"attempts_without_progress": 3}, triggers.STAGNATION),
+    ({"judge_score": 0.1, "consecutive_failures": 9}, triggers.JUDGE_SCORE),
+    ({"consecutive_failures": 3}, triggers.RETRIES_EXHAUSTED),
 ])
 def test_precedence_names_the_first_rule_that_fires(kwargs, expected):
     assert should_probe(**kwargs).trigger == expected

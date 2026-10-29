@@ -17,7 +17,7 @@ uv run cognitive-harness2 experience approve ID --by NAME
 | `harness2_probe` | Run each candidate in a local `sbx` microVM, or an ephemeral rootless Docker container when `sbx` is absent (below). With neither it **fails closed** and runs nothing; `allow_worktree_diff` opts in to static diffs, which execute no code. |
 | `harness2_compose` | Contrast outcomes without labels and propose a patch. Output always has `requires_human_approval: true`. |
 | `harness2_reflect` | Stage a lesson as **pending**. Nothing is committed. |
-| `harness2_trigger` | Read-only pull check: evaluates a failure or stagnation summary and recommends whether to probe, with readiness, cost class and `requires_human_approval` (see Triggers). Starts nothing. Not in the RFC 004 §2.7 list; it is the pull tool of §2.3. |
+| `harness2_trigger` | Read-only pull check: evaluates a failure summary and recommends whether to probe, with readiness, cost class and `requires_human_approval` (see Triggers). Starts nothing. Not in the RFC 004 §2.7 list; it is the pull tool of §2.3. |
 | `harness2_status` | Read-only, offline readiness report (sandbox, key configured, storage, protected set). Not in RFC 004; added for Track 4's Gate 3 and the conformance probe. |
 
 ## Rules enforced, and where
@@ -32,15 +32,15 @@ uv run cognitive-harness2 experience approve ID --by NAME
 
 System 2 never starts by itself. Two things can tell you it might be worth running; neither runs it.
 
-**Pull: `harness2_trigger`.** Send a failure or stagnation summary, get a recommendation. It is read-only: it starts no sandbox, calls no model, writes no file and creates no run. The closed argument schema takes `on_demand`, `judge_passed`, `judge_score`, `consecutive_failures`, `failure_signatures` (up to 20 short fingerprints, not stored or echoed), `attempts_without_progress`, `zdr`, `classification` and `check_quota`. The answer carries:
+**Pull: `harness2_trigger`.** Send a failure summary, get a recommendation. It is read-only: it starts no sandbox, calls no model, writes no file and creates no run. The closed argument schema takes `on_demand`, `judge_passed`, `judge_score`, `consecutive_failures`, `failure_signatures` (up to 20 short fingerprints, not stored or echoed), `zdr`, `classification` and `check_quota`. The answer carries:
 
 - `advise`: a trigger fired and nothing known would make the probe refuse.
-- `trigger_fired`, `trigger` and `reason`: which rule fired (`explicit`, `judge_failed`, `judge_score`, `retries_exhausted` or `stagnation`).
+- `trigger_fired`, `trigger` and `reason`: which rule fired (`explicit`, `judge_failed`, `judge_score` or `retries_exhausted`).
 - `readiness` and `blockers`: sandbox (the runtime is constructed and checked, nothing is run), egress and ZDR verdict, quota, and whether a generator model is configured. Quota is pre-flighted only when `check_quota` is true and the endpoint is OpenRouter; otherwise it is reported as not checked and is not a blocker.
 - `cost_class`: `none`, `local` (loopback endpoint), `free_quota` or `metered`.
 - `requires_human_approval`: always `true`.
 
-The rules are `triggers.should_probe` (RFC 004 §2.3): `jev_judge` FAIL or score below 0.50, 3 or more consecutive failures (a trailing run of identical `failure_signatures` counts), or an explicit request. `routing_confidence` is not an input. **Stagnation** (3 or more attempts without progress) is an extension beyond RFC 004.
+The rules are `triggers.should_probe` (RFC 004 §2.3): `jev_judge` FAIL or score below 0.50, 3 or more consecutive failures (a trailing run of identical `failure_signatures` counts), or an explicit request. `routing_confidence` is not an input. There is no stagnation trigger, and the closed schema rejects the old `attempts_without_progress` argument.
 
 **Push: `hooks/harness2-advise.sh`.** A Claude Code hook (bash and `jq`) that counts consecutive tool failures per session and, at the limit, adds advisory context pointing at `harness2_trigger`:
 
