@@ -14,7 +14,8 @@ def refused(path):
 # Each protected prefix, spelled as a file, as a directory, and as a child of that directory.
 PROTECTED = [
     # (the protected name, is it a directory that holds other things)
-    "hooks", "hook", "guard", "hooks.json", "hook.ts", "guard.ts", ".claude/settings", ".claude/settings.json",
+    "hooks", "hook", "guard", "guardrails", "hooks.json", "hook.ts", "guard.ts", "guardrails.md",
+    "guardrails.json", "guardrails.ts", ".claude/settings", ".claude/settings.json",
     "mcp_config.json", ".mcp.json", "egress", "egress_policy.py", "zdr", "governance", "ceiling", "approval",
 ]
 
@@ -157,3 +158,17 @@ def test_git_control_spellings_that_dodge_a_string_match_are_refused(path):
 ])
 def test_names_that_merely_contain_git_still_pass(path):
     assert assert_path_unprotected(path) == path.lower()
+
+
+@pytest.mark.parametrize("path", [
+    "guardrails.md", "GUARDRAILS.md", "GuardRails.MD", "GUARDRAILS", "guardrails",
+    "guardrails/", "guardrails\\", "pkg/guardrails", "pkg/guardrails/", "pkg/guardrails/safety.txt",
+    "guardrails/rules.md", "guardrails.d/rules.md", "guardrails.bak", "guardrails.old", "guardrails.tmp",
+    ".guardrails", ".guardrails/x", ".GUARDRAILS.md", "a/.guardrails/config",
+    "guardrails․md", "guardrails․json", "pkg/guardrails․md",               # U+2024 one-dot leader
+    "ｇｕａｒｄｒａｉｌｓ", "ｇｕａｒｄｒａｉｌｓ.md", "pkg/ｇｕａｒｄｒａｉｌｓ/x",  # fullwidth NFKC
+    "guardrails ", " guardrails", "guardrails. ", "guardrails..", "a/guardrails /x",
+])
+def test_guardrails_stem_and_variants_are_refused(path):
+    refused(path)
+

@@ -32,7 +32,7 @@ PROTECTED_COMPONENTS = frozenset({
 #
 # A segment is protected when its stem (name up to the first dot, leading dots ignored) is one of
 # these. `hooks`, `hooks.json`, `hooks.bak` and `.hooks` all have the stem `hooks`; `hookup` does not.
-PROTECTED_STEMS = frozenset({"hooks", "hook", "guard"})
+PROTECTED_STEMS = frozenset({"hooks", "hook", "guard", "guardrails"})
 # Git control paths, matched as WHOLE segments (so `.gitignore`, `gitutils.py` and `github/` stay
 # ordinary): `.git` (a directory, or a file in a worktree) decides core.hooksPath and filter drivers,
 # `.gitmodules` and `.gitattributes` redirect what git runs, `.github` holds CI. Each protects the whole

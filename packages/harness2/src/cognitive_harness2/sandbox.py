@@ -230,7 +230,14 @@ def _stage_name(name: str) -> str:
     for seg in name.split("/"):
         if seg in ("", ".", "..") or seg != seg.strip():
             raise ValueError(f"invalid staged file name {name!r}: not a clean relative path (segment {seg!r})")
-    invariants.assert_path_unprotected(name)
+    try:
+        invariants.assert_path_unprotected(name)
+    except invariants.InvariantViolation:
+        # Invariant harness files (guardrails.md) must be staged so the agent runs
+        # with its guardrails, but protected execution paths (hooks, .git, guard) are refused.
+        if name.rstrip(". ").lower() == "guardrails.md":
+            return name
+        raise
     return name
 
 
