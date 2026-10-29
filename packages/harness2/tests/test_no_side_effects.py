@@ -28,7 +28,9 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from cognitive_harness2 import settings, sweep_plan
+from h2_profiles import PROFILE
+
+from cognitive_harness2 import sweep_plan
 from cognitive_harness2.invariants import InvariantViolation
 from cognitive_harness2.quota import QuotaVerdict
 from cognitive_harness2.substrate import CognitiveSubstrate, PreflightError, StagedInstall, openrouter_quota_check
@@ -156,7 +158,7 @@ def test_a_trap_is_not_swallowed_by_except_exception(traps):
 
 # ── every seam, happy and refusing, with the traps armed ──────────────────────────
 
-def exercise_every_seam(surface, tmp_path, st) -> dict[str, int]:
+def exercise_every_seam(surface, tmp_path, profile) -> dict[str, int]:
     done = {"happy": 0, "refused": 0}
 
     def happy(fn):
@@ -181,7 +183,10 @@ def exercise_every_seam(surface, tmp_path, st) -> dict[str, int]:
 
     # seam 2: upstream_egress (the proposer is described, never created)
     env = {"PATH": "/usr/bin", "HOME": "/tmp/h"}
-    ok = check_proposer({"kind": "opencode", "model": "ollama/q", "base_url": LOCAL, "env": env, "cwd": "/tmp/w"}, st)
+    def propose(raw, channel="local", **kw):
+        return check_proposer(raw, profile=profile, channel=channel, classification="open", **kw)
+
+    ok = propose({"kind": "opencode", "model": "ollama/qwen3:30b", "base_url": LOCAL, "env": env, "cwd": "/tmp/work"})
     assert ok.allowed
     done["happy"] += 1
     for raw in (
@@ -192,7 +197,7 @@ def exercise_every_seam(surface, tmp_path, st) -> dict[str, int]:
         {"kind": "opencode", "model": "ollama/q", "base_url": LOCAL, "env": {**env, "OPENROUTER_API_KEY": SECRET}},
         {"kind": "nope"}, None,
     ):
-        assert not check_proposer(raw, st).allowed
+        assert not propose(raw).allowed
         done["refused"] += 1
 
     # seam 3: substrate (construct, surface, materialise, release, execute/read refuse, preflight with injected pieces)
@@ -222,19 +227,20 @@ def exercise_every_seam(surface, tmp_path, st) -> dict[str, int]:
     # seam 4: sweep plan
     d = ok
     base = dict(surface=surface, candidates=[SweepCandidate("sp", "systemprompt.md")], k=1, n_tasks=1, max_sessions=3,
-                max_wall_seconds=600, max_cost_or_tokens=CostCap("tokens", 100_000), proposer=d, readiness=READY)
+                max_wall_seconds=600, max_cost_or_tokens=CostCap("tokens", 100_000), proposer=d, readiness=READY,
+                profile=profile, channel="local", classification="open")
     happy(lambda: plan_sweep(**base))
     for over in ({"max_sessions": None}, {"max_wall_seconds": 0}, {"max_cost_or_tokens": CostCap("usd", float("inf"))},
                  {"readiness": {"sandbox": {"ok": False, "detail": "x"}}},
-                 {"proposer": check_proposer({"kind": "opencode", "model": "ollama/q", "base_url": "https://x.example"}, st)},
+                 {"proposer": propose({"kind": "opencode", "model": "ollama/q", "base_url": "https://x.example"})},
+                 {"channel": "undeclared"}, {"classification": "restricted"}, {"profile": None},
                  {"candidates": [SweepCandidate("g", "guardrails.md")]}):
         refuses(lambda o=over: plan_sweep(**{**base, **o}))
     return done
 
 
 def test_every_seam_runs_with_every_process_and_network_path_trapped(traps, surface, tmp_path, private_tmp):
-    st = settings.from_env({settings.ENV_EXPERIENCE_ROOT: str(tmp_path / "exp")})
-    done = exercise_every_seam(surface, tmp_path, st)
+    done = exercise_every_seam(surface, tmp_path, PROFILE)
     assert traps.attempts == []
     assert done["happy"] >= 8 and done["refused"] >= 25      # the paths really ran
 
@@ -286,9 +292,8 @@ class DockerLog:
 
 def test_no_other_seam_touches_the_docker_daemon(monkeypatch, surface, tmp_path, private_tmp):
     log = DockerLog(monkeypatch)
-    st = settings.from_env({settings.ENV_EXPERIENCE_ROOT: str(tmp_path / "exp")})
     # everything except the real preflight (which the exercise only runs against an injected fake)
-    exercise_every_seam(surface, tmp_path, st)
+    exercise_every_seam(surface, tmp_path, PROFILE)
     assert log.calls == []
 
 

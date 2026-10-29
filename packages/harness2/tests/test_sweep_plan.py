@@ -11,7 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from cognitive_harness2 import settings
+from h2_profiles import PROFILE, make_profile
+
 from cognitive_harness2.quota import QuotaVerdict
 from cognitive_harness2.sweep_plan import (
     CostCap,
@@ -34,15 +35,17 @@ def surface():
     return OPENCODE_SURFACE
 
 
-@pytest.fixture
-def st(tmp_path):
-    return settings.from_env({settings.ENV_EXPERIENCE_ROOT: str(tmp_path / "exp")})
+LOCAL_CFG = {"kind": "opencode", "model": "ollama/qwen3:30b", "base_url": LOCAL, "env": CLEAN_ENV,
+             "cwd": "/tmp/work"}
+
+
+def decide(config=LOCAL_CFG, channel="local", *, profile=PROFILE, classification="open", **kw):
+    return check_proposer(config, profile=profile, channel=channel, classification=classification, **kw)
 
 
 @pytest.fixture
-def decision(st):
-    d = check_proposer({"kind": "opencode", "model": "ollama/qwen3", "base_url": LOCAL, "env": CLEAN_ENV,
-                        "cwd": "/tmp/work"}, st)
+def decision():
+    d = decide()
     assert d.allowed
     return d
 
@@ -52,7 +55,7 @@ def good(surface, decision, **over):
         surface=surface,
         candidates=[SweepCandidate("sp", "systemprompt.md"), SweepCandidate("tools", "tool_descriptions/tool_guidance.md")],
         k=1, n_tasks=2, max_sessions=6, max_wall_seconds=3600, max_cost_or_tokens=CostCap("usd", 5.0),
-        proposer=decision, readiness=OK_READINESS,
+        proposer=decision, readiness=OK_READINESS, profile=PROFILE, channel="local", classification="open",
     )
     args.update(over)
     return args
@@ -93,11 +96,11 @@ def test_the_plan_cannot_be_built_without_the_gate(surface, decision):
         p.max_sessions = 10**9  # type: ignore[misc]
 
 
-def test_the_cost_class_comes_from_advice(surface, st):
-    d = check_proposer({"kind": "opencode", "model": "ollama/x", "base_url": "https://zdr.example/v1", "env": CLEAN_ENV},
-                       settings.from_env({settings.ENV_EXPERIENCE_ROOT: "/tmp/exp-x", settings.ENV_ZDR_ENDPOINTS: "zdr.example"}))
+def test_the_cost_class_comes_from_advice(surface):
+    d = decide({"kind": "opencode", "model": "ollama/x", "base_url": "https://zdr.example/v1", "env": CLEAN_ENV},
+               "zdr-host")
     assert d.allowed
-    assert plan_sweep(**good(surface, d)).cost_class == "metered"
+    assert plan_sweep(**good(surface, d, channel="zdr-host")).cost_class == "metered"
 
 
 def test_unknown_readiness_is_allowed_and_recorded(surface, decision):
@@ -189,7 +192,10 @@ def test_sessions_already_spent_count_against_the_cap(surface, decision):
 def test_money_already_spent_counts_against_a_usd_cap(surface, decision):
     assert "ledger" in text(refused(**good(surface, decision, ledger=SimpleNamespace(P=0, usd=5.0))))
     plan_sweep(**good(surface, decision, ledger=SimpleNamespace(P=0, usd=4.99)))
-    plan_sweep(**good(surface, decision, ledger=SimpleNamespace(P=0, usd=999.0), max_cost_or_tokens=CostCap("tokens", 5)))
+    # a tokens cap cannot be compared with dollars, but the channel always has a usd cap of its own
+    plan_sweep(**good(surface, decision, ledger=SimpleNamespace(P=0, usd=4.0), max_cost_or_tokens=CostCap("tokens", 5)))
+    assert "channel" in text(refused(**good(surface, decision, ledger=SimpleNamespace(P=0, usd=999.0),
+                                            max_cost_or_tokens=CostCap("tokens", 5))))
 
 
 def test_an_unreadable_ledger_is_refused(surface, decision):
@@ -254,8 +260,8 @@ def test_no_quota_verdict_leaves_quota_as_the_caller_reported_it(surface, decisi
 
 # ── the proposer decision ─────────────────────────────────────────────────────────
 
-def test_a_refused_proposer_decision_refuses_the_plan(surface, st):
-    d = check_proposer({"kind": "opencode", "model": "ollama/x", "base_url": "https://api.openai.com/v1", "env": CLEAN_ENV}, st)
+def test_a_refused_proposer_decision_refuses_the_plan(surface):
+    d = decide({"kind": "opencode", "model": "ollama/x", "base_url": "https://api.openai.com/v1", "env": CLEAN_ENV})
     assert not d.allowed
     e = refused(**good(surface, d))
     assert "proposer" in text(e) and "api.openai.com" in text(e)
@@ -303,10 +309,107 @@ def test_an_unrecognised_surface_is_refused(decision):
     assert "surface" in text(refused(**good(object(), decision)))
 
 
-def test_every_reason_is_reported_together(surface, st):
-    d = check_proposer({"kind": "claude_cli", "model": "claude-x"}, st)
+def test_every_reason_is_reported_together(surface):
+    d = decide({"kind": "claude_cli", "model": "claude-x"})
     e = refused(**good(surface, d, max_sessions=None, readiness={"sandbox": {"ok": False, "detail": "x"}},
                        candidates=[SweepCandidate("g", "guardrails.md")]))
     t = text(e)
     for needle in ("max_sessions", "sandbox", "candidate", "proposer"):
         assert needle in t, needle
+
+
+# ── the channel: declared, allowed for this sweep, and the source of the hard caps ─
+
+def test_the_plan_records_its_channel_classification_and_the_channels_caps(surface, decision):
+    p = plan_sweep(**good(surface, decision))
+    assert (p.channel, p.classification) == ("local", "open")
+    assert p.channel_caps == {"sessions": 30, "wall_s": 3600.0, "cost_usd": 5.0}
+    d = p.to_dict()
+    assert d["channel"] == "local" and d["classification"] == "open" and d["channel_caps"]["sessions"] == 30
+    assert p.requires_human_approval is True
+
+
+def test_requested_caps_are_clipped_to_the_channels_and_the_plan_says_so(surface, decision):
+    p = plan_sweep(**good(surface, decision, max_sessions=900, max_wall_seconds=10**5,
+                          max_cost_or_tokens=CostCap("usd", 500.0)))
+    assert (p.max_sessions, p.max_wall_seconds, p.max_cost_or_tokens) == (30, 3600.0, CostCap("usd", 5.0))
+    assert sum("channel's cap" in w for w in p.warnings) == 3
+
+
+def test_a_request_under_the_channels_caps_is_kept(surface, decision):
+    p = plan_sweep(**good(surface, decision, max_sessions=7, max_wall_seconds=60, max_cost_or_tokens=CostCap("usd", 1.0)))
+    assert (p.max_sessions, p.max_wall_seconds, p.max_cost_or_tokens) == (7, 60, CostCap("usd", 1.0))
+    assert not any("channel's cap" in w for w in p.warnings)
+
+
+def test_a_plan_that_needs_more_than_the_channels_session_cap_is_refused(surface, decision):
+    # k=5 needs 15 sessions per task; the channel allows 30, however much was requested
+    e = refused(**good(surface, decision, k=5, n_tasks=3, max_sessions=1000))
+    assert "45" in text(e) and "max_sessions 30" in text(e) and "channel's cap" in text(e)
+    plan_sweep(**good(surface, decision, k=5, n_tasks=2, max_sessions=1000))
+
+
+def test_the_ledger_is_held_to_the_channels_usd_cap_too(surface, decision):
+    e = refused(**good(surface, decision, ledger=SimpleNamespace(P=0, usd=5.0), max_cost_or_tokens=CostCap("usd", 100.0)))
+    assert "channel 'local'" in text(e)
+
+
+@pytest.mark.parametrize("over", [{"channel": "nope"}, {"channel": None}, {"channel": ""}, {"channel": 5},
+                                  {"profile": None}, {"profile": {}}, {"profile": "p"}])
+def test_an_undeclared_channel_or_a_missing_profile_refuses_the_plan(surface, decision, over):
+    t = text(refused(**good(surface, decision, **over)))
+    assert "profile" in t or "channel" in t
+
+
+def test_a_profile_with_no_file_refuses_and_says_how_to_create_one(surface, decision):
+    from cognitive_harness2.channels import ChannelProfile
+    e = refused(**good(surface, decision, profile=ChannelProfile(source="/x/p.toml", declared=False)))
+    assert "/x/p.toml" in text(e) and "[channels.<name>]" in text(e)
+
+
+@pytest.mark.parametrize("cls", [None, "gated", "restricted", "unstated", "junk"])
+def test_a_missing_or_stricter_classification_than_the_decision_is_refused(surface, decision, cls):
+    e = refused(**good(surface, decision, classification=cls))
+    assert "classification" in text(e)
+
+
+def test_a_missing_classification_is_restricted_and_noted(surface):
+    d = decide(classification=None)
+    assert d.view["classification"] == "restricted"
+    p = plan_sweep(**good(surface, d, classification=None))
+    assert p.classification == "restricted" and any("treated as restricted" in w for w in p.warnings)
+
+
+def test_a_decision_made_for_another_channel_cannot_be_reused(surface):
+    other = decide({"kind": "opencode", "model": "ollama/x", "base_url": "https://zdr.example/v1", "env": CLEAN_ENV},
+                   "zdr-host")
+    assert other.allowed
+    e = refused(**good(surface, other))          # the sweep names channel "local"
+    assert "channel 'zdr-host'" in text(e)
+
+
+def test_a_decision_made_under_another_zdr_mode_cannot_be_reused(surface):
+    off = decide(zdr="off")
+    assert off.allowed
+    assert "zdr" in text(refused(**good(surface, off)))
+
+
+def test_the_channel_policy_is_rechecked_by_the_plan(surface):
+    # a forged-looking but real decision for the claude channel under zdr=off ...
+    d = decide({"kind": "claude_cli", "model": "claude-x", "base_url": "https://api.anthropic.com", "env": CLEAN_ENV},
+               "claude", zdr="off")
+    assert d.allowed
+    plan_sweep(**good(surface, d, channel="claude", zdr="off"))
+    # ... is not usable under the default strict mode, whatever the decision says
+    e = refused(**good(surface, d, channel="claude"))
+    assert "rule retention-vs-zdr" in text(e)
+    e = refused(**good(surface, d, channel="claude", zdr="off", classification="gated"))
+    assert "rule unknown-retention-open-only" in text(e)
+
+
+def test_a_restricted_sweep_on_a_gated_channel_is_refused(surface):
+    d = decide({"kind": "opencode", "model": "openrouter/anthropic/claude-x", "base_url": "https://openrouter.ai/api/v1",
+                "env": CLEAN_ENV}, "openrouter", classification="gated")
+    assert d.allowed
+    plan_sweep(**good(surface, d, channel="openrouter", classification="gated"))
+    assert "classification-ceiling" in text(refused(**good(surface, d, channel="openrouter", classification="restricted")))
