@@ -453,3 +453,10 @@ def test_redaction_removes_the_value_everywhere_and_a_truncated_prefix():
 ])
 def test_terminal_escapes_and_control_characters_are_stripped(raw, clean):
     assert sr.sanitize_terminal(raw) == clean
+
+
+def test_the_file_size_limit_is_a_flag_and_is_validated(world):
+    assert "fsize=268435456:268435456" in flags(session_argv(world)[1], "--ulimit")
+    for n in (0, 1000, 1 << 40, "big"):
+        with pytest.raises(SessionRefused):
+            runner().authorize(spec(world, limits=SessionLimits(file_bytes=n)))

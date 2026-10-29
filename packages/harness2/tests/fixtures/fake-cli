@@ -95,6 +95,7 @@ case "$1" in
   noisy) head -c "$2" /dev/zero | tr '\0' x ;;
   forkbomb) for i in $(seq 1 400); do sleep 30 & done 2>&1; echo "reached-end children=$(jobs -p | wc -l)" ;;
   memhog) python3 -c 'import sys; b = bytearray(int(sys.argv[1]) * 1024 * 1024); print("allocated")' "$2" ;;
+  fsfill) dd if=/dev/zero of="$2/big" bs=1M count="$3" 2>&1 | tail -n 1; echo "rc=${PIPESTATUS[0]}"; ls -l "$2/big" | awk '{print "size="$5}' ;;
   tmpfill) dd if=/dev/zero of=/tmp/big bs=1M count="$2" 2>&1 | tail -n 1; echo "rc=${PIPESTATUS[0]}" ;;
   harvest-mess)
     WS="$2"

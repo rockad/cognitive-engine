@@ -131,6 +131,7 @@ class SessionLimits:
     max_output_bytes: int = 10 * 1024 * 1024
     proxy_memory: str = "128m"
     proxy_pids: int = 64
+    file_bytes: int = 256 * 1024 * 1024        # RLIMIT_FSIZE: the largest single file the session can write
 
     def check(self) -> None:
         if not (isinstance(self.pids, int) and 8 <= self.pids <= 4096):
@@ -142,6 +143,8 @@ class SessionLimits:
             raise SessionRefused("cpus must be a small decimal number such as 1 or 2")
         if not (isinstance(self.max_output_bytes, int) and 1024 <= self.max_output_bytes <= 1 << 28):
             raise SessionRefused("max_output_bytes must be from 1 KiB to 256 MiB")
+        if not (isinstance(self.file_bytes, int) and 1 << 20 <= self.file_bytes <= 1 << 36):
+            raise SessionRefused("file_bytes must be from 1 MiB to 64 GiB")
 
 
 @dataclass(frozen=True)
@@ -308,7 +311,8 @@ def build_session_run(plan: Plan, names: Names, *, docker: str, host: str, cred_
     argv += ["--network", names.internal, "--dns", "127.0.0.1",
              "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
              "--pids-limit", str(lim.pids), "--memory", lim.memory, "--memory-swap", lim.memory, "--cpus", lim.cpus,
-             "--ulimit", "core=0", "--ulimit", "nofile=4096:4096", "--user", USER,
+             "--ulimit", "core=0", "--ulimit", "nofile=4096:4096",
+             "--ulimit", f"fsize={lim.file_bytes}:{lim.file_bytes}", "--user", USER,
              *_tmpfs("/tmp", lim.tmpfs_size, exec_=spec.tmp_exec, owned=False),
              *_tmpfs(HOME, lim.tmpfs_size, exec_=spec.tmp_exec, owned=True)]
     for d in spec.tmpfs_dirs:

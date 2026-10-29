@@ -596,3 +596,24 @@ def test_reap_all_removes_only_labelled_leftovers(verified, proposer_image, egre
     assert any(x.startswith("container") for x in removed) and any(x.startswith("network") for x in removed)
     assert session_leftovers(verified) == []
     assert egress_world.network in docker(verified, "network", "ls", "--format", "{{.Name}}").stdout      # not labelled: untouched
+
+
+# ── additions from the threat model ──────────────────────────────────────────────
+
+def test_a_symlink_pre_created_in_the_workspace_cannot_reach_the_host_file_it_names(verified, proposer_image, egress_world, ws, tmp_path):
+    secret = tmp_path / "host-secret.txt"
+    secret.write_text("HOST-ONLY-CONTENT")
+    (ws / "hostlink").symlink_to(secret)                    # an absolute symlink to a host file outside the workspace
+    (ws / "uplink").symlink_to("../host-secret.txt")
+    r = hosted_runner(verified, proposer_image, egress_world)
+    res = r.run(spec(ws, "cat", str(ws / "hostlink")))
+    assert res.exit_code != 0 and "HOST-ONLY-CONTENT" not in res.stdout + res.stderr
+    res = r.run(spec(ws, "cat", str(ws / "uplink")))
+    assert res.exit_code != 0 and "HOST-ONLY-CONTENT" not in res.stdout + res.stderr
+    assert {f.rule for f in res.harvest.findings} == {"symlink-escape"}
+
+
+def test_a_single_file_cannot_exceed_the_file_size_limit_on_the_host_backed_workspace(verified, proposer_image, egress_world, ws):
+    r = hosted_runner(verified, proposer_image, egress_world)
+    res = r.run(spec(ws, "fsfill", str(ws), "20", limits=SessionLimits(file_bytes=4 * 1024 * 1024)))
+    assert "rc=0" not in res.stdout and int(kv(res.stdout)["size"]) <= 4 * 1024 * 1024
