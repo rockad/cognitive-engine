@@ -65,6 +65,24 @@ describe('Claude Code ceiling', () => {
     expect(decideClaudeAgentCall({}, null)).toBeNull();
   });
 
+  it('words every ask as a fluent sentence (no "uses model ... cannot be compared")', () => {
+    const reasons = [
+      decideClaudeAgentCall({ model: 'opus' }, null)?.reason, // session model unknown
+      decideClaudeAgentCall({ model: 'haiku' }, 'some-future-model')?.reason, // session model not rankable
+      decideClaudeAgentCall({ model: 'mystery' }, 'claude-sonnet-5-5')?.reason, // requested model unknown
+      decideClaudeAgentCall({ model: 'opus' }, 'claude-sonnet-5-5')?.reason // escalation
+    ];
+    for (const r of reasons) {
+      expect(r).toBeDefined();
+      expect(r).not.toMatch(/uses model/);
+      expect(r).toContain('needs approval: model "');
+    }
+    expect(reasons[0]).toContain('cannot be compared with the session model, which could not be determined.');
+    expect(reasons[1]).toContain('cannot be compared with the session model "some-future-model", which Jev cannot rank.');
+    expect(reasons[2]).toContain('is not a model Jev can rank.');
+    expect(reasons[3]).toContain('is stronger than the session model');
+  });
+
   it('uses the subagent definition model when the call sets none', () => {
     expect(decideClaudeAgentCall({ subagent_type: 'x' }, 'claude-sonnet-5-5', 'opus')?.decision).toBe('ask');
     expect(decideClaudeAgentCall({ subagent_type: 'x' }, 'claude-sonnet-5-5', 'haiku')).toBeNull();

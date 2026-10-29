@@ -62,7 +62,7 @@ export function decideClaudeAgentCall(
       : 'Approve to run it, or deny and re-run it on a model Jev can rank.';
   return {
     decision: 'ask',
-    reason: `[jev] This delegation uses ${assessment.reason}. ${advice}`,
+    reason: `[jev] This delegation needs approval: ${assessment.reason}. ${advice}`,
     audit: { kind: assessment.kind, requested: model ?? null, sessionModel, sessionModelSource }
   };
 }
