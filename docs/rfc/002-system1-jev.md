@@ -76,31 +76,40 @@ Establishes Track 1 of Cognitive Engine: migrating the TypeSafe Jev System 1 cop
 - Develop and verify parser tests against committed fixtures.
 
 ### 3.5 Native Hook Failure Policy
-- Guard hooks use native `"onFailure": "block"` (Claude Code >= 2.1.295) to prevent silent fail-open bypasses.
-- Log-only canary hooks remain fail-open (`"onFailure": "continue"`).
+- Guard hooks use native `"onFailure": "block"` (Claude Code >= 2.1.295) to prevent silent fail-open bypasses. Tested and verified in headless runs: crashing hook with `onFailure: "block"` blocks tool execution.
+- Log-only canary hooks remain fail-open (`"onFailure": "continue"` or omitted).
 - Regression test: inject process termination to verify hook failure blocks tool execution.
 
-### 3.6 Implementation Ownership Division
+### 3.6 Implementation Ownership Division & Operational Rules
 - **Claude Code Ownership**:
   - `adapters/claude/hooks/hooks.json` configuration.
-  - `packages/jev/src/guard.ts` (fail-open shell wrapper, fable rank / version-aware, active in both `on` and `on-demand` modes).
+  - `packages/jev/src/guard.ts` (fail-closed, version-aware model ranking, active in both `on` and `on-demand` modes across both harnesses).
   - `packages/jev/src/workflow-guard.ts` (Acorn AST inspector and tests).
+  - `packages/jev/src/core/config.ts` (`validateJevConfig`, `inspectJevConfigFile`).
 - **Antigravity Ownership**:
   - Plugin agent definitions (`agentDefinitionModel`).
   - Antigravity hook path quoting in `adapters/antigravity/src/index.ts`.
+- **Config Rule (User Decision)**:
+  - Do nothing when Jev is explicitly `off`.
+  - When config is malformed, fail loudly: every guarded call (`Agent|Task|Workflow`, both harnesses) answers `ask` with file path, problems, and fix; writes one stderr line; emits a `config_malformed` audit event.
+  - Missing config file or `{}` is treated as unset and takes the default `off`.
+- **Known Operational Limits**:
+  - Built-in agentTypes (e.g. `general-purpose`) prompt `ask` (no static allow-list yet).
+  - Resume gap: after `--resume --model X`, transcript tail can reflect the previous model until a switch event is recorded.
+  - Static analysis cannot prove dynamic runtime indirection (fail closed on unprovable forms).
 
 ---
 
 ## 4. Acceptance Criteria
 
-- [ ] `packages/jev` compiles under Bun with 0 TypeScript errors.
+- [x] `packages/jev` compiles under Bun with 0 TypeScript errors.
 - [ ] Stdio and Streamable HTTP transports (`:8115`) functional with strict tool argument validation.
-- [ ] Subagent guard triggers `ask` on any escalation above active session model.
-- [ ] Model alias normalization resolves `opus->5.5`, `sonnet->5.5`, `fable->5.1`.
-- [ ] Session model state tracking via `PostModelSwitch` with transcript-tail fallback.
-- [ ] Acorn AST workflow parser fails closed on dynamic expressions, spreads, and parse errors.
-- [ ] Test fixtures committed from live canary payload captures.
-- [ ] Guard hooks configured with `"onFailure": "block"` and verified via failure test.
+- [x] Subagent guard triggers `ask` on any escalation above active session model.
+- [x] Model alias normalization resolves `opus->5.5`, `sonnet->5.5`, `fable->5.1`.
+- [x] Session model state tracking via `PostModelSwitch` with transcript-tail fallback.
+- [x] Acorn AST workflow parser fails closed on dynamic expressions, spreads, and parse errors.
+- [x] Test fixtures committed from live canary payload captures (`packages/jev/tests/fixtures/payloads/`).
+- [x] Guard hooks configured with `"onFailure": "block"` and verified via failure test.
 - [ ] `adapters/` installs cleanly via `engine install-adapters` across Antigravity, Claude Code, and OpenCode.
-- [ ] All existing Jev unit tests and Decision API schemas pass in `packages/jev`.
+- [x] All existing Jev unit tests and Decision API schemas pass in `packages/jev`.
 - [ ] Root `LICENSE` (MIT) applied.

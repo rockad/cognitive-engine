@@ -117,11 +117,13 @@ Empirical testing confirmed that Claude Code workflow-spawned subagents bypass t
   - Capture live payloads (`PreToolUse[Workflow]`, `PostModelSwitch`, `SubagentStart`) with a log-only canary hook.
   - Commit real payloads as test fixtures before implementing production logic.
 - **Native Hook Failure Policy**:
-  - Guard hooks use native `"onFailure": "block"` (Claude Code >= 2.1.295). Log-only hooks stay fail-open.
+  - Guard hooks use native `"onFailure": "block"` (Claude Code >= 2.1.295). Verified in headless runs: crashing hook with `onFailure: "block"` blocks tool execution. Log-only hooks stay fail-open.
   - Unit test kills the hook process to assert a block.
-- **Implementation Ownership Division**:
-  - Claude Code owns: `hooks.json`, `guard.ts` (fail-open shell wrapper, fable rank / version-aware, active in `on` and `on-demand`), and `packages/jev/src/workflow-guard.ts`.
+- **Implementation Ownership Division & Operational Rules**:
+  - Claude Code owns: `hooks.json`, `guard.ts` (fail-closed, version-aware model ranking, active in `on` and `on-demand` for both harnesses), `packages/jev/src/workflow-guard.ts`, and `packages/jev/src/core/config.ts` (`validateJevConfig`, `inspectJevConfigFile`).
   - Antigravity owns: plugin agent definitions (`agentDefinitionModel`) and Antigravity hook path quoting (`adapters/antigravity/src/index.ts`).
+  - Config Rule (User Decision): Do nothing when Jev is explicitly `off`; when config is malformed fail loudly (ask on every guarded call, stderr line, `config_malformed` audit event). Missing file or `{}` = unset = default `off`.
+  - Known Limits: Built-in agentTypes ask (no static allow-list yet), resume gap (after `--resume --model X` transcript tail can show previous model until switch event), static analysis cannot prove dynamic runtime indirection.
 
 ---
 
@@ -184,17 +186,16 @@ Full list with evidence in [RFC 003 §4](../rfc/003-memory-lookup.md). The ones 
     - Proposes candidate prompt/tool/context mutations across allowed dimensions without ground truth.
     - Behavioral contrast composer synthesizes candidate outputs into human-reviewable proposals.
   - **Dual-Engine Execution Isolation**:
-    - Primary: Parallel candidate execution runs exclusively inside local Docker Sandboxes via standalone `sbx` CLI.
+    - Primary: Parallel candidate execution runs inside local Docker Sandboxes via standalone `sbx` CLI. (Implemented via `SbxRunner`, unverified on host as `sbx` is not installed).
     - Fallback: Ephemeral rootless Docker container sandbox (`--network none`, `--read-only`, zero off-host egress) when `sbx` is not installed.
-    - Host prerequisite: Rootless Docker on this host is a host-setup prerequisite owned by the user (`sudo`), status: **not started**. Slice 2 stays blocked on it.
+    - Host prerequisite: Rootless Docker is **installed and verified on host** (`unix:///run/user/1000/docker.sock`, `docker info` reports `name=rootless`). 21 real-daemon integration tests pass unskipped.
   - **Fail-Closed Sandbox Fallback**:
     - If neither `sbx` nor Docker is available, candidate probing fails closed immediately.
     - Optional `mkdtemp` worktree mode generates diffs for inspection only and never executes untrusted code.
   - **Decoupled Probe Triggers**:
-    - Probing is completely decoupled from routing confidence metrics.
-    - Fires via:
-      - Advisory push via hook: Post-task verification failure (`jev_judge` returns `FAIL` or score < 0.50), or execution retry limit exhausted in the agent loop.
-      - Explicit pull tool / command: On-demand request (`/probe <task>` in chat, `engine probe`, or `harness2_trigger` tool).
+    - Probing is completely decoupled from routing confidence metrics. Stagnation heuristics are dropped; triggers are exactly RFC 004 §2.3:
+      - Advisory push via hook: Post-task verification failure (`jev_judge` returns `FAIL` or score < 0.50), or execution retry limit exhausted ($N \ge 3$) in the agent loop. Documented in `packages/harness2/hooks/harness2-advise.sh` (snippet in README, not installed).
+      - Explicit pull tool: On-demand request via read-only `harness2_trigger` (`advise` = trigger fired; `ready` = true|false|null; `blockers` listed; zero execution, pure read), `/probe <task>` in chat, or `engine probe`.
   - **Daily Quota Pre-Flight Check**:
     - Pre-flights `free_model_daily_requests` from `GET /api/v1/key` before triggering candidate sweeps.
     - Throttles or skips sweeps when OpenRouter daily quota is constrained.
@@ -202,28 +203,24 @@ Full list with evidence in [RFC 003 §4](../rfc/003-memory-lookup.md). The ones 
     - Guardrails, Egress/ZDR policies, Session ceilings, Lifecycle hooks, and the human gate on composer are immune to mutation.
   - **Continual Experience Learning**:
     - Proposes reflection entries into out-of-tree domain libraries at `~/.local/share/cognitive-engine/experiences/<domain>/`.
-    - Requires human sign-off before committing to permanent storage.
+    - Requires human sign-off before committing to permanent storage via CLI.
 
-#### 3.3.1 Track 3 Status & Refinements: Slice 1 Verification & Slice 2 Roadmap (2026-10-28)
+#### 3.3.1 Track 3 Status & Refinements: Slice 1 & Slice 2 Completed, Slice 3 Roadmap (2026-10-29)
 
 - **Slice 1 Completed (`feat/track3-harness2`)**:
   - Implemented FastMCP server on `127.0.0.1:8120` with `host_origin_protection="auto"` from the first commit.
   - Verified 12/12 on the black-box MCP conformance runner (`tools/mcp_conformance.py`).
   - Added read-only offline `harness2_status` tool and `dry_run` support on `harness2_propose`.
-  - 129 package tests passing cleanly.
-- **Option A Dual-Engine Isolation (Slice 2)**:
-  - Primary Sandbox: Probing trajectories execute in local sandboxes using native `sbx` when available on `$PATH`.
-  - Fallback Sandbox: If `sbx` is unavailable, prober falls back to an ephemeral, rootless Docker container sandbox (`--network none`, `--read-only`, zero off-host egress) rather than aborting or generating static diffs only.
-  - Host Prerequisite: Rootless Docker on host is a user-owned `sudo` prerequisite, status: **not started**; Slice 2 stays blocked on it.
-  - Fail-Closed: If neither `sbx` nor rootless Docker is accessible, prober fails closed without running untrusted code.
-- **Upstream Citation Lineage Contract**:
-  - `packages/harness2/NOTICE` and `README.md` must formally cite upstream Google Research Harness² (Xu et al. 2026, [arXiv:2610.14224](https://arxiv.org/abs/2610.14224)) as primary, with Promptbreeder and Tool Makers as related work.
-  - Document that `packages/harness2` consumes upstream as a pinned git dependency, with a minimal fork only if forced, and preserves Apache-2.0.
-- **Slice 2 Next Steps**:
-  - User completes rootless Docker host prerequisite.
-  - Implement ephemeral rootless Docker sandbox runner in `packages/harness2/prober/`.
-  - Wire advisory push hooks (`jev_judge` < 0.50, retry exhaustion) and explicit pull tools (`harness2_trigger` / `/probe`).
-  - Update `packages/harness2/NOTICE` with the upstream Google Research citation.
+  - Upstream pinned at `1cfe254e8d25b15f37048c3730134686abe60335` as an optional extra (`[tool.uv.sources]`, extra `upstream`).
+- **Slice 2 Completed (`feat/track3-harness2`)**:
+  - Ephemeral rootless Docker sandbox runner (`DockerRunner`) implemented with full command-line hardening (`--network none`, `--read-only`, `--cap-drop ALL`, `no-new-privileges`, `user 65534`, readonly bind mount).
+  - 21 real rootless-Docker integration tests pass on this host daemon.
+  - Decoupled triggers: `harness2_trigger` pull tool (read-only advise/ready check) and `hooks/harness2-advise.sh` (advisory push hook script). Stagnation trigger dropped per user decision.
+  - NOTICE and README formally cite Google Research / Apache-2.0 upstream as primary; Promptbreeder and Tool Makers cited as related work only.
+  - Flat package layout in `packages/harness2/src/cognitive_harness2/`.
+- **Slice 3 Two Gated Steps (Upstream Wiring Roadmap)**:
+  - **Slice 3a (Safety Seams)**: Wire `MUTABLE` <-> upstream `SurfaceSpec` default-deny, egress gate on the Proposer endpoint, `Substrate.preflight` -> `require_rootless_docker`, quota/ledger pre-flight. Zero model calls, zero execution. Subject to independent review and user gate.
+  - **Slice 3b (Execution)**: `DockerRunner` as `Substrate.execute`, one capped dry-run, hard budget cap, `requires_human_approval` kept intact. Runs only on user's separate go.
 
 ---
 
@@ -306,9 +303,10 @@ WS5 and WS6 are independent. **WS6 is done and committed on `feat/track1-jev-ada
 | **WS4** | **Track 4** | `feat/track4-egress-retirement` | `cognitive-engine/`, `doppelganger/`, `agentic-hub/` | Cross-runtime egress gates, consumer rebinding, and gated surgical retirement of legacy plugins | Antigravity (`system-operator`) | `flash_lite` |
 | **WS5** | **Cross-cutting** | `feat/mcp-conformance` | `tools/` | Black-box MCP conformance runner and per-server probe specs (12/12 verified across all daemons) | Claude Code (`qa-engineer`) | `flash` |
 | **WS6** | **Track 1 follow-up** | `feat/track1-jev-adapters` | `packages/jev/` | Strict `registerTool` migration for all 12 tools plus the `Origin` check (PR #3) | Claude Code (`code-engineer`) | `flash` |
-| **WS7** | **Track 1 seam** | `feat/track1-jev-adapters` | `adapters/claude/hooks/`, `packages/jev/src/workflow-guard.ts` | Workflow Guard static AST inspector on `Workflow` tool closing subagent bypass hole | Claude Code (`code-engineer`) | `flash` |
-| **WS8** | **Track 3 (Slice 2)** | `feat/track3-harness2` | `packages/harness2/prober/`, `NOTICE` | Ephemeral rootless Docker fallback (`--network none`, `--read-only`), failure triggers, upstream citation | Claude Code (`code-engineer`) | `flash` |
+| **WS7** | **Track 1 seam** | `feat/jev-workflow-guard` | `adapters/claude/hooks/`, `packages/jev/src/workflow-guard.ts` | Workflow Guard static AST inspector on `Workflow` tool closing subagent bypass hole | Claude Code (`code-engineer`) | `flash` |
+| **WS8** | **Track 3 (Slice 2)** | `feat/track3-harness2` | `packages/harness2/src/cognitive_harness2/`, `NOTICE` | Ephemeral rootless Docker fallback (`--network none`, `--read-only`), failure triggers, upstream citation | Claude Code (`code-engineer`) | `flash` |
 | **WS9** | **Track 1 review** | `feat/track1-jev-adapters` | `packages/jev/`, `adapters/` | PR #3 remediation, review coordination, and test suite verification | Antigravity (`code-engineer`) | `flash_lite` |
+| **WS10** | **Tooling** | `feat/worktree-protocol` | `tools/wt`, `.githooks/pre-commit`, `AGENTS.md` | Repository-local worktree automation enforcing clean hub and isolated agent worktrees | Antigravity (`code-engineer`) | `flash_lite` |
 
 ---
 
@@ -324,13 +322,13 @@ To ensure seamless peer review with collaborator [@Doc-Cr](https://github.com/Do
      - The guard branch (`feat/jev-workflow-guard`, stacked on `feat/track1-jev-adapters`) merges INTO the PR #3 branch first, then PR #3 -> `main`.
      - Retarget children to `main` after each upstream merge.
    - Keep commits atomic and semantic (`feat:`, `fix:`, `refactor:`, `docs:`, `test:`).
-2. **Planned Worktree Protocol (Repository-Local Automation)**:
-   - *Note*: Planned tooling for this repository only (nothing machine-wide or user-scope):
+2. **Worktree Protocol (Repository-Local Automation)**:
+   - Tooling for this repository only (nothing machine-wide or user-scope):
      - `AGENTS.md` repository rule: "never work in the hub; one agent, one worktree".
      - Standalone helper script `tools/wt` supporting `new`, `list`, `remove`, and `init` operations (refuses a dirty hub or a branch checked out elsewhere).
      - Local `.githooks/pre-commit` rejecting commits attempted directly in the primary worktree unless explicitly overridden with `CE_ALLOW_HUB=1`.
      - Git `core.hooksPath` configured per clone by `tools/wt init`.
-     - *Status*: Documented as planned tooling; not yet implemented.
+     - *Status*: Implemented on branch `feat/worktree-protocol` (commit `d7f4e93`), verified with `tools/tests/test_wt.sh` (11/11 tests pass).
 3. **Pull Request Protocol**:
    - Open PRs against designated target branches on GitHub (`rockad/cognitive-engine`).
    - Title format: `feat(trackX): <short summary> [RFC 00X]` (e.g. `feat(track1): migrate typesafe jev and multi-harness adapters [RFC 002]`).
@@ -365,7 +363,7 @@ Following the approved architectural clarification, work is partitioned by speci
 | **Architectural Governance & PR Remediation** | **Antigravity** | Gemini 3.8 Flash | Dedicated Worktree (`/home/rockad/projects/cognitive-engine-track1`) | Coordinates PR #3 review remediations (WS9), multi-track dependency tracking, RFC alignment. |
 | **Verification Gates & Quality Acceptance** | **Antigravity** | Gemini 3.8 Flash + `jev_judge` | Assigned Worktree | Runs test suites (`bun test`, `uv run pytest`), diff validation, and binary quality gating. |
 | **Git, PRs & Review Coordination with @Doc-Cr** | **Antigravity** | Gemini 3.8 Flash | Assigned Worktree | Branch checkout, semantic commits, PR management, and GitHub review updates. |
-| **Session State & Cross-Harness Continuity** | **Unified Memory** | Recall (:8110) & Lookup (:8100) | Bridge Document | Synchronizes state via `docs/handoffs/antigravity-claude-bridge.md` across both harnesses. |
+| **Session State & Cross-Harness Continuity** | **Unified Memory** | Recall (:8110) & Lookup (:8100) | Live Bridge File | Synchronizes state via `/home/rockad/.agents/antigravity-claude-bridge-cognitive-engine.md` across both harnesses. |
 
 ### 6.2 Dedicated Worktree Protocol
 
