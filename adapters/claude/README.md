@@ -22,6 +22,14 @@ Agents spawned inside a `Workflow` do not pass through the `Agent|Task` hook (ve
 
 - A literal `model` (or an `agentType` whose definition sets one) is ranked against the session model like a direct call. No `model` inherits and is allowed.
 - Anything it cannot read statically asks and names the call site (`file:line:col`): an alias such as `const a = agent`, spread options, computed keys, a model from a variable or `args`, a template with `${}`, member access, `eval`, a parse error, an unreadable or oversized file, a missing agent definition, an unknown `tool_input` shape.
+- The rule is that `agent` and `workflow` may appear only as the callee of a direct call. Anything that could reach them another way also asks: `this`, `arguments`, `globalThis`/`global`/`window`/`self`, `Function`, `eval`, `Reflect`, `Proxy`, `process`, `require`, `Bun`, `Deno`, `module`, `exports`, `import.meta`; the member names `constructor`, `__proto__`, `prototype`, `getPrototypeOf`, `getOwnPropertyDescriptor(s)`; destructuring `agent`/`workflow`; reading them off anything but a plain local name; `setTimeout`/`setInterval` given a string; and any computed lookup whose key is not a literal or provably a number (it could spell `constructor`).
+- Known limits. A static check cannot be sound, so this is a fail-closed filter and not a sandbox:
+  - "Provably a number" trusts `.length`, the index parameter of `map`/`forEach`/`filter`/`some`/`every`/`find*`/`flatMap` callbacks and local names that only ever hold numbers. A user-defined `map` that passes a string, or an object whose `length` is a string, gets through.
+  - `setTimeout(name, ms)` is allowed because it is the common sleep shape. Node and Bun throw on a string there; a runtime that evaluates it would not be covered.
+  - `x.agent` read off a plain unbound name such as `args` is allowed (it is data unless the sandbox hands out an object that holds the function).
+  - Options of `pipeline`, `parallel` and `phase` are not inspected, only `agent()` and `meta.phases`.
+  - The script is checked as written. A file changed between the check and the run, or a saved workflow that Claude Code resolves differently from Jev, is not covered.
+  - Deliberate false positives: every `this`, variable-key lookups such as `o[k]` on plain data (writes into a local `{}`/`[]` are fine), and a local method that happens to be named `agent` or `workflow`.
 
 ## Requirements
 
