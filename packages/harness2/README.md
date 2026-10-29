@@ -22,7 +22,7 @@ uv run cognitive-harness2 experience approve ID --by NAME
 
 ## Rules enforced, and where
 
-- **Protected set** (`invariants.py`): only `prompt`, `tool_description`, `context_assembly` and `decomposition_strategy` are mutable; everything else, and every unknown name, is refused. Protected paths (hooks, hook, guard, egress, ZDR, governance, settings, approval) are refused after normalisation (NFKC, case folding, separators, `.` and `..` segments): the protected files, the protected directories themselves, and everything under them, plus `../`, absolute and drive-letter escapes and control or invisible characters.
+- **Protected set** (`invariants.py`): only `prompt`, `tool_description`, `context_assembly` and `decomposition_strategy` are mutable; everything else, and every unknown name, is refused. Protected paths (hooks, hook, guard, egress, ZDR, governance, settings, approval, and git control paths: `.git`, `.gitmodules`, `.gitattributes`, `.github`) are refused after normalisation (NFKC, case folding, separators, `.` and `..` segments): the protected files, the protected directories themselves, and everything under them, plus `../`, absolute and drive-letter escapes and control or invisible characters.
 - **Triggers** (`triggers.py`): probing starts on a failed verification (`jev_judge` FAIL or score < 0.50), 3+ consecutive failures, or an explicit request. Routing confidence is accepted and ignored. See Triggers below.
 - **Egress** (`egress.py`): under `zdr=strict` only a loopback or explicitly listed zero-retention host, never a free-tier model. Unknown classification is `restricted`.
 - **Quota** (`quota.py`): `GET /api/v1/key` before an OpenRouter run; fails closed on no key, error, or an unreadable response.
@@ -59,7 +59,7 @@ The rules are `triggers.should_probe` (RFC 004 §2.3): `jev_judge` FAIL or score
 - `PostToolUseFailure` counts one failure (a user interrupt is not counted) and advises at 3, then again at 6, 9 and so on.
 - `PostToolUse` (a tool succeeded) and `UserPromptSubmit` (a new task) reset the count.
 - `Stop` shows the user a one-line suggestion if the limit was reached. It does not reset.
-- It never blocks, never exits non-zero (bad input, a missing `jq`, an unwritable state directory all exit 0), makes no network call, and writes only a count: one short numeric token line per failure in `<state>/<session_id>.count` (each failure takes its own line number as its position, so a burst of simultaneous failures still advises exactly once per multiple of the limit, with no lock), mode 700, no prompt text, tool input, error text or secrets. Session ids that are not `[A-Za-z0-9_-]{1,64}` are ignored. Counts older than 7 days are pruned.
+- It never blocks, never exits non-zero (bad input, a missing `jq`, an unwritable state directory all exit 0), makes no network call, and writes only a count: one short numeric token line per failure in `<state>/<session_id>.count` (each failure takes its own line number as its position, so a burst of simultaneous failures still advises exactly once per multiple of the limit, with no lock), mode 700, no prompt text, tool input, error text or secrets. Session ids that are not `[A-Za-z0-9_-]{1,64}` are ignored. A state file or state directory that is a symlink is never read, appended to, reset or created through (the hook exits 0 and does nothing). Counts older than 7 days are pruned.
 - `COGNITIVE_HARNESS2_HOOK_STATE_DIR` overrides the state directory (default `$XDG_STATE_HOME` or `~/.local/state`, then `cognitive-engine/harness2-hook`). The script's `RETRY_LIMIT` is pinned to `triggers.RETRY_LIMIT` by a test.
 
 It is **documented, not installed**. To enable it, merge this into `~/.claude/settings.json` or a project `.claude/settings.json` (not the Jev adapter's `hooks.json`), replacing `<repo>`:
@@ -97,6 +97,27 @@ Host setup is rootless Docker (`dockerd-rootless-setuptool.sh install`), then `d
 
 Upstream [google-research/harness2](https://github.com/google-research/harness2) (Xu et al. 2026, [arXiv:2610.14224](https://arxiv.org/abs/2610.14224), Apache-2.0) is the primary source. It is pinned by commit SHA in `pyproject.toml` (`[tool.uv.sources]`, extra `upstream`) and locked in `uv.lock`; to adopt a new upstream version, move the `rev` and run `uv lock`. It is not vendored. *Promptbreeder* (Fernando et al. 2023) and *Large Language Models as Tool Makers* (Cai et al. 2023) are related work only. See `NOTICE`.
 
+## Upstream seams (slice 3a)
+
+Four safety seams sit between this engine and upstream's `Substrate` and `Proposer`. **Nothing here runs a model, starts a container or opens a connection: execution is not enabled.** Every seam is default-deny and fails closed, and each is importable without the `upstream` extra (upstream is read by duck typing or imported lazily).
+
+| module | guards |
+| --- | --- |
+| `upstream_surface.py` | Maps upstream's `SurfaceSpec` components c1..c8 onto `invariants.MUTABLE`. Mutable: c1 system prompt (`prompt`), c3 memory (`context_assembly`), c4 tool guidance (`tool_description`), c5 subagents (`decomposition_strategy`). Denied: c2 guardrails (protected), c6 skills (undecided), c7 scripts (executable code), c8 plugins and hooks (protected), codex's single `AGENTS.md` (it folds in the guardrails), and every unknown slot. `check_surface(spec, request=, tree=)` raises `InvariantViolation` for any slot or path outside that set, or failing the path rules (traversal, absolute, case variants, unicode look-alikes, symlink-looking names, protected prefixes). |
+| `upstream_egress.py` | `check_proposer(config, settings)` decides, before any session exists, whether an upstream Proposer may be created. Returns a `Decision` (allowed, reasons, warnings, redacted view). Refuses Vertex and any hosted cloud route, an endpoint that cannot be determined (upstream's Proposer has none: it must be declared), any endpoint that is not loopback or ZDR-listed, a hosted provider behind a loopback address, inherited credential-like env vars (by name only), non-approved `*_BASE_URL` and proxy vars, credential flags on the command line, unsafe working directories, and a `claude` CLI proposer unless `COGNITIVE_HARNESS2_ALLOW_CLAUDE_PROPOSER=1` (`settings.allow_claude_cli_proposer`), which is necessary and not sufficient. No secret value ever reaches a reason or the view. |
+| `substrate.py` | `CognitiveSubstrate` implements upstream's `Substrate` Protocol. `surface`, `materialise` (read-only staging through `DockerRunner`'s key rules; no symlinks, UTF-8 only, capped) and `preflight` (`require_rootless_docker`, then a quota check only if the caller passes `quota_check=`) work and start nothing. `execute` and `read_trajectory` raise `NotImplementedError("slice 3b, not enabled")`. |
+| `sweep_plan.py` | `plan_sweep(...)` returns an immutable `SweepPlan` (candidates, hard caps, upstream's ledger budget P = 3k and R = 4k, `advice.cost_class`, readiness, `requires_human_approval: true`) or raises `SweepRefused` listing every cause: a missing, zero, negative, infinite or oversized cap, a plan over its own cap, a candidate off the mutable surface, a known readiness blocker or quota refusal, or a Proposer decision that is not allowed. It starts no sweep. |
+
+`tests/test_no_side_effects.py` is the proof: it traps subprocess, `os.system`, the exec and spawn family, asyncio subprocesses, sockets, DNS, urllib, http.client and httpx, runs every seam's happy and refusal paths, and asserts nothing was attempted. It also shows the Docker daemon is asked only by `preflight`, with pinned read-only `info` and `image inspect`.
+
+Things worth knowing:
+
+- Importing `harness2.substrate`, `harness2.config` or `harness2.core.proposer` runs upstream's `config.py`, which reads `$CWD/.env` into `os.environ`. The seams avoid those imports (a canary test pins this). `harness2.core.tree` and `harness2.core.ledger` are stdlib-only and safe.
+- Even an allowed Proposer decision carries warnings: upstream's sessions run agent tools (shell, files) on the host, and `HOME` file credentials (gcloud, `~/.claude`, `~/.aws`) cannot be listed by an environment check. Isolating the proposer session is a slice 3b question.
+- Upstream is inconsistent about c-numbers (its README makes guardrails c2, its prompt tables call `guardrails.md` c6). The seams bind to paths.
+
+**The 3b gate.** Slice 3b (`DockerRunner` as `Substrate.execute`, one capped dry run, a hard budget cap, `requires_human_approval` kept) is not started and runs only on the user's separate go. Slice 3a is subject to independent review before that.
+
 ## Configuration
 
 | variable | default |
@@ -105,6 +126,7 @@ Upstream [google-research/harness2](https://github.com/google-research/harness2)
 | `COGNITIVE_HARNESS2_BASE_URL` | `http://127.0.0.1:11434/v1` (local Ollama) |
 | `COGNITIVE_HARNESS2_MODEL` | unset: a real `propose` refuses until a model is configured |
 | `COGNITIVE_HARNESS2_ZDR_ENDPOINTS` | unset: comma-separated hosts you attest are zero-retention |
+| `COGNITIVE_HARNESS2_ALLOW_CLAUDE_PROPOSER` | unset (off): `1`/`true` lets `upstream_egress` consider a `claude` CLI proposer, which spends Claude subscription quota |
 | `COGNITIVE_HARNESS2_EXPERIENCE_ROOT` | `~/.local/share/cognitive-engine/experiences` |
 
 The API key is read from `JEV_OPENROUTER_API_KEY` or `OPENROUTER_API_KEY` and is never returned or logged.
@@ -112,10 +134,11 @@ The API key is read from `JEV_OPENROUTER_API_KEY` or `OPENROUTER_API_KEY` and is
 ## What is not done
 
 - **`sbx` is not installed on this machine**, so real microVM isolation is unverified. `SbxRunner._argv` is an assumption about the `sbx` command line; the fail-closed path is tested and does not depend on it. The rootless Docker fallback below is verified against a real daemon.
-- **The engine does not yet call upstream.** Upstream is pinned and import-tested (see Upstream), but `engine.py`'s propose, probe and compose are still the slice 1 local baseline, and the composer is a heuristic (exit status, timeouts, output, stderr). Binding them to upstream's `Substrate` and recursion code is the next step.
+- **The engine does not yet call upstream.** Upstream is pinned and import-tested (see Upstream), but `engine.py`'s propose, probe and compose are still the slice 1 local baseline, and the composer is a heuristic (exit status, timeouts, output, stderr). The safety seams to upstream's `Substrate` exist (see Upstream seams); binding the stages themselves to upstream's execution is slice 3b.
 - The OpenRouter quota field names follow RFC 004 and are unverified against the live API.
 - The push hook counts tool failures only. It does not see `jev_judge` verdicts (the shape of that tool result in a PostToolUse payload has not been captured), and there is no `/probe` slash command or `engine probe`; the pull tool covers on-demand requests. The `PostToolUseFailure` payload is also uncaptured: the hook relies on the documented `hook_event_name`, `session_id` and `is_interrupt` fields.
-- The path rule in `invariants.py` is tested but unused: this slice mutates components, not files.
+- The path rule in `invariants.py` is used by `upstream_surface.py` and the staging key rules; the engine itself still mutates components, not files.
+- `~/.docker/config.json` (container proxies, credential helpers) is still read by docker: only `DOCKER_*` variables are stripped from the child env. The endpoint resolver (`docker context inspect`, when `DOCKER_HOST` is unset) deliberately reads the ambient context.
 
 ## Tests
 
