@@ -503,3 +503,12 @@ def test_the_prompt_fields_pass_upstreams_own_wording_rule():
         assert all(bad not in v.lower() for v in ss.PROMPT_FIELDS.values())
 
 
+
+
+def test_solver_task_hands_the_substrate_the_prompt_and_the_input():
+    from cognitive_harness2.substrate import SolverTask
+    t = ss.solver_task(FIRST)
+    assert isinstance(t, SolverTask) and t.prompt == ss.task_prompt_text(FIRST)
+    assert dict(t.files) == {"input.txt": ss.instance(FIRST).input_text}
+    with pytest.raises(ValueError):
+        ss.solver_task("nope/sum-1")

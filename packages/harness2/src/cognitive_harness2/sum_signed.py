@@ -491,3 +491,10 @@ class SumSignedAdapter:
         if self._verifier is None:
             raise RuntimeError("no verifier runner was given to this adapter")
         return verify_in_container(self._verifier, task_id, self._answer_bytes(run_dir))
+
+
+def solver_task(task_ref: str) -> Any:
+    """The prompt and the input files a solver session gets, as `substrate.SolverTask` (the `task_loader`)."""
+    from .substrate import SolverTask   # local: substrate does not import this module
+    inst = instance(task_ref)
+    return SolverTask(prompt=task_prompt_text(task_ref), files={"input.txt": inst.input_text})
