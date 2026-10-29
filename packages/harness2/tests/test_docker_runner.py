@@ -509,6 +509,17 @@ def test_an_unclean_staging_key_is_refused_before_anything_is_staged(key, tmp_pa
     assert list(tmp_path.iterdir()) == []                                     # no stage dir was even created
 
 
+def test_only_the_exact_root_guardrails_file_name_may_be_staged_among_protected_names(tmp_path, monkeypatch):
+    # The surface's own guardrails.md is stageable (the agent runs with its guardrails); no variant is.
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    DockerRunner("/usr/bin/docker", docker_host=SOCK)._stage(SandboxSpec(command=["x"], files={"guardrails.md": "Never delete.\n"}))
+    for variant in ("GUARDRAILS.md", "Guardrails.MD", "guardrails.md.", "guardrails.MD", "sub/guardrails.md",
+                    "a/b/guardrails.md", "guardrails/rules.md", "guardrails.json", "guardrails.md.bak",
+                    "guardrails․md", "ｇuardrails.md", "hooks/guardrails.md"):
+        with pytest.raises((ValueError, InvariantViolation)):
+            DockerRunner("/usr/bin/docker", docker_host=SOCK)._stage(SandboxSpec(command=["x"], files={variant: "x"}))
+
+
 @pytest.mark.parametrize("key", sorted(BAD_KEYS.values()), ids=sorted(BAD_KEYS, key=lambda k: BAD_KEYS[k]))
 def test_run_validates_keys_before_it_touches_docker(key, monkeypatch):
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("docker must not be contacted"))

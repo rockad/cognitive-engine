@@ -233,9 +233,10 @@ def _stage_name(name: str) -> str:
     try:
         invariants.assert_path_unprotected(name)
     except invariants.InvariantViolation:
-        # Invariant harness files (guardrails.md) must be staged so the agent runs
-        # with its guardrails, but protected execution paths (hooks, .git, guard) are refused.
-        if name.rstrip(". ").lower() == "guardrails.md":
+        # The surface's own guardrails.md must be stageable so the agent runs with its guardrails,
+        # but ONLY as the exact root-level name: no case variant, no trailing dot or space, no
+        # directory prefix. Everything else protected (hooks, .git, guard, ...) stays refused.
+        if name == "guardrails.md":
             return name
         raise
     return name
