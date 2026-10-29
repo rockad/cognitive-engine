@@ -253,7 +253,17 @@ export function normalizeTier(rawTier: string): CognitiveTier {
   return 'standard';
 }
 
-let cachedConfig: { at: number; data: JevConfig; dirKey: string } | null = null;
+let cachedConfig: { at: number; data: JevConfig; dirKey: string; userProblem: string | null } | null = null;
+
+/**
+ * Why the last load could not use the user config file (unreadable, over the size limit, not valid
+ * JSON), or null when it read it or the file is simply absent. The loader still falls back to its
+ * defaults in that case; the guard hook uses this to see that a file it had just validated
+ * stopped being readable, and asks instead of trusting the fallback.
+ */
+export function userConfigLoadProblem(): string | null {
+  return cachedConfig?.userProblem ?? null;
+}
 const CONFIG_CACHE_TTL_MS = 2000;
 
 export function clearConfigCacheForTesting(): void {
@@ -504,9 +514,23 @@ export function validateJevConfig(raw: unknown): JevConfigValidation {
   return { ok: problems.length === 0, problems };
 }
 
+/**
+ * The mode a harness resolves to from a user config object: its own `harnesses.<h>.mode`, else
+ * `defaults.mode`, else `off`. The single place this precedence lives: {@link loadJevConfigSync}
+ * applies it to every harness, and the guard hook calls it on the same object it just validated,
+ * so the two cannot disagree. Pass only a config that passed {@link validateJevConfig}.
+ */
+export function resolveJevModeFromConfig(config: unknown, harness: JevHarness): JevMode {
+  const cfg = (config && typeof config === 'object' ? config : {}) as {
+    defaults?: { mode?: JevMode };
+    harnesses?: Record<string, { mode?: JevMode } | undefined>;
+  };
+  return cfg.harnesses?.[harness]?.mode || cfg.defaults?.mode || 'off';
+}
+
 export type JevConfigFileInspection =
   | { state: 'missing'; file: string; problems: [] }
-  | { state: 'valid'; file: string; problems: [] }
+  | { state: 'valid'; file: string; problems: []; config: Record<string, unknown> }
   | { state: 'malformed'; file: string; problems: string[] };
 
 /** The config file is never legitimately larger than this; a bigger one is malformed, not parsed. */
@@ -587,7 +611,7 @@ export function inspectJevConfigFile(file: string = jevUserConfigFile(), io: Jev
     return { state: 'malformed', file, problems: ['the file is not valid JSON'] };
   }
   const v = validateJevConfig(parsed);
-  return v.ok ? { state: 'valid', file, problems: [] } : { state: 'malformed', file, problems: v.problems };
+  return v.ok ? { state: 'valid', file, problems: [], config: parsed as Record<string, unknown> } : { state: 'malformed', file, problems: v.problems };
 }
 
 export function loadJevConfigSync(startDir?: string, bypassCache = false): JevConfig {
@@ -602,8 +626,10 @@ export function loadJevConfigSync(startDir?: string, bypassCache = false): JevCo
 
   // Level 2: User Config (~/.config/jev/config.json or process.env.JEV_CONFIG_FILE)
   const userConfigFile = process.env.JEV_CONFIG_FILE || JEV_CONFIG_FILE;
+  let userProblem: string | null = null;
   try {
     const read = readConfigFile(userConfigFile, DEFAULT_CONFIG_IO);
+    if (read.kind === 'problem') userProblem = read.problem;
     if (read.kind === 'text') {
       const parsed = JSON.parse(read.text);
       if (parsed && typeof parsed === 'object') {
@@ -612,23 +638,19 @@ export function loadJevConfigSync(startDir?: string, bypassCache = false): JevCo
           config.version = parsed.version;
         }
 
-        // Mode inheritance: if user config specifies defaults.mode, but omits harnesses[h].mode,
-        // the harness MUST inherit from defaults.mode.
-        if (parsed.defaults && parsed.defaults.mode) {
-          const userDefaultMode = parsed.defaults.mode as JevMode;
-          if (config.harnesses) {
-            for (const h of Object.keys(config.harnesses) as JevHarness[]) {
-              if (!parsed.harnesses?.[h]?.mode) {
-                if (!config.harnesses[h]) config.harnesses[h] = {} as any;
-                config.harnesses[h]!.mode = userDefaultMode;
-              }
-            }
+        // Mode inheritance: a harness takes its own mode, else defaults.mode, else off
+        // (resolveJevModeFromConfig, shared with the guard hook).
+        if (config.harnesses) {
+          for (const h of Object.keys(config.harnesses) as JevHarness[]) {
+            if (!config.harnesses[h]) config.harnesses[h] = {} as any;
+            config.harnesses[h]!.mode = resolveJevModeFromConfig(parsed, h);
           }
         }
       }
     }
   } catch {
     // Return default on error
+    userProblem = 'the file is not valid JSON';
   }
 
   // Level 3: Project Config (.agents/jev.json primary, .jev.json fallback) - UNTRUSTED INPUT
@@ -647,7 +669,7 @@ export function loadJevConfigSync(startDir?: string, bypassCache = false): JevCo
     }
   }
 
-  cachedConfig = { at: now, data: config, dirKey };
+  cachedConfig = { at: now, data: config, dirKey, userProblem };
   return config;
 }
 
