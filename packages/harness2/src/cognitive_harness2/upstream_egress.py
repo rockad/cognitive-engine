@@ -23,6 +23,8 @@ starting anything. It is default-deny:
   * the endpoint must be DECLARED (it cannot be read off the CLI) and a `local` channel must use a
     local provider (ollama, lmstudio, ...), because a loopback gateway can forward to a hosted model;
   * Vertex, Bedrock and any other hosted cloud route are refused;
+  * the command line must be exactly the expected argv for the kind (`COMMAND_SHAPES`: the executable, an
+    allow-list of flags, the expected positionals); any other flag or endpoint-looking value is refused;
   * credential-LOOKING environment variable names are refused unless listed in `allowed_env`;
     endpoint variables (`*_BASE_URL`) must point at one of the channel's declared endpoints.
 
@@ -206,6 +208,141 @@ def _bad_cwd(cwd: str) -> str | None:
     return None
 
 
+
+# ── the command line: ALLOW-LISTED per kind ───────────────────────────────────────
+# Scanning a command for bad words is not enough: a flag such as `--api-base=...`, `--proxy ...` or
+# `--endpoint ...` can outrank the environment. So the command must be exactly the expected argv for the
+# kind: the executable, then only the flags below (each at most once, values checked), then exactly the
+# positionals below. Anything else is refused. Value kinds: None (the flag takes no value), json (the
+# literal `json`), word (a short lowercase word), path (an absolute path that is not a URL), cwd (the
+# configuration's own working directory), model (the configuration's own model id), text (free text: it may
+# not be a flag, a response file, a control string, or ITSELF a URL, host:port or `KEY=value` setting).
+# This list is the policy, so widening it is a deliberate edit here and nowhere else.
+
+@dataclass(frozen=True)
+class CommandShape:
+    executables: tuple[str, ...]
+    flags: Mapping[str, str | None]
+    positionals: Mapping[str, tuple[str, ...]]   # executable -> expected positionals; `<prompt>` is free text
+
+
+COMMAND_SHAPES: Mapping[str, CommandShape] = MappingProxyType({
+    # `claude --dangerously-skip-permissions -p --output-format json --effort E [--append-system-prompt S]`
+    "claude_cli": CommandShape(
+        executables=("claude", "claude-code"),
+        flags=MappingProxyType({"--dangerously-skip-permissions": None, "-p": None, "--output-format": "json",
+                                "--effort": "word", "--append-system-prompt": "text"}),
+        positionals=MappingProxyType({"claude": (), "claude-code": ()}),
+    ),
+    # `bun run --cwd C --conditions=browser src/index.ts run PROMPT --dir D --model M --format json [--variant V]`
+    "opencode": CommandShape(
+        executables=("bun", "opencode"),
+        flags=MappingProxyType({"--cwd": "path", "--conditions=browser": None, "--dir": "cwd", "--model": "model",
+                                "--format": "json", "--variant": "word"}),
+        positionals=MappingProxyType({"bun": ("run", "src/index.ts", "run", "<prompt>"),
+                                      "opencode": ("run", "<prompt>")}),
+    ),
+})
+
+_WORD = re.compile(r"[a-z0-9_-]{1,16}")
+_SETTINGLIKE = re.compile(
+    r"(?i)^[a-z][a-z0-9+.-]*://"                                         # a URL
+    r"|^[^\s=]*(base|endpoint|proxy|gateway|server|host|url|api)[^\s=]*="  # an endpoint setting, KEY=value
+    r"|^[\w.\-\[\]:]+:\d{2,5}(/|$)")                                      # host:port
+_DASHES = "−"                                                         # MINUS SIGN is not category Pd
+
+
+def _dashlike(token: str) -> bool:
+    t = token.lstrip()
+    t = unicodedata.normalize("NFKC", t)
+    return bool(t) and (t[0] == "-" or unicodedata.category(t[0]) == "Pd" or t[0] in _DASHES)
+
+
+def _flag_name(token: str) -> str:
+    """A flag token as shown in a reason: the part before `=`, escaped, truncated. Never a value."""
+    return ascii(token.split("=", 1)[0][:40])
+
+
+def _value_problem(kind: str | None, value: str, c: ProposerConfig) -> str | None:
+    if _dashlike(value) or value.lstrip().startswith("@"):
+        return "its value is a flag or a response file"
+    if any(unicodedata.category(ch) in ("Cc", "Cf", "Cs", "Co", "Cn") for ch in value):
+        return "its value contains control or invisible characters"
+    if len(value) > (4096 if kind == "text" else 512):
+        return "its value is too long"
+    if _SETTINGLIKE.match(value.strip()):
+        return "its value looks like a URL, host or endpoint setting"
+    if kind == "json" and value != "json":
+        return "its value must be json"
+    if kind == "word" and not _WORD.fullmatch(value):
+        return "its value must be a short lowercase word"
+    if kind == "path" and not os.path.isabs(value):
+        return "its value must be an absolute path"
+    if kind == "cwd" and (c.cwd is None or value != c.cwd):
+        return "its value must equal the configuration's working directory"
+    if kind == "model" and value != c.model:
+        return "its value must equal the configuration's model"
+    return None
+
+
+def _command_problems(c: ProposerConfig, exe: str | None) -> list[str]:
+    """Why the command is not the expected argv for the kind. Names flags (escaped, truncated), never values."""
+    assert c.command
+    shape = COMMAND_SHAPES.get(c.kind)
+    if shape is None:
+        return ["no command shape is declared for this kind"]
+    problems: list[str] = []
+    args = c.command[1:]
+    seen: set[str] = set()
+    positionals: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if any(unicodedata.category(ch) in ("Cc", "Cf", "Cs", "Co", "Cn") for ch in a):
+            problems.append("an argument contains control or invisible characters")
+            continue
+        if a == "--" or a.strip() == "--":
+            problems.append("the `--` end-of-options marker is refused (flags after it would be smuggled)")
+            continue
+        if a.lstrip().startswith("@"):
+            problems.append("a response file (@file) argument is refused")
+            continue
+        if _dashlike(a):
+            if a not in shape.flags:
+                problems.append(f"the flag {_flag_name(a)} is not on the allow-list for {c.kind}")
+                continue
+            if a in seen:
+                problems.append(f"the flag {_flag_name(a)} is repeated")
+                continue
+            seen.add(a)
+            vkind = shape.flags[a]
+            if vkind is None:
+                continue
+            if i >= len(args):
+                problems.append(f"the flag {_flag_name(a)} is missing its value")
+                continue
+            why = _value_problem(vkind, args[i], c)
+            i += 1
+            if why:
+                problems.append(f"the flag {_flag_name(a)}: {why}")
+            continue
+        positionals.append(a)
+    expected = shape.positionals.get(exe or "")
+    if expected is None:
+        pass                                                   # an unrecognised executable is reported elsewhere
+    elif len(positionals) != len(expected):
+        problems.append(f"expected {len(expected)} positional argument(s), found {len(positionals)}")
+    else:
+        for got, want in zip(positionals, expected):
+            if want == "<prompt>":
+                why = _value_problem("text", got, c)
+                if why:
+                    problems.append(f"the prompt argument: {why}")
+            elif got != want:
+                problems.append("a positional argument is not the expected one")
+    return problems
+
 def _endpoint_key(raw: Any) -> tuple[str, int] | None:
     return channels.endpoint_key(raw) if isinstance(raw, str) else None
 
@@ -347,11 +484,14 @@ def _evaluate(c: ProposerConfig, profile: Any, channel_name: Any, zdr: str, clas
     flags: list[str] = []
     if c.command:
         for arg in c.command[1:]:
-            if arg.startswith("-"):
-                flags.append(arg.split("=", 1)[0])
+            if _dashlike(arg):
+                name = arg.split("=", 1)[0].strip()
+                flags.append(name if name.isascii() and name.isprintable() and len(name) <= 40 else "<unprintable flag>")
         bad = sorted({f for f in flags if _SECRET_WORDS.search(f.lstrip("-").replace("-", "_").upper())})
         if bad:
             refuse("command-shape", f"the command line carries credential-like flags: {', '.join(bad)} (names only)")
+        for problem in _command_problems(c, exe):
+            refuse("command-shape", f"the command line is not the expected argv for {c.kind}: {problem}")
 
     # working directory
     if c.cwd is None:
