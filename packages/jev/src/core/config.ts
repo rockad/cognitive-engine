@@ -318,6 +318,170 @@ export function sanitizeProjectConfig(parsed: any): Partial<JevConfig> {
   return sanitized;
 }
 
+/** Path of the user config the loader reads (JEV_CONFIG_FILE wins over the home default). */
+export function jevUserConfigFile(): string {
+  return process.env.JEV_CONFIG_FILE || JEV_CONFIG_FILE;
+}
+
+export const VALID_JEV_MODES: readonly JevMode[] = ['off', 'on-demand', 'on'];
+const KNOWN_HARNESSES: readonly JevHarness[] = ['antigravity', 'claude-code', 'opencode', 'cli'];
+
+export interface JevConfigValidation {
+  ok: boolean;
+  /** One human-readable line per problem; names the key path and the expected shape, never file contents. */
+  problems: string[];
+}
+
+function describeType(v: unknown): string {
+  if (v === null) return 'null';
+  if (Array.isArray(v)) return 'an array';
+  return `a ${typeof v}`;
+}
+
+/**
+ * Whether a parsed user config (~/.config/jev/config.json) can be trusted. Single source of truth
+ * for the guard hook and for `jev_get_mode`.
+ *
+ * Recognized keys are exactly the ones the loader and its getters read; every other key is left
+ * alone, since other tools may add their own. A missing key is "unset" and never a problem. Where
+ * the loader already merges a value, a wrong type or an unknown mode is what makes the resolved
+ * mode untrustworthy, so those are reported; the only rejected key the loader does not read is a
+ * top-level `mode`, which is the common mistake for `defaults.mode`.
+ */
+export function validateJevConfig(raw: unknown): JevConfigValidation {
+  const problems: string[] = [];
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    problems.push(`the top level must be a JSON object, found ${describeType(raw)}`);
+    return { ok: false, problems };
+  }
+  const cfg = raw as Record<string, unknown>;
+  const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+  const object = (at: string, v: unknown): Record<string, unknown> | null => {
+    if (v === undefined) return null;
+    if (isObj(v)) return v;
+    problems.push(`${at} must be an object, found ${describeType(v)}`);
+    return null;
+  };
+  const typed = (at: string, v: unknown, type: 'string' | 'number' | 'boolean') => {
+    if (v !== undefined && typeof v !== type) problems.push(`${at} must be a ${type}, found ${describeType(v)}`);
+  };
+  const stringList = (at: string, v: unknown) => {
+    if (v === undefined) return;
+    if (!Array.isArray(v) || v.some((x) => typeof x !== 'string')) {
+      problems.push(`${at} must be an array of strings, found ${Array.isArray(v) ? 'an array with non-string items' : describeType(v)}`);
+    }
+  };
+  const stringMap = (at: string, v: unknown) => {
+    const o = object(at, v);
+    if (!o) return;
+    for (const [k, val] of Object.entries(o)) typed(`${at}.${k}`, val, 'string');
+  };
+  const mode = (at: string, v: unknown) => {
+    if (v === undefined) return;
+    if (typeof v !== 'string') {
+      problems.push(`${at} must be one of ${VALID_JEV_MODES.join(', ')}, found ${describeType(v)}`);
+    } else if (!(VALID_JEV_MODES as readonly string[]).includes(v)) {
+      problems.push(`${at} must be one of ${VALID_JEV_MODES.join(', ')}, found ${JSON.stringify(v.slice(0, 40))}`);
+    }
+  };
+  const routing = (at: string, v: unknown, strategy: boolean) => {
+    const r = object(at, v);
+    if (!r) return;
+    if (strategy && r.strategy !== undefined && r.strategy !== 'router' && r.strategy !== 'keyword') {
+      problems.push(`${at}.strategy must be "router" or "keyword"`);
+    }
+    typed(`${at}.swap`, r.swap, 'boolean');
+    stringMap(`${at}.models`, r.models);
+  };
+
+  if ('mode' in cfg) problems.push("top-level 'mode' is ignored; use defaults.mode");
+  typed('version', cfg.version, 'number');
+
+  const defaults = object('defaults', cfg.defaults);
+  if (defaults) {
+    mode('defaults.mode', defaults.mode);
+    typed('defaults.requireUpgradeApproval', defaults.requireUpgradeApproval, 'boolean');
+    typed('defaults.swap', defaults.swap, 'boolean');
+    stringList('defaults.availableSubagents', defaults.availableSubagents);
+    stringList('defaults.agentPaths', defaults.agentPaths);
+  }
+
+  routing('routing', cfg.routing, true);
+  stringMap('models', cfg.models);
+
+  const tiers = object('tiers', cfg.tiers);
+  if (tiers) {
+    for (const [name, t] of Object.entries(tiers)) {
+      const entry = object(`tiers.${name}`, t);
+      if (!entry) continue;
+      typed(`tiers.${name}.description`, entry.description, 'string');
+      typed(`tiers.${name}.concurrencyCap`, entry.concurrencyCap, 'number');
+      typed(`tiers.${name}.requiresApproval`, entry.requiresApproval, 'boolean');
+    }
+  }
+
+  const timeouts = object('timeouts', cfg.timeouts);
+  if (timeouts) for (const k of ['decisionMs', 'fallbackMs', 'freeModelMs', 'freeExecutionMs']) typed(`timeouts.${k}`, timeouts[k], 'number');
+
+  const cache = object('cache', cfg.cache);
+  if (cache) {
+    typed('cache.ttlSec', cache.ttlSec, 'number');
+    typed('cache.shmPath', cache.shmPath, 'string');
+    typed('cache.fallbackPath', cache.fallbackPath, 'string');
+  }
+
+  const thresholds = object('thresholds', cfg.thresholds);
+  if (thresholds) for (const [k, val] of Object.entries(thresholds)) typed(`thresholds.${k}`, val, 'number');
+
+  const harnesses = object('harnesses', cfg.harnesses);
+  if (harnesses) {
+    for (const h of KNOWN_HARNESSES) {
+      const at = `harnesses.${h}`;
+      const hc = object(at, harnesses[h]);
+      if (!hc) continue;
+      mode(`${at}.mode`, hc.mode);
+      stringMap(`${at}.models`, hc.models);
+      stringList(`${at}.freePool`, hc.freePool);
+      routing(`${at}.routing`, hc.routing, false);
+      typed(`${at}.requireUpgradeApproval`, hc.requireUpgradeApproval, 'boolean');
+      stringList(`${at}.availableSubagents`, hc.availableSubagents);
+      stringList(`${at}.agentPaths`, hc.agentPaths);
+    }
+  }
+
+  return { ok: problems.length === 0, problems };
+}
+
+export type JevConfigFileInspection =
+  | { state: 'missing'; file: string; problems: [] }
+  | { state: 'valid'; file: string; problems: [] }
+  | { state: 'malformed'; file: string; problems: string[] };
+
+/**
+ * Reads and validates the user config file. `missing` means no file at all (the loader then uses
+ * its defaults); `malformed` means the file is there but cannot be trusted: unreadable, not
+ * valid JSON, or rejected by {@link validateJevConfig}.
+ */
+export function inspectJevConfigFile(file: string = jevUserConfigFile()): JevConfigFileInspection {
+  if (!fsSync.existsSync(file)) return { state: 'missing', file, problems: [] };
+  let text: string;
+  try {
+    text = fsSync.readFileSync(file, 'utf8');
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    return { state: 'malformed', file, problems: [`the file could not be read${code ? ` (${code})` : ''}`] };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { state: 'malformed', file, problems: ['the file is not valid JSON'] };
+  }
+  const v = validateJevConfig(parsed);
+  return v.ok ? { state: 'valid', file, problems: [] } : { state: 'malformed', file, problems: v.problems };
+}
+
 export function loadJevConfigSync(startDir?: string, bypassCache = false): JevConfig {
   const now = Date.now();
   const dirKey = startDir ? path.resolve(startDir) : '';

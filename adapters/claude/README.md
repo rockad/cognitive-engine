@@ -43,7 +43,9 @@ Jev reads its OpenRouter key from `~/.config/zsh/secrets.env` or `~/.config/jev/
 
 ## Enable the guard
 
-The hook is active in `on` and `on-demand`. Run `/jev on-demand` (or `/jev on`), or set `harnesses.claude-code.mode` in `~/.config/jev/config.json`. Only `off` silences it.
+The hook is active in `on` and `on-demand`. Run `/jev on-demand` (or `/jev on`), or set `harnesses.claude-code.mode` in `~/.config/jev/config.json`. Only an explicit `off` silences it (`{"defaults":{"mode":"off"}}`, or `/jev off`). A missing config file keeps the loader default, which is `off`.
+
+A config that exists but cannot be trusted is not treated as `off`. Unreadable, invalid JSON, not an object, an unknown mode, a wrong type for a key Jev reads, or a stray top-level `"mode"` (the mistake `{"mode":"on"}`; the mode belongs at `defaults.mode`) makes the guard ask on **every** `Agent`, `Task` and `Workflow` call. The prompt names the file and the problems, a one-line message goes to stderr, and a `config_malformed` event (path and problem list only) is appended to the decisions log. Fix the file to `{"defaults":{"mode":"on-demand"}}`, run `/jev status` to see what Jev reads, or set `/jev off` explicitly.
 
 ## Validate
 

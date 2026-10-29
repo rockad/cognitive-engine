@@ -25,6 +25,8 @@ System 1 coprocessor for Cognitive Engine (RFC 002). A Bun/TypeScript MCP server
 
 `~/.config/jev/config.json` is the single store for the global default mode (`defaults.mode`) and per-harness overrides (`harnesses.<harness>.mode`). The OpenRouter key is read from `JEV_OPENROUTER_API_KEY`, a dedicated key separate from `OPENROUTER_API_KEY`.
 
+The expected shape is `{"defaults":{"mode":"on-demand"}}`, with `mode` one of `off`, `on-demand`, `on`. `validateJevConfig` (`src/core/config.ts`) is the single check for whether that file can be trusted. A missing file, `{}`, or a file with no mode set is unset and takes the loader default (`off`). A file that exists but is unusable is malformed: unreadable, not valid JSON, not an object, an unknown or non-string mode, a wrong type for any key the loader reads, or a stray top-level `mode` (it is ignored; the mode lives at `defaults.mode`). Unrelated extra keys are never flagged. A malformed config is neither on nor off: the subagent guard asks on every guarded call until the file is fixed or `off` is set explicitly, and `jev_get_mode` returns a `configWarning` with the same problems.
+
 Harness detection reads `JEV_HARNESS` first (`antigravity`, `claude-code`, `opencode`, `cli`), then falls back to each harness's own environment markers.
 
 ## Development
@@ -43,4 +45,4 @@ Ported from `agentic-hub/plugins/jev` v2.3.0. Of the Claude Code hooks, only the
 
 ## Subagent guard hook
 
-`bun src/hook.ts claude|antigravity` is a narrow `PreToolUse` guard (`src/guard.ts`). Claude Code asks before a subagent runs on a model above the session's (version-aware ranking, `src/models.ts`); Antigravity asks before any Pro-class subagent. It is the only enforcement point (`jev_dispatch` and its clamp are advice). It is deterministic, makes no network calls, and runs in Jev modes `on` and `on-demand` (not `off`); once active, it asks rather than passing silently when it cannot evaluate a call.
+`bun src/hook.ts claude|antigravity` is a narrow `PreToolUse` guard (`src/guard.ts`). Claude Code asks before a subagent runs on a model above the session's (version-aware ranking, `src/models.ts`); Antigravity asks before any Pro-class subagent. It is the only enforcement point (`jev_dispatch` and its clamp are advice). It is deterministic, makes no network calls, and runs in Jev modes `on` and `on-demand` (not `off`); once active, it asks rather than passing silently when it cannot evaluate a call. A malformed Jev config fails loudly: see Configuration.

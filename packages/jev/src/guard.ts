@@ -162,6 +162,25 @@ export function guardErrorVerdict(err: unknown): Verdict {
   };
 }
 
+/**
+ * The verdict for every guarded call while the Jev config cannot be trusted. Never an allow and
+ * never limited to escalations: the user cannot know whether Jev is meant to be on or off.
+ */
+export function configMalformedVerdict(file: string, problems: string[]): Verdict {
+  const list = problems.map((p) => `- ${p}`).join('\n');
+  const stray = problems.some((p) => p.startsWith("top-level 'mode'"));
+  return {
+    decision: 'ask',
+    reason:
+      `[jev] The Jev config ${file} is malformed, so the subagent guard cannot tell whether Jev is on or off and asks on every guarded call.\n` +
+      `Problems:\n${list}\n` +
+      `Fix: run \`/jev status\` to see what Jev reads, then repair the file to the expected shape ` +
+      `{"defaults":{"mode":"on-demand"}}${stray ? ' (move the top-level "mode" under "defaults")' : ''}, ` +
+      `or set \`/jev off\` explicitly to silence the guard. Approve this call only if you intended it.`,
+    audit: { kind: 'config-malformed', file, problems }
+  };
+}
+
 /** The JSON each harness expects on stdout for a verdict. */
 export function formatVerdict(harness: GuardHarness, verdict: Verdict): string {
   if (harness === 'claude') {
