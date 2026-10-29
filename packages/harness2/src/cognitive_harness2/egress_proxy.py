@@ -49,6 +49,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 READY_LINE = "harness2-proxy ready"
+PROXY_PORT_DEFAULT = 3128
 
 MAX_REQUEST_LINE = 8 * 1024
 MAX_HEADER_BYTES = 32 * 1024
@@ -605,7 +606,7 @@ def parse_config(raw: object) -> tuple[Policy, str, int, list[tuple[int, str]], 
         raise ValueError(f"unknown proxy config keys: {sorted(extra)}")
     policy = Policy.build(raw.get("allow", []), raw.get("unix_routes", []), raw.get("test_allow_cidrs", []))
     host = raw.get("listen_host", "0.0.0.0")
-    port = raw.get("listen_port", 3128)
+    port = raw.get("listen_port", PROXY_PORT_DEFAULT)
     if not isinstance(host, str) or not host:
         raise ValueError("listen_host must be a string")
     try:
