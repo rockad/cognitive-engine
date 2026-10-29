@@ -53,7 +53,7 @@ describe('validateJevConfig: classification', () => {
     ['defaults.mode on-demand', { defaults: { mode: 'on-demand' } }],
     ['defaults.mode off', { defaults: { mode: 'off' } }],
     ['per-harness mode', { harnesses: { 'claude-code': { mode: 'on' }, cli: { mode: 'off' } } }],
-    ['unrelated extra keys', { defaults: { mode: 'on', futureKey: 1 }, somethingElse: { a: [1] }, harnesses: { other: { mode: 'banana' } } }],
+    ['unrelated extra keys', { defaults: { mode: 'on', futureKey: 1 }, somethingElse: { a: [1] }, harnesses: { other: { note: 'banana' } } }],
     ['the shipped default config', DEFAULT_JEV_CONFIG]
   ];
   for (const [name, cfg] of valid) {
@@ -388,5 +388,78 @@ describe('guard hook: file-level hazards ask loudly', () => {
     expect(decisionOf(r.out)).toBe('ask');
     expect(reasonOf(r.out)).toContain('JEV_CONFIG_FILE points at a file that does not exist');
     expect(reasonOf(r.out)).toContain(cfgFile);
+  });
+});
+
+describe('validateJevConfig: near-miss keys are malformed, unrelated keys are not', () => {
+  const nearMiss: Array<[string, unknown, string]> = [
+    ['singular top-level default (finding 2)', { default: { mode: 'on' } }, "top-level 'default' is ignored; did you mean 'defaults'?"],
+    ['top-level defualts (transposition)', { defualts: { mode: 'on' } }, "top-level 'defualts' is ignored; did you mean 'defaults'?"],
+    ['top-level Default (case)', { Default: { mode: 'on' } }, "top-level 'Default' is ignored; did you mean 'defaults'?"],
+    ['top-level Defaults (case)', { Defaults: { mode: 'on' } }, "did you mean 'defaults'?"],
+    ['top-level harness alias', { harness: { cli: { mode: 'on' } } }, "top-level 'harness' is ignored; did you mean 'harnesses'?"],
+    ['top-level harnesess', { harnesess: {} }, "did you mean 'harnesses'?"],
+    ['top-level timeout', { timeout: { decisionMs: 5 } }, "did you mean 'timeouts'?"],
+    ['harness claude (finding 3)', { harnesses: { claude: { mode: 'on' } } }, "harnesses.claude is ignored; did you mean 'claude-code'?"],
+    ['harness antigravty', { harnesses: { antigravty: { mode: 'on' } } }, "harnesses.antigravty is ignored; did you mean 'antigravity'?"],
+    ['harness opencod', { harnesses: { opencod: { mode: 'on' } } }, "harnesses.opencod is ignored; did you mean 'opencode'?"],
+    ['harness opencdoe (transposition)', { harnesses: { opencdoe: {} } }, "did you mean 'opencode'?"],
+    ['harness Claude-Code (case)', { harnesses: { 'Claude-Code': { mode: 'on' } } }, "did you mean 'claude-code'?"],
+    ['harness claude_code', { harnesses: { claude_code: {} } }, "did you mean 'claude-code'?"],
+    ['harness gemini alias', { harnesses: { gemini: {} } }, "did you mean 'antigravity'?"]
+  ];
+  for (const [name, cfg, fragment] of nearMiss) {
+    it(`rejects ${name}`, () => {
+      const v = validateJevConfig(cfg);
+      expect(v.ok).toBe(false);
+      expect(v.problems.join('\n')).toContain(fragment);
+    });
+  }
+
+  it('a harness block with a mode under an unrelated, non-near name is malformed (a mode that applies to nothing)', () => {
+    const v = validateJevConfig({ harnesses: { zed: { mode: 'on' } } });
+    expect(v.ok).toBe(false);
+    expect(v.problems.join('\n')).toContain("harnesses.zed sets a mode but 'zed' is not a known harness (antigravity, claude-code, opencode, cli)");
+  });
+
+  const stillValid: Array<[string, unknown]> = [
+    ['unrelated extra top-level keys', { defaults: { mode: 'on' }, notes: 'x', experimental: { a: 1 }, owner: 'me' }],
+    ['unrelated harness block without a mode', { harnesses: { zed: { note: 1 }, 'claude-code': { mode: 'on' } } }],
+    ['a valid per-harness override', { defaults: { mode: 'on' }, harnesses: { 'claude-code': { mode: 'off' } } }],
+    ['short unrelated harness name (api)', { harnesses: { api: { note: 1 } } }],
+    ['a short unrelated top-level key', { api: {} }]
+  ];
+  for (const [name, cfg] of stillValid) {
+    it(`accepts ${name}`, () => expect(validateJevConfig(cfg)).toEqual({ ok: true, problems: [] }));
+  }
+});
+
+describe('guard hook: near-miss keys ask loudly instead of reading as off', () => {
+  const cases: Array<[string, unknown, string]> = [
+    ['singular default', { default: { mode: 'on' } }, "did you mean 'defaults'?"],
+    ['defualts', { defualts: { mode: 'on' } }, "did you mean 'defaults'?"],
+    ['Default', { Default: { mode: 'on' } }, "did you mean 'defaults'?"],
+    ['harness claude', { harnesses: { claude: { mode: 'on' } } }, "did you mean 'claude-code'?"],
+    ['harness antigravty', { harnesses: { antigravty: { mode: 'on' } } }, "did you mean 'antigravity'?"],
+    ['harness opencode typo', { harnesses: { opencod: { mode: 'on' } } }, "did you mean 'opencode'?"],
+    ['unrelated harness with a mode', { harnesses: { zed: { mode: 'on' } } }, 'is not a known harness']
+  ];
+  for (const [name, cfg, hint] of cases) {
+    it(`${name}: asks with file, problem and hint, on stderr and in the audit`, () => {
+      fs.writeFileSync(cfgFile, JSON.stringify(cfg));
+      const r = runHook(plainAgent);
+      expect(decisionOf(r.out)).toBe('ask');
+      expect(reasonOf(r.out)).toContain(cfgFile);
+      expect(reasonOf(r.out)).toContain(hint);
+      expect(r.err).toContain(cfgFile);
+      expect(audit().filter((e) => e.event === 'config_malformed')).toHaveLength(1);
+    });
+  }
+
+  it('a valid config with unrelated extra keys stays silent when off and active when on', () => {
+    fs.writeFileSync(cfgFile, JSON.stringify({ defaults: { mode: 'off' }, notes: 'x' }));
+    expect(runHook(opusAgent).out).toBe('');
+    fs.writeFileSync(cfgFile, JSON.stringify({ defaults: { mode: 'on' }, notes: 'x' }));
+    expect(reasonOf(runHook(opusAgent).out)).not.toContain('malformed');
   });
 });
