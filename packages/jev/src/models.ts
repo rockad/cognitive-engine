@@ -98,7 +98,7 @@ export function assessModelRequest(requested: string | null | undefined, session
   if (session === 'unknown') {
     return {
       kind: 'unknown-session',
-      reason: `model "${requested}" cannot be compared because the session model ${sessionModel ? `"${sessionModel}" is not one Jev can rank` : 'could not be determined'}`
+      reason: `model "${requested}" cannot be compared with the session model${sessionModel ? ` "${sessionModel}", which Jev cannot rank` : ', which could not be determined'}`
     };
   }
   if (compareModels(req, session) > 0) {
