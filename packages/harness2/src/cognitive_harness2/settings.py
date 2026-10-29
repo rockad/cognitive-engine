@@ -19,6 +19,9 @@ ENV_EXPERIENCE_ROOT = "COGNITIVE_HARNESS2_EXPERIENCE_ROOT"
 ENV_BASE_URL = "COGNITIVE_HARNESS2_BASE_URL"
 ENV_MODEL = "COGNITIVE_HARNESS2_MODEL"
 ENV_ZDR_ENDPOINTS = "COGNITIVE_HARNESS2_ZDR_ENDPOINTS"
+# Off unless set to exactly `1` or `true`. A `claude` CLI proposer burns the user's Claude
+# subscription quota, so it is refused by `upstream_egress` until this names it.
+ENV_ALLOW_CLAUDE_PROPOSER = "COGNITIVE_HARNESS2_ALLOW_CLAUDE_PROPOSER"
 DEFAULT_EXPERIENCE_ROOT = Path("~/.local/share/cognitive-engine/experiences")
 DEFAULT_BASE_URL = "http://127.0.0.1:11434/v1"  # local Ollama, OpenAI-compatible
 
@@ -36,6 +39,18 @@ class Settings:
     base_url: str
     model: str | None
     zdr_endpoints: frozenset[str]
+    allow_claude_cli_proposer: bool = False
+
+
+def _flag(env: Mapping[str, str], name: str) -> bool:
+    raw = env.get(name)
+    if raw is None or raw == "":
+        return False
+    if raw.strip().lower() in ("1", "true"):
+        return True
+    if raw.strip().lower() in ("0", "false"):
+        return False
+    raise SettingsError(f"{name}={raw!r} must be 1, true, 0 or false")
 
 
 def from_env(environ: Mapping[str, str] | None = None) -> Settings:
@@ -60,4 +75,5 @@ def from_env(environ: Mapping[str, str] | None = None) -> Settings:
 
     endpoints = frozenset(h.strip().lower() for h in env.get(ENV_ZDR_ENDPOINTS, "").split(",") if h.strip())
     return Settings(port=port, experience_root=root, base_url=env.get(ENV_BASE_URL, DEFAULT_BASE_URL),
-                    model=env.get(ENV_MODEL) or None, zdr_endpoints=endpoints)
+                    model=env.get(ENV_MODEL) or None, zdr_endpoints=endpoints,
+                    allow_claude_cli_proposer=_flag(env, ENV_ALLOW_CLAUDE_PROPOSER))
