@@ -603,3 +603,42 @@ def test_from_upstream_takes_the_env_the_caller_will_really_pass():
 def test_from_upstream_refuses_what_it_cannot_read():
     with pytest.raises(upstream_egress.ProposerConfigError):
         from_upstream(object())
+
+
+# ── model ids (review F4): a strict character set per kind ────────────────────────
+
+BAD_MODELS = ["a\nb", "a\rb", "a\tb", "a b", " a", "a ", "ollama/q\x00", "ollama/q\x1b[0m", "a;b", "a|b", "a&b", "a`b`",
+              "$(id)", "a$b", "a>b", "a<b", "a'b", 'a"b', "a\\b", "a*b", "a?b", "a(b)", "a{b}", "a!b", "a#b", "a~b",
+              "a%b", "a=b", "a@b", "a,b", "-x", "--model", "-", "", "ollama/‮q", "ollama/qwеn", "ｏllama/q",
+              "ollama/q ", "a" * 129, "a/" * 70, "−x", ".x", "/x", "_x"]
+
+
+@pytest.mark.parametrize("model", BAD_MODELS, ids=[ascii(m)[:30] for m in BAD_MODELS])
+@pytest.mark.parametrize("kind", ["opencode", "claude_cli"])
+def test_a_model_id_outside_the_character_set_is_unparseable(kind, model):
+    with pytest.raises(upstream_egress.ProposerConfigError, match="model"):
+        parse_config({"kind": kind, "model": model, "base_url": LOCAL})
+    d = chk({"kind": kind, "model": model, "base_url": LOCAL})
+    refused(d, "unparseable")
+    assert len(model) < 4 or model not in " ".join(d.reasons)
+
+
+@pytest.mark.parametrize(("kind", "model"), [
+    ("opencode", "ollama/qwen3:30b"), ("opencode", "openrouter/anthropic/claude-sonnet-4.5"),
+    ("opencode", "a" * 128), ("opencode", "ollama/q_1-2.3:latest"), ("claude_cli", "claude-sonnet-5-5"),
+    ("claude_cli", "claude-x:1m"), ("claude_cli", "a" * 64), ("opencode", "9b/x"),
+])
+def test_ordinary_model_ids_parse(kind, model):
+    assert parse_config({"kind": kind, "model": model, "base_url": LOCAL}).model == model
+
+
+def test_the_length_limit_is_per_kind():
+    assert parse_config({"kind": "opencode", "model": "a" * 100, "base_url": LOCAL})
+    with pytest.raises(upstream_egress.ProposerConfigError, match="longer than 64"):
+        parse_config({"kind": "claude_cli", "model": "a" * 100, "base_url": LOCAL})
+
+
+def test_the_profile_and_the_configuration_share_the_model_rule():
+    for kind in ("opencode", "claude_cli", "agy_cli"):
+        for m in BAD_MODELS[:12]:
+            assert channels.model_id_problem(kind, m)

@@ -129,6 +129,8 @@ def parse_config(raw: Any) -> ProposerConfig:
     model = raw.get("model")
     if not isinstance(model, str) or not model.strip():
         raise ProposerConfigError("model must be a non-empty string")
+    if (why := channels.model_id_problem(kind, model)) is not None:   # strict per kind; never echoes the value
+        raise ProposerConfigError(why)
 
     env = raw.get("env")
     if env is not None:
@@ -144,7 +146,7 @@ def parse_config(raw: Any) -> ProposerConfig:
     project, region = raw.get("project") or "", raw.get("region") or ""
     if not isinstance(project, str) or not isinstance(region, str):
         raise ProposerConfigError("project and region must be strings")
-    return ProposerConfig(kind=kind, model=model.strip(), base_url=_str_or_none(raw, "base_url"), env=env,
+    return ProposerConfig(kind=kind, model=model, base_url=_str_or_none(raw, "base_url"), env=env,
                           cwd=_str_or_none(raw, "cwd"), command=command, project=project, region=region)
 
 
