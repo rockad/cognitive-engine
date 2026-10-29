@@ -11,9 +11,11 @@ inference.
 """
 from __future__ import annotations
 
-import fnmatch
 import posixpath
 import re
+import unicodedata
+
+_DRIVE = re.compile(r"^[a-z]:")
 
 MUTABLE = frozenset({"prompt", "tool_description", "context_assembly", "decomposition_strategy"})
 
@@ -22,13 +24,21 @@ PROTECTED_COMPONENTS = frozenset({
     "session_ceiling", "lifecycle_hook", "human_approval",
 })
 
-# Paths whose contents define the protected set. Matched after normalisation, so
-# `./a/../hooks/x`, `HOOKS/x` and `hooks\x` all hit the same rule.
-PROTECTED_PATH_PATTERNS = (
-    "*/hooks/*", "hooks/*", "*hooks.json", "*/guard.*", "guard.*", "*/hook.*", "hook.*",
-    "*egress*", "*zdr*", "*governance*", "*ceiling*", "*.claude/settings*", "*approval*",
-    "*mcp_config.json", "*.mcp.json",
-)
+# Paths whose contents define the protected set. Matching is per path SEGMENT, after
+# normalisation (so `./a/../hooks/x`, `HOOKS/x`, `hooks\x` and fullwidth `ｈｏｏｋｓ` hit the
+# same rule), and a protected segment protects the whole subtree below it. Matching on a
+# whole-path glob missed the directories themselves and every directory spelled without a
+# dot (`src/guard/index.ts`, bare `hooks`), because the globs needed a `.` or a child.
+#
+# A segment is protected when its stem (name up to the first dot, leading dots ignored) is one of
+# these. `hooks`, `hooks.json`, `hooks.bak` and `.hooks` all have the stem `hooks`; `hookup` does not.
+PROTECTED_STEMS = frozenset({"hooks", "hook", "guard"})
+# ...or when the segment name ends with one of these (`my-hooks.json`, `x.mcp.json`).
+PROTECTED_SEGMENT_SUFFIXES = ("hooks.json", "mcp_config.json", ".mcp.json")
+# ...or when this text appears anywhere in the path.
+PROTECTED_SUBSTRINGS = ("egress", "zdr", "governance", "ceiling", "approval")
+# ...or when a `.claude` segment is followed by a `settings*` segment.
+PROTECTED_CLAUDE_DIR, PROTECTED_CLAUDE_CHILD = ".claude", "settings"
 
 
 class InvariantViolation(PermissionError):
@@ -40,13 +50,23 @@ def normalise_component(name: str) -> str:
 
 
 def normalise_path(path: str) -> str:
-    """Lower-cased, separator-normalised and collapsed (`a/../b` -> `b`).
+    """NFKC-folded, case-folded, separator-normalised and collapsed (`a/../b` -> `b`).
 
     ⚠️ Deliberately does NOT strip leading dots or slashes: an earlier `.lstrip("./")`
     turned `../../escape` into `escape` and `/etc/passwd` into `etc/passwd`, hiding the
     very escapes `assert_path_unprotected` exists to catch.
     """
-    return posixpath.normpath(path.replace("\\", "/").strip().lower())
+    folded = unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", path).casefold())
+    return posixpath.normpath(folded.replace("\\", "/").strip())
+
+
+def _segment_protected(seg: str) -> bool:
+    seg = seg.rstrip(". ")  # `hooks.` and `hooks ` name the same entry on some filesystems
+    if not seg:
+        return False
+    if seg.lstrip(".").split(".", 1)[0] in PROTECTED_STEMS:
+        return True
+    return seg.endswith(PROTECTED_SEGMENT_SUFFIXES)
 
 
 def assert_mutable(component: str) -> str:
@@ -61,10 +81,27 @@ def assert_mutable(component: str) -> str:
 
 
 def assert_path_unprotected(path: str) -> str:
+    """Return the normalised path, or raise. Default-deny: anything odd is refused.
+
+    Refused: control or invisible characters (checked on the raw text, before any trimming),
+    absolute and drive-letter paths, `..` escapes, the tree root, and any protected file, any
+    protected directory itself, and anything under one (see `PROTECTED_*`).
+    """
+    if any(unicodedata.category(c) in ("Cc", "Cf", "Cs", "Co", "Cn") for c in path):
+        raise InvariantViolation(f"{path!r} contains control or invisible characters")
     norm = normalise_path(path)
-    if norm == ".." or norm.startswith("../") or posixpath.isabs(norm):
+    if norm in ("", "."):
+        raise InvariantViolation(f"{path!r} names the working tree itself")
+    if norm == ".." or norm.startswith("../") or posixpath.isabs(norm) or _DRIVE.match(norm):
         raise InvariantViolation(f"{path!r} escapes the working tree")
-    for pattern in PROTECTED_PATH_PATTERNS:
-        if fnmatch.fnmatch(norm, pattern):
-            raise InvariantViolation(f"{path!r} matches protected pattern {pattern!r}")
+    segments = [s for s in norm.split("/") if s]
+    for i, seg in enumerate(segments):
+        if _segment_protected(seg):
+            raise InvariantViolation(f"{path!r} is, or is under, protected path segment {seg!r}")
+        if seg.endswith(PROTECTED_CLAUDE_DIR) and i + 1 < len(segments) \
+                and segments[i + 1].startswith(PROTECTED_CLAUDE_CHILD):
+            raise InvariantViolation(f"{path!r} is, or is under, protected {PROTECTED_CLAUDE_DIR}/settings")
+    for text in PROTECTED_SUBSTRINGS:
+        if text in norm:
+            raise InvariantViolation(f"{path!r} contains protected name {text!r}")
     return norm
