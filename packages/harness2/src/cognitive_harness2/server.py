@@ -93,8 +93,9 @@ def build_server(engine: Engine | None = None, s: cfg.Settings | None = None) ->
         return out
 
     @server.tool(name="harness2_trigger", description="Read-only pull check: given a failure summary, "
-                 "say whether a System 2 probe is worth suggesting, which trigger fired, whether quota, egress, "
-                 "sandbox and model are ready, the cost class, and that human approval is required. Starts no "
+                 "say whether a System 2 probe is worth suggesting (advise: a trigger fired), which trigger fired, "
+                 "whether quota, egress, sandbox and model are ready (ready: false if any is known-bad, true only "
+                 "if all are ok, null if unchecked), the cost class, and that human approval is required. Starts no "
                  "sandbox, calls no model, writes nothing; run harness2_propose and harness2_probe explicitly to act.")
     async def trigger(
         on_demand: Annotated[bool, Field(description="the user or agent explicitly asks for a probe")] = False,

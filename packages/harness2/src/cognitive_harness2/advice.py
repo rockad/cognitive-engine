@@ -7,9 +7,18 @@ already makes (constructing the sandbox runner validates the local runtime; it d
 run anything) plus, only when the caller asks and the endpoint is OpenRouter, the same
 `GET /api/v1/key` the quota pre-flight uses.
 
-`advise` means: a trigger fired AND nothing known would make the probe refuse. A fired
-trigger with a blocker still reports `trigger_fired: true` and lists the blockers, so the
-caller can see why the answer is no.
+Two separate answers, never folded into one:
+
+  * `advise`: a trigger fired (`decision.probe`). It says nothing about readiness.
+  * `ready`: tri-state over the four readiness checks (sandbox, egress, quota, model).
+      - `false`: at least one check is known-bad. `blockers` lists each one.
+      - `true`:  every check is positively ok.
+      - `null`:  none is known-bad but at least one is unchecked or unknown (quota is
+                 unchecked unless the caller passes `check_quota=true` on OpenRouter).
+    A known-bad check always wins over an unchecked one.
+
+A fired trigger with `ready: false` still has `advise: true`; the caller reads `blockers`
+to see why the probe would refuse.
 """
 from __future__ import annotations
 
@@ -62,6 +71,16 @@ def cost_class(eng: Engine, fired: bool) -> str:
     return "free_quota" if egress._is_free_tier(eng.model or "") else "metered"
 
 
+def tri_state_ready(readiness: dict[str, dict]) -> bool | None:
+    """False if any check is known-bad; True only if all are positively ok; else None (unknown)."""
+    oks = [v["ok"] for v in readiness.values()]
+    if any(ok is False for ok in oks):
+        return False
+    if oks and all(ok is True for ok in oks):
+        return True
+    return None
+
+
 async def advise(eng: Engine, decision: triggers.Decision, *, zdr: str, classification: str,
                  check_quota: bool) -> dict:
     sandbox, eg, q = await _sandbox(eng), _egress(eng, zdr, classification), await _quota(eng, check_quota)
@@ -69,10 +88,15 @@ async def advise(eng: Engine, decision: triggers.Decision, *, zdr: str, classifi
              else {"ok": False, "detail": "no generator model configured (set COGNITIVE_HARNESS2_MODEL)"})
     readiness = {"sandbox": sandbox, "egress": eg, "quota": q, "model": model}
     blockers = [f"{k}: {v['detail']}" for k, v in readiness.items() if v["ok"] is False]
-    ready = not blockers
+    ready = tri_state_ready(readiness)
+    nxt = None
+    if decision.probe and ready is not False:
+        nxt = ("call harness2_propose (dry_run first), then harness2_probe and harness2_compose; "
+               "the composed patch needs human approval")
+        if ready is None:
+            nxt += "; readiness is not fully checked (see readiness for what is unknown)"
     return {
-        "advise": decision.probe and ready,
-        "trigger_fired": decision.probe,
+        "advise": decision.probe,
         "trigger": decision.trigger,
         "reason": decision.reason,
         "ready": ready,
@@ -81,6 +105,5 @@ async def advise(eng: Engine, decision: triggers.Decision, *, zdr: str, classifi
         "cost_class": cost_class(eng, decision.probe),
         "requires_human_approval": True,
         "read_only": True,
-        "next": ("call harness2_propose (dry_run first), then harness2_probe and harness2_compose; "
-                 "the composed patch needs human approval" if decision.probe and ready else None),
+        "next": nxt,
     }

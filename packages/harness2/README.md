@@ -34,11 +34,23 @@ System 2 never starts by itself. Two things can tell you it might be worth runni
 
 **Pull: `harness2_trigger`.** Send a failure summary, get a recommendation. It is read-only: it starts no sandbox, calls no model, writes no file and creates no run. The closed argument schema takes `on_demand`, `judge_passed`, `judge_score`, `consecutive_failures`, `failure_signatures` (up to 20 short fingerprints, not stored or echoed), `zdr`, `classification` and `check_quota`. The answer carries:
 
-- `advise`: a trigger fired and nothing known would make the probe refuse.
-- `trigger_fired`, `trigger` and `reason`: which rule fired (`explicit`, `judge_failed`, `judge_score` or `retries_exhausted`).
-- `readiness` and `blockers`: sandbox (the runtime is constructed and checked, nothing is run), egress and ZDR verdict, quota, and whether a generator model is configured. Quota is pre-flighted only when `check_quota` is true and the endpoint is OpenRouter; otherwise it is reported as not checked and is not a blocker.
+- `advise`: a trigger fired. It says nothing about readiness.
+- `trigger` and `reason`: which rule fired (`explicit`, `judge_failed`, `judge_score` or `retries_exhausted`), or `null` when none did.
+- `ready`: tri-state over the four readiness checks.
+  - `false`: at least one check is known-bad. `blockers` says which.
+  - `true`: every check is positively ok.
+  - `null`: none is known-bad, but at least one is unchecked or unknown (for example quota without `check_quota`). A known-bad check always wins over an unchecked one.
+- `readiness` and `blockers`: sandbox (the runtime is constructed and checked, nothing is run), egress and ZDR verdict, quota, and whether a generator model is configured. `blockers` lists only the known-bad ones. Quota is pre-flighted only when `check_quota` is true and the endpoint is OpenRouter; otherwise it is reported as not checked, which makes `ready` `null` rather than `true`.
 - `cost_class`: `none`, `local` (loopback endpoint), `free_quota` or `metered`.
 - `requires_human_approval`: always `true`.
+
+Example: three failures on an OpenRouter endpoint, quota not checked. A trigger fired, nothing is known-bad, but quota is unknown:
+
+```json
+{"advise": true, "trigger": "retries_exhausted", "reason": "retries exhausted (3 >= 3)",
+ "ready": null, "blockers": [], "cost_class": "metered", "requires_human_approval": true, "read_only": true,
+ "readiness": {"sandbox": {"ok": true}, "egress": {"ok": true}, "quota": {"ok": null, "status": "not_checked"}, "model": {"ok": true}}}
+```
 
 The rules are `triggers.should_probe` (RFC 004 §2.3): `jev_judge` FAIL or score below 0.50, 3 or more consecutive failures (a trailing run of identical `failure_signatures` counts), or an explicit request. `routing_confidence` is not an input. There is no stagnation trigger, and the closed schema rejects the old `attempts_without_progress` argument.
 
