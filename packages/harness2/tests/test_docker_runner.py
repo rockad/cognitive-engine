@@ -415,3 +415,81 @@ def test_the_default_runner_carries_the_verified_host(monkeypatch):
     monkeypatch.setattr(sandbox, "verify_rootless_docker", lambda *a, **k: VerifiedDocker("/usr/bin/docker", SOCK))
     r = sandbox.default_runner(lambda n: None if n == "sbx" else "/usr/bin/docker")
     assert isinstance(r, DockerRunner) and r.docker_host == SOCK
+
+
+# ── staging keys must already be clean relative paths ─────────────────────────────
+
+CLEAN = ["payload.py", "a/b.txt", "deep/er/x_y-z.py", ".hidden", "a..b", "a.b/c.d", "Prompt.TXT", "ünï/ĉode.py",
+         "has space/in name.txt"]
+
+BAD_KEYS = {
+    "leading ./": "./payload.py",
+    "doubled slash": "a//b",
+    "inner dot segment": "a/./b",
+    "dot only": ".",
+    "dotdot only": "..",
+    "dotdot prefix": "../x",
+    "dotdot inner": "a/../b",       # would normalise to a clean name; still refused as written
+    "dotdot trailing": "a/..",
+    "absolute": "/etc/passwd",
+    "double slash absolute": "//x",
+    "backslash": "a\\b",
+    "backslash leading": "\\x",
+    "empty": "",
+    "NUL": "a\0b",
+    "NUL trailing": "x\0",
+    "trailing slash": "dir/",
+    "trailing slash on a file": "payload.py/",
+    "newline": "a\nb",
+    "tab": "a\tb",
+    "carriage return": "a\rb",
+    "escape char": "a\x1bb",
+    "DEL": "a\x7fb",
+    "zero width space": "a\u200bb",
+    "bidi override": "a\u202eb",
+    "leading space": " payload.py",
+    "trailing space": "payload.py ",
+    "padded segment": "a/ b/c",
+    "drive letter": "c:/x",
+}
+
+
+@pytest.mark.parametrize("key", sorted(BAD_KEYS.values()), ids=sorted(BAD_KEYS, key=lambda k: BAD_KEYS[k]))
+def test_an_unclean_staging_key_is_refused_before_anything_is_staged(key, tmp_path, monkeypatch):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    spec = SandboxSpec(command=["x"], files={"fine.txt": "ok", key: "bad"})   # a good key must not be staged either
+    with pytest.raises((ValueError, InvariantViolation)):
+        DockerRunner("/usr/bin/docker", docker_host=SOCK)._stage(spec)
+    assert list(tmp_path.iterdir()) == []                                     # no stage dir was even created
+
+
+@pytest.mark.parametrize("key", sorted(BAD_KEYS.values()), ids=sorted(BAD_KEYS, key=lambda k: BAD_KEYS[k]))
+def test_run_validates_keys_before_it_touches_docker(key, monkeypatch):
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("docker must not be contacted"))
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: pytest.fail("a container must not start"))
+    monkeypatch.setattr(tempfile, "mkdtemp", lambda *a, **k: pytest.fail("nothing may be staged"))
+    with pytest.raises((ValueError, InvariantViolation)):
+        DockerRunner("/usr/bin/docker", docker_host=SOCK).run(SandboxSpec(command=["x"], files={key: "bad"}))
+
+
+@pytest.mark.parametrize("key", CLEAN)
+def test_clean_relative_keys_are_staged_under_exactly_the_name_given(key):
+    r = DockerRunner("/usr/bin/docker", docker_host=SOCK)
+    stage = r._stage(SandboxSpec(command=["x"], files={key: "content"}))
+    try:
+        assert (stage / key).read_text() == "content"   # not lower-cased, not normalised
+    finally:
+        sandbox.shutil.rmtree(stage)
+
+
+@pytest.mark.parametrize("key", ["hooks", "pkg/guard/x.ts", "hooks/pre.sh", "my_egress_policy", "x/Hooks.JSON"])
+def test_protected_keys_are_still_refused_and_nothing_is_left_behind(key, tmp_path, monkeypatch):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    with pytest.raises(InvariantViolation):
+        DockerRunner("/usr/bin/docker", docker_host=SOCK)._stage(SandboxSpec(command=["x"], files={key: "x"}))
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_non_string_key_is_refused():
+    with pytest.raises(ValueError):
+        DockerRunner("/usr/bin/docker", docker_host=SOCK)._stage(SandboxSpec(command=["x"], files={1: "x"}))  # type: ignore[dict-item]

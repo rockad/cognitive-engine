@@ -25,12 +25,12 @@ from __future__ import annotations
 import difflib
 import json
 import os
-import posixpath
 import secrets
 import shutil
 import subprocess
 import tempfile
 import threading
+import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -206,10 +206,33 @@ def require_rootless_docker(
 
 
 def _stage_name(name: str) -> str:
-    """A staged file name must be a clean relative path that the protected set allows."""
-    if not name or "\0" in name or posixpath.isabs(name):
-        raise ValueError(f"invalid staged file name {name!r}")
-    return invariants.assert_path_unprotected(name)
+    """A staged file name must ALREADY be a clean relative path, and one the protected set allows.
+
+    Nothing is normalised for the caller: a key that needs `normpath` to become safe
+    (`./payload.py`, `a//b`, `a/./b`, `a/../b`) is refused as written, so what is staged is
+    exactly what was asked for. Refused: non-strings, empty, absolute, a leading or trailing
+    `/`, backslashes, empty / `.` / `..` / space-padded segments, and control or invisible
+    characters. Returns the key unchanged.
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"invalid staged file name {name!r}: must be a non-empty string")
+    if any(unicodedata.category(c) in ("Cc", "Cf", "Cs", "Co", "Cn") for c in name):
+        raise ValueError(f"invalid staged file name {name!r}: control or invisible characters")
+    if "\\" in name:
+        raise ValueError(f"invalid staged file name {name!r}: backslashes are not allowed")
+    if name.startswith("/") or name.endswith("/"):
+        raise ValueError(f"invalid staged file name {name!r}: must be a relative file path, not absolute or a directory")
+    for seg in name.split("/"):
+        if seg in ("", ".", "..") or seg != seg.strip():
+            raise ValueError(f"invalid staged file name {name!r}: not a clean relative path (segment {seg!r})")
+    invariants.assert_path_unprotected(name)
+    return name
+
+
+def _validate_stage_names(files: Mapping[str, str]) -> None:
+    """Check every key before anything is created, so one bad key stages nothing."""
+    for name in files:
+        _stage_name(name)
 
 
 def _drain(stream: IO[bytes], limit: int, sink: bytearray, truncated: list[bool]) -> None:
@@ -261,7 +284,8 @@ class DockerRunner:
         ]
 
     def _stage(self, spec: SandboxSpec) -> Path:
-        stage = Path(tempfile.mkdtemp(prefix="harness2-stage-")).resolve()
+        _validate_stage_names(spec.files)  # before mkdtemp: a bad key leaves nothing behind
+        stage =Path(tempfile.mkdtemp(prefix="harness2-stage-")).resolve()
         try:
             home = Path.home().resolve()
             if stage == home or home in stage.parents:
@@ -291,6 +315,7 @@ class DockerRunner:
     def run(self, spec: SandboxSpec) -> SandboxResult:
         if not spec.command:
             raise ValueError("command cannot be empty")
+        _validate_stage_names(spec.files)  # cheapest refusal first: no docker call for a bad key
         # Re-checked on every run: the daemon can be stopped or swapped between probes. The
         # endpoint it verifies is the endpoint every later call in this run is pinned to, so
         # an ambient DOCKER_HOST or DOCKER_CONTEXT that changes after the check is never used.
