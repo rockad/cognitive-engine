@@ -44,6 +44,9 @@ main() {
 
   local dir="${COGNITIVE_HARNESS2_HOOK_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/cognitive-engine/harness2-hook}"
   local file="$dir/$sid.count" count=0
+  # Never read, append to, reset or create through a symlink: a link planted at the state file or the
+  # state directory would redirect the write (or the rm) somewhere else. Fail open: do nothing.
+  [[ -L "$file" || -L "$dir" ]] && return 0
   [[ -f "$file" ]] && count=$(wc -l <"$file" 2>/dev/null | tr -d '[:space:]')
   [[ "$count" =~ ^[0-9]+$ ]] || count=0
 

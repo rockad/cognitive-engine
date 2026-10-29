@@ -241,3 +241,59 @@ def test_stale_state_is_pruned_when_a_new_streak_starts(state):
     fresh.write_text("x")
     run(state, ev(FAIL, sid="new"))
     assert not old.exists() and fresh.exists() and (state / "new.count").exists()
+
+
+# ── a symlinked state file or state directory is never written through ────────────
+
+ALL_EVENTS = [FAIL, "PostToolUse", "UserPromptSubmit", "Stop"]
+
+
+@pytest.mark.parametrize("event", ALL_EVENTS)
+def test_a_symlinked_state_file_is_refused_and_nothing_is_written_through_it(tmp_path, event):
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("precious\n")
+    (state / "s1.count").symlink_to(victim)
+    for _ in range(4):    # past the limit: a followed link would also advise
+        r = run(state, ev(event))
+        assert r.returncode == 0 and r.stdout == ""
+    assert victim.read_text() == "precious\n"
+    assert (state / "s1.count").is_symlink() and os.readlink(state / "s1.count") == str(victim)
+
+
+def test_a_dangling_symlinked_state_file_is_not_created_through(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    target = tmp_path / "not-yet.txt"
+    (state / "s1.count").symlink_to(target)
+    for _ in range(4):
+        assert run(state, ev(FAIL)).returncode == 0
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("event", ALL_EVENTS)
+def test_a_symlinked_state_dir_is_refused_and_nothing_is_written_through_it(tmp_path, event):
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "s1.count").write_text("a\nb\nc\n")      # already past the limit
+    link = tmp_path / "state"
+    link.symlink_to(real)
+    r = run(link, ev(event))
+    assert r.returncode == 0 and r.stdout == ""
+    assert sorted(p.name for p in real.iterdir()) == ["s1.count"]
+    assert (real / "s1.count").read_text() == "a\nb\nc\n"      # not appended to, not reset
+
+
+def test_a_dangling_symlinked_state_dir_is_not_created_through(tmp_path):
+    link = tmp_path / "state"
+    link.symlink_to(tmp_path / "nowhere")
+    for _ in range(4):
+        assert run(link, ev(FAIL)).returncode == 0
+    assert not (tmp_path / "nowhere").exists()
+
+
+def test_a_regular_state_dir_and_file_still_work_after_the_check(state):
+    for i in range(1, 4):
+        run(state, ev(FAIL))
+    assert count(state) == 3
