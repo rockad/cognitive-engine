@@ -12,9 +12,10 @@
 #   Stop                if the limit was reached, show the user a one-line suggestion (systemMessage)
 #   anything else       ignored
 #
-# State is one file per session holding one byte per failure (appending a byte is atomic, so
-# parallel tool calls and concurrent sessions need no lock). It holds NO prompt text, tool
-# input, error text or secret: only a count, in a file named after the sanitised session id.
+# State is one file per session holding one short numeric token line per failure (an append this
+# small is atomic, so parallel tool calls and concurrent sessions need no lock; each failure learns
+# its own position from its own line number). It holds NO prompt text, tool input, error text or
+# secret: only numeric tokens, in a file named after the sanitised session id.
 #
 # Env: COGNITIVE_HARNESS2_HOOK_STATE_DIR  state directory (default $XDG_STATE_HOME or
 #      ~/.local/state, then cognitive-engine/harness2-hook)
@@ -43,7 +44,7 @@ main() {
 
   local dir="${COGNITIVE_HARNESS2_HOOK_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/cognitive-engine/harness2-hook}"
   local file="$dir/$sid.count" count=0
-  [[ -f "$file" ]] && count=$(wc -c <"$file" 2>/dev/null | tr -d '[:space:]')
+  [[ -f "$file" ]] && count=$(wc -l <"$file" 2>/dev/null | tr -d '[:space:]')
   [[ "$count" =~ ^[0-9]+$ ]] || count=0
 
   case "$event" in
@@ -51,8 +52,14 @@ main() {
       [[ "$interrupt" == "true" ]] && return 0
       mkdir -p "$dir" 2>/dev/null && chmod 700 "$dir" 2>/dev/null || return 0
       [[ "$count" -eq 0 ]] && find "$dir" -type f -name '*.count' -mtime +"$STALE_DAYS" -delete 2>/dev/null
-      printf 'x' >>"$file" 2>/dev/null || return 0
-      count=$(wc -c <"$file" 2>/dev/null | tr -d '[:space:]')
+      # Lock-free position: append one short unique token line (an O_APPEND write this small is
+      # atomic and totally ordered), then take MY OWN line number as my position. Reading the file
+      # size instead lets a burst of simultaneous failures all see a count past the limit multiple,
+      # so nobody advises (a lock does not help: mkdir was not exclusive under rapid create/remove
+      # cycling on the test host). With distinct positions each multiple is seen by exactly one process.
+      local tok="$$.$RANDOM.$RANDOM"
+      printf '%s\n' "$tok" >>"$file" 2>/dev/null || return 0
+      count=$(grep -n -F -x -m1 -- "$tok" "$file" 2>/dev/null | cut -d: -f1)
       [[ "$count" =~ ^[0-9]+$ ]] || return 0
       # at the limit, then again at each further multiple of it, so a long streak is not silent but not noisy
       if [[ "$count" -ge "$RETRY_LIMIT" && $((count % RETRY_LIMIT)) -eq 0 ]]; then

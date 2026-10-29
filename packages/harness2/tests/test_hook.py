@@ -35,7 +35,7 @@ def ev(event, sid="s1", **extra):
 
 def count(state, sid="s1"):
     f = state / f"{sid}.count"
-    return f.stat().st_size if f.exists() else 0
+    return len(f.read_text().splitlines()) if f.is_file() else 0   # one token line per failure
 
 
 def test_jq_and_bash_are_installed():
@@ -135,6 +135,17 @@ def test_concurrent_failures_in_one_session_are_all_counted(state):
     assert sum(1 for r in results if r.stdout) >= 1       # the limit was crossed by someone
 
 
+def test_a_burst_advises_exactly_once_per_multiple_of_the_limit(state):
+    # Each failure takes its own line number as its position, so every multiple of the limit is
+    # observed by exactly one process: a burst can neither skip an advisory nor repeat one.
+    n, limit = 24, 3
+    with ThreadPoolExecutor(12) as ex:
+        results = list(ex.map(lambda _: run(state, ev(FAIL, sid="burst")), range(n)))
+    assert all(r.returncode == 0 for r in results)
+    assert count(state, "burst") == n
+    assert sum(1 for r in results if r.stdout) == n // limit
+
+
 def test_concurrent_sessions_do_not_interfere(state):
     sids = [f"c{i}" for i in range(6)]
     jobs = [sid for sid in sids for _ in range(4)]
@@ -214,7 +225,8 @@ def test_nothing_but_a_count_is_written_to_disk(state, tmp_path):
         assert secret not in r.stdout and "private prompt" not in r.stdout
     files = [p for p in state.rglob("*") if p.is_file()]
     assert [p.name for p in files] == ["s1.count"]
-    assert set(files[0].read_bytes()) == {ord("x")}           # one byte per failure, no text
+    tokens = files[0].read_text().splitlines()                # one numeric token per failure, no text
+    assert len(tokens) == 4 and all(t.replace(".", "").isdigit() for t in tokens)
     assert oct(state.stat().st_mode & 0o777) == "0o700"
     leaked = subprocess.run(["rg", "-l", "-a", "SECRETSECRET|private prompt", str(tmp_path)], capture_output=True)
     assert leaked.stdout == b""
