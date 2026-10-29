@@ -348,11 +348,38 @@ def test_endpoint_variables_in_the_environment_must_be_a_declared_endpoint():
     assert chk(cfg(env={**CLEAN_ENV, "OPENAI_BASE_URL": LOCAL})).allowed
 
 
-@pytest.mark.parametrize("name", ["HTTP_PROXY", "https_proxy", "ALL_PROXY"])
-def test_a_proxy_that_is_not_a_declared_endpoint_is_refused(name):
-    d = chk(cfg(env={**CLEAN_ENV, name: f"http://u:{SENTINEL}@proxy.corp:3128"}))
-    refused(d, name)
-    assert SENTINEL not in dump(d)
+PROXY_NAMES = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "FTP_PROXY", "http_proxy", "https_proxy",
+               "all_proxy", "no_proxy", "ftp_proxy", "Http_Proxy", "No_Proxy", "SOCKS_PROXY", "RSYNC_PROXY",
+               "GIT_PROXY_COMMAND", "npm_config_proxy", "NOPROXY", "MY_PROXY_URL"]
+
+
+@pytest.mark.parametrize("name", PROXY_NAMES)
+@pytest.mark.parametrize("value", ["", "*", "localhost,127.0.0.1", "http://127.0.0.1:11434", LOCAL, "http://proxy.corp:3128"])
+def test_any_proxy_variable_is_refused_outright_whatever_its_value(name, value):
+    # the container runner sets proxies itself, and NO_PROXY can bypass them, so none may be passed in
+    d = chk(cfg(env={**CLEAN_ENV, name: value}))
+    refused(d, "rule proxy-env", name, "set by the runner")
+
+
+@pytest.mark.parametrize("name", PROXY_NAMES)
+def test_an_allowed_env_entry_cannot_let_a_proxy_through(name):
+    refused(chk(cfg(env={**CLEAN_ENV, name: "x"}), allowed_env=frozenset({name})), "rule proxy-env")
+
+
+def test_an_inherited_proxy_is_refused_too():
+    d = chk(cfg(env=None), environ={**CLEAN_ENV, "no_proxy": "*"})
+    refused(d, "rule proxy-env", "no_proxy")
+
+
+def test_proxy_names_are_listed_once_and_the_values_never_shown():
+    d = chk(cfg(env={**CLEAN_ENV, "HTTP_PROXY": f"http://u:{SENTINEL}@p.example", "NO_PROXY": SENTINEL}))
+    reasons = [r for r in d.reasons if "rule proxy-env" in r]
+    assert len(reasons) == 1 and "HTTP_PROXY" in reasons[0] and "NO_PROXY" in reasons[0]
+    assert SENTINEL not in dump(d) and "p.example" not in dump(d)
+
+
+def test_a_name_that_merely_contains_letters_of_proxy_is_not_a_proxy():
+    assert chk(cfg(env={**CLEAN_ENV, "PROXIMITY_SENSOR": "1", "PROXIES_ENABLED": "no"})).allowed
 
 
 @pytest.mark.parametrize("value", [3, ["PATH"], {"PATH": 1}, {1: "x"}, "PATH=/usr/bin"])

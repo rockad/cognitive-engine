@@ -26,7 +26,8 @@ starting anything. It is default-deny:
   * the command line must be exactly the expected argv for the kind (`COMMAND_SHAPES`: the executable, an
     allow-list of flags, the expected positionals); any other flag or endpoint-looking value is refused;
   * credential-LOOKING environment variable names are refused unless listed in `allowed_env`;
-    endpoint variables (`*_BASE_URL`) must point at one of the channel's declared endpoints.
+    endpoint variables (`*_BASE_URL`) must point at one of the channel's declared endpoints, and ANY proxy
+    variable (HTTP_PROXY, NO_PROXY, no_proxy, ...) is refused outright because the runner sets those itself.
 
 Reasons name environment variables by NAME only. No value, URL userinfo, query, argument or prompt
 text is ever copied into a reason, a warning or the redacted view.
@@ -62,7 +63,7 @@ _SECRET_WORDS = re.compile(
 _SECRET_PREFIXES = ("AWS_", "AZURE_", "ANTHROPIC_", "OPENAI_", "OPENROUTER_", "JEV_", "GITHUB_", "GH_", "GITEA_",
                     "GITLAB_", "HF_", "HUGGINGFACE_", "GPG_")
 _ENDPOINT_SUFFIXES = ("_BASE_URL", "_API_BASE", "_ENDPOINT", "_API_URL")
-_PROXIES = frozenset({"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"})
+_PROXY_WORD = "PROXY"   # any variable whose name contains it: HTTP_PROXY, no_proxy, SOCKS_PROXY, GIT_PROXY_COMMAND ...
 _VERTEX_ENV_PREFIXES = ("GOOGLE_VERTEX_", "ANTHROPIC_VERTEX_", "VERTEXAI_")
 _CLOUD_FLAGS = ("CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_BEDROCK")
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
@@ -434,13 +435,16 @@ def _evaluate(c: ProposerConfig, profile: Any, channel_name: Any, zdr: str, clas
     allow = frozenset(allowed_env)
     groups: dict[str, list[str]] = {"secret_like": [], "allowed": [], "endpoint_vars": []}
     vertex_env: list[str] = []
+    proxy_env: list[str] = []
     other = 0
     for name, value in env.items():
         up = name.upper()
         if up.startswith(_VERTEX_ENV_PREFIXES) or up == "CLOUD_ML_REGION" or (
                 up in _CLOUD_FLAGS and value.strip().lower() in _TRUTHY):
             vertex_env.append(name)
-        if up in _PROXIES or up.endswith(_ENDPOINT_SUFFIXES):
+        if _PROXY_WORD in up:
+            proxy_env.append(name)
+        elif up.endswith(_ENDPOINT_SUFFIXES):
             groups["endpoint_vars"].append(name)
             k = _endpoint_key(value)
             h_ok = k is not None and ch is not None and k in ch.endpoint_keys
@@ -453,6 +457,11 @@ def _evaluate(c: ProposerConfig, profile: Any, channel_name: Any, zdr: str, clas
             groups["secret_like"].append(name)
         else:
             other += 1
+    if proxy_env:
+        # The container runner (slice 3b) sets the proxy variables itself, and NO_PROXY can bypass them, so no
+        # proxy-ish variable may arrive in the configuration, whatever it points at and even if listed in allowed_env.
+        refuse("proxy-env", f"proxy variables are refused outright: {", ".join(sorted(proxy_env))} (names only; "
+                            "proxy settings are set by the runner, never by the configuration)")
     if groups["secret_like"]:
         refuse("credential-env",
                "the session would inherit credential-like environment variables that were not explicitly allowed: "
