@@ -25,7 +25,19 @@ System 1 coprocessor for Cognitive Engine (RFC 002). A Bun/TypeScript MCP server
 
 `~/.config/jev/config.json` is the single store for the global default mode (`defaults.mode`) and per-harness overrides (`harnesses.<harness>.mode`). The OpenRouter key is read from `JEV_OPENROUTER_API_KEY`, a dedicated key separate from `OPENROUTER_API_KEY`.
 
-The expected shape is `{"defaults":{"mode":"on-demand"}}`, with `mode` one of `off`, `on-demand`, `on`. `validateJevConfig` (`src/core/config.ts`) is the single check for whether that file can be trusted. A missing file, `{}`, or a file with no mode set is unset and takes the loader default (`off`). A file that exists but is unusable is malformed: unreadable, not valid JSON, not an object, an unknown or non-string mode, a wrong type for any key the loader reads, or a stray top-level `mode` (it is ignored; the mode lives at `defaults.mode`). Unrelated extra keys are never flagged. A malformed config is neither on nor off: the subagent guard asks on every guarded call until the file is fixed or `off` is set explicitly, and `jev_get_mode` returns a `configWarning` with the same problems.
+The expected shape is `{"defaults":{"mode":"on-demand"}}`, with `mode` one of `off`, `on-demand`, `on`. `validateJevConfig` (`src/core/config.ts`) is the single check for whether that file can be trusted. A missing file (no entry at the default path), `{}`, or a file with no mode set is unset and takes the loader default (`off`). A file that exists but is unusable is malformed:
+
+- unreadable, not a regular file, or a symlink whose target is missing or unreadable ("broken symlink"); a symlink to a valid file is fine
+- over the 1 MB limit ("config is over the 1 MB limit"; exactly 1 MB is accepted), checked by `stat` before reading and again on the bytes read
+- not valid JSON, not an object, an unknown or non-string mode, or a wrong type for any key the loader reads
+- a stray top-level `mode` (it is ignored; the mode lives at `defaults.mode`)
+- a near-miss key that the loader would silently ignore, with a did-you-mean hint: at the top level `default`, `defualts`, `Default`, `harness`, `timeout` and the like; under `harnesses`, `claude`, `antigravty`, `opencod`, `Claude-Code` and the like
+- a `mode` inside a `harnesses` block whose name matches no known harness (`antigravity`, `claude-code`, `opencode`, `cli`): a mode that applies to nothing
+- `JEV_CONFIG_FILE` set to a path that does not exist (explicitly pointing at nothing is a mistake; with the variable unset a missing default file is just unset)
+
+The near-miss rule: a key that is not exactly a known key is flagged when, compared case-insensitively, it is an explicit alias (`default`, `harness`, `claude`, `claudecode`, `gemini`, `agy`) or within edit distance 2 of a known key (1 when the known key has 5 characters or fewer, so a short unrelated name such as `api` is not taken for `cli`; a swap of two adjacent letters counts as 1). Any other extra key is never flagged, since other tools may add their own.
+
+A malformed config is neither on nor off: the subagent guard asks on every guarded call until the file is fixed or `off` is set explicitly, and `jev_get_mode` returns a `configWarning` with the same problems. The guard reads the file once, derives the mode from the object it validated (`resolveJevModeFromConfig`, the same function the loader uses), and cross-checks the loader; a mismatch, or a file that stops being readable between the two reads, asks instead of falling back to `off`.
 
 Harness detection reads `JEV_HARNESS` first (`antigravity`, `claude-code`, `opencode`, `cli`), then falls back to each harness's own environment markers.
 
