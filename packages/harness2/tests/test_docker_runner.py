@@ -386,6 +386,52 @@ def test_every_docker_call_a_run_makes_names_the_pinned_daemon(monkeypatch):
     assert not any("attacker.example" in " ".join(a) for a, _ in rec.calls)
 
 
+DOCKER_VARS = {
+    "DOCKER_HOST": "tcp://attacker.example:2375", "DOCKER_CONTEXT": "remote", "DOCKER_CONFIG": "",
+    "DOCKER_CERT_PATH": "/tmp/certs", "DOCKER_TLS_VERIFY": "1", "DOCKER_API_VERSION": "1.40",
+    "DOCKER_CONTENT_TRUST": "1", "DOCKER_DEFAULT_PLATFORM": "linux/s390x", "DOCKER_BUILDKIT": "0",
+    "DOCKER_HIDE_LEGACY_COMMANDS": "1", "DOCKER_SOMETHING_NEW": "x",
+}
+
+
+def _docker_config_dir(tmp_path):
+    d = tmp_path / "dockercfg"
+    d.mkdir()
+    (d / "config.json").write_text(json.dumps({
+        "currentContext": "remote", "credsStore": "evil-helper",
+        "proxies": {"default": {"httpProxy": "http://attacker.example:3128"}},
+    }))
+    return d
+
+
+def test_no_docker_variable_reaches_any_docker_child(monkeypatch, tmp_path):
+    """DOCKER_CONFIG (currentContext, credsStore, proxies) and every other DOCKER_* is dropped, not just HOST/CONTEXT."""
+    rec = Recorder(monkeypatch)
+    for k, v in DOCKER_VARS.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("DOCKER_CONFIG", str(_docker_config_dir(tmp_path)))
+    monkeypatch.setenv("docker_lower", "x")   # env names are case-sensitive; strip look-alikes too
+    monkeypatch.setenv("KEEP_ME", "1")
+    DockerRunner("/usr/bin/docker", docker_host=SOCK).run(SandboxSpec(command=["echo"], files={"prompt": "x"}))
+    assert {"info", "image", "run", "kill", "rm"} <= set(rec.verbs())
+    for argv, env in rec.calls:
+        assert env is not None, argv
+        assert not [k for k in env if k.upper().startswith("DOCKER_")], (argv, sorted(k for k in env if "OCKER" in k.upper()))
+        assert env["KEEP_ME"] == "1"   # only DOCKER_* goes
+    assert "dockercfg" not in " ".join(" ".join(a) for a, _ in rec.calls)
+
+
+def test_the_gate_probes_carry_no_docker_variable_either(monkeypatch, tmp_path):
+    rec = Recorder(monkeypatch)
+    for k, v in DOCKER_VARS.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("DOCKER_CONFIG", str(_docker_config_dir(tmp_path)))
+    sandbox.verify_rootless_docker(which_docker, run=subprocess.run, environ={"DOCKER_HOST": SOCK})
+    assert rec.calls
+    for argv, env in rec.calls:
+        assert env is not None and not [k for k in env if k.upper().startswith("DOCKER_")], argv
+
+
 def test_the_kill_and_rm_after_a_timeout_are_pinned_too(monkeypatch):
     rec = Recorder(monkeypatch, hang_first=True)
     hostile(monkeypatch)

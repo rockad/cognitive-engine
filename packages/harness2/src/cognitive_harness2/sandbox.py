@@ -95,7 +95,6 @@ DEFAULT_IMAGE = "alpine:3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b8
 CANDIDATE_DIR = "/candidate"
 MAX_OUTPUT_BYTES = 1 << 20
 _PROBE_TIMEOUT_S = 15
-_AMBIENT_ENDPOINT_VARS = ("DOCKER_HOST", "DOCKER_CONTEXT")
 
 
 def _probe(argv: list[str], run: Callable[..., subprocess.CompletedProcess],
@@ -129,10 +128,16 @@ def _is_local_unix(host: str) -> bool:
 def _pinned_env() -> dict[str, str]:
     """The process environment minus everything that can redirect the docker CLI.
 
-    `-H` already outranks DOCKER_HOST and DOCKER_CONTEXT, but they are dropped as well so a
-    value that changed after the check can never be consulted for any docker invocation.
+    `-H` already outranks DOCKER_HOST and DOCKER_CONTEXT, but EVERY variable starting with DOCKER_ is
+    dropped (DOCKER_CONFIG, whose config.json can set currentContext, a credential helper and container
+    proxies; DOCKER_CERT_PATH, DOCKER_TLS_VERIFY, DOCKER_API_VERSION, DOCKER_CONTENT_TRUST, ...), so
+    nothing ambient can be consulted by any docker invocation after the check. The endpoint is carried
+    by `-H unix://...` and the image is never pulled.
+
+    The one call that is not pinned is the endpoint resolver (`docker context inspect`, used only when
+    DOCKER_HOST is unset): reading the ambient context is its job.
     """
-    return {k: v for k, v in os.environ.items() if k not in _AMBIENT_ENDPOINT_VARS}
+    return {k: v for k, v in os.environ.items() if not k.upper().startswith("DOCKER_")}
 
 
 def verify_rootless_docker(

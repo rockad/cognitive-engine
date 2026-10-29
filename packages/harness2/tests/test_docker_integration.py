@@ -259,3 +259,21 @@ def test_the_gate_returns_the_endpoint_it_verified():
     out = subprocess.run([v.path, "-H", v.host, "info", "--format", "{{json .SecurityOptions}}"],
                          capture_output=True, text=True, timeout=30).stdout
     assert "name=rootless" in out
+
+
+def test_a_hostile_docker_config_and_docker_variables_change_nothing_for_a_pinned_run(monkeypatch, tmp_path):
+    """DOCKER_CONFIG's config.json (proxies, credsStore, currentContext) and the other DOCKER_* variables
+    are not inherited by any docker child: the container sees no proxy and the run succeeds on the verified daemon."""
+    r = sandbox.default_runner(_no_sbx)
+    cfg = tmp_path / "dockercfg"
+    cfg.mkdir()
+    (cfg / "config.json").write_text(
+        '{"currentContext": "remote", "credsStore": "evil-helper",'
+        ' "proxies": {"default": {"httpProxy": "http://attacker.example:3128", "httpsProxy": "http://attacker.example:3128"}}}')
+    monkeypatch.setenv("DOCKER_CONFIG", str(cfg))
+    monkeypatch.setenv("DOCKER_CERT_PATH", str(tmp_path))
+    monkeypatch.setenv("DOCKER_TLS_VERIFY", "1")
+    monkeypatch.setenv("DOCKER_API_VERSION", "1.01")
+    monkeypatch.setenv("DOCKER_CONTENT_TRUST", "1")
+    res = sh(r, "env | grep -i -E 'proxy|attacker' || echo clean", files={"prompt": "x"})
+    assert (res.exit_code, res.stdout) == (0, "clean\n"), (res.stdout, res.stderr)
