@@ -532,7 +532,9 @@ class CognitiveSubstrate:
         ws = Path(tempfile.mkdtemp(prefix=f"h2ws-{run_id[:24]}-", dir=ex.workspace_root)).resolve()
         removed = False
         try:
-            ws.chmod(0o777)                         # the container user (65534) is not the host user
+            # The container user (65534) is not the host user, so the directory must be world-writable. The sticky
+            # bit stops it unlinking or renaming the files placed here (AGENTS.md, the inputs): it owns none of them.
+            ws.chmod(0o1777)
             if agents_md:
                 _write_private(ws / "AGENTS.md", agents_md)
             for name, body in task.files.items():
@@ -540,7 +542,7 @@ class CognitiveSubstrate:
                 p.parent.mkdir(parents=True, exist_ok=True)
                 _write_private(p, body)
             (ws / OUTPUT_DIR).mkdir()
-            (ws / OUTPUT_DIR).chmod(0o777)
+            (ws / OUTPUT_DIR).chmod(0o1777)
             job = SolverJob(task_ref, run_id, task.prompt, str(ws), ex.model_name, sr.container_cli_path(ex.cli))
             spec = sr.SessionSpec(argv=tuple(ex.argv_builder(job)), workspace=str(ws), cli=ex.cli,
                                   timeout_s=min(timeout, g.per_session_s),

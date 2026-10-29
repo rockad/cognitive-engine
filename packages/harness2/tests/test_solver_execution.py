@@ -302,7 +302,7 @@ def test_a_granted_run_builds_the_workspace_runs_the_session_and_records_everyth
     assert seen["entries"] == ["AGENTS.md", "input.txt", "output"]
     assert seen["agents"] == "Be careful.\n\n---\n\nNever guess.\n\n---\n\nUse bash.\n"      # always-on files only
     assert seen["input"] == INST.input_text
-    assert seen["ws_mode"] == 0o777 and seen["out_mode"] == 0o777
+    assert seen["ws_mode"] == 0o1777 and seen["out_mode"] == 0o1777          # sticky: the solver cannot unlink the inputs
     # the session it was given
     spec = sess.plans[0].spec
     assert spec.argv == ("/opt/cli/fake-cli", "solve", "run-1") and spec.timeout_s == 300
