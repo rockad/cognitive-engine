@@ -22,8 +22,7 @@ from cognitive_harness2.upstream_egress import (
 
 SENTINEL = "SENTINEL-do-not-leak-7f3a"
 CLEAN_ENV = {"PATH": "/usr/bin", "LANG": "C.UTF-8", "HOME": "/tmp/h"}
-ARGV = ("bun", "run", "--cwd", "/x", "src/index.ts", "run", f"PROMPT {SENTINEL}", "--dir", WORK,
-        "--model", "ollama/qwen3:30b", "--format", "json")
+ARGV = ("opencode", "run", "--standalone", "--auto", "--format", "json", "--model", "ollama/qwen3:30b", f"PROMPT {SENTINEL}")
 
 
 def cfg(**over) -> ProposerConfig:
@@ -423,7 +422,7 @@ def test_a_claude_executable_is_claude_whatever_the_kind_says():
 
 
 def test_a_command_that_disagrees_with_its_kind_is_refused():
-    d = chk(cfg(**CLAUDE, command=("bun", "run", "src/index.ts")), "claude", zdr="off", classification="open")
+    d = chk(cfg(**CLAUDE, command=("opencode", "run", "go")), "claude", zdr="off", classification="open")
     refused(d, "does not match")
 
 
@@ -432,12 +431,12 @@ def test_a_command_that_disagrees_with_its_kind_is_refused():
 def test_the_view_shows_the_executable_and_flag_names_never_arguments():
     d = chk(cfg(command=ARGV))
     assert d.allowed
-    assert d.view["command"] == {"executable": "bun", "flags": ["--cwd", "--dir", "--format", "--model"]}
+    assert d.view["command"] == {"executable": "opencode", "flags": ["--auto", "--format", "--model", "--standalone"]}
     assert SENTINEL not in dump(d)
 
 
-@pytest.mark.parametrize("argv", [("bun", "--api-key", SENTINEL), ("bun", f"--token={SENTINEL}"),
-                                  ("bun", "--password", SENTINEL)])
+@pytest.mark.parametrize("argv", [("opencode", "--api-key", SENTINEL), ("opencode", f"--token={SENTINEL}"),
+                                  ("opencode", "--password", SENTINEL)])
 def test_a_credential_flag_on_the_command_line_is_refused_without_its_value(argv):
     d = chk(cfg(command=argv))
     refused(d, "command line")
@@ -478,7 +477,7 @@ BAD_RAW = {
     "model empty": {"kind": "opencode", "model": "  ", "base_url": LOCAL},
     "model int": {"kind": "opencode", "model": 7, "base_url": LOCAL},
     "command string": {"kind": "opencode", "model": "ollama/x", "base_url": LOCAL, "command": "bun run"},
-    "command items": {"kind": "opencode", "model": "ollama/x", "base_url": LOCAL, "command": ["bun", 3]},
+    "command items": {"kind": "opencode", "model": "ollama/x", "base_url": LOCAL, "command": ["opencode", 3]},
     "empty command": {"kind": "opencode", "model": "ollama/x", "base_url": LOCAL, "command": []},
     "cwd int": {"kind": "opencode", "model": "ollama/x", "base_url": LOCAL, "cwd": 3},
     "unknown key": {"kind": "opencode", "model": "ollama/x", "base_url": LOCAL, "api_key": SENTINEL},

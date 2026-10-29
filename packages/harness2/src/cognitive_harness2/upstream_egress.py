@@ -1,7 +1,8 @@
 """Seam 2: where an upstream Proposer session may send content, decided BEFORE a session exists.
 
 Upstream's `Proposer` (harness2.core.proposer) runs an agentic CLI session (`opencode` through
-bun, or the `claude` CLI) with file and shell access. Reading its source at the pinned commit:
+bun, or the `claude` CLI) with file and shell access. This package runs three CLIs instead (opencode v2,
+claude headless, agy) and checks the argv it will run against `COMMAND_SHAPES`. Reading its source at the pinned commit:
 
   * it has NO endpoint field. The claude channel sets CLAUDE_CODE_USE_VERTEX=1, the opencode
     channel sets GOOGLE_VERTEX_PROJECT, so out of the box both go to Vertex AI;
@@ -50,11 +51,13 @@ from . import channels
 from .channels import Channel, ChannelProfile
 
 KINDS = ("claude_cli", "opencode")  # == harness2.core.spec.CHANNELS (pinned by a test)
-_KIND_ALIASES = {"claude": "claude_cli"}
+AGY_KIND = "agy_cli"                 # not an upstream channel: our own (the contained proposer carries it, see contained_proposer.py)
+CHECKED_KINDS = (*KINDS, AGY_KIND)   # what `check_proposer` accepts
+_KIND_ALIASES = {"claude": "claude_cli", "agy": "agy_cli"}
 _FIELDS = ("kind", "model", "base_url", "env", "cwd", "command", "project", "region")
 
 LOCAL_PROVIDERS = frozenset({"ollama", "lmstudio", "llamacpp", "llama.cpp", "llama-cpp", "local", "localai", "vllm"})
-_EXE_KIND = {"claude": "claude_cli", "claude-code": "claude_cli", "bun": "opencode", "opencode": "opencode"}
+_EXE_KIND = {"claude": "claude_cli", "claude-code": "claude_cli", "opencode": "opencode", "agy": "agy_cli"}
 
 _NON_SECRET_SUFFIXES = ("_BASE_URL", "_API_BASE", "_ENDPOINT", "_API_URL", "_MODEL", "_REGION", "_LOCATION",
                         "_PROJECT", "_PROJECT_ID")
@@ -124,8 +127,8 @@ def parse_config(raw: Any) -> ProposerConfig:
         raise ProposerConfigError("kind must be a string")
     kind = kind.strip().lower()
     kind = _KIND_ALIASES.get(kind, kind)
-    if kind not in KINDS:
-        raise ProposerConfigError(f"kind is not one of {', '.join(KINDS)}")
+    if kind not in CHECKED_KINDS:
+        raise ProposerConfigError(f"kind is not one of {', '.join(CHECKED_KINDS)}")
     model = raw.get("model")
     if not isinstance(model, str) or not model.strip():
         raise ProposerConfigError("model must be a non-empty string")
@@ -234,7 +237,10 @@ def _cwd_problem(cwd: str, profile: Any) -> str | None:
 # positionals below. Anything else is refused. Value kinds: None (the flag takes no value), json (the
 # literal `json`), word (a short lowercase word), path (an absolute path that is not a URL), cwd (the
 # configuration's own working directory), model (the configuration's own model id), text (free text: it may
-# not be a flag, a response file, a control string, or ITSELF a URL, host:port or `KEY=value` setting).
+# not be a flag, a response file, a control string, or ITSELF a URL, host:port or `KEY=value` setting),
+# number (a small decimal), toollist (a comma-separated tool list such as `Bash,Edit`), and choice:a|b (one of
+# the listed words). A flag in `flags` is written as TWO tokens (`--model M`); a flag in `joined` is written as
+# ONE (`--model=M`) and only that way, because that is how the CLI that takes it is invoked.
 # This list is the policy, so widening it is a deliberate edit here and nowhere else.
 
 @dataclass(frozen=True)
@@ -242,27 +248,42 @@ class CommandShape:
     executables: tuple[str, ...]
     flags: Mapping[str, str | None]
     positionals: Mapping[str, tuple[str, ...]]   # executable -> expected positionals; `<prompt>` is free text
+    joined: Mapping[str, str | None] = MappingProxyType({})   # `--name=value` flags: always carry a value
 
 
 COMMAND_SHAPES: Mapping[str, CommandShape] = MappingProxyType({
-    # `claude --dangerously-skip-permissions -p --output-format json --effort E [--append-system-prompt S]`
+    # claude 2.1.x headless; the prompt arrives on stdin (so it is not limited by the argument size):
+    #   `claude -p --output-format json --permission-mode M --no-session-persistence --model M --effort E
+    #          [--append-system-prompt S] [--max-budget-usd N] [--tools L] [--allowedTools L] [--disallowedTools L]`
     "claude_cli": CommandShape(
         executables=("claude", "claude-code"),
-        flags=MappingProxyType({"--dangerously-skip-permissions": None, "-p": None, "--output-format": "json",
-                                "--effort": "word", "--append-system-prompt": "text"}),
+        flags=MappingProxyType({"-p": None, "--output-format": "json",
+                                "--permission-mode": "choice:bypassPermissions|acceptEdits",
+                                "--no-session-persistence": None, "--model": "model", "--effort": "word",
+                                "--append-system-prompt": "text", "--max-budget-usd": "number",
+                                "--tools": "toollist", "--allowedTools": "toollist",
+                                "--disallowedTools": "toollist"}),
         positionals=MappingProxyType({"claude": (), "claude-code": ()}),
     ),
-    # `bun run --cwd C --conditions=browser src/index.ts run PROMPT --dir D --model M --format json [--variant V]`
+    # opencode v2.0.x non-interactive: `opencode run --standalone --auto --format json --model M PROMPT`
+    # (the provider and base URL arrive through OPENCODE_CONFIG_CONTENT, never a flag)
     "opencode": CommandShape(
-        executables=("bun", "opencode"),
-        flags=MappingProxyType({"--cwd": "path", "--conditions=browser": None, "--dir": "cwd", "--model": "model",
-                                "--format": "json", "--variant": "word"}),
-        positionals=MappingProxyType({"bun": ("run", "src/index.ts", "run", "<prompt>"),
-                                      "opencode": ("run", "<prompt>")}),
+        executables=("opencode",),
+        flags=MappingProxyType({"--standalone": None, "--auto": None, "--format": "json", "--model": "model"}),
+        positionals=MappingProxyType({"opencode": ("run", "<prompt>")}),
+    ),
+    # Antigravity CLI: `agy --print=PROMPT --dangerously-skip-permissions --model=M [--effort=low]`
+    "agy_cli": CommandShape(
+        executables=("agy",),
+        flags=MappingProxyType({"--dangerously-skip-permissions": None}),
+        joined=MappingProxyType({"--print": "text", "--model": "model", "--effort": "choice:low"}),
+        positionals=MappingProxyType({"agy": ()}),
     ),
 })
 
 _WORD = re.compile(r"[a-z0-9_-]{1,16}")
+_NUMBER = re.compile(r"[0-9]{1,4}(\.[0-9]{1,4})?")
+_TOOLLIST = re.compile(r"[A-Za-z][A-Za-z0-9_,:()* .-]{0,199}")
 _SETTINGLIKE = re.compile(
     r"(?i)^[a-z][a-z0-9+.-]*://"                                         # a URL
     r"|^[^\s=]*(base|endpoint|proxy|gateway|server|host|url|api)[^\s=]*="  # an endpoint setting, KEY=value
@@ -300,6 +321,12 @@ def _value_problem(kind: str | None, value: str, c: ProposerConfig) -> str | Non
         return "its value must equal the configuration's working directory"
     if kind == "model" and value != c.model:
         return "its value must equal the configuration's model"
+    if kind == "number" and not _NUMBER.fullmatch(value):
+        return "its value must be a small decimal number"
+    if kind == "toollist" and not _TOOLLIST.fullmatch(value):
+        return "its value must be a short comma-separated tool list"
+    if kind is not None and kind.startswith("choice:") and value not in kind[len("choice:"):].split("|"):
+        return "its value is not one of the permitted words"
     return None
 
 
@@ -327,6 +354,19 @@ def _command_problems(c: ProposerConfig, exe: str | None) -> list[str]:
             problems.append("a response file (@file) argument is refused")
             continue
         if _dashlike(a):
+            name, eq, joined_value = a.partition("=")
+            if eq and name in shape.joined:
+                if name in seen:
+                    problems.append(f"the flag {_flag_name(a)} is repeated")
+                    continue
+                seen.add(name)
+                why = _value_problem(shape.joined[name], joined_value, c)
+                if why:
+                    problems.append(f"the flag {_flag_name(a)}: {why}")
+                continue
+            if a in shape.joined:
+                problems.append(f"the flag {_flag_name(a)} must be written --name=value in one argument")
+                continue
             if a not in shape.flags:
                 problems.append(f"the flag {_flag_name(a)} is not on the allow-list for {c.kind}")
                 continue
@@ -408,17 +448,20 @@ def _evaluate(c: ProposerConfig, profile: Any, channel_name: Any, zdr: str, clas
     exe = os.path.basename(c.command[0]).lower() if c.command else None
     exe_kind = _EXE_KIND.get(exe) if exe else None
     if exe is not None and exe_kind is None:
-        refuse("command-shape", f"the executable {exe!r} is not a CLI this gate recognises (expected claude, bun or opencode)")
+        refuse("command-shape", f"the executable {exe!r} is not a CLI this gate recognises (expected claude, opencode or agy)")
     elif exe_kind is not None and exe_kind != c.kind:
         refuse("command-shape", f"the executable ({exe_kind}) does not match the declared kind ({c.kind})")
     if c.kind == "claude_cli" or exe_kind == "claude_cli":
         warnings.append("a claude CLI proposer can spend the user's Claude subscription quota")
+    if c.kind == AGY_KIND or exe_kind == AGY_KIND:
+        warnings.append("an agy CLI proposer can spend the user's Google AI subscription quota; its retention is unknown")
 
-    provider = "anthropic" if c.kind == "claude_cli" else (c.model.split("/", 1)[0].lower() if "/" in c.model else "")
+    provider = ("anthropic" if c.kind == "claude_cli" else "google" if c.kind == AGY_KIND
+                else (c.model.split("/", 1)[0].lower() if "/" in c.model else ""))
     if c.kind == "opencode" and not provider:
         refuse("provider", "an opencode model id must be provider-prefixed (provider/model), so its provider is unknown")
-    if c.kind == "claude_cli" and "/" in c.model:
-        refuse("provider", "a claude_cli model id must be a bare Anthropic id, so its provider is unknown")
+    if c.kind in ("claude_cli", AGY_KIND) and "/" in c.model:
+        refuse("provider", f"a {c.kind} model id must be a bare vendor id, so its provider is unknown")
 
     # the endpoint
     host, shown, creds, problem = _split_url(c.base_url) if c.base_url is not None else (None, None, False, "")
@@ -474,7 +517,8 @@ def _evaluate(c: ProposerConfig, profile: Any, channel_name: Any, zdr: str, clas
     evidence = []
     if "vertex" in provider:
         evidence.append("model provider")
-    if host and host.endswith("googleapis.com"):
+    # googleapis.com is the agy CLI's own (non-Vertex) endpoint; for it only the Vertex API host is evidence
+    if host and (host.endswith("aiplatform.googleapis.com") if c.kind == AGY_KIND else host.endswith("googleapis.com")):
         evidence.append("endpoint host")
     if c.project:
         evidence.append("a Vertex project is configured")
