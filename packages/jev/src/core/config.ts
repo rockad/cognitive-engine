@@ -326,6 +326,42 @@ export function jevUserConfigFile(): string {
 export const VALID_JEV_MODES: readonly JevMode[] = ['off', 'on-demand', 'on'];
 const KNOWN_HARNESSES: readonly JevHarness[] = ['antigravity', 'claude-code', 'opencode', 'cli'];
 
+const KNOWN_TOP_LEVEL_KEYS: readonly string[] = ['version', 'defaults', 'routing', 'models', 'tiers', 'timeouts', 'cache', 'thresholds', 'harnesses', 'privacy'];
+const TOP_LEVEL_ALIASES: Readonly<Record<string, string>> = { default: 'defaults', harness: 'harnesses' };
+const HARNESS_ALIASES: Readonly<Record<string, string>> = { claude: 'claude-code', claudecode: 'claude-code', gemini: 'antigravity', agy: 'antigravity' };
+
+/** Optimal-string-alignment distance: insert, delete, substitute and adjacent transposition each cost 1. */
+function editDistance(a: string, b: string): number {
+  const d: number[][] = Array.from({ length: a.length + 1 }, (_, i) => [i, ...new Array<number>(b.length).fill(0)]);
+  for (let j = 1; j <= b.length; j++) d[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1);
+    }
+  }
+  return d[a.length][b.length];
+}
+
+/**
+ * The known key a misspelled one was probably meant to be, or undefined when it is not a near miss.
+ * Rule: a key that is not exactly a known key is a near miss when, compared case-insensitively, it
+ * is an explicit alias, or its edit distance to a known key is at most 2 (at most 1 when the known
+ * key has 5 characters or fewer, so a short unrelated name like `api` is not taken for `cli`).
+ */
+function nearMissOf(key: string, known: readonly string[], aliases: Readonly<Record<string, string>>): string | undefined {
+  if (known.includes(key)) return undefined;
+  const lower = key.toLowerCase();
+  if (aliases[lower]) return aliases[lower];
+  let best: { k: string; dist: number } | undefined;
+  for (const k of known) {
+    const dist = editDistance(lower, k);
+    if (dist <= (k.length <= 5 ? 1 : 2) && (!best || dist < best.dist)) best = { k, dist };
+  }
+  return best?.k;
+}
+
 export interface JevConfigValidation {
   ok: boolean;
   /** One human-readable line per problem; names the key path and the expected shape, never file contents. */
@@ -396,6 +432,11 @@ export function validateJevConfig(raw: unknown): JevConfigValidation {
   };
 
   if ('mode' in cfg) problems.push("top-level 'mode' is ignored; use defaults.mode");
+  for (const key of Object.keys(cfg)) {
+    if (key === 'mode') continue;
+    const intended = nearMissOf(key, KNOWN_TOP_LEVEL_KEYS, TOP_LEVEL_ALIASES);
+    if (intended) problems.push(`top-level '${key.slice(0, 40)}' is ignored; did you mean '${intended}'?`);
+  }
   typed('version', cfg.version, 'number');
 
   const defaults = object('defaults', cfg.defaults);
@@ -436,6 +477,16 @@ export function validateJevConfig(raw: unknown): JevConfigValidation {
 
   const harnesses = object('harnesses', cfg.harnesses);
   if (harnesses) {
+    for (const [name, block] of Object.entries(harnesses)) {
+      if ((KNOWN_HARNESSES as readonly string[]).includes(name)) continue;
+      const shown = name.slice(0, 40);
+      const intended = nearMissOf(name, KNOWN_HARNESSES, HARNESS_ALIASES);
+      if (intended) {
+        problems.push(`harnesses.${shown} is ignored; did you mean '${intended}'?`);
+      } else if (isObj(block) && 'mode' in block) {
+        problems.push(`harnesses.${shown} sets a mode but '${shown}' is not a known harness (${KNOWN_HARNESSES.join(', ')}), so the mode applies to nothing`);
+      }
+    }
     for (const h of KNOWN_HARNESSES) {
       const at = `harnesses.${h}`;
       const hc = object(at, harnesses[h]);
