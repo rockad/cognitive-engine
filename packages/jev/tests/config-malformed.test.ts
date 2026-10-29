@@ -19,16 +19,18 @@ beforeEach(() => {
 });
 afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-function runHook(stdin: unknown, arg = 'claude') {
+function runHook(stdin: unknown, arg = 'claude', opts: { unsetConfigEnv?: boolean } = {}) {
+  const env: Record<string, string | undefined> = {
+    ...process.env,
+    HOME: tmp,
+    JEV_CONFIG_FILE: cfgFile,
+    JEV_CLAUDE_STATE_DIR: path.join(tmp, 'state'),
+    JEV_CLAUDE_DECISIONS_FILE: path.join(tmp, 'decisions.jsonl')
+  };
+  if (opts.unsetConfigEnv) delete env.JEV_CONFIG_FILE;
   const r = Bun.spawnSync(['bun', HOOK, arg], {
     stdin: new TextEncoder().encode(typeof stdin === 'string' ? stdin : JSON.stringify(stdin)),
-    env: {
-      ...process.env,
-      HOME: tmp,
-      JEV_CONFIG_FILE: cfgFile,
-      JEV_CLAUDE_STATE_DIR: path.join(tmp, 'state'),
-      JEV_CLAUDE_DECISIONS_FILE: path.join(tmp, 'decisions.jsonl')
-    }
+    env: env as Record<string, string>
   });
   return { code: r.exitCode, out: r.stdout.toString(), err: r.stderr.toString() };
 }
@@ -144,8 +146,8 @@ describe('guard hook: off is silent, healthy configs unchanged', () => {
     expect(runHook(opusAgent).out).toBe('');
   });
 
-  it('missing file keeps the loader default (off): silent', () => {
-    const r = runHook(opusAgent);
+  it('no JEV_CONFIG_FILE and no file at the default path keeps the loader default (off): silent', () => {
+    const r = runHook(opusAgent, 'claude', { unsetConfigEnv: true });
     expect([r.code, r.out, r.err]).toEqual([0, '', '']);
   });
 
@@ -264,10 +266,127 @@ describe('jev_get_mode surfaces the same validator', () => {
     expect(r.configWarning.problems).toEqual(["top-level 'mode' is ignored; use defaults.mode"]);
   });
 
-  it('adds nothing for a valid or missing config', async () => {
-    expect((await result()).configWarning).toBeUndefined();
+  it('warns when JEV_CONFIG_FILE names a missing file', async () => {
+    const r = await result();
+    expect(r.configWarning.problems).toEqual(['JEV_CONFIG_FILE points at a file that does not exist']);
+  });
+
+  it('adds nothing for a valid config', async () => {
     fs.writeFileSync(cfgFile, '{"defaults":{"mode":"on"}}');
     clearConfigCacheForTesting();
     expect((await result()).configWarning).toBeUndefined();
+  });
+});
+
+describe('inspectJevConfigFile: file-level hazards', () => {
+  const MB = 1024 * 1024;
+  const padded = (bytes: number) => {
+    const head = '{"defaults":{"mode":"off"},"pad":"';
+    const tail = '"}';
+    return head + 'x'.repeat(bytes - head.length - tail.length) + tail;
+  };
+  let savedEnv: string | undefined;
+  beforeEach(() => {
+    savedEnv = process.env.JEV_CONFIG_FILE;
+    delete process.env.JEV_CONFIG_FILE;
+  });
+  afterEach(() => {
+    if (savedEnv === undefined) delete process.env.JEV_CONFIG_FILE;
+    else process.env.JEV_CONFIG_FILE = savedEnv;
+  });
+
+  it('exactly 1 MB is valid', () => {
+    fs.writeFileSync(cfgFile, padded(MB));
+    expect(fs.statSync(cfgFile).size).toBe(MB);
+    expect(inspectJevConfigFile(cfgFile).state).toBe('valid');
+  });
+
+  it('1 MB + 1 byte is malformed, naming the limit', () => {
+    fs.writeFileSync(cfgFile, padded(MB + 1));
+    const r = inspectJevConfigFile(cfgFile);
+    expect(r.state).toBe('malformed');
+    expect(r.problems).toEqual(['config is over the 1 MB limit']);
+  });
+
+  it('re-checks the size on the bytes read, not only on stat', () => {
+    fs.writeFileSync(cfgFile, '{}');
+    const big = Buffer.alloc(MB + 1, 0x20);
+    const r = inspectJevConfigFile(cfgFile, {
+      lstat: fs.lstatSync,
+      stat: (f: string) => ({ ...fs.statSync(f), size: 2, isFile: () => true }) as fs.Stats,
+      readFile: () => big
+    });
+    expect(r.state).toBe('malformed');
+    expect(r.problems).toEqual(['config is over the 1 MB limit']);
+  });
+
+  it('a symlink to a valid file is valid', () => {
+    const target = path.join(tmp, 'real.json');
+    fs.writeFileSync(target, '{"defaults":{"mode":"on"}}');
+    fs.symlinkSync(target, cfgFile);
+    expect(inspectJevConfigFile(cfgFile).state).toBe('valid');
+  });
+
+  it('a dangling symlink is malformed ("broken symlink"), not missing', () => {
+    fs.symlinkSync(path.join(tmp, 'nowhere.json'), cfgFile);
+    const r = inspectJevConfigFile(cfgFile);
+    expect(r.state).toBe('malformed');
+    expect(r.problems).toEqual(['broken symlink: the target does not exist or cannot be read']);
+  });
+
+  it('a symlink loop is malformed', () => {
+    fs.symlinkSync(cfgFile, cfgFile);
+    expect(inspectJevConfigFile(cfgFile).problems[0]).toContain('broken symlink');
+  });
+
+  it('no entry at all stays missing', () => {
+    expect(inspectJevConfigFile(cfgFile)).toEqual({ state: 'missing', file: cfgFile, problems: [] });
+  });
+
+  it('JEV_CONFIG_FILE set to a missing path is malformed', () => {
+    process.env.JEV_CONFIG_FILE = cfgFile;
+    const r = inspectJevConfigFile();
+    expect(r.state).toBe('malformed');
+    expect(r.file).toBe(cfgFile);
+    expect(r.problems[0]).toContain('JEV_CONFIG_FILE points at a file that does not exist');
+  });
+
+  it('JEV_CONFIG_FILE set to an existing valid file is valid', () => {
+    fs.writeFileSync(cfgFile, '{}');
+    process.env.JEV_CONFIG_FILE = cfgFile;
+    expect(inspectJevConfigFile().state).toBe('valid');
+  });
+});
+
+describe('guard hook: file-level hazards ask loudly', () => {
+  it('an over-limit config asks, naming the file and the limit', () => {
+    fs.writeFileSync(cfgFile, '{"defaults":{"mode":"off"},"pad":"' + 'x'.repeat(1024 * 1024) + '"}');
+    const r = runHook(plainAgent);
+    expect(decisionOf(r.out)).toBe('ask');
+    expect(reasonOf(r.out)).toContain(cfgFile);
+    expect(reasonOf(r.out)).toContain('config is over the 1 MB limit');
+    expect(audit().filter((e) => e.event === 'config_malformed')).toHaveLength(1);
+  });
+
+  it('a dangling symlink asks instead of reading as off', () => {
+    fs.symlinkSync(path.join(tmp, 'nowhere.json'), cfgFile);
+    const r = runHook(plainAgent);
+    expect(decisionOf(r.out)).toBe('ask');
+    expect(reasonOf(r.out)).toContain('broken symlink');
+    expect(r.err).toContain(cfgFile);
+  });
+
+  it('a symlink to a valid off config is silent', () => {
+    const target = path.join(tmp, 'real.json');
+    fs.writeFileSync(target, '{"defaults":{"mode":"off"}}');
+    fs.symlinkSync(target, cfgFile);
+    expect(runHook(opusAgent).out).toBe('');
+  });
+
+  it('JEV_CONFIG_FILE naming a missing file asks (explicitly pointing at nothing is a mistake)', () => {
+    const r = runHook(plainAgent);
+    expect(decisionOf(r.out)).toBe('ask');
+    expect(reasonOf(r.out)).toContain('JEV_CONFIG_FILE points at a file that does not exist');
+    expect(reasonOf(r.out)).toContain(cfgFile);
   });
 });
