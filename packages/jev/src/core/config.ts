@@ -458,20 +458,77 @@ export type JevConfigFileInspection =
   | { state: 'valid'; file: string; problems: [] }
   | { state: 'malformed'; file: string; problems: string[] };
 
+/** The config file is never legitimately larger than this; a bigger one is malformed, not parsed. */
+export const MAX_JEV_CONFIG_BYTES = 1024 * 1024;
+
+/** The filesystem calls the config reader makes, injectable so tests can simulate a file that changes under it. */
+export interface JevConfigIo {
+  lstat: (file: string) => fsSync.Stats;
+  stat: (file: string) => fsSync.Stats;
+  readFile: (file: string) => Buffer;
+}
+
+const DEFAULT_CONFIG_IO: JevConfigIo = {
+  lstat: (f) => fsSync.lstatSync(f),
+  stat: (f) => fsSync.statSync(f),
+  readFile: (f) => fsSync.readFileSync(f)
+};
+
+type ConfigFileRead = { kind: 'missing' } | { kind: 'problem'; problem: string } | { kind: 'text'; text: string };
+
 /**
- * Reads and validates the user config file. `missing` means no file at all (the loader then uses
- * its defaults); `malformed` means the file is there but cannot be trusted: unreadable, not
- * valid JSON, or rejected by {@link validateJevConfig}.
+ * Reads the config file once, defensively: lstat first so a dangling symlink is not mistaken for
+ * "no file", a size check before and after the read, and a regular-file check so a FIFO or
+ * directory is never read. A path with no entry at all is `missing`.
  */
-export function inspectJevConfigFile(file: string = jevUserConfigFile()): JevConfigFileInspection {
-  if (!fsSync.existsSync(file)) return { state: 'missing', file, problems: [] };
-  let text: string;
+function readConfigFile(file: string, io: JevConfigIo): ConfigFileRead {
+  let isLink = false;
   try {
-    text = fsSync.readFileSync(file, 'utf8');
+    isLink = io.lstat(file).isSymbolicLink();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return { kind: 'missing' };
+    const code = (err as NodeJS.ErrnoException)?.code;
+    return { kind: 'problem', problem: `the file could not be read${code ? ` (${code})` : ''}` };
+  }
+  let size: number;
+  try {
+    const st = io.stat(file);
+    if (!st.isFile()) return { kind: 'problem', problem: 'the file could not be read (not a regular file)' };
+    size = st.size;
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
-    return { state: 'malformed', file, problems: [`the file could not be read${code ? ` (${code})` : ''}`] };
+    if (isLink) return { kind: 'problem', problem: 'broken symlink: the target does not exist or cannot be read' };
+    return { kind: 'problem', problem: `the file could not be read${code ? ` (${code})` : ''}` };
   }
+  if (size > MAX_JEV_CONFIG_BYTES) return { kind: 'problem', problem: 'config is over the 1 MB limit' };
+  let bytes: Buffer;
+  try {
+    bytes = io.readFile(file);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    return { kind: 'problem', problem: `the file could not be read${code ? ` (${code})` : ''}` };
+  }
+  if (bytes.length > MAX_JEV_CONFIG_BYTES) return { kind: 'problem', problem: 'config is over the 1 MB limit' };
+  return { kind: 'text', text: bytes.toString('utf8') };
+}
+
+/**
+ * Reads and validates the user config file. `missing` means no file at all (the loader then uses
+ * its defaults), except when JEV_CONFIG_FILE names the path: pointing at a file that is not there
+ * is a mistake, not "unset". `malformed` means the file is there but cannot be trusted:
+ * unreadable, a broken symlink, over the size limit, not valid JSON, or rejected by
+ * {@link validateJevConfig}.
+ */
+export function inspectJevConfigFile(file: string = jevUserConfigFile(), io: JevConfigIo = DEFAULT_CONFIG_IO): JevConfigFileInspection {
+  const read = readConfigFile(file, io);
+  if (read.kind === 'missing') {
+    if (process.env.JEV_CONFIG_FILE && process.env.JEV_CONFIG_FILE === file) {
+      return { state: 'malformed', file, problems: ['JEV_CONFIG_FILE points at a file that does not exist'] };
+    }
+    return { state: 'missing', file, problems: [] };
+  }
+  if (read.kind === 'problem') return { state: 'malformed', file, problems: [read.problem] };
+  const text = read.text;
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -495,8 +552,9 @@ export function loadJevConfigSync(startDir?: string, bypassCache = false): JevCo
   // Level 2: User Config (~/.config/jev/config.json or process.env.JEV_CONFIG_FILE)
   const userConfigFile = process.env.JEV_CONFIG_FILE || JEV_CONFIG_FILE;
   try {
-    if (fsSync.existsSync(userConfigFile)) {
-      const parsed = JSON.parse(fsSync.readFileSync(userConfigFile, 'utf8'));
+    const read = readConfigFile(userConfigFile, DEFAULT_CONFIG_IO);
+    if (read.kind === 'text') {
+      const parsed = JSON.parse(read.text);
       if (parsed && typeof parsed === 'object') {
         config = deepMergeWithArrayReplacement(config, parsed);
         if (typeof parsed.version === 'number') {
