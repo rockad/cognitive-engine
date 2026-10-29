@@ -199,52 +199,101 @@ Every channel is governed by a declarative profile (`proposer-channels.json`):
 > [!IMPORTANT]
 > **ZDR Declaration vs. Verification**: Zero Data Retention is recorded based on the user's explicit declaration and provider terms. Remote provider adherence cannot be cryptographically audited. Subscription channels (Claude Code, Antigravity) provide no verifiable ZDR guarantees for subscription tiers; they default strictly to `retention: unknown` and are restricted to `open` content only. Channel profiles follow loud-failure validation: any malformed profile causes immediate fail-closed refusal.
 
-#### 3. Execution Isolation (Rootless Docker with Allow-List Forward Proxy)
+#### 3. Execution Isolation (Host Unix-Socket Bridge & Forward Proxy Container)
 Proposer CLI sessions run in isolated, rootless Docker containers reusing the hardened `DockerRunner` architecture:
 
 ```mermaid
 flowchart TD
-    subgraph Host ["Host System (Debian / Core)"]
+    subgraph Host ["Host System (Debian / Linux)"]
         Harness["Upstream Harness² Engine"]
         Profile["Channel Profile<br/>(Loud-failure validation)"]
         DockerDaemon["Rootless Docker Daemon<br/>(Pinned unix socket)"]
+        HostBridge["Host Bridge Process<br/>(unix domain socket)"]
+        OllamaHost["Host Ollama Daemon<br/>(127.0.0.1:11434)"]
+        HostBridge -->|forward| OllamaHost
     end
 
-    subgraph Container ["Rootless Docker Container (glibc base)"]
+    subgraph ProxyContainer ["Allow-List Forward Proxy Container"]
+        AllowProxy["Forward Proxy<br/>(Routes to socket or egress)"]
+    end
+
+    subgraph SessionContainer ["Proposer Session Container (ubuntu:26.04)"]
         direction TB
         AgentCLI["Proposer Agent CLI<br/>(claude / opencode / agy)"]
         TmpHome["tmpfs /tmp (HOME)"]
-        Scratch["rw /scratch (Candidate)"]
+        SamePathWS["rw /path/to/workspace<br/>(Same absolute path as host)"]
         ReadOnlyCLI["ro /usr/local/bin/<cli>"]
     end
 
-    subgraph NetworkFilter ["Internal Network Isolation"]
-        direction TB
-        InternalNet["--network internal"]
-        AllowProxy["Allow-List Forward Proxy<br/>(Permits ONLY declared channel endpoint)"]
+    subgraph NetworkTopology ["Network Isolation"]
+        InternalNet["--network internal<br/>(No default route, zero egress)"]
+        EgressNet["--network egress<br/>(Authorized external endpoints)"]
     end
 
-    subgraph Outbound ["Authorized Target Endpoint"]
-        TargetEndpoint["Ollama / Claude API / OpenRouter"]
+    subgraph Outbound ["Authorized Remote Endpoints"]
+        TargetEndpoint["Claude API / OpenRouter / Antigravity API"]
     end
 
     Harness --> Profile
     Profile --> DockerDaemon
-    DockerDaemon --> Container
-    AgentCLI --> InternalNet
-    InternalNet --> AllowProxy
-    AllowProxy --> TargetEndpoint
+    DockerDaemon --> SessionContainer
+    DockerDaemon --> ProxyContainer
+    HostBridge -.->|bind-mount /run/user/.../ollama.sock| ProxyContainer
+    SessionContainer -->|HTTP via proxy| InternalNet
+    InternalNet --> ProxyContainer
+    ProxyContainer -->|External traffic| EgressNet
+    EgressNet --> TargetEndpoint
 ```
 
-- **Container Hardening**: Read-only root filesystem, tmpfs `HOME`, dropped capabilities (`--cap-drop ALL`), strict pids/memory/cpu limits, CLI mounted read-only, candidate workspace mounted read-write on scratch tmpfs.
-- **Network Containment**: Container runs on `--network internal`. Outbound traffic routes strictly through a single dedicated allow-list forward proxy permitting communication exclusively with the channel's declared endpoint.
-- **Base Image**: Uses a lightweight glibc base image (such as Debian Bookworm slim) to support standard agent CLIs (`alpine:3` musl is incompatible with glibc CLI binaries).
+- **Rootlesskit Network Boundary & Isolation**:
+  - `rootlesskit` executes with `--net=gvisor-tap-vsock --disable-host-loopback`.
+  - Empirically verified: host loopback is **unreachable** from inside rootless containers via `127.0.0.1`, `172.17.0.1`, `10.0.2.2`, `192.168.127.1`, or `host.docker.internal:host-gateway` (which resolves to `172.17.0.1`, the bridge inside rootlesskit's network namespace, not the host).
+  - An `--internal` container network has no default route and zero egress.
+  - Consequence: A standard forward proxy inside a container attempting to connect to host loopback `127.0.0.1:11434` over TCP fails.
+- **Host Unix-Socket Bridge Topology**:
+  - A lightweight host process bridges a single unix domain socket (e.g. `/run/user/1000/cognitive-engine/ollama.sock`, mode 0600) to host loopback `127.0.0.1:11434` (Ollama) and nothing else.
+  - The socket is bind-mounted into the forward proxy container only.
+  - The forward proxy container connects to two networks:
+    - `--network internal`: Shared with the proposer session container (no default gateway, zero outbound access).
+    - `--network egress`: Connected to the external gateway for remote provider calls.
+  - For local channels (`opencode` -> `ollama`), internal HTTP requests are forwarded directly to the bind-mounted unix socket.
+  - For remote channels (Claude API, OpenRouter, Antigravity API), internal HTTP requests route strictly to the declared host/port via the egress network.
+  - Complete Host Isolation: All other host loopback services (`8100` Lookup, `8105` Recall, `8115`, `8120`, Samba, etc.) remain strictly unreachable from containers by default.
+- **Base Image Selection**:
+  - Selected: `ubuntu:26.04` (glibc 2.43 matching the host system; 40 MiB) as primary container image; `debian:13-slim` (28 MiB) as fallback.
+  - Evaluated and Rejected: `distroless/cc-debian13` (10 MiB) was rejected because it lacks a shell, which Claude Code's `Bash` tool strictly requires. `alpine:3` was rejected because musl is incompatible with glibc CLI binaries.
+- **Workspace Mounting (Same Absolute Path)**:
+  - The candidate workspace is bind-mounted read-write at the **same absolute path** inside the container as on the host.
+  - This is strictly required because agent tooling (`OPENCODE_PERMISSION` in particular) hard-codes and enforces exact host-absolute paths.
+- **Container Hardening**: Read-only root filesystem, tmpfs `HOME`, dropped capabilities (`--cap-drop ALL`), strict pids/memory/cpu limits, CLI mounted read-only, candidate workspace mounted read-write at host absolute path.
 - **Alternatives Considered & Rejected**:
   - *Bubblewrap (`bwrap`)*: Rejected as a secondary technology requiring independent maintenance without standard seccomp/cgroup defaults and lacking macOS portability.
   - *Host process with tool filtering*: Rejected because subscription agent CLIs store active credentials in `HOME`, presenting ambient token exfiltration risk.
 
-#### 4. Package Binding
-`packages/harness2` subclasses upstream's `Proposer` class, overriding invocation methods to redirect agent execution into the isolated container under the declared channel profile. Upstream recursion, ledger budgets, judge evaluations, and candidate selection remain untouched. Slice 1 baseline serves as fallback and test double. An `agy_cli` channel is implemented in `packages/harness2` to support headless Antigravity runs alongside upstream's `claude_cli` and `opencode`.
+#### 4. Package Binding & Channel Execution
+- **Upstream Proposer Subclassing (Verified via WS-0 Spike)**:
+  - Upstream Harness² callers do not invoke `isinstance(p, Proposer)`; interactions follow duck typing.
+  - `packages/harness2` subclasses upstream `Proposer`, overriding `_claude_cli` and `_opencode` to execute `docker run --rm -i ...` with the workspace bind-mounted at the same absolute path.
+  - Subclass overrides `env()` because upstream's `env()` hard-codes `CLAUDE_CODE_USE_VERTEX=1`.
+  - Duck typing requirements verified: `_selector_for` calls `p.env(selector_spec)`, `generate()` yields candidate proposals.
+  - Upstream Couplings to Navigate:
+    - `spec.py:33`: `CHANNELS` is a closed tuple; `ChannelSpec.__post_init__` rejects `agy_cli` unless adapted in our package.
+    - `schedule.py:188-192`: `_selector_for` constructs a plain `Proposer` when selector spec differs; our entry points must pass `selector_prop` explicitly to retain the containerized subclass.
+    - `cli/run_sweep.py:151`: Constructs `Proposer(...)` directly; our CLI entry point invokes `schedule.run_sweep` directly with our containerized subclass.
+    - Private method signatures: `_claude_cli`, `_opencode`, `env`, context/harness harvest paths, and CLI flags.
+- **Opencode Binary Version Mismatch**:
+  - Host installed binary is `opencode` v2.0.25 (lacks `--dir` and `--variant` flags, defaults to a background daemon; `--standalone` flag runs foreground session).
+  - Upstream tests assume `bun run src/index.ts run --dir ... --variant ...` against a pinned source checkout that is not cloned in standard environments.
+  - Resolution: Adapt to v2 flags in our overridden `_opencode` method (we build the command line anyway) and validate JSON event streaming with a real local smoke call during Stage 1, avoiding building bun + pinned source checkouts into the container base image.
+- **Headless Antigravity CLI (`agy_cli`) Feasibility (Verified via WS-0 Spike)**:
+  - 100% verified feasible headlessly in a container without GUI or browser interaction.
+  - Invocation: `agy --print="<prompt>" --dangerously-skip-permissions --model="<model>" [--effort=low]`. (Prompt attached as `--print="..."` to avoid flag ingestion; workspace passed via positional argument or `--add-dir`). Real autonomous file edits verified in 9 seconds.
+  - Authentication: Reads JSON oauth token from `$HOME/.gemini/antigravity-cli/antigravity-oauth-token`, injectable read-only without browser (`chmod 400`).
+  - Filesystem & MCP: `/` read-only, `$HOME` tmpfs, empty `mcp_config.json` (`{"mcpServers":{}}`) ensures zero MCP startup hangs, `--sandbox` enables terminal restrictions.
+  - Network: Exactly ONE endpoint contacted: `daily-cloudcode-pa.googleapis.com:443` (HTTP/2 SSE). Single allow-list rule is 100% sufficient.
+  - Cost: $0 under Google AI subscription (~21k tokens).
+- **Dotenv Loading Source Correction**:
+  - Upstream `config.py:21` sets `ROOT` to the clone directory when `pyproject.toml` sits beside the package, so `load_dotenv` reads `<clone>/.env`, NOT `$CWD/.env` (`harness2/.env` does not exist).
 
 #### 5. Slot Table & Component Immutability
 Upstream paths are mapped to invariant components:
@@ -290,8 +339,8 @@ Slice 3b executes through three strictly sequential, user-gated stages:
 - [x] Side-effect trap test suite proves zero network, subprocess, or filesystem side-effects occur during seam execution.
 
 ### Slice 3b Stage 1: Local Smoke (Gated on User Go)
-- [ ] Glibc-based rootless container image built and verified on local daemon.
-- [ ] Allow-list forward proxy successfully restricts container egress to loopback Ollama.
+- [ ] Glibc-based rootless container image (`ubuntu:26.04`) built and verified on local daemon.
+- [ ] Host unix-socket bridge and forward proxy container successfully restrict container egress to loopback Ollama.
 - [ ] Upstream `Proposer` subclass launches containerized `opencode` session and captures output.
 - [ ] Frontmatter freeze validator rejects attempts to alter `model` or `tools` in candidate skills/subagents.
 - [ ] Complete k=1 smoke sweep completes within resource limits (2 GB, 2 CPU, 45m wall) without side-effects on host.
@@ -306,9 +355,10 @@ Slice 3b executes through three strictly sequential, user-gated stages:
 
 ---
 
-## 8. Unverified Assumptions
-The following architectural assumptions are tracked and must be verified before production cutover:
-1. **Proposer Subclassing**: Assumes upstream `harness2.proposer.Proposer` cleanly delegates execution methods without internal hard-coded host dependencies.
-2. **Headless Antigravity CLI (`agy`)**: Assumes `agy` supports fully headless, non-interactive command-line execution within a container. (Tracked as prerequisite spike `WS-0`).
-3. **Native `sbx` MicroVMs**: Local `sbx` runtime remains unverified on host (not installed). Ephemeral rootless Docker is the verified active sandbox.
-4. **Live OpenRouter Quota Response Schema**: Field names for `GET /api/v1/key` are verified against mock schemas but pending validation against live endpoint responses.
+## 8. Unverified Assumptions & Spike Verifications
+The following architectural assumptions are tracked and verified across slice spikes:
+1. **Proposer Subclassing**: **VERIFIED WITH CAVEATS**. Upstream callers rely on duck typing rather than `isinstance`. Subclassing works cleanly by overriding `_claude_cli`, `_opencode`, and `env()` with same-absolute-path workspace mounting. Caveats and couplings tracked: closed `CHANNELS` tuple in `spec.py`, `_selector_for` fallback construction in `schedule.py`, direct `Proposer` instantiation in `cli/run_sweep.py`, and opencode CLI v2 argument differences.
+2. **Headless Antigravity CLI (`agy`)**: **VERIFIED**. Headless non-interactive execution confirmed in container spike (`--print="..."`, read-only token injection `antigravity-oauth-token` mode 0400, single allow-list endpoint `daily-cloudcode-pa.googleapis.com:443`, tmpfs `HOME`, 9s execution).
+3. **Rootless Docker Host-Loopback Egress**: **DISPROVEN & REDESIGNED**. Direct container-to-host loopback via TCP is impossible under rootlesskit `gvisor-tap-vsock`. Replaced with host unix-socket bridge + forward proxy container architecture.
+4. **Native `sbx` MicroVMs**: Local `sbx` runtime remains unverified on host (not installed). Ephemeral rootless Docker is the verified active sandbox.
+5. **Live OpenRouter Quota Response Schema**: Field names for `GET /api/v1/key` are verified against mock schemas but pending validation against live endpoint responses.

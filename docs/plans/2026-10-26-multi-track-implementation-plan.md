@@ -232,23 +232,29 @@ Governed by user decisions made via `/clarify` on 2026-10-29. Slice 3b wires ups
    - **Loud-Failure Config Validation**: Any malformed, unparseable, or missing required field causes immediate fail-closed abort (identical to Jev config rules).
    - **ZDR Honest Disclosure**: ZDR represents the user's declaration and cannot be verified cryptographically against remote provider servers. Subscription tiers (Claude Code, Antigravity) default to `retention: unknown` and are restricted to `open` content.
    - **Ceiling Enforcement**: Sweeps inherit the strictest classification across all ingested sources. A channel is eligible only if `channel.max_classification >= sweep.classification` and its retention satisfies the active ZDR mode (`zdr: strict` prohibits `unknown`).
-2. **Container Isolation with Allow-List Forward Proxy**:
-   - Proposer agent CLI sessions run inside rootless Docker containers reusing `DockerRunner` hardening: read-only root, tmpfs `HOME`, dropped capabilities, pids/memory/cpu limits, CLI mounted read-only, candidate workspace mounted rw on scratch tmpfs.
-   - Container connects to `--network internal` with a single dedicated allow-list forward proxy permitting outbound egress exclusively to the channel's declared endpoint.
-   - Requires a lightweight glibc base image (such as Debian Bookworm slim) because musl (`alpine:3`) cannot execute glibc CLI binaries.
+2. **Container Isolation with Host Unix-Socket Bridge & Forward Proxy Container**:
+   - Proposer agent CLI sessions run inside rootless Docker containers reusing `DockerRunner` hardening: read-only root, tmpfs `HOME`, dropped capabilities, pids/memory/cpu limits, CLI mounted read-only.
+   - **Rootlesskit Host-Loopback Constraint**: Under rootlesskit `gvisor-tap-vsock --disable-host-loopback`, host loopback (`127.0.0.1:11434`) is unreachable from inside containers via `127.0.0.1`, `172.17.0.1`, `10.0.2.2`, `192.168.127.1`, or `host.docker.internal:host-gateway`. Container `--network internal` has zero default route and zero egress.
+   - **Host Unix-Socket Bridge Topology**: A lightweight host process bridges a single unix domain socket (`ollama.sock`) to `127.0.0.1:11434` (Ollama) and nothing else. The socket is bind-mounted into the forward proxy container only. The proxy container connects to both `--network internal` and an egress network, routing internal requests to the unix socket (local channels) or declared external endpoints, while keeping host daemons (`8100`, `8105`, `8115`, `8120`, Samba) completely isolated.
+   - **Base Image**: Uses `ubuntu:26.04` (glibc 2.43 matching host; 40 MiB) with `debian:13-slim` (28 MiB) fallback. Distroless `distroless/cc-debian13` rejected due to lack of a shell required by Claude Code's `Bash` tool. `alpine:3` rejected due to musl incompatibility with glibc CLI binaries.
+   - **Workspace Mounting (Same Absolute Path)**: Candidate workspace is bind-mounted read-write at the **same absolute path** inside the container as on the host, as agent tooling (`OPENCODE_PERMISSION`) hard-codes this path.
 3. **Upstream Binding & Package Extensions**:
-   - `packages/harness2` subclasses upstream's `Proposer` class, overriding invocation methods to redirect execution into the isolated container.
-   - Adds an `agy_cli` channel implementation alongside upstream's `claude_cli` and `opencode`.
+   - Upstream callers rely on duck typing (no `isinstance(p, Proposer)` checks). `packages/harness2` subclasses upstream's `Proposer` class, overriding `_claude_cli` and `_opencode` to redirect execution into the isolated container via `docker run --rm -i ...` at the same absolute workspace path.
+   - Subclass overrides `env()` to drop forced Vertex AI configuration (`CLAUDE_CODE_USE_VERTEX=1`).
+   - Upstream couplings to navigate: `spec.py:33` closed `CHANNELS` tuple workaround, `schedule.py:188-192` `_selector_for` explicit `selector_prop` passing, and `cli/run_sweep.py:151` direct `schedule.run_sweep` invocation.
+   - Adds an `agy_cli` channel implementation alongside upstream's `claude_cli` and `opencode` (verified feasible via WS-0 spike: headless execution, read-only token injection, single endpoint `daily-cloudcode-pa.googleapis.com:443`).
+   - Dotenv loading source: Upstream `config.py:21` sets `ROOT` to the clone directory when `pyproject.toml` sits beside the package, so `load_dotenv` reads `<clone>/.env`, NOT `$CWD/.env`.
+   - Opencode binary version mismatch: Host binary is `opencode` v2.0.25 (lacks `--dir`/`--variant`, defaults to background daemon; `--standalone` runs foreground session). Overridden `_opencode` adapts command-line arguments and validates JSON event streaming during Stage 1 smoke test.
 4. **Slot Table & Frontmatter Freezing**:
    - Mutable components: `c1` prompt, `c3` context_assembly, `c4` tool_description, `c5` decomposition_strategy (BODY ONLY), `c6` skills (BODY ONLY).
    - Denied: `c2` guardrails (slot and path stem), `c7` scripts, `c8` plugins/hooks.
    - In `c5` and `c6`, frontmatter keys (`model`, `tools`, `allowed-tools`, `permissions`) are strictly frozen to prevent privilege escalation.
 5. **Execution Workstreams**:
-   - **`WS-0` Spike**: Verify unverified assumptions: (a) Proposer subclassing feasibility without monkey-patching upstream internals, (b) headless non-interactive `agy` CLI container execution. (If `agy` headless execution is not viable, Antigravity channel is deferred).
-   - **`WS-D` Slot Table**: Implement path-to-component surface mapping, frontmatter freezing AST visitor, and invariant rejection tests.
+   - **`WS-0` Spike**: **COMPLETE** (Antigravity & Claude Code). Verified: (a) Proposer duck typing subclassing without monkey-patching, (b) rootlesskit host-loopback constraint and host unix-socket bridge topology, (c) opencode v2 binary adaptation plan, (d) `ubuntu:26.04` base image, (e) headless non-interactive `agy` CLI container execution ($0 cost, single allow-list endpoint `daily-cloudcode-pa.googleapis.com:443`, read-only token injection `antigravity-oauth-token` mode 0400).
+   - **`WS-D` Slot Table**: **COMPLETE** (Antigravity, branch `feat/3b-slot-table` head `1e5d591`). Implemented `guardrails` protected stem in `invariants.py`, `c6` mapping to `context_assembly` in `SLOT_COMPONENT`, and AST leading frontmatter freezing in `upstream_surface.py`.
    - **`WS-A` Channel Profile & Egress**: Implement `proposer-channels.json` schema, loud-failure validator, and per-channel egress filtering.
-   - **`WS-B` Container Image & Proxy**: Build glibc rootless Docker base image, configure allow-list forward proxy, and implement container session runner.
-   - **`WS-C` Proposer Subclass & Binding**: Subclass upstream `Proposer`, bind container runner, and add `agy_cli` adapter.
+   - **`WS-B` Container Image & Proxy**: Build `ubuntu:26.04` rootless Docker base image, configure host unix-socket bridge and allow-list forward proxy container, and implement container session runner.
+   - **`WS-C` Proposer Subclass & Binding**: Subclass upstream `Proposer` with duck-typing couplings workaround, explicit `selector_prop`, direct `schedule.run_sweep` entry point, container runner binding, and `agy_cli` adapter.
    - **`WS-E` Stage 1 Local Smoke Runner**: Execute Stage 1 smoke test ($k=1$, 3 sessions, 4 rollouts, demo task, `opencode` -> `ollama gemma4:12b`, 2 GB / 2 CPU / 45m wall cap, $0 cost) under explicit user approval gate.
    - *Adversarial Gate*: Each workstream step undergoes read-only adversarial review by Antigravity on its own quota prior to human approval gates.
 
@@ -337,11 +343,11 @@ WS5 and WS6 are independent. **WS6 is done and committed on `feat/track1-jev-ada
 | **WS8** | **Track 3 (Slice 2)** | `feat/track3-harness2` | `packages/harness2/src/cognitive_harness2/`, `NOTICE` | Ephemeral rootless Docker fallback (`--network none`, `--read-only`), failure triggers, upstream citation | Claude Code (`code-engineer`) | `flash` |
 | **WS9** | **Track 1 review** | `feat/track1-jev-adapters` | `packages/jev/`, `adapters/` | PR #3 remediation, review coordination, and test suite verification | Antigravity (`code-engineer`) | `flash_lite` |
 | **WS10** | **Tooling** | `feat/worktree-protocol` | `tools/wt`, `.githooks/pre-commit`, `AGENTS.md` | Repository-local worktree automation enforcing clean hub and isolated agent worktrees | Antigravity (`code-engineer`) | `flash_lite` |
-| **WS-0** | **Track 3 (Slice 3b spike)** | `feat/track3-harness2` | `packages/harness2/` | Spike verifying Proposer subclassing feasibility and headless `agy` CLI container execution | Claude Code (`code-engineer`) | `flash` |
-| **WS-D** | **Track 3 (Slice 3b slot)** | `feat/track3-harness2` | `packages/harness2/src/cognitive_harness2/` | Path-to-component slot table mapping and frontmatter freeze AST validator for c5/c6 | Claude Code (`code-engineer`) | `flash` |
+| **WS-0** | **Track 3 (Slice 3b spike)** | `feat/track3-harness2` | `packages/harness2/` | **Complete**: Spike verified Proposer duck typing, rootless unix-socket bridge, and headless `agy` CLI execution | Antigravity & Claude Code | `flash` |
+| **WS-D** | **Track 3 (Slice 3b slot)** | `feat/3b-slot-table` | `packages/harness2/src/cognitive_harness2/` | **Complete**: Slot table mapping (`c6` to `context_assembly`), `guardrails` protected stem, and AST frontmatter freezing | Antigravity (`code-engineer`) | `flash` |
 | **WS-A** | **Track 3 (Slice 3b policy)** | `feat/track3-harness2` | `packages/harness2/src/cognitive_harness2/` | Declarative `proposer-channels.json` schema, loud-failure validator, and per-channel egress filtering | Claude Code (`code-engineer`) | `flash` |
-| **WS-B** | **Track 3 (Slice 3b runner)** | `feat/track3-harness2` | `packages/harness2/` | Glibc rootless Docker container base, allow-list forward proxy, and session execution runner | Claude Code (`code-engineer`) | `flash` |
-| **WS-C** | **Track 3 (Slice 3b binding)** | `feat/track3-harness2` | `packages/harness2/` | Upstream `Proposer` subclass binding container runner with `agy_cli` channel adapter | Claude Code (`code-engineer`) | `flash` |
+| **WS-B** | **Track 3 (Slice 3b runner)** | `feat/track3-harness2` | `packages/harness2/` | `ubuntu:26.04` rootless Docker base image, host unix-socket bridge, forward proxy container, and session runner | Claude Code (`code-engineer`) | `flash` |
+| **WS-C** | **Track 3 (Slice 3b binding)** | `feat/track3-harness2` | `packages/harness2/` | Upstream `Proposer` subclass with duck-typing couplings workaround, container runner binding, and `agy_cli` adapter | Claude Code (`code-engineer`) | `flash` |
 | **WS-E** | **Track 3 (Slice 3b smoke)** | `feat/track3-harness2` | `packages/harness2/` | Stage 1 local smoke runner (k=1, 3 sessions, 4 rollouts, demo task, `opencode` -> `ollama`) | Claude Code (`code-engineer`) | `flash` |
 
 ---
