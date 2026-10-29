@@ -12,8 +12,8 @@ one of the four `invariants.MUTABLE` components, and everything else is refused.
     c2    guardrails.md                              (guardrail: protected)
     c3    LongTermMEMORY.md                          context_assembly
     c4    tool_descriptions/tool_guidance.md         tool_description
-    c5    sub_agents/<name>/AGENT.md                 decomposition_strategy
-    c6    skills/<name>/SKILL.md                     (undecided: denied)
+    c5    sub_agents/<name>/AGENT.md                 decomposition_strategy (BODY ONLY)
+    c6    skills/<name>/SKILL.md                     context_assembly (BODY ONLY)
     c7    scripts/<name>.py, <skill>/scripts/*       (executable code: denied)
     c8    plugin/<name>.ts, hooks_file               (lifecycle hooks: protected)
 
@@ -23,10 +23,12 @@ while its prompt tables label `guardrails.md` as c6 and have no c2. This module 
 PATHS, which agree everywhere, and uses the README numbering. Codex folds c1/c3/c4 and the
 guardrails into one `AGENTS.md`; it cannot be split, so it is denied whole.
 
-The mapping c3 -> context_assembly, c5 -> decomposition_strategy and c6 -> denied is a policy
-choice RFC 004 does not spell out. It lives in `SLOT_COMPONENT` as data: widening it is a
-deliberate edit there, never an inference. `invariants.assert_mutable` is consulted on every
-call, so removing a component from `MUTABLE` removes its slot.
+The mapping c3 -> context_assembly, c5 -> decomposition_strategy and c6 -> context_assembly is
+a policy choice RFC 004 / Slice 3b defines: skills are on-demand instructions assembled into
+context, while `MUTABLE` stays strictly the four components. Frontmatter in c5 and c6 is frozen.
+It lives in `SLOT_COMPONENT` as data: widening it is a deliberate edit there, never an
+inference. `invariants.assert_mutable` is consulted on every call, so removing a component from
+`MUTABLE` removes its slot.
 
 Nothing here imports upstream: a spec is read by duck typing, so this module imports (and its
 refusals work) without the `upstream` extra. Importing `harness2.substrate` would run
@@ -43,7 +45,6 @@ from typing import Any
 
 from . import invariants
 from .invariants import InvariantViolation
-from .sandbox import _stage_name
 
 SLOTS = ("c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8")
 
@@ -54,14 +55,13 @@ SLOT_COMPONENT: Mapping[str, str | None] = MappingProxyType({
     "c3": "context_assembly",
     "c4": "tool_description",
     "c5": "decomposition_strategy",
-    "c6": None,
+    "c6": "context_assembly",
     "c7": None,
     "c8": None,
 })
 
 SLOT_DENIAL: Mapping[str, str] = MappingProxyType({
     "c2": "guardrails are a protected component (invariants.PROTECTED_COMPONENTS)",
-    "c6": "skills are not placed in any of the four mutable components by RFC 004 (undecided, denied)",
     "c7": "scripts are executable code, not one of the four mutable components",
     "c8": "plugins and lifecycle hooks act inside the tool loop and are protected (lifecycle_hook)",
     "composite": "AGENTS.md folds the prompt, memory, tool prose and guardrails into one file; "
@@ -168,12 +168,19 @@ def _check_name(raw: Any) -> str:
     """The key rules of the hardened staging, plus the extra ones this seam needs."""
     if not isinstance(raw, str):
         raise _refuse(f"path {raw!r} is not a string")
+    if not raw:
+        raise _refuse("invalid staged file name '': must be a non-empty string")
+    if any(unicodedata.category(c) in ("Cc", "Cf", "Cs", "Co", "Cn") for c in raw):
+        raise _refuse(f"invalid staged file name {raw!r}: control or invisible characters")
+    if "\\" in raw:
+        raise _refuse(f"invalid staged file name {raw!r}: backslashes are not allowed")
+    if raw.startswith("/") or raw.endswith("/"):
+        raise _refuse(f"invalid staged file name {raw!r}: must be a relative file path, not absolute or a directory")
+    for seg in raw.split("/"):
+        if seg in ("", ".", "..") or seg != seg.strip():
+            raise _refuse(f"invalid staged file name {raw!r}: not a clean relative path (segment {seg!r})")
     if "->" in raw or raw.endswith(("@", "|", "=")) or any(seg.endswith("@") for seg in raw.split("/")):
         raise _refuse(f"{raw!r} looks like a symlink (a listing marker or arrow in the name)")
-    try:
-        _stage_name(raw)  # clean relative path, no control chars, and not a protected path
-    except ValueError as e:
-        raise _refuse(str(e)) from e
     if unicodedata.normalize("NFKC", raw) != raw:
         raise _refuse(f"{raw!r} is not NFKC-normal (look-alike characters are refused)")
     if ":" in raw or "~" in raw or "*" in raw or "?" in raw:
@@ -190,7 +197,6 @@ def classify_path(spec: Any, path: str) -> tuple[str, str | None]:
     """
     _require_spec(spec)
     rel = _check_name(path)
-    invariants.assert_path_unprotected(rel)
 
     slot = _ALWAYS_ON_SLOT.get(rel) if rel in spec.always_on else None
     if slot is None and rel in spec.always_on:
@@ -211,7 +217,11 @@ def classify_path(spec: Any, path: str) -> tuple[str, str | None]:
         hint = next((n for n in (*spec.always_on, *_ALWAYS_ON_SLOT) if n.lower() == rel.lower() and n != rel), None)
         why = f" (differs only by case from {hint!r})" if hint else ""
         raise _refuse(f"{path!r} is not on the {spec.name} surface (unknown slot, denied by default){why}")
-    return slot, _component_if_mutable(slot)
+
+    component = _component_if_mutable(slot)
+    if component is not None:
+        invariants.assert_path_unprotected(rel)
+    return slot, component
 
 
 def check_surface(spec: Any, *, request: Iterable[str] | None = None,
@@ -263,3 +273,156 @@ def check_surface(spec: Any, *, request: Iterable[str] | None = None,
         patterns=patterns,
         denied=MappingProxyType(dict(denied)),
     )
+
+
+# ── Slot table (3b): Frontmatter freezing and mutation validation ──────────────────
+
+MAX_MUTATION_BYTES = 512 * 1024  # 512 KiB per editable file cap
+
+_FRONTMATTER_FENCE = "---"
+_SENSITIVE_KEYS = (
+    "model:", "tools:", "allowed-tools:", "permissions:", "permission-mode:",
+    "agent:", "effort:", "role:",
+)
+_YAML_KEY_PATTERN = re.compile(r"^[a-zA-Z0-9_\-]+\s*:\s*\S")
+
+
+def _to_clean_text(val: str | bytes, label: str) -> str:
+    if isinstance(val, bytes):
+        if len(val) > MAX_MUTATION_BYTES:
+            raise InvariantViolation(
+                f"{label} exceeds maximum allowed size ({len(val)} > {MAX_MUTATION_BYTES} bytes)")
+        try:
+            text = val.decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise InvariantViolation(f"{label} is not valid UTF-8: {e}") from e
+    elif isinstance(val, str):
+        raw_bytes = val.encode("utf-8")
+        if len(raw_bytes) > MAX_MUTATION_BYTES:
+            raise InvariantViolation(
+                f"{label} exceeds maximum allowed size ({len(raw_bytes)} > {MAX_MUTATION_BYTES} bytes)")
+        text = val
+    else:
+        raise InvariantViolation(f"{label} must be str or bytes, got {type(val).__name__}")
+
+    if "\x00" in text:
+        raise InvariantViolation(f"{label} contains NUL character")
+
+    for c in text:
+        if c in ("\n", "\r", "\t"):
+            continue
+        cat = unicodedata.category(c)
+        if cat in ("Cc", "Cf", "Cs"):
+            raise InvariantViolation(
+                f"{label} contains disallowed control or invisible character U+{ord(c):04X} ({cat})")
+
+    return text
+
+
+def _extract_leading_frontmatter(text: str) -> tuple[str | None, str]:
+    """Return (frontmatter_block_including_fences, remaining_body).
+
+    Leading frontmatter begins on the first line (or after initial blank lines)
+    with `---` and ends with a closing `---` or `...` line.
+    """
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return None, text
+
+    first_non_blank_idx = None
+    for idx, line in enumerate(lines):
+        if line.strip():
+            first_non_blank_idx = idx
+            break
+
+    if first_non_blank_idx is None:
+        return None, text
+
+    first_line_clean = lines[first_non_blank_idx].rstrip("\r\n")
+    if first_line_clean != _FRONTMATTER_FENCE:
+        return None, text
+
+    closing_idx = None
+    for idx in range(first_non_blank_idx + 1, len(lines)):
+        line_clean = lines[idx].rstrip("\r\n")
+        if line_clean in (_FRONTMATTER_FENCE, "..."):
+            closing_idx = idx
+            break
+
+    if closing_idx is None:
+        raise InvariantViolation("unclosed frontmatter fence (missing closing '---')")
+
+    frontmatter_block = "".join(lines[:closing_idx + 1])
+    body = "".join(lines[closing_idx + 1:])
+    return frontmatter_block, body
+
+
+def _check_no_secondary_frontmatter(body: str) -> None:
+    """Reject any second frontmatter-looking block or stray frontmatter keys after `---`."""
+    lines = body.splitlines()
+    in_code_block = False
+    fence_line_idx = None
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_code_block = not in_code_block
+            continue
+
+        if in_code_block:
+            continue
+
+        if stripped == _FRONTMATTER_FENCE:
+            if fence_line_idx is None:
+                fence_line_idx = idx
+            else:
+                between = lines[fence_line_idx + 1:idx]
+                if any(_YAML_KEY_PATTERN.match(l.strip()) for l in between):
+                    raise InvariantViolation("mutation body contains a secondary frontmatter-looking block")
+                fence_line_idx = idx
+            continue
+
+        if fence_line_idx is not None and (idx - fence_line_idx) <= 10:
+            lower = stripped.lower()
+            if any(lower.startswith(k) for k in _SENSITIVE_KEYS):
+                raise InvariantViolation(
+                    f"mutation body contains frontmatter key {stripped!r} following a '---' fence")
+
+
+def check_mutation(slot: str, path: str, old_text: str | bytes, new_text: str | bytes) -> None:
+    """Validate that a proposed file mutation is permitted under the slot table and invariants.
+
+    Enforces RFC 004 §6.5:
+    1. `slot` must be a known, mutable slot (c1, c3, c4, c5, c6).
+    2. `path` must be an unprotected path (refusing guardrails, hooks, git, escapes).
+    3. Content must be valid UTF-8, within size limits (512 KiB), free of NUL and control characters.
+    4. In c5 (AGENT.md) and c6 (SKILL.md), the leading frontmatter block is FROZEN:
+       - If old has frontmatter, new must have an exact byte-identical leading frontmatter block.
+       - If old has no frontmatter, new must not introduce one.
+       - The body must not introduce a secondary frontmatter-looking block or stray frontmatter keys.
+    """
+    if not isinstance(slot, str) or slot not in SLOTS:
+        raise InvariantViolation(f"{slot!r} is an unknown slot (known: {', '.join(SLOTS)})")
+    comp = _component_if_mutable(slot)
+    if comp is None:
+        raise InvariantViolation(f"slot {slot} is not mutable: {SLOT_DENIAL.get(slot, 'denied by default')}")
+
+    invariants.assert_path_unprotected(path)
+
+    old_clean = _to_clean_text(old_text, "original text")
+    new_clean = _to_clean_text(new_text, "new text")
+
+    old_fm, _ = _extract_leading_frontmatter(old_clean)
+    new_fm, new_body = _extract_leading_frontmatter(new_clean)
+
+    if old_fm is None:
+        if new_fm is not None:
+            raise InvariantViolation("mutation introduces a frontmatter block where none existed")
+    else:
+        if new_fm is None:
+            raise InvariantViolation("mutation removed the frozen leading frontmatter block")
+        if old_fm.encode("utf-8") != new_fm.encode("utf-8"):
+            raise InvariantViolation("leading frontmatter is frozen and must be byte-identical")
+
+    _check_no_secondary_frontmatter(new_body)
+

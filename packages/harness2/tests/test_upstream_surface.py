@@ -47,32 +47,32 @@ def test_every_mapped_component_is_one_of_our_four_mutable_components():
     assert mapped == set(invariants.MUTABLE)  # one slot per mutable component, none invented
 
 
-def test_the_other_four_slots_are_denied_with_a_reason():
-    assert {s for s, c in SLOT_COMPONENT.items() if c is None} == {"c2", "c6", "c7", "c8"}
-    assert all(upstream_surface.SLOT_DENIAL[s] for s in ("c2", "c6", "c7", "c8"))
+def test_the_other_three_slots_are_denied_with_a_reason():
+    assert {s for s, c in SLOT_COMPONENT.items() if c is None} == {"c2", "c7", "c8"}
+    assert all(upstream_surface.SLOT_DENIAL[s] for s in ("c2", "c7", "c8"))
 
 
 # ── what each real surface may mutate ─────────────────────────────────────────────
 
-def test_opencode_allows_c1_c3_c4_c5(opencode):
+def test_opencode_allows_c1_c3_c4_c5_c6(opencode):
     got = check_surface(opencode)
-    assert got.slots == {"c1", "c3", "c4", "c5"}
+    assert got.slots == {"c1", "c3", "c4", "c5", "c6"}
     assert got.components == invariants.MUTABLE
     assert got.surface == "opencode"
-    assert set(got.denied) >= {"c2", "c6", "c7", "c8"}
+    assert set(got.denied) >= {"c2", "c7", "c8"}
 
 
-def test_codex_allows_only_c5(codex):
+def test_codex_allows_c5_c6(codex):
     got = check_surface(codex)
-    assert got.slots == {"c5"}
-    assert got.components == {"decomposition_strategy"}
-    # codex folds c1/c3/c4/c6 into one AGENTS.md, which also carries the guardrails: denied whole
+    assert got.slots == {"c5", "c6"}
+    assert got.components == {"decomposition_strategy", "context_assembly"}
+    # codex folds c1/c3/c4 into one AGENTS.md, which also carries the guardrails: denied whole
     assert "composite" in got.denied
 
 
 REQUEST_CASES = [
     ("c1", True), ("c2", False), ("c3", True), ("c4", True),
-    ("c5", True), ("c6", False), ("c7", False), ("c8", False),
+    ("c5", True), ("c6", True), ("c7", False), ("c8", False),
 ]
 
 
@@ -133,7 +133,6 @@ def test_a_tree_can_be_a_mapping_or_any_iterable_of_paths(opencode):
 
 DENIED_BY_SLOT = [
     ("guardrails.md", "c2"),
-    ("skills/review/SKILL.md", "c6"),
     ("skills/review/scripts/run.sh", "c7"),
     ("scripts/helper.py", "c7"),
     ("plugin/gate.ts", "c8"),
@@ -150,7 +149,6 @@ def test_paths_in_a_denied_slot_are_refused_and_name_the_slot(opencode, path, sl
 @pytest.mark.parametrize(("path", "slot"), [
     ("AGENTS.md", "composite"),
     (".codex/hooks.json", "c8"),
-    (".agents/skills/review/SKILL.md", "c6"),
     ("scripts/helper.py", "c7"),
 ])
 def test_denied_paths_on_codex(codex, path, slot):
@@ -158,8 +156,16 @@ def test_denied_paths_on_codex(codex, path, slot):
         check_surface(codex, tree=[path])
 
 
-def test_subagent_paths_are_allowed_on_codex(codex):
-    assert check_surface(codex, tree=["sub_agents/helper/AGENT.md"]).slots == {"c5"}
+def test_subagent_and_skill_paths_are_allowed_on_codex(codex):
+    assert check_surface(codex, tree=["sub_agents/helper/AGENT.md"]).slots == {"c5", "c6"}
+    assert check_surface(codex, tree=[".agents/skills/review/SKILL.md"]).slots == {"c5", "c6"}
+
+
+def test_skill_paths_are_allowed_on_opencode(opencode):
+    assert "c6" in check_surface(opencode, tree=["skills/review/SKILL.md"]).slots
+    slot, comp = upstream_surface.classify_path(opencode, "skills/review/SKILL.md")
+    assert slot == "c6"
+    assert comp == "context_assembly"
 
 
 def test_one_bad_path_refuses_the_whole_tree(opencode):
@@ -266,7 +272,7 @@ def test_a_stored_symlink_name_is_refused_even_if_the_tail_is_an_allowed_file(op
 def test_an_unrecognised_always_on_file_is_denied_not_allowed():
     spec = stand_in(always_on=("systemprompt.md", "brand_new.md"))
     got = check_surface(spec)
-    assert got.slots == {"c1", "c5"}
+    assert got.slots == {"c1", "c5", "c6"}
     assert any("brand_new.md" in why for why in got.denied.values())
     with pytest.raises(InvariantViolation):
         check_surface(spec, tree=["brand_new.md"])
@@ -283,8 +289,7 @@ def test_a_hooks_file_is_c8_and_denied():
 
 def test_the_skill_dir_comes_from_the_spec():
     spec = stand_in(skill_dir=".agents/skills")
-    with pytest.raises(InvariantViolation, match="c6"):
-        check_surface(spec, tree=[".agents/skills/x/SKILL.md"])
+    assert "c6" in check_surface(spec, tree=[".agents/skills/x/SKILL.md"]).slots
     with pytest.raises(InvariantViolation, match="unknown slot"):
         check_surface(spec, tree=["skills/x/SKILL.md"])  # not THIS surface's skill dir
 
@@ -322,3 +327,151 @@ def test_the_result_is_immutable(opencode):
         got.slots = frozenset({"c8"})  # type: ignore[misc]
     with pytest.raises(TypeError):
         got.denied["c1"] = "x"  # type: ignore[index]
+
+
+# ── check_mutation (3b): Frontmatter freezing & mutation validation ───────────────
+
+from cognitive_harness2.upstream_surface import MAX_MUTATION_BYTES, check_mutation
+
+VALID_AGENT_OLD = """---
+name: helper
+model: sonnet
+tools:
+  - read
+  - edit
+description: A helpful assistant
+---
+# Helper Instructions
+Follow instructions carefully.
+"""
+
+VALID_AGENT_NEW_BODY = """---
+name: helper
+model: sonnet
+tools:
+  - read
+  - edit
+description: A helpful assistant
+---
+# Helper Instructions
+Follow instructions carefully and be thorough in testing.
+"""
+
+
+def test_check_mutation_accepts_valid_body_edits_with_identical_frontmatter():
+    check_mutation("c5", "sub_agents/helper/AGENT.md", VALID_AGENT_OLD, VALID_AGENT_NEW_BODY)
+    check_mutation("c6", "skills/helper/SKILL.md", VALID_AGENT_OLD, VALID_AGENT_NEW_BODY)
+    # bytes also accepted
+    check_mutation("c5", "sub_agents/helper/AGENT.md", VALID_AGENT_OLD.encode("utf-8"), VALID_AGENT_NEW_BODY.encode("utf-8"))
+
+
+def test_check_mutation_accepts_valid_edits_without_frontmatter_for_non_frontmatter_files():
+    old = "# System Prompt\nDo things."
+    new = "# System Prompt\nDo things well.\n\n---\n\n## Section 2"
+    check_mutation("c1", "systemprompt.md", old, new)
+    check_mutation("c3", "LongTermMEMORY.md", old, new)
+    check_mutation("c4", "tool_descriptions/tool_guidance.md", old, new)
+
+
+def test_check_mutation_accepts_fenced_code_blocks_containing_yaml_in_body():
+    new = VALID_AGENT_OLD + "\n```yaml\nmodel: opus\ntools:\n  - bash\n```\n"
+    check_mutation("c5", "sub_agents/helper/AGENT.md", VALID_AGENT_OLD, new)
+
+
+@pytest.mark.parametrize("bad_new", [
+    # Altering model to opus
+    VALID_AGENT_OLD.replace("model: sonnet", "model: opus"),
+    # Adding tools (bash)
+    VALID_AGENT_OLD.replace("  - edit", "  - edit\n  - bash"),
+    # Adding allowed-tools
+    VALID_AGENT_OLD.replace("model: sonnet", "model: sonnet\nallowed-tools: [bash]"),
+    # Adding permissions
+    VALID_AGENT_OLD.replace("model: sonnet", "model: sonnet\npermissions: unrestricted"),
+    # Adding permission-mode
+    VALID_AGENT_OLD.replace("model: sonnet", "model: sonnet\npermission-mode: auto"),
+    # Changing description in frontmatter
+    VALID_AGENT_OLD.replace("A helpful assistant", "A modified assistant"),
+    # Adding whitespace inside frontmatter
+    VALID_AGENT_OLD.replace("model: sonnet", "model:  sonnet"),
+    # CRLF vs LF trick: convert frontmatter to \r\n
+    VALID_AGENT_OLD.replace("\n", "\r\n"),
+    # Removing frontmatter entirely
+    "# Helper Instructions\nFollow instructions carefully.",
+    # Unclosed frontmatter fence
+    "---\nname: helper\nmodel: sonnet\n# No closing fence\nBody",
+])
+def test_check_mutation_rejects_frontmatter_tampering(bad_new):
+    with pytest.raises(InvariantViolation):
+        check_mutation("c5", "sub_agents/helper/AGENT.md", VALID_AGENT_OLD, bad_new)
+
+
+@pytest.mark.parametrize("introduced_fm", [
+    "---\nmodel: opus\n---\n# Body",
+    "   \n\n---\nmodel: opus\n---\n# Body",  # leading blank lines
+    "\n---\nname: injected\n---\n# Body",
+])
+def test_check_mutation_rejects_introducing_frontmatter_when_old_had_none(introduced_fm):
+    old = "# Plain instructions\nNo frontmatter."
+    with pytest.raises(InvariantViolation):
+        check_mutation("c5", "sub_agents/helper/AGENT.md", old, introduced_fm)
+
+
+@pytest.mark.parametrize("bad_body_new", [
+    # Second frontmatter block in body
+    VALID_AGENT_OLD + "\n---\nmodel: opus\ntools: [bash]\n---\n",
+    # Stray --- followed by sensitive frontmatter keys
+    VALID_AGENT_OLD + "\n---\nmodel: opus\n",
+    VALID_AGENT_OLD + "\n---\ntools:\n  - bash\n",
+    VALID_AGENT_OLD + "\n---\npermissions: allow-all\n",
+    VALID_AGENT_OLD + "\n---\nallowed-tools: [bash]\n",
+    VALID_AGENT_OLD + "\n---\npermission-mode: auto\n",
+    # Body containing a secondary YAML mapping block enclosed by ---
+    VALID_AGENT_OLD + "\n---\nfoo: bar\nbaz: qux\n---\n",
+])
+def test_check_mutation_rejects_secondary_frontmatter_in_body(bad_body_new):
+    with pytest.raises(InvariantViolation):
+        check_mutation("c5", "sub_agents/helper/AGENT.md", VALID_AGENT_OLD, bad_body_new)
+
+
+@pytest.mark.parametrize("bad_char", [
+    "\x00",           # NUL byte
+    "\ufeff",         # BOM (category Cf)
+    "\u200b",         # zero-width space (Cf)
+    "\u200c",         # zero-width non-joiner (Cf)
+    "\u202e",         # right-to-left override (Cf)
+    "\x1b",           # ANSI escape (Cc)
+    "\x0c",           # form feed (Cc)
+    "\x0b",           # vertical tab (Cc)
+])
+def test_check_mutation_rejects_control_and_invisible_characters(bad_char):
+    bad = f"{bad_char}# Instructions\nBody"
+    with pytest.raises(InvariantViolation):
+        check_mutation("c1", "systemprompt.md", "# Instructions\nBody", bad)
+
+
+def test_check_mutation_rejects_non_utf8_bytes():
+    bad_bytes = b"\xff\xfe\x00\x00invalid"
+    with pytest.raises(InvariantViolation):
+        check_mutation("c1", "systemprompt.md", b"# Old", bad_bytes)
+
+
+def test_check_mutation_rejects_oversize():
+    huge = "a" * (MAX_MUTATION_BYTES + 1)
+    with pytest.raises(InvariantViolation):
+        check_mutation("c1", "systemprompt.md", "old", huge)
+
+
+@pytest.mark.parametrize("slot", ["c2", "c7", "c8", "c9", "unknown", ""])
+def test_check_mutation_rejects_non_mutable_slots(slot):
+    with pytest.raises(InvariantViolation):
+        check_mutation(slot, "some/path.md", "old", "new")
+
+
+@pytest.mark.parametrize("path", [
+    "guardrails.md", "GUARDRAILS.md", "pkg/guardrails/safety.txt",
+    "hooks/pre-commit", "hooks.json", ".git/config", "../escape", "/etc/passwd",
+])
+def test_check_mutation_rejects_protected_paths(path):
+    with pytest.raises(InvariantViolation):
+        check_mutation("c1", path, "old", "new")
+

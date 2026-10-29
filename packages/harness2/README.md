@@ -103,7 +103,7 @@ Four safety seams sit between this engine and upstream's `Substrate` and `Propos
 
 | module | guards |
 | --- | --- |
-| `upstream_surface.py` | Maps upstream's `SurfaceSpec` components c1..c8 onto `invariants.MUTABLE`. Mutable: c1 system prompt (`prompt`), c3 memory (`context_assembly`), c4 tool guidance (`tool_description`), c5 subagents (`decomposition_strategy`). Denied: c2 guardrails (protected), c6 skills (undecided), c7 scripts (executable code), c8 plugins and hooks (protected), codex's single `AGENTS.md` (it folds in the guardrails), and every unknown slot. `check_surface(spec, request=, tree=)` raises `InvariantViolation` for any slot or path outside that set, or failing the path rules (traversal, absolute, case variants, unicode look-alikes, symlink-looking names, protected prefixes). |
+| `upstream_surface.py` | Maps upstream's `SurfaceSpec` components c1..c8 onto `invariants.MUTABLE`. Mutable: c1 system prompt (`prompt`), c3 memory (`context_assembly`), c4 tool guidance (`tool_description`), c5 subagents (`decomposition_strategy`, body only), c6 skills (`context_assembly`, body only). Denied: c2 guardrails (protected by slot denial and the `guardrails` path stem), c7 scripts (executable code), c8 plugins and hooks (protected), codex's single `AGENTS.md` (it folds in the guardrails), and every unknown slot. `check_surface(spec, request=, tree=)` raises `InvariantViolation` for any slot or path outside that set, or failing the path rules. `check_mutation(slot, path, old, new)` enforces frontmatter freezing, UTF-8 validity, size limits, and absence of control characters or body frontmatter blocks. |
 | `upstream_egress.py` | `check_proposer(config, settings)` decides, before any session exists, whether an upstream Proposer may be created. Returns a `Decision` (allowed, reasons, warnings, redacted view). Refuses Vertex and any hosted cloud route, an endpoint that cannot be determined (upstream's Proposer has none: it must be declared), any endpoint that is not loopback or ZDR-listed, a hosted provider behind a loopback address, inherited credential-like env vars (by name only), non-approved `*_BASE_URL` and proxy vars, credential flags on the command line, unsafe working directories, and a `claude` CLI proposer unless `COGNITIVE_HARNESS2_ALLOW_CLAUDE_PROPOSER=1` (`settings.allow_claude_cli_proposer`), which is necessary and not sufficient. No secret value ever reaches a reason or the view. |
 | `substrate.py` | `CognitiveSubstrate` implements upstream's `Substrate` Protocol. `surface`, `materialise` (read-only staging through `DockerRunner`'s key rules; no symlinks, UTF-8 only, capped) and `preflight` (`require_rootless_docker`, then a quota check only if the caller passes `quota_check=`) work and start nothing. `execute` and `read_trajectory` raise `NotImplementedError("slice 3b, not enabled")`. |
 | `sweep_plan.py` | `plan_sweep(...)` returns an immutable `SweepPlan` (candidates, hard caps, upstream's ledger budget P = 3k and R = 4k, `advice.cost_class`, readiness, `requires_human_approval: true`) or raises `SweepRefused` listing every cause: a missing, zero, negative, infinite or oversized cap, a plan over its own cap, a candidate off the mutable surface, a known readiness blocker or quota refusal, or a Proposer decision that is not allowed. It starts no sweep. |
@@ -117,6 +117,33 @@ Things worth knowing:
 - Upstream is inconsistent about c-numbers (its README makes guardrails c2, its prompt tables call `guardrails.md` c6). The seams bind to paths.
 
 **The 3b gate.** Slice 3b (`DockerRunner` as `Substrate.execute`, one capped dry run, a hard budget cap, `requires_human_approval` kept) is not started and runs only on the user's separate go. Slice 3a is subject to independent review before that.
+
+## Slot table (3b)
+
+Slice 3b extends the safety seams to govern proposed candidate file mutations across upstream surfaces (RFC 004 §6.5):
+
+| slot | upstream path | component | status & constraint |
+| --- | --- | --- | --- |
+| `c1` | `systemprompt.md` | `prompt` | Mutable |
+| `c2` | `guardrails.md` | `(guardrail)` | **Denied**: protected by slot table and path stem `guardrails` |
+| `c3` | `LongTermMEMORY.md` | `context_assembly` | Mutable |
+| `c4` | `tool_descriptions/tool_guidance.md` | `tool_description` | Mutable |
+| `c5` | `sub_agents/<name>/AGENT.md` | `decomposition_strategy` | **Mutable (BODY ONLY)**: leading frontmatter is frozen |
+| `c6` | `skills/<name>/SKILL.md` | `context_assembly` | **Mutable (BODY ONLY)**: leading frontmatter is frozen |
+| `c7` | `scripts/<name>.py`, `<skill>/scripts/*` | `(scripts)` | **Denied**: executable code |
+| `c8` | `plugin/<name>.ts`, `hooks_file` | `(lifecycle_hook)` | **Denied**: lifecycle hooks |
+
+### Frontmatter Freezing & Mutation Policy
+
+Subagent definitions (`c5`) and skills (`c6`) carry YAML frontmatter defining execution parameters (`model`, `tools`, `allowed-tools`, `permissions`, `effort`). Permitting candidate mutations to alter frontmatter introduces privilege and model-tier escalation hazards (e.g. escalating from Flash to Opus, or granting tool execution).
+
+`upstream_surface.check_mutation(slot, path, old_text, new_text)` enforces:
+1. **Slot & Invariant Verification**: `slot` must be mutable (`c1`, `c3`, `c4`, `c5`, `c6`). `path` must not touch any protected stem (`guardrails`, `hooks`, `guard`, `.git`) or path escape.
+2. **Leading Frontmatter Freezing**:
+   - If `old_text` has leading frontmatter, `new_text` must contain an **exact byte-identical** frontmatter block (byte-level match, identical fences, preserved whitespace, no CRLF/LF tampering, no key or value modifications).
+   - If `old_text` has no frontmatter, `new_text` must not introduce one.
+3. **Body Hygiene**: The body must not introduce a secondary frontmatter-looking block or stray frontmatter keys (`model:`, `tools:`, `permissions:`, etc.) following a `---` fence outside fenced code blocks.
+4. **Encoding & Size Hygiene**: Files must be valid UTF-8, strictly capped at 512 KiB, free of NUL characters (`\x00`), and free of disallowed Unicode control or invisible characters (BOM `\ufeff`, zero-width spaces, bidi overrides, ANSI escapes).
 
 ## Configuration
 
