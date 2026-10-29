@@ -20,24 +20,40 @@ from cognitive_harness2.sandbox import (
     SandboxSpec,
     SandboxUnavailable,
     SbxRunner,
+    VerifiedDocker,
     require_rootless_docker,
+    verify_rootless_docker,
 )
 
 ROOTLESS = ["name=seccomp,profile=builtin", "name=rootless", "name=cgroupns"]
 ROOTFUL = ["name=seccomp,profile=builtin", "name=cgroupns"]
-UNIX = {"DOCKER_HOST": "unix:///run/user/1000/docker.sock"}
+SOCK = "unix:///run/user/1000/docker.sock"
+OTHER = "unix:///tmp/other-daemon.sock"
+UNIX = {"DOCKER_HOST": SOCK}
 which_docker = lambda _: "/usr/bin/docker"  # noqa: E731
 
 
 def fake_docker(*, options=ROOTLESS, info_rc=0, info_out=None, info_err="", context="unix:///run/user/1000/docker.sock",
-                image_rc=0, info_timeout=False, calls=None):
-    """A stand-in for subprocess.run that answers the three probes the gate makes."""
+                image_rc=0, info_timeout=False, calls=None, contexts=None):
+    """A stand-in for subprocess.run that answers the three probes the gate makes.
+
+    `contexts`, when given, is a list of answers to successive `context inspect` calls (a context
+    that changes under the gate's feet); the last one repeats. Every other call must be pinned
+    with `-H <host>` and is recorded with the `-H <host>` stripped as `sub`.
+    """
+    asked = []
+
     def run(argv, **kw):
         if calls is not None:
             calls.append(argv)
         sub = argv[1:]
         if sub[:2] == ["context", "inspect"]:
-            return subprocess.CompletedProcess(argv, 0, context + "\n", "")
+            asked.append(1)
+            answer = context if contexts is None else contexts[min(len(asked), len(contexts)) - 1]
+            return subprocess.CompletedProcess(argv, 0, answer + "\n", "")
+        if sub[0] != "-H":
+            raise AssertionError(f"docker call not pinned to the verified host: {argv}")
+        sub = sub[2:]
         if sub[0] == "info":
             if info_timeout:
                 raise subprocess.TimeoutExpired(argv, 15)
@@ -98,7 +114,7 @@ def test_a_non_unix_endpoint_is_refused_before_any_daemon_call(host):
     calls: list = []
     with pytest.raises(SandboxUnavailable, match="local unix socket"):
         gate(environ={"DOCKER_HOST": host}, context=host, calls=calls)
-    assert not any(c[1] == "info" for c in calls)
+    assert not any("info" in c for c in calls)
 
 
 def test_the_active_context_is_used_when_docker_host_is_unset():
@@ -120,24 +136,25 @@ def test_sbx_wins_when_installed(monkeypatch):
 
 
 def test_docker_is_the_fallback_when_sbx_is_absent(monkeypatch):
-    monkeypatch.setattr(sandbox, "require_rootless_docker", lambda which=None, **k: "/usr/bin/docker")
+    monkeypatch.setattr(sandbox, "verify_rootless_docker", lambda which=None, **k: VerifiedDocker("/usr/bin/docker", SOCK))
     r = sandbox.default_runner(lambda n: None if n == "sbx" else f"/usr/bin/{n}")
     assert isinstance(r, DockerRunner) and r.docker_path == "/usr/bin/docker"
+    assert r.docker_host == SOCK  # the verified endpoint travels with the runner
 
 
 def test_neither_runtime_fails_closed_and_names_both(monkeypatch):
     def boom(*a, **k):
         raise SandboxUnavailable("daemon is not rootless")
-    monkeypatch.setattr(sandbox, "require_rootless_docker", boom)
+    monkeypatch.setattr(sandbox, "verify_rootless_docker", boom)
     with pytest.raises(SandboxUnavailable, match="`sbx`.*not installed.*Docker fallback.*not rootless"):
         sandbox.default_runner(lambda _: None)
 
 
 def test_status_reports_the_runtime_or_the_refusal(monkeypatch):
-    monkeypatch.setattr(sandbox, "require_rootless_docker", lambda *a, **k: "/usr/bin/docker")
+    monkeypatch.setattr(sandbox, "verify_rootless_docker", lambda *a, **k: VerifiedDocker("/usr/bin/docker", SOCK))
     assert sandbox.sandbox_status(lambda n: None if n == "sbx" else "/d") == "rootless-docker"
     assert sandbox.sandbox_status(lambda n: "/x/sbx") == "sbx"
-    monkeypatch.setattr(sandbox, "require_rootless_docker",
+    monkeypatch.setattr(sandbox, "verify_rootless_docker",
                         lambda *a, **k: (_ for _ in ()).throw(SandboxUnavailable("nope")))
     assert sandbox.sandbox_status(lambda _: None).startswith("unavailable (fail closed)")
 
@@ -145,7 +162,7 @@ def test_status_reports_the_runtime_or_the_refusal(monkeypatch):
 # ── argv construction ────────────────────────────────────────────────────────────
 
 def argv(command=("echo", "hi"), **kw):
-    return DockerRunner("/usr/bin/docker", **kw)._argv(SandboxSpec(command=list(command)), Path("/tmp/stage"), "h2-x")
+    return DockerRunner("/usr/bin/docker", **kw)._argv(SandboxSpec(command=list(command)), Path("/tmp/stage"), "h2-x", SOCK)
 
 
 def pair(a, flag):
@@ -154,7 +171,7 @@ def pair(a, flag):
 
 def test_argv_carries_every_required_hardening_flag():
     a = argv()
-    assert a[:3] == ["/usr/bin/docker", "run", "--rm"]
+    assert a[:5] == ["/usr/bin/docker", "-H", SOCK, "run", "--rm"]  # pinned to the verified daemon
     assert pair(a, "--network") == "none"
     assert "--read-only" in a
     assert pair(a, "--cap-drop") == "ALL"
@@ -177,7 +194,9 @@ def test_argv_stages_the_candidate_read_only_and_nothing_else():
 def test_argv_never_exposes_the_home_directory_the_docker_socket_or_the_host_environment():
     text = " ".join(argv())
     assert str(Path.home()) not in text
-    assert "docker.sock" not in text and "/var/run" not in text
+    assert "/var/run" not in text
+    assert text.count("docker.sock") == 1 and f"-H {SOCK} run" in text  # only as the pinned daemon endpoint
+    assert "dst=/run" not in text and "src=/run" not in text   # never mounted into the container
     toks = argv()
     for banned in ("--privileged", "--env-file", "--pid", "--cap-add", "--device", "--userns", "--ipc", "--uts"):
         assert banned not in toks
@@ -231,7 +250,7 @@ def test_staging_under_the_home_directory_is_refused(tmp_path, monkeypatch):
 
 def test_run_rechecks_the_daemon_and_never_starts_a_container_when_it_is_not_rootless(monkeypatch):
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: pytest.fail("a container must not start"))
-    monkeypatch.setattr(sandbox, "require_rootless_docker",
+    monkeypatch.setattr(sandbox, "verify_rootless_docker",
                         lambda *a, **k: (_ for _ in ()).throw(SandboxUnavailable("daemon went away")))
     with pytest.raises(SandboxUnavailable, match="daemon went away"):
         DockerRunner("/usr/bin/docker").run(SandboxSpec(command=["echo"], files={"prompt": "x"}))
@@ -264,3 +283,135 @@ async def test_a_runtime_that_vanishes_mid_probe_is_refused_not_degraded(tmp_pat
                                 classification="unstated", dry_run=False))["run_id"]
     with pytest.raises(Refused, match="daemon went away"):
         eng.probe(run_id=run_id, command=["x"], timeout_s=5, allow_worktree_diff=True)
+
+
+# ── TOCTOU: the verified daemon is pinned on every docker invocation ──────────────
+
+def test_the_gate_returns_the_verified_endpoint_and_pins_its_own_probes_to_it():
+    calls: list = []
+    v = verify_rootless_docker(which_docker, run=fake_docker(calls=calls), environ=UNIX)
+    assert v == VerifiedDocker("/usr/bin/docker", SOCK)
+    assert [c[3] for c in calls] == ["info", "image"]
+    assert all(c[:3] == ["/usr/bin/docker", "-H", SOCK] for c in calls)
+
+
+def test_the_context_is_read_once_and_the_answer_it_gave_is_the_one_used_everywhere():
+    calls: list = []
+    v = verify_rootless_docker(which_docker, run=fake_docker(calls=calls, contexts=[SOCK, OTHER]), environ={})
+    assert v.host == SOCK
+    assert sum(c[1] == "context" for c in calls) == 1
+    assert all(c[1:3] == ["-H", SOCK] for c in calls if c[1] != "context")
+    assert not any(OTHER in c for c in calls)
+
+
+def test_a_caller_supplied_host_skips_the_ambient_environment_and_context_entirely():
+    calls: list = []
+    v = verify_rootless_docker(which_docker, run=fake_docker(calls=calls), environ={"DOCKER_HOST": "tcp://evil:1"},
+                               host=SOCK)
+    assert v.host == SOCK and not any(c[1] == "context" for c in calls)
+
+
+@pytest.mark.parametrize("host", ["tcp://127.0.0.1:2375", "ssh://me@h", "", "bogus", "unix:/x", "UNIX:///x"])
+def test_a_pinned_non_unix_host_is_refused(host):
+    with pytest.raises(SandboxUnavailable, match="local unix socket"):
+        verify_rootless_docker(which_docker, run=fake_docker(), environ=UNIX, host=host)
+    with pytest.raises(SandboxUnavailable, match="local unix socket"):
+        DockerRunner("/usr/bin/docker", docker_host=host)
+
+
+class Recorder:
+    """Stands in for subprocess.run and subprocess.Popen; records (argv, env) for every docker call."""
+
+    def __init__(self, monkeypatch, *, context=SOCK, hang_first=False):
+        import io
+        self.calls: list[tuple[list[str], dict | None]] = []
+        self.hang_first = hang_first
+        inner = fake_docker(context=context)
+
+        def run(argv, **kw):
+            self.calls.append((list(argv), kw.get("env")))
+            verb = argv[argv.index("-H") + 2] if "-H" in argv else argv[1]
+            if verb in ("kill", "rm"):
+                return subprocess.CompletedProcess(argv, 0, b"", b"")
+            return inner(argv, **kw)
+
+        rec = self
+
+        class Popen:
+            def __init__(self, argv, **kw):
+                rec.calls.append((list(argv), kw.get("env")))
+                self.stdout, self.stderr, self.waits = io.BytesIO(b"out"), io.BytesIO(b""), 0
+
+            def wait(self, timeout=None):
+                self.waits += 1
+                if rec.hang_first and self.waits == 1:
+                    raise subprocess.TimeoutExpired("docker", timeout)
+                return 0
+
+            def poll(self):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "run", run)
+        monkeypatch.setattr(subprocess, "Popen", Popen)
+
+    def verbs(self):
+        return [a[a.index("-H") + 2] if "-H" in a else a[1] for a, _ in self.calls]
+
+
+def assert_every_call_is_pinned(rec, host):
+    assert rec.calls
+    for argv, env in rec.calls:
+        if argv[1] == "context":
+            continue
+        assert argv[1:3] == ["-H", host], argv
+        assert env is not None and "DOCKER_HOST" not in env and "DOCKER_CONTEXT" not in env, (argv, env)
+
+
+def hostile(monkeypatch):
+    monkeypatch.setenv("DOCKER_HOST", "tcp://attacker.example:2375")
+    monkeypatch.setenv("DOCKER_CONTEXT", "remote")
+
+
+def test_every_docker_call_a_run_makes_names_the_pinned_daemon(monkeypatch):
+    rec = Recorder(monkeypatch)
+    hostile(monkeypatch)  # switched after the runner was verified and built
+    res = DockerRunner("/usr/bin/docker", docker_host=SOCK).run(SandboxSpec(command=["echo"], files={"prompt": "x"}))
+    assert res.exit_code == 0
+    assert {"info", "image", "run", "kill", "rm"} <= set(rec.verbs())
+    assert "context" not in rec.verbs()   # a pinned runner never consults the ambient context
+    assert_every_call_is_pinned(rec, SOCK)
+    assert not any("attacker.example" in " ".join(a) for a, _ in rec.calls)
+
+
+def test_the_kill_and_rm_after_a_timeout_are_pinned_too(monkeypatch):
+    rec = Recorder(monkeypatch, hang_first=True)
+    hostile(monkeypatch)
+    res = DockerRunner("/usr/bin/docker", docker_host=SOCK).run(SandboxSpec(command=["sleep", "9"], timeout_s=1))
+    assert res.timed_out
+    assert rec.verbs().count("kill") >= 1 and rec.verbs().count("rm") >= 1
+    assert_every_call_is_pinned(rec, SOCK)
+
+
+def test_an_unpinned_runner_resolves_the_endpoint_once_per_run_then_pins_all_of_it(monkeypatch):
+    rec = Recorder(monkeypatch)
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.setenv("DOCKER_CONTEXT", "rootless")
+    DockerRunner("/usr/bin/docker").run(SandboxSpec(command=["echo"], files={"prompt": "x"}))
+    assert rec.verbs().count("context") == 1
+    assert_every_call_is_pinned(rec, SOCK)
+
+
+def test_a_pinned_runner_still_refuses_when_its_own_daemon_stops_being_rootless(monkeypatch):
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: pytest.fail("a container must not start"))
+    monkeypatch.setattr(subprocess, "run", fake_docker(options=ROOTFUL))
+    with pytest.raises(SandboxUnavailable, match="rootful"):
+        DockerRunner("/usr/bin/docker", docker_host=SOCK).run(SandboxSpec(command=["echo"]))
+
+
+def test_the_default_runner_carries_the_verified_host(monkeypatch):
+    monkeypatch.setattr(sandbox, "verify_rootless_docker", lambda *a, **k: VerifiedDocker("/usr/bin/docker", SOCK))
+    r = sandbox.default_runner(lambda n: None if n == "sbx" else "/usr/bin/docker")
+    assert isinstance(r, DockerRunner) and r.docker_host == SOCK

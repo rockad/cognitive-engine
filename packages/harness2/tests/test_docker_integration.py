@@ -6,6 +6,7 @@ the sandbox is unusable. See `require_rootless_docker` for the gate they all pas
 """
 from __future__ import annotations
 
+import shutil
 import subprocess
 import time
 
@@ -208,3 +209,53 @@ async def test_the_engine_fails_closed_on_an_unreachable_daemon_even_with_the_di
 
 def test_status_reports_rootless_docker_when_sbx_is_absent():
     assert sandbox.sandbox_status(lambda n: None if n == "sbx" else "/usr/bin/docker") == "rootless-docker"
+
+
+# ── the verified daemon is pinned: switching the ambient environment after the gate changes nothing ──
+
+def _no_sbx(name):
+    return None if name == "sbx" else shutil.which("docker")
+
+
+@pytest.mark.parametrize("env", [
+    {"DOCKER_HOST": "unix:///nonexistent/other-daemon.sock"},          # another (unreachable) local socket
+    {"DOCKER_HOST": "tcp://127.0.0.1:9"},                              # a remote endpoint
+    {"DOCKER_CONTEXT": "no-such-context"},                             # a context that does not exist
+    {"DOCKER_HOST": "unix:///var/run/docker.sock", "DOCKER_CONTEXT": "default"},   # the usual rootful path
+])
+def test_a_pinned_runner_ignores_an_ambient_switch_made_after_the_gate(monkeypatch, env):
+    r = sandbox.default_runner(_no_sbx)                       # the gate ran here and recorded the endpoint
+    assert isinstance(r, DockerRunner) and r.docker_host.startswith("unix://")
+    verified = r.docker_host
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    # Control: the same switched environment really does redirect (here: break) an unpinned docker call.
+    try:
+        control = subprocess.run(["docker", "info", "--format", "{{json .SecurityOptions}}"], capture_output=True,
+                                 text=True, timeout=5)
+        assert control.returncode != 0 or "name=rootless" not in control.stdout
+    except subprocess.TimeoutExpired:
+        pass  # an unreachable endpoint that hangs is a redirect too
+    # The pinned runner still runs, and on the daemon the gate verified.
+    res = sh(r, "echo pinned; id -u", files={"prompt": "x"})
+    assert (res.exit_code, res.stdout) == (0, "pinned\n65534\n")
+    monkeypatch.undo()
+    assert r.docker_host == verified
+    assert subprocess.run(["docker", "-H", verified, "ps", "-a", "-q", "--filter",
+                           "label=cognitive-harness2.sandbox=1"], capture_output=True, text=True,
+                          timeout=30).stdout.split() == []   # --rm: nothing leaked on the verified daemon
+
+
+def test_an_unpinned_runner_is_still_refused_by_the_per_run_check_when_the_env_points_nowhere(monkeypatch):
+    r = DockerRunner(require_rootless_docker())               # no pinned endpoint: resolves at run time
+    monkeypatch.setenv("DOCKER_HOST", "unix:///nonexistent/other-daemon.sock")
+    with pytest.raises(SandboxUnavailable):
+        sh(r, "echo must not run")
+
+
+def test_the_gate_returns_the_endpoint_it_verified():
+    v = sandbox.verify_rootless_docker()
+    assert v.host.startswith("unix://") and v.path.endswith("docker")
+    out = subprocess.run([v.path, "-H", v.host, "info", "--format", "{{json .SecurityOptions}}"],
+                         capture_output=True, text=True, timeout=30).stdout
+    assert "name=rootless" in out
