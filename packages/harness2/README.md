@@ -116,7 +116,101 @@ Things worth knowing:
 - Even an allowed Proposer decision carries warnings: upstream's sessions run agent tools (shell, files) on the host, and `HOME` file credentials (gcloud, `~/.claude`, `~/.aws`) cannot be listed by an environment check. Isolating the proposer session is a slice 3b question.
 - Upstream is inconsistent about c-numbers (its README makes guardrails c2, its prompt tables call `guardrails.md` c6). The seams bind to paths.
 
-**The 3b gate.** Slice 3b (`DockerRunner` as `Substrate.execute`, one capped dry run, a hard budget cap, `requires_human_approval` kept) is not started and runs only on the user's separate go. Slice 3a is subject to independent review before that.
+**The 3b gate.** Slice 3b (see "Contained proposer sessions (slice 3b)" below for the session runner; `DockerRunner` as `Substrate.execute`, one capped dry run, a hard budget cap, `requires_human_approval` kept) is not started and runs only on the user's separate go. Slice 3a is subject to independent review before that.
+
+## Contained proposer sessions (slice 3b)
+
+The proposer's agent CLI (shell and file tools) runs in a **rootless Docker container per session**, never on the host. **No model call and no real CLI is run by this code's tests**: they drive a fake CLI (`tests/fixtures/fake-cli`, a shell script). The real stage-1 run waits for the user's go.
+
+```
+ host (rootless dockerd, every call: docker -H unix://<verified socket>, no DOCKER_* in the env)
+ ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │  ProposerSessionRunner ── gate: rootless? channel allowed? proposer decision? image pinned? argv ok? │
+ │                                                                                                     │
+ │  HostBridge (local channel only)                    private dir 0700                                │
+ │    127.0.0.1:11434 ◄──── bytes ◄──── ollama.sock 0600 ──────────────┐ (mounted read-only,           │
+ │    (ollama, host loopback)                                          │  PROXY container only)        │
+ │                                                                     ▼                               │
+ │   ┌─ session container ───────────┐      ┌─ proxy container (egress_proxy.py) ─────┐   egress net   │
+ │   │ agent CLI (ro bind mount)     │ int. │ allow-list: exact host:port, deny rest  │ ─────────────► │
+ │   │ ro root, tmpfs HOME + /tmp    ├─────►│ resolve once, pin IP, refuse private /  │  (hosted only) │
+ │   │ cap-drop ALL, user 65534      │ net  │ loopback / link-local / metadata        │  the profile's │
+ │   │ workspace rw at the SAME path │ (no  │ local channel: relay to the unix socket │  endpoint(s)   │
+ │   │ credential file (ro, optional)│route)│ log: host:port + decision only          │  only          │
+ │   └───────────────────────────────┘      └─────────────────────────────────────────┘                │
+ └─────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+| piece | module | what it enforces |
+| --- | --- | --- |
+| image | `image.py`, `containers/proposer/{Dockerfile,build.sh}` | `ubuntu:26.04` pinned **by digest**; `ca-certificates`, `python3-minimal`; no apt lists; user 65534. The tag is `cognitive-harness2-proposer:<12 hex of sha256(Dockerfile, proxy source)>`, so a tag names its source. A session runs the image **by id**. An unpinned, `latest`, untagged or label-mismatched image is refused; it is never pulled or built at run time. |
+| host bridge | `host_bridge.py` | One unix socket (private 0700 directory, socket 0600) forwarded to one fixed **loopback IP literal** and port (names are refused). Connection, byte, idle and connect caps; logs nothing; always cleans up. |
+| proxy | `egress_proxy.py` | Default deny on exact `(host, port)`; host normalisation (case, trailing dot, IDNA, ideographic full stops); ambiguous numerics (`127.1`, `2130706433`, `0x7f.1`, `0177.0.0.1`) refused; an IP literal passes only if listed; **resolve once and connect to the IP**; refuses private, loopback, link-local (incl. `169.254.169.254`), multicast, reserved, CGNAT and IPv4-in-IPv6 addresses even for an allow-listed name, and refuses a mixed answer whole; CONNECT and absolute-URI HTTP only (origin form, userinfo, fragments refused; Host pinned, hop-by-hop headers dropped, `Connection: close`); request-line 8 KiB, header block 32 KiB, 100 headers, 10 s for the whole head (slowloris), connection, rate, idle, lifetime and byte caps; the access log is `decision host port rule` and nothing else. |
+| runner | `session_runner.py` | The lifecycle and the gate (below). |
+| harvest | `workspace_harvest.py` | Reading the workspace back: refuses sockets, FIFOs, devices, symlinks that escape, setuid/setgid/sticky, execute bits, hardlinks, files over 512 KiB, count/depth/total caps, hostile names (control and ANSI characters), protected paths, and any file containing the credential value. |
+
+**What `run` checks before anything is created (fail closed).** The rootless gate against the pinned image id; `channels.decide` recomputed from `zdr` and `classification`; for `opencode` and `claude_cli`, an allowed `upstream_egress.Decision`; a wall clock within the channel's `wall_s`; `argv[0]` equal to the mounted CLI path (`/opt/cli/<name>`), with the rest of argv data and never a shell string; a workspace that is a normalised, symlink-free, non-system directory (never the home directory or an ancestor); an environment of `UPPER_SNAKE` names that cannot override the proxy variables and cannot look like a credential; no credential value in argv or env.
+
+**Session container.** `--read-only`, tmpfs `HOME` (`/home/agent`) and `/tmp` (size-capped, `noexec,nosuid`), `--cap-drop ALL`, `no-new-privileges`, user 65534, pids/memory/cpu limits (defaults 256, 2g, 2 cpus: stage-1 proposals), the CLI bind-mounted read-only, the workspace read-write at the same absolute path, one `--internal` network, `--dns 127.0.0.1`, `HTTP(S)_PROXY` at the proxy container and an empty `NO_PROXY`. Nothing else is mounted: never the home directory, never the docker socket. The **proxy container** is read-only, cap-dropped and limited too; it is attached to the internal network and, for a hosted channel only, an egress network. The local channel has no egress network at all.
+
+**Credentials** go only into the session container, as a read-only file mounted at a path the caller names (`Credential`), never argv, `-e VALUE`, `docker inspect` or `ps`. The value is redacted from stdout and stderr, and harvest refuses workspace files that contain it. Deviation from a "0400 file": under rootless Docker the container user 65534 is not the file's owner, so the file is `0444` with a random 24-hex name in a `0711` directory inside a `0700` parent, removed in `finally`; the secrecy comes from the private parent and from only the session container mounting it.
+
+**Workspaces.** The container user is not the host user, so the workspace directory must be writable by others (mode `0777`), and files the CLI creates are owned by a sub-uid the host user cannot delete. After the session a one-shot container (no network, only the workspace, `CHOWN`/`DAC_OVERRIDE`/`FOWNER`) gives them to the host user (`reclaim_workspace`, default on). That `chown` also clears any setuid bit the model set.
+
+**Using it.**
+
+```python
+from cognitive_harness2 import image, sandbox
+from cognitive_harness2.session_runner import ProposerSessionRunner, SessionSpec, Credential
+
+verified = image.gate_for_build()                      # rootless gate; pins the socket
+ref = image.resolve_image(verified)                    # checked, by id; raises if absent
+runner = ProposerSessionRunner(verified, ref, channel, zdr="strict", classification="open", proposer_decision=decision)
+result = runner.run(SessionSpec(argv=("/opt/cli/opencode", "run", ...), workspace="/abs/ws", cli="/abs/path/opencode", timeout_s=600))
+# result.stdout / .stderr (capped, escape-stripped, redacted), .egress_log, .harvest, .timed_out
+```
+
+For a local channel the CLI must be configured with `runner.local_endpoint` (`http://harness2-proxy:<port>`), because the session's own `127.0.0.1` is empty.
+
+**Rebuild the image.** `packages/harness2/containers/proposer/build.sh` (or `uv run python -m cognitive_harness2.image build`; `status` only checks). It builds from a context of two files with the pinned socket. Any change to the Dockerfile or `egress_proxy.py` changes the tag, so rebuild after editing either; old tags are removed by hand (`docker rmi cognitive-harness2-proposer:<old>`). The base digest is in the Dockerfile; to move it, pull the new base once, edit the `FROM`, rebuild. Packages are installed from the Ubuntu archive at build time, so the digest pins the base, not the package set.
+
+**Measured on this host** (rootless dockerd 29.9.2, rootlesskit `gvisor-tap-vsock --disable-host-loopback`): an `--internal` network has no default route and Docker's resolver does not answer external names on it; the session reaches the proxy by its network alias; a proxy container that is root with every capability dropped can connect to the bridge socket mounted read-only (a non-root container user cannot open a socket owned by the host user, which is container root); host loopback is unreachable from containers by `127.0.0.1`, `172.17.0.1`, `10.0.2.2`, `192.168.127.1` and `host.docker.internal`.
+
+**Not covered, honestly.**
+
+- The CLI sends **whatever it likes to its allow-listed endpoint**, including anything in the workspace or the credential it was given. The proxy limits where, not what. A hostile model with a credential can spend it at that endpoint.
+- The host bridge exposes ollama (the whole API, not only generation) to the **proxy container**, and the proxy relays any session traffic to it. Other host loopback services stay unreachable.
+- DNS to the allow-listed name is resolved by the proxy container through Docker's resolver, so the allowed hostname (and nothing else) is visible to the host's resolver.
+- The egress side trusts the container runtime's networking; a kernel or runc escape defeats all of this (rootless limits the blast radius to the host user).
+- Output is stripped of escape sequences and control characters and redacted by exact credential value; a transformed (encoded) secret is not recognised.
+- `SbxRunner` (microVM) is still unverified; this path is rootless Docker only.
+- Not verified here: any real CLI (opencode, `claude`, `agy`) inside this container. A CLI that needs to execute from `HOME` or `/tmp` (native code unpacking) needs `SessionSpec(tmp_exec=True)`; one that writes next to its token needs `tmpfs_dirs`. Stage 1 is where that is found out.
+- The wall cap compared against is the channel's `wall_s`, which the profile defines per sweep; per-session budgeting is the caller's.
+- **The workspace is a rw bind mount to host disk** with no total-size quota (see the coverage notes below).
+- If the Python process is killed with SIGKILL, containers and networks labelled `cognitive-harness2.session` can remain; `runner.reap_all()` removes exactly those.
+
+**Threat-model coverage** (checklist from the Antigravity review, by test; `T` = `tests/test_session_integration.py`, `U` = `tests/test_session_runner.py`, `H` = `tests/test_workspace_harvest.py`, `P` = `tests/test_egress_proxy.py`):
+
+| item | where |
+| --- | --- |
+| read-only root, caps dropped, no-new-privileges, user | `U` every hardening flag; `T` privileges_are_dropped |
+| rootless gate, rootless mapping | `T` not_rootless / stopped_daemon / missing_image fail closed; `T` reclaim (container root = host user) |
+| `/proc`, `/sys`, mount, unshare, cgroup | `T` kernel_and_privileged_operations_fail |
+| same-path workspace, no `../` escape, nothing else mounted | `T` nothing_else_is_mounted; `U` mounts_are_exactly |
+| tmpfs HOME and /tmp, noexec, size cap | `T` only_the_workspace_and_tmpfs; `T` tmpfs_is_size_capped |
+| symlink and hardlink attacks | `T` hardlinks_across_the_mount_boundary; `T` symlink_pre_created; `H` symlink rules |
+| CLI binary read-only | `T` privileges_are_dropped (mount `ro`, append denied) |
+| environment scrubbing, `DOCKER_*` | `T` session_environment_is_closed (hostile ambient env); `U` pinned_and_carries_no_docker_variable |
+| token hygiene (ro, not in argv/env/inspect/ps/workspace) | `T` credential tests; `U` no_secret_is_anywhere_in_any_argv |
+| harvest scrubbing | `T` credential_written_into_the_workspace; `H` credential rule |
+| no egress, loopback unreachable, DNS, proxy enforcement | `T` the network tests (direct targets, DNS, unset proxy, proxy deny table) |
+| unix-socket bridge, proxy-only mount | `T` local_channel...bridge; `T` bridge_directory_is_private; `U` proxy_container_command_line |
+| proxy allow-list, redirects, rebinding, oversize, slowloris | `P` |
+| fork bomb, OOM, CPU quota, wall clock, guaranteed kill | `T` fork_bomb / memory_hogs / resource_limits / timeout_kills / crash cleanup |
+| output cap, ANSI filter | `T` output_is_capped_stripped; `U` terminal escapes |
+| harvest: special files, escaping symlinks, suid/exec, size | `H`; `T` reclaimed...harvest_refuses_the_mess |
+
+Not covered by a test: modification of staged protected files (`guardrails.md`) is the caller's check, because this runner stages nothing and `inspect_workspace` can only refuse protected path *names*; total bytes written to the workspace are not capped (only a single file, `SessionLimits.file_bytes`), so a hostile session can fill the host disk through the rw mount unless the workspace sits on a quota'd filesystem; UDP is not probed separately (there is no route at all); a kernel or runc escape is out of scope.
 
 ## Channel profile
 

