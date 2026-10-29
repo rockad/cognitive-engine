@@ -22,7 +22,12 @@ ENV_ZDR_ENDPOINTS = "COGNITIVE_HARNESS2_ZDR_ENDPOINTS"
 # Off unless set to exactly `1` or `true`. A `claude` CLI proposer burns the user's Claude
 # subscription quota, so it is refused by `upstream_egress` until this names it.
 ENV_ALLOW_CLAUDE_PROPOSER = "COGNITIVE_HARNESS2_ALLOW_CLAUDE_PROPOSER"
-DEFAULT_EXPERIENCE_ROOT = Path("~/.local/share/cognitive-engine/experiences")
+# The channel profile (TOML) that declares which proposer channels may carry content. Unset and no
+# default file: no channel is declared and every channel is denied. Set to a missing file: malformed.
+# Read by `channels.load_profile`; not a Settings field, because a profile is loaded per sweep.
+ENV_CHANNELS_FILE = "COGNITIVE_HARNESS2_CHANNELS_FILE"
+DEFAULT_CHANNELS_FILE = Path("~/.config/cognitive-engine/harness2-channels.toml")
+DEFAULT_EXPERIENCE_ROOT =Path("~/.local/share/cognitive-engine/experiences")
 DEFAULT_BASE_URL = "http://127.0.0.1:11434/v1"  # local Ollama, OpenAI-compatible
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
