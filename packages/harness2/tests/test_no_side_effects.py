@@ -14,14 +14,17 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import ctypes
 import http.client
 import json
+import multiprocessing
 import os
 import socket
 import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
@@ -61,6 +64,12 @@ def _targets():
         (asyncio.base_events.BaseEventLoop, "subprocess_exec"), (asyncio.base_events.BaseEventLoop, "subprocess_shell"),
         (socket, "create_connection"), (socket, "getaddrinfo"), (socket, "gethostbyname"),
         (socket.socket, "connect"), (socket.socket, "connect_ex"),
+        # raw datagrams need no connect(): UDP goes out with sendto/sendmsg, and send/sendall on any socket
+        (socket.socket, "sendto"), (socket.socket, "sendmsg"), (socket.socket, "send"), (socket.socket, "sendall"),
+        # native code can reach the network or start processes without touching any module trapped above
+        (ctypes.CDLL, "__init__"), (ctypes.PyDLL, "__init__"), (ctypes.LibraryLoader, "LoadLibrary"),
+        # a thread or a worker process is a way to run code the other traps are not watching
+        (multiprocessing.Process, "start"), (threading.Thread, "start"),
         (urllib.request, "urlopen"), (urllib.request.OpenerDirector, "open"),
         (http.client.HTTPConnection, "connect"), (http.client.HTTPConnection, "request"),
         (httpx.Client, "send"), (httpx.AsyncClient, "send"),
@@ -125,6 +134,14 @@ def fake_docker(calls):
 
 # ── the traps are real ────────────────────────────────────────────────────────────
 
+def _udp(action):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        action(s)
+    finally:
+        s.close()
+
+
 def test_every_trap_trips_and_is_recorded(traps):
     probes = [
         lambda: subprocess.run(["true"]), lambda: subprocess.Popen(["true"]), lambda: subprocess.check_output(["true"]),
@@ -138,6 +155,17 @@ def test_every_trap_trips_and_is_recorded(traps):
         lambda: httpx.get("http://127.0.0.1:9/"),
         lambda: asyncio.run(asyncio.create_subprocess_exec("true")),
         lambda: asyncio.run(asyncio.create_subprocess_shell("true")),
+        # raw UDP, native libraries, forks, worker processes and threads
+        lambda: _udp(lambda s: s.sendto(b"x", ("127.0.0.1", 9))),
+        lambda: _udp(lambda s: s.sendmsg([b"x"], [], 0, ("127.0.0.1", 9))),
+        lambda: _udp(lambda s: s.connect(("127.0.0.1", 9))),
+        lambda: _udp(lambda s: s.send(b"x")),
+        lambda: _udp(lambda s: s.sendall(b"x")),
+        lambda: ctypes.CDLL(None), lambda: ctypes.CDLL("libc.so.6"), lambda: ctypes.PyDLL(None),
+        lambda: ctypes.cdll.LoadLibrary("libc.so.6"), lambda: ctypes.cdll.libc,
+        lambda: os.fork(), lambda: os.forkpty(),
+        lambda: multiprocessing.Process(target=print).start(),
+        lambda: threading.Thread(target=print).start(),
     ]
     for probe in probes:
         with pytest.raises(SideEffectAttempted):
@@ -455,3 +483,20 @@ def test_the_channel_modules_read_only_the_profile_and_write_nothing(traps, prof
     assert readers == [str(profile_file), str(profile_file.parent / "missing.toml")]      # only the pinned reader
     assert file_traps.opened == [str(profile_file)]                                       # one read, of that file only
     assert file_traps.writes == [] and traps.attempts == []
+
+
+def test_the_new_traps_are_in_the_target_list():
+    names = {f"{getattr(o, '__name__', o)}.{a}" for o, a in _targets()}
+    for want in ("socket.sendto", "socket.sendmsg", "CDLL.__init__", "PyDLL.__init__", "LibraryLoader.LoadLibrary",
+                 "Process.start", "Thread.start", "posix_spawn", "fork"):
+        assert any(n.endswith(want) for n in names), want
+
+
+def test_a_thread_is_not_started_by_any_seam(traps, profile_file, surface):
+    # every seam, including the channel profile reader, runs on the calling thread
+    profile = channels.load_profile({settings.ENV_CHANNELS_FILE: str(profile_file)})
+    assert profile.declared
+    check_proposer({"kind": "opencode", "model": "ollama/qwen3:30b", "base_url": LOCAL, "env": {}},
+                   profile=profile, channel="local", classification="open")
+    check_surface(surface)
+    assert traps.attempts == []
