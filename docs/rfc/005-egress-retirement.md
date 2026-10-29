@@ -75,7 +75,7 @@ Outbound egress rules must be enforced symmetrically across both runtimes:
 
 ### 2.2 Classification Inheritance Invariant
 Directory path matching alone is insufficient when aggregating knowledge across shared notes and transcripts:
-- Any content derived from memory notes, transcripts, or experience files inherits the **strictest classification** of all its sources.
+- Any content derived from memory notes, transcripts, or experience files inherits the **strictest classification** of all its sources (`open` < `gated` < `restricted`).
 - Records lacking explicit classification default to **restricted**.
 - Derived prompts containing restricted content are barred from public or free-tier model endpoints.
 
@@ -92,6 +92,24 @@ When operating under `zdr: strict`:
 - Probing requests route exclusively to local inference (e.g. Ollama) or verified commercial Zero Data Retention endpoints.
 - If no compliant ZDR endpoint is available, the request aborts fail-closed.
 
+### 2.5 Channel Retention Levels & Per-Channel Ceiling
+In System 2 recursive optimization and multi-agent workflows, each communication or proposer channel declares its data retention characteristics:
+- **`local`**: Traffic never leaves localhost (e.g. Ollama on `127.0.0.1:11434`). Eligible for `open`, `gated`, and `restricted` data under all ZDR modes.
+- **`zdr-attested`**: Commercial endpoints with contractual Zero Data Retention terms (e.g. OpenRouter with ZDR enabled). Eligible for `open` and `gated` data under `zdr: strict`.
+- **`unknown`**: Standard endpoints or subscription channels without auditable or contractual zero-retention guarantees (e.g. Claude Code or Antigravity standard subscriptions). Eligible strictly for `open` content only; prohibited under `zdr: strict`.
+
+> [!IMPORTANT]
+> **"Declared, Not Verified" Rule**: Zero Data Retention is based on provider terms and user configuration declaration. Remote provider logging cannot be verified cryptographically or mechanically by the client. As a result:
+> - Subscription-based agent CLIs (Claude Code, Antigravity) provide no verifiable ZDR API contracts and default strictly to `retention: unknown` (open content only).
+> - Undeclared channels are **DENIED** by default.
+> - Channel profile configurations (`proposer-channels.json`) must fail loudly: malformed, invalid, or unparseable configurations abort immediately fail-closed.
+
+#### Per-Channel Ceiling Enforcement
+- A sweep or optimization run inherits the **strictest classification** among all ingested sources (RFC 005 inheritance).
+- A channel is eligible to participate in a sweep if and only if:
+  1. `channel.max_classification >= sweep.classification`
+  2. The channel's declared retention satisfies the active ZDR mode (`zdr: strict` forbids `unknown`).
+
 ---
 
 ## 3. Gated agentic-hub Retirement Protocol
@@ -103,7 +121,7 @@ To ensure 100% developer continuity, migration executes through four distinct ph
 - [ ] `packages/memory` runs natively on `127.0.0.1:8105/mcp` with resident memory verified under 2–3 GB RAM during sustained hybrid queries.
 - [ ] `packages/lookup` runs natively on `127.0.0.1:8101/mcp` (staging; the legacy container holds `:8100`) and correctly filters search results by `docs.visibility`.
 - [ ] `packages/lookup` indexes the same network-share sources as the legacy container with no host mount (RFC 001 D31), verified by document-count parity per source.
-- [ ] `packages/lookup` real-Samba check on host `core`: optional live check using dedicated read-only account `ce-lookup-ro`, password generated and kept on core (0600), fetched into process env per run, never logged; needs the user's go. Status: not started.
+- [x] `packages/lookup` real-Samba check on host `core`: dedicated read-only account `ce-lookup-ro` provisioned; password generated and kept on core (0600); traversal ACLs and `valid users = rockad @smb ce-lookup-ro` applied; all 7 live SMB and SmbFS client integration tests passed against `//core/knowledge-archive`.
 - [ ] Every daemon (`:8105`, `:8101`, `:8115`, Harness²) passes `tools/mcp_conformance.py` (RFC 001 D30): loopback only, forged Host and foreign Origin refused, strict arguments, stateless.
 - [ ] Gate 3: `packages/harness2` completes candidate probing inside local sandboxes (native `sbx` or ephemeral rootless Docker fallback) and confirms fail-closed behavior when neither runtime is available.
 - [ ] Cross-runtime egress test suites pass identically under Bun and Python.

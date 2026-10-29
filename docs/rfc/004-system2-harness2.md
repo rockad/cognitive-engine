@@ -164,10 +164,151 @@ The optimizer is strictly barred from modifying:
 7. **Slice 3 Two Gated Steps**:
    - **Slice 3a (Safety Seams)**: Wire `MUTABLE` <-> upstream `SurfaceSpec` default-deny, egress gate on Proposer endpoint, `Substrate.preflight` -> `require_rootless_docker`, quota/ledger pre-flight. Zero model calls, zero execution. Subject to independent review and user gate.
    - **Slice 3b (Execution)**: `DockerRunner` as `Substrate.execute`, one capped dry-run, hard budget cap, `requires_human_approval` kept intact. Runs only on user's separate go.
-1. **Port `8120`.** RFC 004 assigns none; `8120` is clear of 8100/8105/8110/8115 and overridable with `COGNITIVE_HARNESS2_PORT`. Registered with the conformance runner via `tools/probes/harness2.toml`.
-2. **A fifth tool, `harness2_status`.** Read-only and offline: sandbox availability, whether a key is configured (never its value), storage root, the protected set. Track 4's Gate 3 needs a way to ask "is sbx there, is the quota ok" without running a probe, and the conformance runner needs a harmless valid call.
-3. **`dry_run` on `harness2_propose`.** Reports the egress and quota verdict without calling a model, so a caller can see a refusal before committing to a run.
-4. **Only four components are mutable.** RFC 001 says Harness² mutates 8 components; this RFC names four. Anything else, and every unknown name, is refused until someone edits `MUTABLE` deliberately.
-5. **Human sign-off is a CLI step, not a tool.** An agent can stage a lesson with `harness2_reflect` but cannot commit it.
-6. **Upstream consumption.** Consumes upstream `google-research/harness2` directly as a pinned git dependency (commit SHA), wrapping its core optimizer and providing the FastMCP and Dual-Engine sandbox adapters rather than reimplementing the algorithmic core.
-7. **Bug found while testing:** the protected-path check stripped leading `../` and `/` before testing for escapes, so `../../escape` and `/etc/passwd` passed. Fixed, with tests.
+---
+
+## 6. Upstream Wiring & Execution Roadmap (Slice 3)
+
+### 6.1 Slice 3a: Safety Seams (Verified, No Model Calls, No Execution)
+- **Upstream Surface Mapping (`upstream_surface.py`)**: Maps upstream `SurfaceSpec` paths to the protected invariant set with default-deny. Binds directly to filesystem paths rather than ambiguous `c1..c8` slot aliases: `c3` (memory) maps to `context_assembly`, `c5` (subagents) maps to `decomposition_strategy`, `c6` (skills) is denied as undecided.
+- **Proposer Egress Gate (`upstream_egress.py`)**: Decides on an upstream `Proposer` configuration before any session exists. Upstream's Proposer forces Vertex AI via environment variables and inherits the host environment; Cognitive Engine requires an explicit endpoint declaration and enforces 15 strict refusal rules (refuses Vertex/hosted cloud, cloud CLI without explicit opt-in, undeclared endpoints, credential-like environment variables, userinfo/query/fragments in URLs, hosted providers behind loopback).
+- **Substrate Seam (`substrate.py`)**: Implements `CognitiveSubstrate` adhering to upstream's `Substrate` protocol. Preflight invokes `require_rootless_docker`; `execute` and `read_trajectory` refuse execution ("slice 3b").
+- **Sweep Plan Gate (`sweep_plan.py`)**: Refuses sweep generation without hard caps (sessions, wall time, cost), when a blocker exists, or without an allowed proposer.
+- **Zero-Side-Effect Proof (`test_no_side_effects.py`)**: Trap-based testing verifies that zero subprocess, network socket, HTTP client, or filesystem mutation occurs outside verified preflight checks.
+
+### 6.2 Slice 3b: Execution & Proposer Isolation Design
+Slice 3b connects upstream Harness² recursive optimization to real execution under a strict multi-tier safety architecture governed by user decisions (2026-10-29):
+
+#### 1. Proposer Channels
+Optimization proposals originate from one of three supported channels:
+- **Local**: `opencode` -> `ollama` on loopback (currently `gemma4:12b` only).
+- **Agent Provider**: The harness's own CLI (`Claude` via `claude` CLI, `Antigravity` via `agy` CLI).
+- **OpenRouter**: Commercial models accessed via OpenRouter API under strict ZDR.
+All channels are subject to uniform zero-data-retention and classification policies.
+
+#### 2. Uniform Policy via Per-Channel Profile
+Every channel is governed by a declarative profile (`proposer-channels.json`):
+- `kind`: CLI runner type (`opencode`, `claude_cli`, `agy_cli`, `openrouter`).
+- `provider`: Underlying provider identity.
+- `endpoint`: Loopback or authorized remote URL.
+- `model`: Target model identifier.
+- `retention`: Data retention level (`local` | `zdr-attested` | `unknown`).
+- `max_classification`: Ceiling for ingestible source classification (`open` < `gated` < `restricted`).
+- `caps`: Hard budget limits (`max_sessions`, `max_wall_s`, `max_cost_usd`).
+- `approval`: Human approval requirement flag (default true per sweep).
+
+> [!IMPORTANT]
+> **ZDR Declaration vs. Verification**: Zero Data Retention is recorded based on the user's explicit declaration and provider terms. Remote provider adherence cannot be cryptographically audited. Subscription channels (Claude Code, Antigravity) provide no verifiable ZDR guarantees for subscription tiers; they default strictly to `retention: unknown` and are restricted to `open` content only. Channel profiles follow loud-failure validation: any malformed profile causes immediate fail-closed refusal.
+
+#### 3. Execution Isolation (Rootless Docker with Allow-List Forward Proxy)
+Proposer CLI sessions run in isolated, rootless Docker containers reusing the hardened `DockerRunner` architecture:
+
+```mermaid
+flowchart TD
+    subgraph Host ["Host System (Debian / Core)"]
+        Harness["Upstream Harness² Engine"]
+        Profile["Channel Profile<br/>(Loud-failure validation)"]
+        DockerDaemon["Rootless Docker Daemon<br/>(Pinned unix socket)"]
+    end
+
+    subgraph Container ["Rootless Docker Container (glibc base)"]
+        direction TB
+        AgentCLI["Proposer Agent CLI<br/>(claude / opencode / agy)"]
+        TmpHome["tmpfs /tmp (HOME)"]
+        Scratch["rw /scratch (Candidate)"]
+        ReadOnlyCLI["ro /usr/local/bin/<cli>"]
+    end
+
+    subgraph NetworkFilter ["Internal Network Isolation"]
+        direction TB
+        InternalNet["--network internal"]
+        AllowProxy["Allow-List Forward Proxy<br/>(Permits ONLY declared channel endpoint)"]
+    end
+
+    subgraph Outbound ["Authorized Target Endpoint"]
+        TargetEndpoint["Ollama / Claude API / OpenRouter"]
+    end
+
+    Harness --> Profile
+    Profile --> DockerDaemon
+    DockerDaemon --> Container
+    AgentCLI --> InternalNet
+    InternalNet --> AllowProxy
+    AllowProxy --> TargetEndpoint
+```
+
+- **Container Hardening**: Read-only root filesystem, tmpfs `HOME`, dropped capabilities (`--cap-drop ALL`), strict pids/memory/cpu limits, CLI mounted read-only, candidate workspace mounted read-write on scratch tmpfs.
+- **Network Containment**: Container runs on `--network internal`. Outbound traffic routes strictly through a single dedicated allow-list forward proxy permitting communication exclusively with the channel's declared endpoint.
+- **Base Image**: Uses a lightweight glibc base image (such as Debian Bookworm slim) to support standard agent CLIs (`alpine:3` musl is incompatible with glibc CLI binaries).
+- **Alternatives Considered & Rejected**:
+  - *Bubblewrap (`bwrap`)*: Rejected as a secondary technology requiring independent maintenance without standard seccomp/cgroup defaults and lacking macOS portability.
+  - *Host process with tool filtering*: Rejected because subscription agent CLIs store active credentials in `HOME`, presenting ambient token exfiltration risk.
+
+#### 4. Package Binding
+`packages/harness2` subclasses upstream's `Proposer` class, overriding invocation methods to redirect agent execution into the isolated container under the declared channel profile. Upstream recursion, ledger budgets, judge evaluations, and candidate selection remain untouched. Slice 1 baseline serves as fallback and test double. An `agy_cli` channel is implemented in `packages/harness2` to support headless Antigravity runs alongside upstream's `claude_cli` and `opencode`.
+
+#### 5. Slot Table & Component Immutability
+Upstream paths are mapped to invariant components:
+- **Mutable Components**:
+  - `c1` prompt: System prompts and instructions.
+  - `c3` context_assembly: Context assembly rules and memory retrieval heuristics.
+  - `c4` tool_description: Descriptions of exposed tools.
+  - `c5` decomposition_strategy: Subagent task decomposition logic (**BODY ONLY**).
+  - `c6` skills: Procedural skill documentation (**BODY ONLY**).
+- **Immutable & Denied Components**:
+  - `c2` guardrails: Safety boundaries and invariant checks (denied by slot and path stem).
+  - `c7` scripts: Tool executable scripts.
+  - `c8` plugins/hooks: Interceptors, hooks, and extensions.
+  - **Frontmatter Fields**: In `c5` and `c6`, frontmatter keys (`model`, `tools`, `allowed-tools`, `permissions`) are **FROZEN**. Mutations attempting to alter frontmatter are rejected as model-tier or privilege escalations.
+
+#### 6. Phased Rollout Stages
+Slice 3b executes through three strictly sequential, user-gated stages:
+
+1. **Stage 1: Local Smoke Test**:
+   - Budget: $k=1$ (ledger parameters $P=3$k sessions, $R=4$k rollouts; max 3 sessions, 4 rollouts).
+   - Task: Bundled minimal demo task.
+   - Channel: `opencode` -> `ollama` (`gemma4:12b` on loopback).
+   - Resources: 45 min total wall clock, 10 min per session cap, container capped at 2 GB RAM, 2 CPUs, 256 pids, $0 cost. (All figures are proposals).
+   - Gate: Explicit user approval before start.
+2. **Stage 2: OpenRouter Strict ZDR**:
+   - Channel: OpenRouter API under verified ZDR.
+   - Budget: User-defined dollar and session ceiling.
+   - Gate: Requires separate user approval following Stage 1 review.
+3. **Stage 3: Subscription Agent Channels**:
+   - Channel: Claude Code / Antigravity CLI.
+   - Scope: Open content only (`retention: unknown`).
+   - Gate: Requires separate user approval following Stage 2 review.
+
+---
+
+## 7. Acceptance Criteria per Stage
+
+### Slice 3a: Safety Seams & Invariants (Completed)
+- [x] Upstream `SurfaceSpec` maps cleanly to `MUTABLE` with default-deny; slot stems and subpaths rejected if protected.
+- [x] Proposer egress gate enforces 15 refusal rules; Vertex AI and cloud CLIs blocked by default.
+- [x] `CognitiveSubstrate.preflight` enforces rootless Docker requirement; `execute` raises clean "slice 3b" blocker.
+- [x] `sweep_plan` refuses plans without hard budget caps or with unverified readiness.
+- [x] Side-effect trap test suite proves zero network, subprocess, or filesystem side-effects occur during seam execution.
+
+### Slice 3b Stage 1: Local Smoke (Gated on User Go)
+- [ ] Glibc-based rootless container image built and verified on local daemon.
+- [ ] Allow-list forward proxy successfully restricts container egress to loopback Ollama.
+- [ ] Upstream `Proposer` subclass launches containerized `opencode` session and captures output.
+- [ ] Frontmatter freeze validator rejects attempts to alter `model` or `tools` in candidate skills/subagents.
+- [ ] Complete k=1 smoke sweep completes within resource limits (2 GB, 2 CPU, 45m wall) without side-effects on host.
+
+### Slice 3b Stage 2: OpenRouter Integration (Gated)
+- [ ] OpenRouter channel profile validates against schema with strict ZDR enforcement.
+- [ ] Dollar budget cap enforced fail-closed by ledger pre-flight.
+
+### Slice 3b Stage 3: Subscription Channels (Gated)
+- [ ] Subscription channel profiles validate with `retention: unknown` and clamp sweep classification to `open`.
+- [ ] Containerized `claude_cli` and `agy_cli` sessions execute without leaking credentials outside container.
+
+---
+
+## 8. Unverified Assumptions
+The following architectural assumptions are tracked and must be verified before production cutover:
+1. **Proposer Subclassing**: Assumes upstream `harness2.proposer.Proposer` cleanly delegates execution methods without internal hard-coded host dependencies.
+2. **Headless Antigravity CLI (`agy`)**: Assumes `agy` supports fully headless, non-interactive command-line execution within a container. (Tracked as prerequisite spike `WS-0`).
+3. **Native `sbx` MicroVMs**: Local `sbx` runtime remains unverified on host (not installed). Ephemeral rootless Docker is the verified active sandbox.
+4. **Live OpenRouter Quota Response Schema**: Field names for `GET /api/v1/key` are verified against mock schemas but pending validation against live endpoint responses.

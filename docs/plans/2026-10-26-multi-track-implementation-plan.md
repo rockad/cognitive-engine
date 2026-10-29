@@ -163,7 +163,7 @@ Full list with evidence in [RFC 003 §4](../rfc/003-memory-lookup.md). The ones 
   - **Dependency:** `smbprotocol` (MIT, pure Python) is a core dependency of `cognitive-lookup`, imported lazily. **NTLM only**: Kerberos needs system krb5 libraries, which is the host setup this feature removes.
   - **Reused as-is:** the `[source.volume]` schema and `${ENV}` credential references (never inline values); an unreachable share still lets the daemon start, with rows kept and marked stale; reparse points are not followed and every document path is re-checked against its root.
   - **S2–S5 status (2026-10-28, done on `feat/lookup-smb-sources`, after S1):** `smb.py` adds `SmbFS` over `smbprotocol` (core dependency, imported lazily; NTLM only). Size, mtime and the reparse flag come from one listing per directory, so an unchanged share costs zero reads and zero extra network calls; reparse points are skipped and counted (`skipped_links`); unsafe path segments (`..`, backslash, `:`, NUL) are refused before any network call; a failed listing raises `SourceUnreachable` and deletes nothing, while the other sources still ingest. Credentials are `${VAR}` references checked at manifest load (a literal value or an unset variable names the problem; the value never appears in an error). **24 SMB tests against a real SMB server** plus a fake client, 271 repo-wide, README and RFC 003 updated. Findings: a dev-only dependency (impacket) shadowed the production `smbclient` import under `uv run pytest` and a broad `except Exception` disguised that as "share unreachable" (impacket now runs only in an isolated environment, handlers narrowed); `smbprotocol` caches sessions per host, port and user.
-  - **Real-Samba check on host `core`**: Optional live check using dedicated read-only account `ce-lookup-ro`, password generated and kept on core (0600), fetched into process env per run, never logged; needs the user's go. Status: not started.
+  - **Real-Samba check on host `core`**: Completed on host `core` (2026-10-29). Dedicated read-only account `ce-lookup-ro` provisioned; password stored in `~/.config/samba/ce-lookup-ro.pass` (0600); filesystem traversal ACLs and Samba read-only access applied. All 7 live SMB tests and `SmbFS` walk/stat/read_text client tests passed against `//core/knowledge-archive`. Status: **DONE**.
   - **S1 status (2026-10-28, done on `feat/lookup-smb-sources`):** `lookup/vfs.py` adds the `FileSystem` protocol, `LocalFS` (today's behaviour moved verbatim) and a duck-typed `VPath`; `Source.fs` routes `exists`, `contains` and `files()`, and the pipeline's containment check and content digest, through it. **All 197 existing Lookup tests pass unedited.** An in-memory backend ingests the same tree identically after the real tree is deleted, and a second pass over an unchanged tree performs zero reads (mutation-checked: severing the digest routing fails the parity test). Extractors needed no change. S2 (`SmbFS`) is next.
   - **Streams** (S-prefixed to avoid clashing with the matrix): S1 introduce the seam with `LocalFS` only, a pure refactor that keeps all existing Lookup tests green unedited and blocks the rest; S2 `SmbFS`; S3 manifest schema (`subpath`, `type` accepts `cifs`/`smb`) and loud errors on unset credential references; S4 tests (an in-memory `FakeFS`, the ledger/escape/visibility tests parametrized over both backends, one in-process SMB server integration test); S5 docs.
   - **Acceptance:** a second pass over an unchanged share performs zero file opens; the existing core `[source.volume]` block indexes from an SMB server with no host mount; `..`, absolute paths and reparse points are refused and counted; no credential appears in any log or error string; and the server passes the §3.5 conformance runner.
@@ -221,6 +221,36 @@ Full list with evidence in [RFC 003 §4](../rfc/003-memory-lookup.md). The ones 
 - **Slice 3 Two Gated Steps (Upstream Wiring Roadmap)**:
   - **Slice 3a (Safety Seams)**: Wire `MUTABLE` <-> upstream `SurfaceSpec` default-deny, egress gate on the Proposer endpoint, `Substrate.preflight` -> `require_rootless_docker`, quota/ledger pre-flight. Zero model calls, zero execution. Subject to independent review and user gate.
   - **Slice 3b (Execution)**: `DockerRunner` as `Substrate.execute`, one capped dry-run, hard budget cap, `requires_human_approval` kept intact. Runs only on user's separate go.
+
+#### 3.3.2 Slice 3b (Execution) Architectural Design & Workstreams (2026-10-29)
+
+Governed by user decisions made via `/clarify` on 2026-10-29. Slice 3b wires upstream Harness² optimization to real execution under a hardened rootless container topology with allow-list proxying and loud-failure configuration validation:
+
+1. **Proposer Channels & Uniform Policy**:
+   - **Supported Channels**: Local (`opencode` -> loopback `ollama`, `gemma4:12b`), agent provider (`claude` via Claude CLI, `agy` via Antigravity CLI), and `openrouter` (commercial models with ZDR).
+   - **Declarative Channel Profiles (`proposer-channels.json`)**: Declares `kind`, `provider`, `endpoint`, `model`, `retention` (`local` | `zdr-attested` | `unknown`), `max_classification` (`open` < `gated` < `restricted`), `caps` {`sessions`, `wall_s`, `cost`}, and `approval` requirement.
+   - **Loud-Failure Config Validation**: Any malformed, unparseable, or missing required field causes immediate fail-closed abort (identical to Jev config rules).
+   - **ZDR Honest Disclosure**: ZDR represents the user's declaration and cannot be verified cryptographically against remote provider servers. Subscription tiers (Claude Code, Antigravity) default to `retention: unknown` and are restricted to `open` content.
+   - **Ceiling Enforcement**: Sweeps inherit the strictest classification across all ingested sources. A channel is eligible only if `channel.max_classification >= sweep.classification` and its retention satisfies the active ZDR mode (`zdr: strict` prohibits `unknown`).
+2. **Container Isolation with Allow-List Forward Proxy**:
+   - Proposer agent CLI sessions run inside rootless Docker containers reusing `DockerRunner` hardening: read-only root, tmpfs `HOME`, dropped capabilities, pids/memory/cpu limits, CLI mounted read-only, candidate workspace mounted rw on scratch tmpfs.
+   - Container connects to `--network internal` with a single dedicated allow-list forward proxy permitting outbound egress exclusively to the channel's declared endpoint.
+   - Requires a lightweight glibc base image (such as Debian Bookworm slim) because musl (`alpine:3`) cannot execute glibc CLI binaries.
+3. **Upstream Binding & Package Extensions**:
+   - `packages/harness2` subclasses upstream's `Proposer` class, overriding invocation methods to redirect execution into the isolated container.
+   - Adds an `agy_cli` channel implementation alongside upstream's `claude_cli` and `opencode`.
+4. **Slot Table & Frontmatter Freezing**:
+   - Mutable components: `c1` prompt, `c3` context_assembly, `c4` tool_description, `c5` decomposition_strategy (BODY ONLY), `c6` skills (BODY ONLY).
+   - Denied: `c2` guardrails (slot and path stem), `c7` scripts, `c8` plugins/hooks.
+   - In `c5` and `c6`, frontmatter keys (`model`, `tools`, `allowed-tools`, `permissions`) are strictly frozen to prevent privilege escalation.
+5. **Execution Workstreams**:
+   - **`WS-0` Spike**: Verify unverified assumptions: (a) Proposer subclassing feasibility without monkey-patching upstream internals, (b) headless non-interactive `agy` CLI container execution. (If `agy` headless execution is not viable, Antigravity channel is deferred).
+   - **`WS-D` Slot Table**: Implement path-to-component surface mapping, frontmatter freezing AST visitor, and invariant rejection tests.
+   - **`WS-A` Channel Profile & Egress**: Implement `proposer-channels.json` schema, loud-failure validator, and per-channel egress filtering.
+   - **`WS-B` Container Image & Proxy**: Build glibc rootless Docker base image, configure allow-list forward proxy, and implement container session runner.
+   - **`WS-C` Proposer Subclass & Binding**: Subclass upstream `Proposer`, bind container runner, and add `agy_cli` adapter.
+   - **`WS-E` Stage 1 Local Smoke Runner**: Execute Stage 1 smoke test ($k=1$, 3 sessions, 4 rollouts, demo task, `opencode` -> `ollama gemma4:12b`, 2 GB / 2 CPU / 45m wall cap, $0 cost) under explicit user approval gate.
+   - *Adversarial Gate*: Each workstream step undergoes read-only adversarial review by Antigravity on its own quota prior to human approval gates.
 
 ---
 
@@ -307,6 +337,12 @@ WS5 and WS6 are independent. **WS6 is done and committed on `feat/track1-jev-ada
 | **WS8** | **Track 3 (Slice 2)** | `feat/track3-harness2` | `packages/harness2/src/cognitive_harness2/`, `NOTICE` | Ephemeral rootless Docker fallback (`--network none`, `--read-only`), failure triggers, upstream citation | Claude Code (`code-engineer`) | `flash` |
 | **WS9** | **Track 1 review** | `feat/track1-jev-adapters` | `packages/jev/`, `adapters/` | PR #3 remediation, review coordination, and test suite verification | Antigravity (`code-engineer`) | `flash_lite` |
 | **WS10** | **Tooling** | `feat/worktree-protocol` | `tools/wt`, `.githooks/pre-commit`, `AGENTS.md` | Repository-local worktree automation enforcing clean hub and isolated agent worktrees | Antigravity (`code-engineer`) | `flash_lite` |
+| **WS-0** | **Track 3 (Slice 3b spike)** | `feat/track3-harness2` | `packages/harness2/` | Spike verifying Proposer subclassing feasibility and headless `agy` CLI container execution | Claude Code (`code-engineer`) | `flash` |
+| **WS-D** | **Track 3 (Slice 3b slot)** | `feat/track3-harness2` | `packages/harness2/src/cognitive_harness2/` | Path-to-component slot table mapping and frontmatter freeze AST validator for c5/c6 | Claude Code (`code-engineer`) | `flash` |
+| **WS-A** | **Track 3 (Slice 3b policy)** | `feat/track3-harness2` | `packages/harness2/src/cognitive_harness2/` | Declarative `proposer-channels.json` schema, loud-failure validator, and per-channel egress filtering | Claude Code (`code-engineer`) | `flash` |
+| **WS-B** | **Track 3 (Slice 3b runner)** | `feat/track3-harness2` | `packages/harness2/` | Glibc rootless Docker container base, allow-list forward proxy, and session execution runner | Claude Code (`code-engineer`) | `flash` |
+| **WS-C** | **Track 3 (Slice 3b binding)** | `feat/track3-harness2` | `packages/harness2/` | Upstream `Proposer` subclass binding container runner with `agy_cli` channel adapter | Claude Code (`code-engineer`) | `flash` |
+| **WS-E** | **Track 3 (Slice 3b smoke)** | `feat/track3-harness2` | `packages/harness2/` | Stage 1 local smoke runner (k=1, 3 sessions, 4 rollouts, demo task, `opencode` -> `ollama`) | Claude Code (`code-engineer`) | `flash` |
 
 ---
 
