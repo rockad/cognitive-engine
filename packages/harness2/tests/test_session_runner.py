@@ -460,3 +460,222 @@ def test_the_file_size_limit_is_a_flag_and_is_validated(world):
     for n in (0, 1000, 1 << 40, "big"):
         with pytest.raises(SessionRefused):
             runner().authorize(spec(world, limits=SessionLimits(file_bytes=n)))
+
+
+# ── WS-E: the solver role and the shared sweep budget ─────────────────────────────
+
+from cognitive_harness2.sweep_budget import BudgetExhausted, SweepBudget  # noqa: E402
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 100.0
+
+    def __call__(self):
+        return self.t
+
+
+def budget(**kw):
+    clock = kw.pop("clock", None) or _Clock()
+    return SweepBudget(kw.pop("total", 2700.0), kw.pop("per", 600.0), kw.pop("n", 7), clock=clock, **kw), clock
+
+
+def solver(name="local", *, decision=None, **kw):
+    return runner(name, decision=decision, role="solver", **kw)
+
+
+def test_the_default_role_is_proposer_and_a_role_must_be_one_of_two(world):
+    assert runner().role == "proposer" and runner().budget is None
+    for bad in ("judge", "", None, "Solver", 3):
+        with pytest.raises(SessionRefused, match="role"):
+            runner(role=bad)
+    with pytest.raises(SessionRefused, match="budget"):
+        runner(budget=object())
+
+
+def test_a_solver_on_an_opencode_channel_needs_no_proposer_decision_but_a_proposer_still_does(world):
+    for name, zdr in (("local", "strict"), ("claude", "off")):
+        plan = runner(name, zdr=zdr, decision=None, role="solver").authorize(spec(world))
+        assert plan.spec.argv[0] == "/opt/cli/fake-cli"
+        with pytest.raises(SessionRefused, match="proposer decision"):
+            runner(name, zdr=zdr, decision=None).authorize(spec(world))          # byte-identical proposer behaviour
+
+
+def test_a_solver_with_a_refusing_decision_is_still_refused(world):
+    refused = upstream_egress.Decision(False, ("no",))
+    for d in (refused, SimpleNamespace(allowed=True), "yes"):
+        with pytest.raises(SessionRefused, match="proposer decision"):
+            solver(decision=d).authorize(spec(world))
+
+
+def test_a_solver_still_needs_the_channel_decision_for_its_channel(world, monkeypatch):
+    trap = Trap(monkeypatch)
+    for r in (solver("agy", cls="gated"), solver("agy", zdr="strict"), solver("claude", cls="restricted", zdr="off"),
+              solver("router", cls="restricted"), solver("local", zdr="bogus"), solver("claude", cls=None)):
+        with pytest.raises(SessionRefused, match="channel decision"):
+            r.run(spec(world))
+    assert trap.calls == []
+
+
+def test_a_solver_gets_the_same_hardening_as_a_proposer(world):
+    sp = spec(world)
+    for name, zdr in (("local", "strict"), ("agy", "off"), ("router", "strict")):
+        a = runner(name, zdr=zdr, cls="open", role="solver", decision=None).authorize(sp)
+        b = runner(name, zdr=zdr, cls="open", decision=OK).authorize(sp)
+        names_ = sr.Names("abc123abc123")
+        argv_a = sr.build_session_run(a, names_, docker=V.path, host=SOCK, cred_file=None)
+        argv_b = sr.build_session_run(b, names_, docker=V.path, host=SOCK, cred_file=None)
+        assert argv_a == argv_b
+        assert sr.build_proxy_create(a, names_, docker=V.path, host=SOCK, proxy_dir="/p", bridge_dir=None) == \
+            sr.build_proxy_create(b, names_, docker=V.path, host=SOCK, proxy_dir="/p", bridge_dir=None)
+        assert "--cap-drop" in argv_a and "--read-only" in argv_a and "no-new-privileges" in argv_a
+        assert "exec" not in sr._tmpfs("/tmp", "1m", exec_=False, owned=False)[1].split(",")
+
+
+def test_the_solver_refusals_are_the_proposer_refusals(world):
+    s = solver()
+    cli = sr.container_cli_path(world.cli)
+    for bad in (dict(argv=("/bin/sh", "-c", "id")), dict(env={"HTTP_PROXY": "x"}), dict(env={"MY_SECRET": "x"}),
+                dict(timeout_s=9999), dict(workspace="/etc"), dict(workspace="/etc/x"),
+                dict(argv=(cli, "x"), tmpfs_dirs=("/elsewhere",)), dict(limits=SessionLimits(pids=1))):
+        with pytest.raises(SessionRefused):
+            s.authorize(spec(world, **bad))
+
+
+def test_tmp_exec_is_off_unless_asked_for(world):
+    assert SessionSpec(argv=("/opt/cli/x",), workspace="/w", cli="/c", timeout_s=1).tmp_exec is False
+    plan = solver().authorize(spec(world))
+    argv = sr.build_session_run(plan, sr.Names("abc123abc123"), docker=V.path, host=SOCK, cred_file=None)
+    assert all("noexec" in t for t in argv if t.startswith("/tmp:") or t.startswith("/home/agent:"))
+    plan = solver().authorize(spec(world, tmp_exec=True))
+    argv = sr.build_session_run(plan, sr.Names("abc123abc123"), docker=V.path, host=SOCK, cred_file=None)
+    assert any(t.startswith("/tmp:") and ",exec," in t for t in argv)
+
+
+# ── the budget around run() ──────────────────────────────────────────────────────────
+
+CANNED = sr.SessionResult("r1", 0, "out", "", False, False, 1.0, ())
+
+
+def stub_execute(monkeypatch, r, *, result=CANNED, exc=None, seen=None):
+    def _execute(plan):
+        if seen is not None:
+            seen.append(plan)
+        if exc is not None:
+            raise exc
+        return result
+    monkeypatch.setattr(r, "_execute", _execute)
+    monkeypatch.setattr(r, "_gate", lambda: None)
+
+
+def test_run_reserves_before_the_gate_and_an_exhausted_budget_starts_nothing(world, monkeypatch):
+    trap = Trap(monkeypatch)
+    b, clock = budget(n=1)
+    r = solver(budget=b)
+    gate = []
+    monkeypatch.setattr(r, "_gate", lambda: gate.append(1))
+    monkeypatch.setattr(r, "_execute", lambda plan: CANNED)
+    r.run(spec(world))
+    with pytest.raises(BudgetExhausted) as e:
+        r.run(spec(world))
+    assert e.value.reason == "sessions" and gate == [1]
+    clock.t += 99999
+    b2, c2 = budget(total=10.0)
+    c2.t += 10
+    r2 = solver(budget=b2)
+    monkeypatch.setattr(r2, "_gate", lambda: gate.append(2))
+    with pytest.raises(BudgetExhausted) as e:
+        r2.run(spec(world))
+    assert e.value.reason == "deadline" and gate == [1]
+    assert trap.calls == []
+
+
+def test_a_refused_spec_never_reserves(world, monkeypatch):
+    trap = Trap(monkeypatch)
+    b, _ = budget()
+    for bad in (dict(argv=("/bin/sh",)), dict(timeout_s=99999)):
+        with pytest.raises(SessionRefused):
+            solver(budget=b).run(spec(world, **bad))
+    with pytest.raises(SessionRefused):
+        solver("agy", cls="gated", budget=b).run(spec(world))
+    assert b.snapshot()["counts"]["total"] == 0 and b.snapshot()["sessions"] == [] and trap.calls == []
+
+
+def test_the_session_timeout_is_clipped_to_the_reservation(world, monkeypatch):
+    b, clock = budget(total=700.0, per=600.0)
+    r = solver(budget=b)
+    seen: list = []
+    stub_execute(monkeypatch, r, seen=seen)
+    r.run(spec(world, timeout_s=2000))
+    assert seen[-1].spec.timeout_s == 600.0                     # the per-session cap
+    clock.t += 300
+    r.run(spec(world, timeout_s=500))
+    assert seen[-1].spec.timeout_s == 400.0                     # what is left of the sweep
+    clock.t -= 300
+    b2, _ = budget(total=700.0, per=600.0)
+    r2 = solver(budget=b2)
+    stub_execute(monkeypatch, r2, seen=seen)
+    r2.run(spec(world, timeout_s=30))
+    assert seen[-1].spec.timeout_s == 30                        # the caller asked for less
+
+
+def test_without_a_budget_the_timeout_is_untouched(world, monkeypatch):
+    r = runner()
+    seen: list = []
+    stub_execute(monkeypatch, r, seen=seen)
+    r.run(spec(world, timeout_s=2000))
+    assert seen[0].spec.timeout_s == 2000
+
+
+def test_sessions_are_counted_by_role_and_recorded(world, monkeypatch):
+    b, clock = budget(role_caps={"proposer": 1, "solver": 2})
+    p, s = runner(budget=b), solver(budget=b)
+    for r in (p, s):
+        stub_execute(monkeypatch, r)
+    p.run(spec(world))
+    s.run(spec(world))
+    s.run(spec(world))
+    with pytest.raises(BudgetExhausted, match="proposer"):
+        p.run(spec(world))
+    with pytest.raises(BudgetExhausted, match="solver"):
+        s.run(spec(world))
+    snap = b.snapshot()
+    assert snap["counts"] == {"proposer": 1, "solver": 2, "total": 3}
+    assert [x["outcome"] for x in snap["sessions"]] == ["ok", "ok", "ok"]
+    assert [x["role"] for x in snap["sessions"]] == ["proposer", "solver", "solver"]
+
+
+@pytest.mark.parametrize("how,outcome,counted", [
+    (dict(exc=sr.SessionError("boom")), "error", 1),
+    (dict(exc=KeyboardInterrupt()), "error", 1),
+    (dict(exc=sr.SessionCleanupError(["container x"])), "leftovers", 1),
+    (dict(result=sr.SessionResult("r", None, "", "", True, False, 9.0, ())), "timed_out", 1),
+])
+def test_the_reservation_is_always_released_with_how_the_session_ended(world, monkeypatch, how, outcome, counted):
+    b, _ = budget()
+    r = solver(budget=b)
+    stub_execute(monkeypatch, r, **how)
+    try:
+        r.run(spec(world))
+    except BaseException:  # noqa: BLE001
+        pass
+    snap = b.snapshot()
+    assert snap["active"] == 0 and snap["counts"]["total"] == counted
+    assert snap["sessions"][0]["outcome"] == outcome
+
+
+def test_a_failed_gate_gives_the_slot_back(world, monkeypatch):
+    trap = Trap(monkeypatch)
+    b, _ = budget(n=1)
+    r = solver(budget=b)
+
+    def closed():
+        raise sandbox.SandboxUnavailable("down")
+    monkeypatch.setattr(r, "_gate", closed)
+    with pytest.raises(sandbox.SandboxUnavailable):
+        r.run(spec(world))
+    snap = b.snapshot()
+    assert snap["counts"]["total"] == 0 and snap["sessions"][0]["outcome"] == "refused" and trap.calls == []
+    stub_execute(monkeypatch, r)
+    r.run(spec(world))                                       # the single slot was still there
+
