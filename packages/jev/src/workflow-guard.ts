@@ -13,10 +13,35 @@
  * - `workflow('name')` / `workflow({scriptPath: 'literal'})`: resolved and analysed one level deep.
  * - Anything else asks: aliasing, passing the function as a value, member or computed access,
  *   spread arguments or options, computed keys, a model from a variable, a template with `${}`,
- *   dynamic import, `eval`, `Function`, `globalThis`; parse errors, unreadable or oversized files.
+ *   dynamic import; parse errors, unreadable or oversized files.
+ *
+ * Principle: `agent` and `workflow` may appear only as the callee of a direct call. Every other way
+ * to reach them, and every way to synthesize code, asks:
+ * - destructuring a property named `agent`/`workflow` (or `constructor`, `getPrototypeOf`, ...), and
+ *   reading them off anything but a plain local name (`x.agent`, `f().agent`, `x?.['agent']`);
+ * - the escape set: `this`, `arguments`, `globalThis`, `global`, `window`, `self`, `Function`,
+ *   `eval`, `Reflect`, `Proxy`, `process`, `require`, `Bun`, `Deno`, `module`, `exports`,
+ *   `import.meta`, and the member names `constructor`, `__proto__`, `prototype`, `getPrototypeOf`,
+ *   `setPrototypeOf`, `getOwnPropertyDescriptor(s)`, `caller`, `callee`, `prepareStackTrace`, ...;
+ * - computed member access whose key is not a literal or provably a number (it could spell
+ *   `constructor`); writes into a fresh local object or array literal are exempt;
+ * - `setTimeout`/`setInterval` given anything but a function or a name; `__proto__` in a literal.
  *
  * The analysis is text only: comments and strings that mention "model" are never read as code.
- * Known limit: a static check cannot prove what dynamic code does, so the guard refuses to guess.
+ *
+ * Known limits (static analysis cannot be sound; this is a fail-closed filter, not a sandbox):
+ * - "Provably a number" trusts `.length`, the second parameter of map, forEach, filter, some,
+ *   every, find, findIndex, findLast, findLastIndex and flatMap callbacks, and numeric-only names. A user-defined `map`, or an object whose
+ *   `length` is a string, defeats it.
+ * - `setTimeout(variable)` is allowed, because `setTimeout(resolve, ms)` is the common shape. Node
+ *   and Bun throw on a string there; a runtime that evaluates it would not be covered.
+ * - `x.agent` read off a plain unbound name (such as `args`) is allowed: it is data unless the
+ *   sandbox exposes an object that holds the function. Unknown sandbox objects are not modelled.
+ * - Options of `pipeline`/`parallel`/`phase` helpers are not inspected, only `agent()` and `meta`.
+ * - The script is checked as written. It cannot see a file changing between the check and the run,
+ *   or what a saved workflow resolves to if Claude Code's lookup differs from `fsResolver`.
+ * - Intentional false positives (always ask): any `this`, any variable-key lookup such as `o[k]`
+ *   on data, and a local method that happens to be called `agent` or `workflow`.
  */
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -97,9 +122,41 @@ type Finding =
   | { kind: 'unverifiable'; reason: string; line: number; col: number };
 
 const WATCHED = new Set(['agent', 'workflow']);
-/** Names that give a script a way to reach `agent` or run code the guard cannot see. */
-const ESCAPES = new Set(['eval', 'Function', 'globalThis']);
+/**
+ * Identifiers that give a script a way to reach `agent` through the global object, to synthesize
+ * code the guard cannot read, or to reflect its way to either. Any reference asks.
+ */
+const ESCAPES = new Set([
+  'eval', 'Function', 'Reflect', 'Proxy',
+  'globalThis', 'global', 'window', 'self', 'frames', 'document',
+  'arguments', 'process', 'require', 'module', 'exports', 'Bun', 'Deno',
+  'importScripts', 'Worker', 'SharedWorker'
+]);
+/**
+ * Property names that reach the Function constructor, a prototype, a property descriptor or a stack
+ * frame's `this`/function. Used as `x.name`, `x['name']` and as a destructured key.
+ */
+const MEMBER_ESCAPES = new Set([
+  'constructor', '__proto__', 'prototype', 'getPrototypeOf', 'setPrototypeOf',
+  'getOwnPropertyDescriptor', 'getOwnPropertyDescriptors',
+  '__lookupGetter__', '__lookupSetter__', '__defineGetter__', '__defineSetter__',
+  'caller', 'callee', 'prepareStackTrace', 'captureStackTrace', 'getThis', 'getFunction'
+]);
+/** Timers whose first argument can be a string of code in some runtimes. */
+const TIMERS = new Set(['setTimeout', 'setInterval']);
+/** Array methods whose callback receives (element, index): the second parameter is a number. */
+const INDEX_METHODS = new Set(['map', 'forEach', 'filter', 'some', 'every', 'find', 'findIndex', 'findLast', 'findLastIndex', 'flatMap']);
 const SKIP_KEYS = new Set(['type', 'start', 'end', 'loc', 'range']);
+
+/** Facts about the names a script binds, computed once per script. See `collectBindings`. */
+interface Bindings {
+  /** Names whose every binding in the script is provably a number. */
+  numeric: Set<string>;
+  /** Names whose every binding is an object or array literal (a fresh local container). */
+  plain: Set<string>;
+  /** Every name the script binds anywhere. */
+  bound: Set<string>;
+}
 
 type Node = any;
 
@@ -254,39 +311,244 @@ function analyseMeta(decl: Node, out: Finding[]): void {
   }
 }
 
-function visit(node: Node, parent: Node, key: string, out: Finding[]): void {
+// ── Binding facts ──────────────────────────────────────────────────────────────────────────────
+//
+// Scope-free and conservative: a name counts as "numeric" or "plain" only if EVERY binding of that
+// name anywhere in the script qualifies, so shadowing can only make the guard ask more, not less.
+
+const NUMERIC_BINARY = new Set(['-', '*', '/', '%', '**', '&', '|', '^', '<<', '>>', '>>>']);
+const NUMERIC_GLOBAL_FNS = new Set(['Number', 'parseInt', 'parseFloat']);
+const MATH_FNS = new Set(['abs', 'ceil', 'floor', 'round', 'trunc', 'max', 'min', 'pow', 'sqrt', 'sign']);
+const NUMERIC_ASSIGN_OPS = new Set(['-=', '*=', '/=', '%=', '**=', '&=', '|=', '^=', '<<=', '>>=', '>>>=']);
+
+/** Whether an expression always evaluates to a number (or bigint), so it cannot spell a property name like "constructor". */
+function isNumeric(e: Node, numeric: Set<string>, bound: Set<string>): boolean {
+  switch (e?.type) {
+    case 'Literal':
+      return typeof e.value === 'number' || typeof e.value === 'bigint';
+    case 'Identifier':
+      return numeric.has(e.name);
+    case 'UnaryExpression':
+      return e.operator === '-' || e.operator === '+' || e.operator === '~';
+    case 'UpdateExpression':
+      return true;
+    case 'BinaryExpression':
+      return e.operator === '+' ? isNumeric(e.left, numeric, bound) && isNumeric(e.right, numeric, bound) : NUMERIC_BINARY.has(e.operator);
+    case 'ConditionalExpression':
+      return isNumeric(e.consequent, numeric, bound) && isNumeric(e.alternate, numeric, bound);
+    case 'SequenceExpression':
+      return isNumeric(e.expressions[e.expressions.length - 1], numeric, bound);
+    case 'MemberExpression':
+      return !e.computed && e.property.type === 'Identifier' && e.property.name === 'length';
+    case 'CallExpression': {
+      const c = e.callee;
+      if (c.type === 'Identifier') return NUMERIC_GLOBAL_FNS.has(c.name) && !bound.has(c.name);
+      return c.type === 'MemberExpression' && !c.computed && c.object.type === 'Identifier' && c.object.name === 'Math' && !bound.has('Math') &&
+        c.property.type === 'Identifier' && MATH_FNS.has(c.property.name);
+    }
+    default:
+      return false;
+  }
+}
+
+function patternNames(p: Node, out: string[]): void {
+  switch (p?.type) {
+    case 'Identifier': out.push(p.name); break;
+    case 'ObjectPattern': for (const q of p.properties) patternNames(q.type === 'RestElement' ? q.argument : q.value, out); break;
+    case 'ArrayPattern': for (const q of p.elements) patternNames(q, out); break;
+    case 'RestElement': patternNames(p.argument, out); break;
+    case 'AssignmentPattern': patternNames(p.left, out); break;
+    default:
+  }
+}
+
+type Fact = { name: string; kind: 'other' | 'num' } | { name: string; kind: 'expr' | 'numIf'; expr: Node | null };
+
+function collectBindings(ast: Node): Bindings {
+  const facts: Fact[] = [];
+  const indexCallbacks = new Set<Node>();
+  const forDeclarators = new Set<Node>();
+  const other = (p: Node) => {
+    const names: string[] = [];
+    patternNames(p, names);
+    for (const name of names) facts.push({ name, kind: 'other' });
+  };
+  const walk = (n: Node): void => {
+    switch (n.type) {
+      case 'VariableDeclarator':
+        if (forDeclarators.has(n) || n.id.type !== 'Identifier') other(n.id);
+        else facts.push({ name: n.id.name, kind: 'expr', expr: n.init ?? null });
+        break;
+      case 'ForInStatement':
+      case 'ForOfStatement':
+        if (n.left.type === 'VariableDeclaration') for (const d of n.left.declarations) forDeclarators.add(d);
+        else other(n.left);
+        break;
+      case 'FunctionDeclaration':
+      case 'FunctionExpression':
+      case 'ArrowFunctionExpression':
+        if (n.id) other(n.id);
+        n.params.forEach((p: Node, i: number) => {
+          if (i === 1 && p.type === 'Identifier' && indexCallbacks.has(n)) facts.push({ name: p.name, kind: 'num' });
+          else other(p);
+        });
+        break;
+      case 'ClassDeclaration':
+      case 'ClassExpression':
+        if (n.id) other(n.id);
+        break;
+      case 'CatchClause':
+        if (n.param) other(n.param);
+        break;
+      case 'ImportSpecifier':
+      case 'ImportDefaultSpecifier':
+      case 'ImportNamespaceSpecifier':
+        other(n.local);
+        break;
+      case 'CallExpression': {
+        const c = n.callee;
+        const m = c.type === 'MemberExpression' && !c.computed && c.property.type === 'Identifier' ? c.property.name : null;
+        const cb = n.arguments[0];
+        if (m !== null && INDEX_METHODS.has(m) && (cb?.type === 'ArrowFunctionExpression' || cb?.type === 'FunctionExpression')) indexCallbacks.add(cb);
+        break;
+      }
+      case 'AssignmentExpression':
+        if (n.left.type === 'Identifier') {
+          if (n.operator === '=') facts.push({ name: n.left.name, kind: 'expr', expr: n.right });
+          else if (NUMERIC_ASSIGN_OPS.has(n.operator)) facts.push({ name: n.left.name, kind: 'num' });
+          else if (n.operator === '+=') facts.push({ name: n.left.name, kind: 'numIf', expr: n.right });
+          else facts.push({ name: n.left.name, kind: 'other' });
+        } else if (n.left.type !== 'MemberExpression') {
+          other(n.left);
+        }
+        break;
+      default:
+    }
+    for (const k of Object.keys(n)) {
+      if (SKIP_KEYS.has(k)) continue;
+      const child = n[k];
+      if (Array.isArray(child)) {
+        for (const c of child) if (isNode(c)) walk(c);
+      } else if (isNode(child)) {
+        walk(child);
+      }
+    }
+  };
+  walk(ast);
+
+  const byName = new Map<string, Fact[]>();
+  for (const f of facts) {
+    const list = byName.get(f.name);
+    if (list) list.push(f);
+    else byName.set(f.name, [f]);
+  }
+  const bound = new Set(byName.keys());
+  // Least fixpoint: a name becomes numeric only when every one of its bindings is, given the names already proven.
+  const numeric = new Set<string>();
+  const isNumFact = (f: Fact): boolean =>
+    f.kind === 'num' || ((f.kind === 'expr' || f.kind === 'numIf') && f.expr !== null && isNumeric(f.expr, numeric, bound));
+  for (let changed = true; changed; ) {
+    changed = false;
+    for (const [name, list] of byName) {
+      if (!numeric.has(name) && list.every(isNumFact)) {
+        numeric.add(name);
+        changed = true;
+      }
+    }
+  }
+  const plain = new Set<string>();
+  for (const [name, list] of byName) {
+    if (list.every((f) => f.kind === 'expr' && (f.expr?.type === 'ObjectExpression' || f.expr?.type === 'ArrayExpression'))) plain.add(name);
+  }
+  return { numeric, plain, bound };
+}
+
+// ── Visitor ────────────────────────────────────────────────────────────────────────────────────
+
+/** Static property name of a member access: a string, null for a private name, undefined when computed from an expression. */
+function memberPropName(m: Node): string | null | undefined {
+  if (!m.computed) return m.property.type === 'Identifier' ? m.property.name : null;
+  return literalString(m.property) ?? undefined;
+}
+
+function isFunctionNode(n: Node): boolean {
+  return n?.type === 'ArrowFunctionExpression' || n?.type === 'FunctionExpression';
+}
+
+function visit(node: Node, parent: Node, key: string, out: Finding[], ctx: Bindings): void {
+  const ask = (reason: string, at: Node = node) => out.push({ kind: 'unverifiable', reason, ...pos(at) });
   switch (node.type) {
     case 'Identifier': {
       if (isNonReference(parent, key)) return;
+      const isDirectCall = parent?.type === 'CallExpression' && key === 'callee';
       if (WATCHED.has(node.name)) {
-        const isDirectCall = parent?.type === 'CallExpression' && key === 'callee';
-        if (!isDirectCall) {
-          out.push({ kind: 'unverifiable', reason: `\`${node.name}\` is aliased, rebound or used as a value, not called directly`, ...pos(node) });
-        }
+        if (!isDirectCall) ask(`\`${node.name}\` is aliased, rebound or used as a value, not called directly`);
       } else if (ESCAPES.has(node.name)) {
-        out.push({ kind: 'unverifiable', reason: `\`${node.name}\` can reach agent() or run code the guard cannot read`, ...pos(node) });
+        ask(`\`${node.name}\` can reach agent() or run code the guard cannot read`);
+      } else if (TIMERS.has(node.name) && !isDirectCall) {
+        ask(`\`${node.name}\` is used as a value, and a timer can run a string as code`);
       }
       return;
+    }
+    case 'ThisExpression':
+      ask('`this` can be the global object, which holds agent()');
+      break;
+    case 'MetaProperty':
+      if (node.meta?.name === 'import') ask('`import.meta` cannot be inspected');
+      break;
+    case 'MemberExpression': {
+      const name = memberPropName(node);
+      const isCallee = parent?.type === 'CallExpression' && key === 'callee';
+      if (name === undefined) {
+        const isPlainWrite = parent?.type === 'AssignmentExpression' && key === 'left' && parent.operator === '=' && node.object.type === 'Identifier' && ctx.plain.has(node.object.name);
+        if (!isPlainWrite && !isNumeric(node.property, ctx.numeric, ctx.bound)) {
+          ask('computed property access with a key that is not a literal or a number could spell `constructor` or `agent`');
+        }
+      } else if (name !== null) {
+        if (MEMBER_ESCAPES.has(name)) ask(`\`.${name}\` can reach the Function constructor, a prototype or the global object`);
+        else if (WATCHED.has(name) && !isCallee && node.object.type !== 'Identifier') {
+          ask(`\`${name}\` read through a member of something other than a plain local name`);
+        }
+      }
+      break;
+    }
+    case 'Property': {
+      if (parent?.type === 'ObjectPattern') {
+        const name = keyName(node);
+        if (name === undefined) {
+          if (!isNumeric(node.key, ctx.numeric, ctx.bound)) ask('destructuring with a computed key that is not a literal or a number could pick `agent` or `constructor`');
+        } else if (WATCHED.has(name) || MEMBER_ESCAPES.has(name)) {
+          ask(`destructuring pulls \`${name}\` out of an object`);
+        }
+      } else if (parent?.type === 'ObjectExpression' && keyName(node) === '__proto__') {
+        ask('`__proto__` in an object literal changes its prototype');
+      }
+      break;
     }
     case 'CallExpression': {
       const callee = node.callee;
       if (callee.type === 'Identifier' && callee.name === 'agent') analyseAgentCall(node, out);
       else if (callee.type === 'Identifier' && callee.name === 'workflow') analyseWorkflowCall(node, out);
-      else if (callee.type === 'MemberExpression') {
-        const prop = callee.computed ? literalString(callee.property) : callee.property.type === 'Identifier' ? callee.property.name : null;
-        if (prop !== null && WATCHED.has(prop)) {
-          out.push({ kind: 'unverifiable', reason: `\`${prop}\` called through member or computed access`, ...pos(node) });
-        }
+      else if (callee.type === 'Identifier' && TIMERS.has(callee.name)) {
+        const first = node.arguments[0];
+        if (!(isFunctionNode(first) || first?.type === 'Identifier')) ask(`${callee.name}() is not given a function, so it may run a string as code`);
+      } else if (callee.type === 'MemberExpression') {
+        const prop = memberPropName(callee);
+        if (typeof prop === 'string' && WATCHED.has(prop)) ask(`\`${prop}\` called through member or computed access`);
       }
       break;
     }
     case 'ImportExpression':
-      out.push({ kind: 'unverifiable', reason: 'dynamic import() cannot be inspected', ...pos(node) });
+      ask('dynamic import() cannot be inspected');
       break;
     case 'ImportDeclaration':
-      out.push({ kind: 'unverifiable', reason: 'import declarations cannot be inspected', ...pos(node) });
+      ask('import declarations cannot be inspected');
+      break;
+    case 'ExportAllDeclaration':
+      ask('`export * from` imports a module the guard cannot inspect');
       break;
     case 'ExportNamedDeclaration':
+      if (node.source) ask('`export { ... } from` imports a module the guard cannot inspect');
       if (node.declaration?.type === 'VariableDeclaration') analyseMeta(node.declaration, out);
       break;
     default:
@@ -295,9 +557,9 @@ function visit(node: Node, parent: Node, key: string, out: Finding[]): void {
     if (SKIP_KEYS.has(k)) continue;
     const child = node[k];
     if (Array.isArray(child)) {
-      for (const c of child) if (isNode(c)) visit(c, node, k, out);
+      for (const c of child) if (isNode(c)) visit(c, node, k, out, ctx);
     } else if (isNode(child)) {
-      visit(child, node, k, out);
+      visit(child, node, k, out, ctx);
     }
   }
 }
@@ -320,7 +582,7 @@ function parseFindings(script: string): Finding[] {
     return [{ kind: 'unverifiable', reason: `script does not parse (${err instanceof Error ? err.message : String(err)})`, line: loc?.line ?? 1, col: (loc?.column ?? 0) + 1 }];
   }
   try {
-    visit(ast, null, '', out);
+    visit(ast, null, '', out, collectBindings(ast));
   } catch (err) {
     return [{ kind: 'unverifiable', reason: `script analysis failed (${err instanceof Error ? err.message : String(err)})`, line: 1, col: 1 }];
   }
