@@ -2,7 +2,17 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { validateJevConfig, inspectJevConfigFile, clearConfigCacheForTesting, DEFAULT_JEV_CONFIG } from '../src/core/config.js';
+import {
+  validateJevConfig,
+  inspectJevConfigFile,
+  clearConfigCacheForTesting,
+  resolveJevModeFromConfig,
+  readJevMode,
+  readJevModeSync,
+  DEFAULT_JEV_CONFIG,
+  type JevConfigIo
+} from '../src/core/config.js';
+import { run as runInProcess } from '../src/hook.js';
 import { handleGetModeTool } from '../src/tools/mode.js';
 
 /**
@@ -461,5 +471,135 @@ describe('guard hook: near-miss keys ask loudly instead of reading as off', () =
     expect(runHook(opusAgent).out).toBe('');
     fs.writeFileSync(cfgFile, JSON.stringify({ defaults: { mode: 'on' }, notes: 'x' }));
     expect(reasonOf(runHook(opusAgent).out)).not.toContain('malformed');
+  });
+});
+
+describe('guard hook: the config is read once, a change mid-run asks (TOCTOU)', () => {
+  let saved: Record<string, string | undefined> = {};
+  const keys = ['JEV_CONFIG_FILE', 'JEV_CLAUDE_STATE_DIR', 'JEV_CLAUDE_DECISIONS_FILE'];
+  beforeEach(() => {
+    saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+    process.env.JEV_CONFIG_FILE = cfgFile;
+    process.env.JEV_CLAUDE_STATE_DIR = path.join(tmp, 'state');
+    process.env.JEV_CLAUDE_DECISIONS_FILE = path.join(tmp, 'decisions.jsonl');
+    clearConfigCacheForTesting();
+  });
+  afterEach(() => {
+    for (const k of keys) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    clearConfigCacheForTesting();
+  });
+
+  const stdin = JSON.stringify(plainAgent);
+  const swapThen = (content: string) => async (h: Parameters<typeof readJevMode>[0]) => {
+    fs.writeFileSync(cfgFile, content);
+    clearConfigCacheForTesting();
+    return readJevMode(h);
+  };
+
+  it('control: no swap, valid on evaluates and valid off is silent', async () => {
+    fs.writeFileSync(cfgFile, '{"defaults":{"mode":"on"}}');
+    const asked = await runInProcess('claude', JSON.stringify(opusAgent));
+    expect(JSON.parse(asked!).hookSpecificOutput.permissionDecision).toBe('ask');
+    expect(JSON.parse(asked!).hookSpecificOutput.permissionDecisionReason).not.toContain('malformed');
+    fs.writeFileSync(cfgFile, '{"defaults":{"mode":"off"}}');
+    clearConfigCacheForTesting();
+    expect(await runInProcess('claude', stdin)).toBeNull();
+  });
+
+  it('valid on, then the file becomes invalid JSON before the loader reads it: asks, never off', async () => {
+    fs.writeFileSync(cfgFile, '{"defaults":{"mode":"on"}}');
+    const out = await runInProcess('claude', stdin, { readMode: swapThen('{ broken') });
+    expect(JSON.parse(out!).hookSpecificOutput.permissionDecision).toBe('ask');
+    const reason = JSON.parse(out!).hookSpecificOutput.permissionDecisionReason as string;
+    expect(reason).toContain(cfgFile);
+    expect(reason).toContain('not on the second read');
+    expect(audit().filter((e) => e.event === 'config_malformed')).toHaveLength(1);
+  });
+
+  it('valid off, then the file becomes invalid JSON (the loader falls back to off too): still asks', async () => {
+    fs.writeFileSync(cfgFile, '{"defaults":{"mode":"off"}}');
+    const out = await runInProcess('claude', stdin, { readMode: swapThen('{ broken') });
+    expect(JSON.parse(out!).hookSpecificOutput.permissionDecision).toBe('ask');
+    expect(JSON.parse(out!).hookSpecificOutput.permissionDecisionReason).toContain('not on the second read');
+  });
+
+  it('valid off, then the file grows past 1 MB: still asks', async () => {
+    fs.writeFileSync(cfgFile, '{"defaults":{"mode":"off"}}');
+    const out = await runInProcess('claude', stdin, {
+      readMode: swapThen('{"defaults":{"mode":"off"},"pad":"' + 'x'.repeat(1024 * 1024) + '"}')
+    });
+    expect(JSON.parse(out!).hookSpecificOutput.permissionDecision).toBe('ask');
+  });
+
+  it('valid off, then the file turns on between steps: asks instead of allowing on the stale off', async () => {
+    fs.writeFileSync(cfgFile, '{"defaults":{"mode":"off"}}');
+    const out = await runInProcess('claude', stdin, { readMode: swapThen('{"defaults":{"mode":"on"}}') });
+    expect(JSON.parse(out!).hookSpecificOutput.permissionDecision).toBe('ask');
+  });
+
+  it('valid on, then the file is deleted before the loader reads it: asks', async () => {
+    fs.writeFileSync(cfgFile, '{"defaults":{"mode":"on"}}');
+    const out = await runInProcess('claude', stdin, {
+      readMode: async (h) => {
+        fs.rmSync(cfgFile);
+        clearConfigCacheForTesting();
+        return readJevMode(h);
+      }
+    });
+    expect(JSON.parse(out!).hookSpecificOutput.permissionDecision).toBe('ask');
+  });
+
+  it('the loader call itself throwing asks (guard error), never off', async () => {
+    fs.writeFileSync(cfgFile, '{"defaults":{"mode":"off"}}');
+    const out = await runInProcess('claude', stdin, {
+      readMode: async () => {
+        throw new Error('boom');
+      }
+    });
+    expect(JSON.parse(out!).hookSpecificOutput.permissionDecision).toBe('ask');
+    expect(JSON.parse(out!).hookSpecificOutput.permissionDecisionReason).toContain('boom');
+  });
+
+  it('the hook reads and parses the file exactly once and derives the mode from that read', async () => {
+    fs.writeFileSync(cfgFile, '{"defaults":{"mode":"on"}}');
+    let reads = 0;
+    const io: JevConfigIo = {
+      lstat: (f) => fs.lstatSync(f),
+      stat: (f) => fs.statSync(f),
+      readFile: (f) => {
+        reads++;
+        return fs.readFileSync(f);
+      }
+    };
+    const out = await runInProcess('claude', stdin, { inspect: () => inspectJevConfigFile(cfgFile, io) });
+    expect(reads).toBe(1); // the hook reads the file once through the injected reader
+    expect(out).toBeNull(); // a plain call under a consistent, valid on config passes
+  });
+
+  it('resolveJevModeFromConfig: per-harness mode wins, defaults.mode fills in, otherwise off', () => {
+    expect(resolveJevModeFromConfig({}, 'claude-code')).toBe('off');
+    expect(resolveJevModeFromConfig({ defaults: { mode: 'on' } }, 'cli')).toBe('on');
+    expect(resolveJevModeFromConfig({ defaults: { mode: 'on' }, harnesses: { cli: { mode: 'off' } } }, 'cli')).toBe('off');
+    expect(resolveJevModeFromConfig({ defaults: { mode: 'on-demand' }, harnesses: { cli: { mode: 'off' } } }, 'antigravity')).toBe('on-demand');
+  });
+
+  it('the loader and the pure helper agree for every harness on a spread of valid configs', () => {
+    const configs: unknown[] = [
+      {},
+      { defaults: { mode: 'on' } },
+      { defaults: { mode: 'on-demand' }, harnesses: { 'claude-code': { mode: 'off' } } },
+      { harnesses: { antigravity: { mode: 'on' } } },
+      { defaults: { mode: 'off' }, harnesses: { opencode: { mode: 'on' }, cli: { mode: 'on-demand' } } }
+    ];
+    for (const cfg of configs) {
+      fs.writeFileSync(cfgFile, JSON.stringify(cfg));
+      for (const h of ['antigravity', 'claude-code', 'opencode', 'cli'] as const) {
+        clearConfigCacheForTesting();
+        expect(readJevModeSync(h)).toBe(resolveJevModeFromConfig(cfg, h));
+      }
+    }
   });
 });

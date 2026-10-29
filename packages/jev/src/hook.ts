@@ -10,7 +10,15 @@
  * The matcher in each adapter limits the hook to calls that spawn subagents, so this only prompts
  * on those calls.
  */
-import { inspectJevConfigFile, readJevMode } from './core/config.js';
+import {
+  inspectJevConfigFile,
+  readJevMode,
+  resolveJevModeFromConfig,
+  userConfigLoadProblem,
+  type JevConfigFileInspection,
+  type JevHarness,
+  type JevMode
+} from './core/config.js';
 import {
   configMalformedVerdict,
   evaluateAntigravity,
@@ -82,17 +90,43 @@ function auditAsk(verdict: Verdict, stdin: string): void {
   appendClaudeDecision({ event: 'ask', tool_name: toolName, session_id: sessionId, ...verdict.audit, reason: verdict.reason });
 }
 
-export async function run(harnessArg: string | undefined, stdin: string): Promise<string | null> {
+/** Seams for tests that need the config to change between the hook's steps. */
+export interface HookDeps {
+  inspect?: () => JevConfigFileInspection;
+  readMode?: (harness: JevHarness) => Promise<JevMode>;
+}
+
+export async function run(harnessArg: string | undefined, stdin: string, deps: HookDeps = {}): Promise<string | null> {
   const harness = HARNESSES[harnessArg as GuardHarness];
   if (!harness) return null;
 
   let verdict: Verdict | null;
   try {
-    const inspection = inspectJevConfigFile();
+    // One read of the config file. The mode is derived from the very object that was validated;
+    // the loader is only a cross-check, and any disagreement (the file changed or became
+    // unreadable between the two reads) asks instead of falling back to off.
+    const inspection = (deps.inspect ?? inspectJevConfigFile)();
     if (inspection.state === 'malformed') {
       return configMalformedResponse(harnessArg as GuardHarness, inspection.file, inspection.problems, stdin);
     }
-    if ((await readJevMode(harness.jevHarness)) === 'off') return null;
+    const derived = inspection.state === 'valid' ? resolveJevModeFromConfig(inspection.config, harness.jevHarness) : 'off';
+    const loaded = await (deps.readMode ?? readJevMode)(harness.jevHarness);
+    // The loader swallows an unreadable or invalid file and falls back to its defaults, which can
+    // coincide with a derived `off`; its recorded problem catches that case.
+    const loaderProblem = inspection.state === 'valid' ? userConfigLoadProblem() : null;
+    if (loaded !== derived || loaderProblem) {
+      return configMalformedResponse(
+        harnessArg as GuardHarness,
+        inspection.file,
+        [
+          loaderProblem
+            ? `the file was valid when the guard read it but not on the second read (${loaderProblem})`
+            : `the file changed while the guard was reading it (first read: ${derived}, second read: ${loaded})`
+        ],
+        stdin
+      );
+    }
+    if (derived === 'off') return null;
     verdict = harness.evaluate(JSON.parse(stdin));
   } catch (err) {
     verdict = guardErrorVerdict(err);
