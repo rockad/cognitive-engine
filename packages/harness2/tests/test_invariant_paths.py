@@ -117,3 +117,43 @@ def test_unicode_that_nfkc_does_not_fold_is_a_different_name_and_stays_allowed()
 
 def test_no_pattern_table_is_left_to_widen_by_accident():
     assert not hasattr(invariants, "PROTECTED_PATH_PATTERNS")
+
+
+# Git control files: `.git/config` can set core.hooksPath or a filter driver, `.gitmodules` and
+# `.gitattributes` redirect what git runs, `.github` holds CI that runs with the repo's secrets.
+GIT_NAMES = [".git", ".gitmodules", ".gitattributes", ".github"]
+
+
+@pytest.mark.parametrize("name", GIT_NAMES)
+@pytest.mark.parametrize("shape", [
+    "{p}",                       # as a file (a worktree's `.git` is a file) or the directory itself
+    "{p}/",                      # as a directory
+    "{p}/config",                # as a parent
+    "{p}/a/b/c.yml",             # deep child
+    "pkg/{p}", "pkg/{p}/", "pkg/{p}/x", "packages/jev/{p}/hooks/pre-commit",
+    "./{p}", "././{p}/x", "a/../{p}", "a/b/../../{p}/x", "a/./{p}/./x",       # . and .. segments
+    "a//{p}", "{p}//x",                                                        # doubled slashes
+    "{p}\\x", "a\\{p}", "a\\..\\{p}\\x",                                       # backslashes
+    "{p} ", " {p}", "{p}.", "{p}..", "{p}. ", "a/{p} /x", "a/{p}. /x", "a/{p}../x",   # trailing dots and spaces
+])
+def test_git_control_files_and_dirs_are_refused_in_every_spelling(name, shape):
+    refused(shape.format(p=name))
+
+
+@pytest.mark.parametrize("path", [
+    ".GIT/config", ".Git/Config", ".GITMODULES", ".GitAttributes", ".GITHUB/workflows/ci.yml", "pkg/.GiT/hooks/x",
+    "．git/config", "．github/x", ".ｇｉｔ/config", ".ｇｉｔｍｏｄｕｌｅｓ", "ｐｋｇ/.ｇｉｔ/x",    # fullwidth, folded by NFKC
+    ".git​/config", ".g​it/config", ".git‮/x",                                        # invisible characters
+    "GIT~1/config", "pkg/git~1/x", ".GIT~2",                                                         # 8.3 short names
+    ".git/", ".git\\", "x/.git\\config",
+])
+def test_git_control_spellings_that_dodge_a_string_match_are_refused(path):
+    refused(path)
+
+
+@pytest.mark.parametrize("path", [
+    ".gitignore", "pkg/.gitignore", "src/gitutils.py", "docs/git.md", "git/readme.md", "src/digit/x.py",
+    ".githooks-docs/x", "legit/x", ".gitkeep", "github/x", "src/.github-notes.md", ".git-blame-ignore-revs",
+])
+def test_names_that_merely_contain_git_still_pass(path):
+    assert assert_path_unprotected(path) == path.lower()

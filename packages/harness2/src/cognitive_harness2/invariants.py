@@ -33,6 +33,12 @@ PROTECTED_COMPONENTS = frozenset({
 # A segment is protected when its stem (name up to the first dot, leading dots ignored) is one of
 # these. `hooks`, `hooks.json`, `hooks.bak` and `.hooks` all have the stem `hooks`; `hookup` does not.
 PROTECTED_STEMS = frozenset({"hooks", "hook", "guard"})
+# Git control paths, matched as WHOLE segments (so `.gitignore`, `gitutils.py` and `github/` stay
+# ordinary): `.git` (a directory, or a file in a worktree) decides core.hooksPath and filter drivers,
+# `.gitmodules` and `.gitattributes` redirect what git runs, `.github` holds CI. Each protects the whole
+# subtree below it. `git~1` style Windows 8.3 short names are the same entries under another spelling.
+PROTECTED_GIT_SEGMENTS = frozenset({".git", ".gitmodules", ".gitattributes", ".github"})
+_GIT_SHORT_NAME = re.compile(r"^\.?git[a-z]*~\d+$")
 # ...or when the segment name ends with one of these (`my-hooks.json`, `x.mcp.json`).
 PROTECTED_SEGMENT_SUFFIXES = ("hooks.json", "mcp_config.json", ".mcp.json")
 # ...or when this text appears anywhere in the path.
@@ -64,6 +70,8 @@ def _segment_protected(seg: str) -> bool:
     seg = seg.rstrip(". ")  # `hooks.` and `hooks ` name the same entry on some filesystems
     if not seg:
         return False
+    if seg in PROTECTED_GIT_SEGMENTS or _GIT_SHORT_NAME.match(seg):
+        return True
     if seg.lstrip(".").split(".", 1)[0] in PROTECTED_STEMS:
         return True
     return seg.endswith(PROTECTED_SEGMENT_SUFFIXES)
