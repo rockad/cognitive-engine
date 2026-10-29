@@ -125,7 +125,7 @@ def test_install_modes_are_upstreams():
 def test_surface_returns_the_spec_and_the_allowed_slice(opencode):
     s = make(opencode)
     assert s.surface() is opencode
-    assert s.allowed_surface().slots == {"c1", "c3", "c4", "c5"}
+    assert s.allowed_surface().slots == {"c1", "c3", "c4", "c5", "c6"}
     assert s.name == "cognitive"
 
 

@@ -204,8 +204,8 @@ def exercise_every_seam(surface, tmp_path, profile) -> dict[str, int]:
 
     # seam 1: upstream_surface
     happy(lambda: check_surface(surface))
-    happy(lambda: check_surface(surface, request=["c1", "c3", "c4", "c5"], tree=["systemprompt.md", "sub_agents/a/AGENT.md"]))
-    for slot in ("c0", "c2", "c6", "c7", "c8", "c9"):
+    happy(lambda: check_surface(surface, request=["c1", "c3", "c4", "c5", "c6"], tree=["systemprompt.md", "sub_agents/a/AGENT.md", "skills/a/SKILL.md"]))
+    for slot in ("c0", "c2", "c7", "c8", "c9"):
         refuses(lambda s=slot: check_surface(surface, request=[s]))
     for path in ("guardrails.md", "../x", "/etc/passwd", ".git/config", "hooks/x", "plugin/p.ts", "SystemPrompt.md"):
         refuses(lambda p=path: check_surface(surface, tree=[p]))
