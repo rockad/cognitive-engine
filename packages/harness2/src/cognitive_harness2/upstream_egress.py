@@ -265,11 +265,12 @@ COMMAND_SHAPES: Mapping[str, CommandShape] = MappingProxyType({
                                 "--disallowedTools": "toollist"}),
         positionals=MappingProxyType({"claude": (), "claude-code": ()}),
     ),
-    # opencode v2.0.x non-interactive: `opencode run --standalone --auto --format json --model M PROMPT`
+    # opencode v2.0.x non-interactive: `opencode run --standalone --auto --format json --model M [--title WORD] PROMPT`
     # (the provider and base URL arrive through OPENCODE_CONFIG_CONTENT, never a flag)
     "opencode": CommandShape(
         executables=("opencode",),
-        flags=MappingProxyType({"--standalone": None, "--auto": None, "--format": "json", "--model": "model"}),
+        flags=MappingProxyType({"--standalone": None, "--auto": None, "--format": "json", "--model": "model",
+                                "--title": "word"}),
         positionals=MappingProxyType({"opencode": ("run", "<prompt>")}),
     ),
     # Antigravity CLI: `agy --print=PROMPT --dangerously-skip-permissions --model=M [--effort=low]`

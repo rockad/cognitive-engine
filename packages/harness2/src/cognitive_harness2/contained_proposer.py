@@ -59,9 +59,12 @@ OPENCODE_PROMPT = ("Read MISSION.md first. Do what it asks. Reply with the reque
                    "your final message AND save it verbatim to output/answer.md.")
 AGY_PROMPT = OPENCODE_PROMPT
 CLAUDE_SYSTEM_POINTER = "Follow the SYSTEM INSTRUCTIONS block at the top of the message."
-# Per kind: does the CLI unpack native code under HOME or /tmp (needs exec there)? UNCONFIRMED for all three
-# until the first real session; opencode (a bun-compiled binary) is the likeliest, so it gets it.
-TMP_EXEC = {"opencode": True, "claude_cli": False, "agy_cli": False}
+# Per kind: does the CLI need to EXECUTE from HOME or /tmp? MEASURED for opencode v2.0.25 (a bun-compiled binary): it
+# unpacks ~19 MB of `.bun-*.so/.node` files into /tmp but runs fine with both mounted noexec (text reply, shell, read,
+# write and edit tools all worked), so it gets False, the safer setting. UNCONFIRMED for claude and agy (not run yet).
+TMP_EXEC = {"opencode": False, "claude_cli": False, "agy_cli": False}
+OPENCODE_TITLE = "adapt"
+OPENCODE_DENIED_TOOLS = ("grep", "glob", "webfetch", "websearch", "question", "subagent")
 # opencode writes a sqlite database, a models cache and config under XDG dirs; they live in the session's tmpfs HOME.
 OPENCODE_XDG = {"XDG_DATA_HOME": f"{HOME}/.local/share", "XDG_STATE_HOME": f"{HOME}/.local/state",
                 "XDG_CACHE_HOME": f"{HOME}/.cache", "XDG_CONFIG_HOME": f"{HOME}/.config"}
@@ -88,7 +91,10 @@ def build_command(kind: str, *, cli_container: str, model: str, effort: str = "h
                   prompt: str = OPENCODE_PROMPT, max_budget_usd: float | None = None) -> tuple[str, ...]:
     """The exact argv for a kind. Each one is an instance of `upstream_egress.COMMAND_SHAPES[kind]`."""
     if kind == "opencode":
-        return (cli_container, "run", "--standalone", "--auto", "--format", "json", "--model", model, prompt)
+        # `--title` is a fixed word: with it opencode v2 skips its separate title-generation model call (measured against
+        # the real binary and a stub model: 2 chat requests without it, 1 with it), so a session is one call fewer.
+        return (cli_container, "run", "--standalone", "--auto", "--format", "json", "--model", model,
+                "--title", OPENCODE_TITLE, prompt)
     if kind == "claude_cli":
         argv = [cli_container, "-p", "--output-format", "json", "--permission-mode", "bypassPermissions",
                 "--no-session-persistence", "--model", model, "--effort", effort,
@@ -107,11 +113,18 @@ def build_command(kind: str, *, cli_container: str, model: str, effort: str = "h
 def opencode_config(model: str, base_url: str) -> str:
     """OPENCODE_CONFIG_CONTENT: an OpenAI-compatible provider whose base URL is the one endpoint the proxy allows.
 
-    ⚠️ The exact schema is UNCONFIRMED against opencode v2.0.25 until the first real call."""
+    Confirmed against the real opencode v2.0.25 and a stub model (`tests/real_cli_probe.py`): `npm:
+    "@ai-sdk/openai-compatible"` is REQUIRED (without it: `provider.no-route: Unsupported package`); the base URL may be
+    `options.baseURL` (used here) or `api`; `name` is optional. `permission` turns off the tools that cannot work in the
+    container and so only cost the model prompt tokens or spend its steps: grep and glob (ripgrep is not in the image and
+    opencode's attempt to download it is, correctly, denied by the proxy: "ripgrep execution failed"), webfetch and
+    websearch (no network but the model), question (nobody to answer) and subagent (more model calls on one GPU).
+    That is 12 tools and a 22 KB request down to 6 tools and 15 KB."""
     provider, _, model_key = model.partition("/")
     return json.dumps({
         "provider": {provider: {"npm": "@ai-sdk/openai-compatible", "name": provider, "options": {"baseURL": base_url},
                                 "models": {model_key: {"name": model_key}}}},
+        "permission": dict.fromkeys(OPENCODE_DENIED_TOOLS, "deny"),
         "autoupdate": False, "share": "disabled"}, separators=(",", ":"))
 
 

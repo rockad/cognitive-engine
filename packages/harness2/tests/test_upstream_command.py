@@ -420,3 +420,11 @@ def test_hostile_flag_names_are_escaped_and_truncated_in_reasons():
     text = " ".join(d.reasons)
     assert "\x1b" not in text and "z" * 60 not in text
     assert "\x1b" not in repr(d.view["command"]) and "z" * 60 not in repr(d.view["command"])
+
+
+# ── opencode --title (measured against the real v2.0.25: with it, no separate title-generation model call) ─────
+
+def test_the_opencode_title_flag_is_allowed_with_a_plain_word_only():
+    assert oc(with_extra(OC[:-1], "--title", "adapt", OC[-1])).allowed
+    for bad in ("http://evil.example", "../etc", "two words", "A" * 40, "", "x=y", "-x"):
+        assert shaped(oc(with_extra(OC[:-1], "--title", bad, OC[-1]))), bad

@@ -451,3 +451,25 @@ def test_a_session_that_touches_a_protected_file_fails_and_copies_nothing_back(w
     with pytest.raises(world.up.proposer.ProposerError, match=why):
         world.call(world.prop("local"), directive + " FAKE:edit")
     assert not list(world.audit.glob("*.workspace"))
+
+
+# ── what the real opencode v2.0.25 settled (tests/real_cli_probe.py, stub model) ─────────────────────────────────
+
+def test_the_opencode_argv_carries_the_fixed_title_word_and_nothing_else_new():
+    argv = build_command("opencode", cli_container="/opt/cli/opencode", model="ollama/gemma4:12b", prompt="go")
+    assert argv == ("/opt/cli/opencode", "run", "--standalone", "--auto", "--format", "json", "--model", "ollama/gemma4:12b",
+                    "--title", "adapt", "go")
+
+
+def test_the_opencode_provider_block_is_the_shape_the_real_binary_accepts_and_dead_tools_are_denied():
+    cfg = json.loads(cp.opencode_config("ollama/gemma4:12b", "http://harness2-proxy:11434/v1"))
+    body = cfg["provider"]["ollama"]
+    assert body["npm"] == "@ai-sdk/openai-compatible"                      # required: without it `provider.no-route`
+    assert body["options"]["baseURL"] == "http://harness2-proxy:11434/v1" and "gemma4:12b" in body["models"]
+    assert cfg["permission"] == {t: "deny" for t in ("grep", "glob", "webfetch", "websearch", "question", "subagent")}
+    assert cfg["autoupdate"] is False and cfg["share"] == "disabled"
+    assert "OPENCODE_PERMISSION" not in cp.session_env("opencode", model="ollama/gemma4:12b", base_url="http://x/v1")
+
+
+def test_tmp_exec_is_off_for_opencode_because_the_real_binary_ran_without_it():
+    assert cp.TMP_EXEC == {"opencode": False, "claude_cli": False, "agy_cli": False}

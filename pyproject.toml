@@ -23,6 +23,7 @@ dev = [
 [tool.pytest.ini_options]
 markers = [
     "requires_rootless_docker: runs real containers against the host rootless Docker daemon; must run, never skip",
+    "real_cli: runs the REAL opencode binary (stub model, no ollama) in a contained session; skipped unless COGNITIVE_HARNESS2_REAL_CLI=1 and the binary exists",
 ]
 testpaths = ["packages/memory/tests", "packages/lookup/tests", "packages/harness2/tests", "tools/tests"]
 pythonpath = ["tools"]
