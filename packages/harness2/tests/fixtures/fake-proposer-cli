@@ -1,0 +1,58 @@
+#!/bin/bash
+# A FAKE opencode / claude / agy for the contained-proposer tests. It never talks to a model.
+# Install it under the name of the CLI it plays (opencode, claude or agy): it behaves by $(basename $0).
+# What it does is chosen by `FAKE:<word>` directives in the MISSION text (MISSION.md for opencode and agy,
+# stdin for claude), so a test steers it through the mission it hands to Proposer.call.
+#
+#   FAKE:record      write argv, env, pwd and the CLI name into context/harness/{argv,env,pwd,who}.txt
+#   FAKE:edit        write context/harness/edited.md (the "harness" edit upstream harvests)
+#   FAKE:file-answer write output/answer.md
+#   FAKE:no-reply    print nothing and write no answer
+#   FAKE:symlink     create context/harness/escape -> /etc/passwd
+#   FAKE:exec        create an executable file context/harness/run.sh
+#   FAKE:big         write a 5 MiB file context/harness/big.bin
+#   FAKE:stamp       record start and end (ns) around a 1.5 s pause in context/harness/stamp.txt
+#   FAKE:sleep       sleep 600 (the test's timeout must kill it)
+#   FAKE:fail        exit 3 with a message on stderr
+#   FAKE:cli-error   (claude) print an is_error payload
+#   FAKE:marker      touch context/harness/marker (proves the CLI ran at all)
+name=$(basename "$0")
+case "$name" in
+  claude) mission=$(cat) ;;
+  *) mission=$(cat MISSION.md 2>/dev/null) ;;
+esac
+has() { printf '%s' "$mission" | grep -q "FAKE:$1"; }
+
+mkdir -p context/harness output 2>/dev/null
+if has record; then
+  printf '%s\n' "$@" > context/harness/argv.txt
+  env | sort | grep -v '^_=' > context/harness/env.txt
+  pwd > context/harness/pwd.txt
+  echo "$name" > context/harness/who.txt
+fi
+has marker && : > context/harness/marker
+has edit && echo "edited by the fake $name" > context/harness/edited.md
+has symlink && ln -s /etc/passwd context/harness/escape
+has exec && { printf '#!/bin/sh\n' > context/harness/run.sh; chmod 755 context/harness/run.sh; }
+has big && head -c 5242880 /dev/zero > context/harness/big.bin
+has file-answer && printf 'FILE-ANSWER' > output/answer.md
+if has stamp; then s=$(date +%s%N); sleep 1.5; e=$(date +%s%N); echo "$s $e" > context/harness/stamp.txt; fi
+has sleep && sleep 600
+has fail && { echo "fake failure" >&2; exit 3; }
+has no-reply && exit 0
+
+case "$name" in
+  opencode)
+    echo '{"type":"step_start","part":{"type":"step-start"}}'
+    echo '{"type":"text","part":{"type":"text","text":"EVENT-ANSWER"}}'
+    echo '{"type":"step_finish","part":{"type":"step-finish","cost":0.25}}'
+    ;;
+  claude)
+    if has cli-error; then
+      echo '{"is_error":true,"subtype":"error_max_turns","result":"gave up","total_cost_usd":0.1}'
+    else
+      echo '{"subtype":"success","is_error":false,"result":"CLAUDE-ANSWER","total_cost_usd":0.5}'
+    fi
+    ;;
+  agy) echo "AGY-ANSWER" ;;
+esac

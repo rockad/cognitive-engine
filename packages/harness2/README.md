@@ -246,7 +246,64 @@ Honest limits:
 - Only the always-on files are rendered into `AGENTS.md`. Skills, subagents, scripts and plugins of the harness tree are not installed in the workspace (upstream's `workspace_agents_md` mode installs them under `.opencode/`).
 - The solver can delete nothing it was given (sticky bit), but it can still write anything it likes under `output/` and the workspace; only `output/` is read back.
 - `max_solver_sessions` counts sessions, not tokens or money; the cost cap is the channel's, enforced by the caller.
-- Importing upstream is not done by any module here; the adapter is duck typed, and a local copy of `runmark` (pinned to upstream by a test) writes `.adapt_complete`.
+- The solver half does not import upstream itself (the proposer binding in the next section does, through `upstream_import`); the adapter is duck typed, and a local copy of `runmark` (pinned to upstream by a test) writes `.adapt_complete`.
+
+## Proposer binding (slice 3b)
+
+Upstream's `Proposer` is the object `run_task` and `run_sweep` call to start every proposer and selector session. Out of the box a session runs on the host, inherits the whole process environment and forces Vertex AI. This slice binds **upstream's own orchestration** (its prompts, evidence, retries, cache, audit trail and harvest) to **contained sessions** by subclassing `Proposer`, so nothing upstream decides about the method is reimplemented. **No model is called and no real CLI is run by its tests**: they drive a fake CLI (`tests/fixtures/fake-proposer-cli`, installed as `opencode`, `claude` and `agy`) through the real `ProposerSessionRunner` on the real rootless daemon.
+
+| piece | module | what it does |
+| --- | --- | --- |
+| verified import | `upstream_import.py` | `import_upstream(runs_dir=...)` imports `config`, `core.{spec,proposer,recursion,schedule,tree}` with the current directory switched to a private **empty** directory and `os.environ` scrubbed of `HARNESS2_*`, `GOOGLE_CLOUD_*` and Vertex variables (plus `HARNESS2_RUNS_DIR` under your directory and a placeholder `HARNESS2_IMPROVER_MODEL`), so `config.py` cannot read a stray `.env` or freeze your Vertex project. Then it **verifies**: the installed distribution is `PINNED_COMMIT` (a git install via `direct_url.json`'s `commit_id`; an editable install must be a git checkout at that HEAD with unmodified tracked files and no `.env` beside the package); the package Python found is the one that distribution installed (no shadowing on `sys.path`) and `config.__file__` is inside it; `os.environ` gained, lost or changed nothing but the controlled variables and upstream's one `setdefault` (`GOOGLE_CLOUD_LOCATION`); `harness2.benchmarks` and `harness2.cli` are not loaded. The environment and directory are restored in a `finally`; any surprise raises `UpstreamImportError` and removes the half-imported modules. Here upstream is installed from git into `site-packages` (`direct_url.json` carries the commit); a module imported by someone else first is refused, because it cannot be shown to have read nothing. |
+| command shapes | `upstream_egress.py` | `COMMAND_SHAPES` is the allow-list of exactly the argv this package runs: `opencode run --standalone --auto --format json --model M PROMPT` (opencode v2.0.25; the v1 `bun ... --dir --variant` shape is gone), `claude -p --output-format json --permission-mode ... --no-session-persistence --model M --effort E --append-system-prompt S [--max-budget-usd N]` (prompt on stdin), and `agy --print=PROMPT --dangerously-skip-permissions --model=M [--effort=low]` (joined flags). `agy_cli` is a checked kind (`CHECKED_KINDS`), with `googleapis.com` as its own endpoint rather than a Vertex route. |
+| model gate | `model_gate.py` | `GATE`: one slot, `hold(timeout=, deadline=)` and `async with ahold(...)`. A single GPU serves one model call at a time; the solver sessions (WS-E) take the same gate. Deadline-aware: a wait past it raises `GateTimeout` naming the holder. Not re-entrant. |
+| contained proposer | `contained_proposer.py` | `contained_proposer_class(up)` builds `ContainedProposer(Proposer)`; `make_proposer(up, SessionConfig(...))` builds one; `make_selector_prop(prop)` builds the selector's, to pass as `selector_prop=` (otherwise upstream's `_selector_for` builds a plain host `Proposer`). |
+| drift pins | `tests/test_upstream_compat.py` | Pins every private or fragile upstream name the binding relies on. A failure says what drifted and the pinned commit. |
+
+```python
+from cognitive_harness2 import image, upstream_import
+from cognitive_harness2.contained_proposer import SessionConfig, make_proposer, make_selector_prop
+
+up = upstream_import.import_upstream(runs_dir=audit / "runs")         # BEFORE anything imports harness2
+verified = image.gate_for_build()
+session = SessionConfig(verified=verified, image=image.resolve_image(verified), profile=profile, channel="local",
+                        zdr="strict", classification="open", scratch_root=str(scratch),   # inside a workspace_roots entry
+                        cli_paths={"opencode": "/abs/opencode"})                          # named opencode | claude | agy
+prop = make_proposer(up, session, audit_dir=audit / "proposer")
+up.schedule.run_task(task_id, k, adapter=adapter, prop=prop, runs_root=runs, modes=("agg",), libraries=None,
+                     selector_prop=make_selector_prop(prop))
+```
+
+**What a `ContainedProposer` session does.** Upstream's `call` copies the evidence to `<tmp>/context` and calls `_claude_cli` or `_opencode`; both run `_contained`, which routes on the channel's REAL kind (an `agy_cli` channel is carried by an `opencode`-kind `ChannelSpec` because upstream's `CHANNELS` is a closed tuple, and `real_kind` says what it is):
+
+1. copies `<tmp>` to a private workspace under `scratch_root` (world-writable for the container user, which is not the host user) and writes `MISSION.md` (opencode, agy) or builds the stdin (claude);
+2. builds the exact argv and **checks it with `check_proposer`** against the channel profile (kind, model, endpoint, retention, classification, command shape, environment). A refusal raises `ProposerRefused` and **starts nothing**;
+3. takes the **model gate**, then runs the session ONLY through `ProposerSessionRunner` (two containers, one `--internal` network, the proxy allow-list). The container is the fence: opencode v2 has no permission variable, and none of the three CLIs' own flags is relied on for isolation;
+4. a timeout kills the session (`subprocess.TimeoutExpired`, which upstream reports as `timeout after Ns`) and the runner's teardown leaves no container, network or directory;
+5. inspects the workspace (`workspace_harvest`): **any finding or any symlink fails the session** and nothing is copied back, because upstream's `_harvest` uses `copytree`, which follows links;
+6. parses stdout with upstream's own parsers (`_opencode_stdout`, `_opencode_cost`, `_parse_json`), preferring `output/answer.md` for opencode and agy, and returns `(text, cost, err)`; cost is 0.0 for a local channel;
+7. copies only the inspected regular files back into upstream's directory, from where upstream harvests `context/harness` into `Reply.workspace`, then deletes the scratch copy.
+
+`env()` is replaced: it never reads `os.environ`, sets no Vertex variable (`CLAUDE_CODE_USE_VERTEX`, `GOOGLE_VERTEX_*`, `VERTEXAI_*`, `CLOUD_ML_REGION`) and returns only the container's extras (opencode: `OPENCODE_CONFIG_CONTENT` with an OpenAI-compatible provider whose base URL is the proxy alias for a local channel or the channel's endpoint plus `api_path`, `OPENCODE_DISABLE_MODELS_FETCH=1`, XDG directories under the tmpfs `HOME`; claude: updater and traffic switches; agy: none). Credentials are `SessionConfig.credentials[kind]`: the runner's read-only credential file, never an env value.
+
+**Deviations from upstream's defaults (all deliberate):**
+
+- **`attempts=1`.** `ContainedProposer.attempts` is 1 (upstream: 2), and `apply_overrides` sets `recursion.STAGE_ATTEMPTS`, `recursion.TRANSPORT_ATTEMPTS` and `config.TRANSPORT_ATTEMPTS` to 1, once, when the class is first built. A failed local session is not retried blind. A test pins the constant names, so an upstream rename is a loud failure and not a silent return to retries.
+- **No reflection.** Call `run_task` with `libraries=None` and `modes=("agg",)`, so each task makes 3 proposer sessions and no experience-reflection session. This is the caller's choice (the stage-1 runner, a later step); nothing here enforces it.
+- **Serialised calls.** One model call at a time (the gate), where upstream allows 2 through its own semaphore (which still wraps the gate). A session waits for the gate up to `gate_wait_s` (default four times its wall clock), then fails with `GateTimeout`.
+- **Per-session timeout 600 s** (`SessionConfig.timeout_s`), also capped by the channel's `wall_s`.
+- `Reply.channel` and the audit `meta.json` carry the REAL kind (`agy_cli`), not the carrier's.
+
+**Honest limits.**
+
+- **The opencode provider schema is unconfirmed.** `OPENCODE_CONFIG_CONTENT` follows the documented `@ai-sdk/openai-compatible` provider shape and was NOT run against opencode v2.0.25 with a model. The first real call is where it is confirmed or fixed (`contained_proposer.opencode_config`). `opencode.json` (`agent.build.steps`) is still written as upstream did; v2 may ignore it. `--variant` (effort) does not exist in v2, so effort has no effect on opencode.
+- **Unverified in the container:** that opencode, claude or agy start with a read-only root and a tmpfs `HOME` at all; `TMP_EXEC` (opencode `True`, the others `False`) is a guess about native-code unpacking.
+- **claude's token.** The runner exposes a credential as a file and, with `env_var`, sets the variable to the file's PATH, not its value. `CLAUDE_CODE_OAUTH_TOKEN` expects the value, so a claude subscription session needs either runner support for that or a credentials file mounted where claude reads it (`~/.claude/.credentials.json`, unverified). Not solved here. agy's token is a file (`~/.gemini/antigravity-cli/antigravity-oauth-token`) and fits the credential mechanism as is. The caller reads the token; this package never touches the host's credential files.
+- **agy** prints its final answer on stdout (taken as plain text) or in `output/answer.md`; its retention is unknown, so the profile caps it at `open` content, and the container is its only boundary.
+- `--max-budget-usd` is passed to claude only when `SessionConfig.max_budget_usd` is set; a subscription's cost is notional.
+- The scratch workspace is a rw bind mount to host disk with no quota (see the contained-session limits above), and a hostile model can still send anything in its workspace to the allow-listed endpoint.
+- `import_upstream` proves that importing read no `.env`. It cannot prove upstream never reads one LATER (config's `load_dotenv` runs only at import).
+- A harvest finding fails the whole session, including a harmless one (an executable bit on a script the harness tree contains). Widen `SessionConfig.harvest_limits` deliberately if a real tree needs it.
 
 ## Channel profile
 
