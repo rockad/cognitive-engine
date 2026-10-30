@@ -54,6 +54,8 @@ PROXY_PORT_DEFAULT = 3128
 MAX_REQUEST_LINE = 8 * 1024
 MAX_HEADER_BYTES = 32 * 1024
 MAX_HEADER_COUNT = 100
+LINGER_BYTES = 1 << 20   # after a refusal: how much unread client input is swallowed before closing ...
+LINGER_S = 0.5           # ... and for how long at most (a refused connection holds its slot this long)
 MAX_CONFIG_BYTES = 64 * 1024
 MAX_ADDRESSES = 8
 _FIELD = re.compile(rb"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
@@ -437,11 +439,30 @@ class Proxy:
             pass
 
     @staticmethod
-    async def _linger(reader: asyncio.StreamReader) -> None:
-        """Swallow what the client already sent, so closing does not RST away the reply it is about to read."""
+    async def _linger(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """Close politely after a refusal, so the client can read it.
+
+        The reply is already written. Send FIN after it, then swallow what the client is still sending, bounded
+        in bytes (`LINGER_BYTES`) AND in time (`LINGER_S`), before the caller closes. Closing a socket whose
+        receive queue still holds unread request bytes makes the kernel send a RST, and a RST discards a reply
+        the client has not read yet (measured: the 414 was lost entirely for a client that read late). A
+        client that keeps sending past the bounds gets the RST it earned. Nothing swallowed is ever forwarded:
+        no upstream connection exists on any path that lingers.
+        """
         try:
-            await asyncio.wait_for(reader.read(65536), 0.25)
-        except (OSError, asyncio.TimeoutError):
+            if writer.can_write_eof():
+                writer.write_eof()
+        except (OSError, RuntimeError):
+            pass
+        left = LINGER_BYTES
+        try:
+            async with asyncio.timeout(LINGER_S):
+                while left > 0:
+                    chunk = await reader.read(65536)
+                    if not chunk:
+                        break
+                    left -= len(chunk)
+        except (OSError, TimeoutError):
             pass
 
     async def _read_head(self, reader: asyncio.StreamReader) -> tuple[bytes, bytes]:
@@ -517,7 +538,7 @@ class Proxy:
         if self.active >= self.limits.max_connections:
             self._log("deny", "<none>", 0, "connection-limit")
             await self._respond(writer, 503, "connection-limit")
-            await self._linger(reader)
+            await self._linger(reader, writer)
             writer.close()
             return
         self.active += 1
@@ -526,7 +547,7 @@ class Proxy:
             if not self.bucket.take():
                 self._log("deny", "<none>", 0, "rate-limit")
                 await self._respond(writer, 429, "rate-limit")
-                await self._linger(reader)
+                await self._linger(reader, writer)
                 return
             host, port = "<invalid>", 0
             try:
@@ -544,12 +565,12 @@ class Proxy:
             except Refused as e:
                 self._log("deny", host, port, e.code)
                 await self._respond(writer, e.status, e.code)
-                await self._linger(reader)
+                await self._linger(reader, writer)
                 return
             except (OSError, asyncio.TimeoutError):
                 self._log("deny", host, port, "upstream-unreachable")
                 await self._respond(writer, 502, "upstream-unreachable")
-                await self._linger(reader)
+                await self._linger(reader, writer)
                 return
             self._log("allow", host, port, decision.reason)
             if path is None:

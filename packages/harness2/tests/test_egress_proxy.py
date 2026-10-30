@@ -495,11 +495,49 @@ def assert_refused_and_nothing_forwarded(ex: Exchange, status: bytes, up, px, re
 @pytest.mark.parametrize("name", OVERSIZED)
 async def test_oversized_request_line_and_header_blocks_are_cut_off(name):
     """Refused (414/431), nothing forwarded, connection closed. A RST AFTER the complete refusal is tolerated here
-    (the client may still be writing)."""
+    (the client may still be writing); `test_a_refusal_is_delivered_and_the_close_is_clean...` pins the clean close."""
     payload, status, reason = OVERSIZED[name]
     async with Upstream() as up, Running([["allowed.test", up.port]]) as px:
         ex = await exchange(px.port, payload)
         assert_refused_and_nothing_forwarded(ex, status, up, px, reason)
+
+
+@pytest.mark.parametrize("name", OVERSIZED)
+async def test_a_refusal_is_delivered_and_the_close_is_clean_even_to_a_slow_reader_still_sending(name):
+    """Regression: the proxy used to close with request bytes still unread, so the kernel sent a RST that could
+    discard the 4xx the client had not read yet (a measured ~2% of rounds lost the reply entirely, ~40% of the
+    old test's runs saw ECONNRESET). The refusal must now arrive intact, followed by a clean EOF, no reset."""
+    payload, status, reason = OVERSIZED[name]
+    filler = b"c" * 300_000      # far more than one 64 KiB read: the old one-shot drain could not keep up
+    async with Upstream() as up, Running([["allowed.test", up.port]]) as px:
+        ex = await exchange(px.port, payload + filler, read_delay=0.8)   # reads only after the proxy has closed
+        assert_refused_and_nothing_forwarded(ex, status, up, px, reason)
+        assert ex.eof and not ex.reset, (ex.eof, ex.reset)
+
+
+async def test_a_client_that_never_stops_sending_cannot_hold_the_proxy_open():
+    """The linger is bounded in bytes and in time: a client sending without end is cut off, still refused, never forwarded."""
+    async with Upstream() as up, Running([["allowed.test", up.port]]) as px:
+        r, w = await asyncio.open_connection("127.0.0.1", px.port)
+        w.write(b"GET http://allowed.test/" + b"a" * 20000)
+
+        async def flood() -> None:
+            try:
+                while True:
+                    w.write(b"z" * 65536)
+                    await w.drain()
+            except (ConnectionError, OSError):
+                pass
+        task = asyncio.ensure_future(flood())
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        async with asyncio.timeout(10):
+            while px.proxy.active:
+                await asyncio.sleep(0.05)
+        assert loop.time() - t0 < 5
+        task.cancel()
+        w.close()
+        assert up.received == []
 
 
 async def test_a_slowloris_client_is_timed_out_on_the_whole_head_not_per_byte():
