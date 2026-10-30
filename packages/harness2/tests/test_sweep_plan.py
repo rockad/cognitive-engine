@@ -413,3 +413,21 @@ def test_a_restricted_sweep_on_a_gated_channel_is_refused(surface):
     assert d.allowed
     plan_sweep(**good(surface, d, channel="openrouter", classification="gated"))
     assert "classification-ceiling" in text(refused(**good(surface, d, channel="openrouter", classification="restricted")))
+
+
+# ── a zero USD channel cap (a local model that must spend nothing) ─────────────────
+
+
+def test_a_zero_usd_channel_cap_plans_and_clips_the_request_to_zero(surface, decision):
+    from cognitive_harness2 import channels as ch
+    raw = {"workspace_roots": [WORK.rsplit("/", 1)[0]],
+           "channels": {"local": {"kind": "opencode", "provider": "ollama", "endpoint": LOCAL, "model": "ollama/qwen3:30b",
+                                  "retention": "local", "max_classification": "restricted", "approval": "per-sweep",
+                                  "caps": {"sessions": 30, "wall_s": 3600, "cost_usd": 0}}}}
+    prof = ch.validate(raw, source="/p/z.toml")
+    p = plan_sweep(**good(surface, decision, profile=prof, ledger=SimpleNamespace(P=0, usd=0.0)))
+    assert p.max_cost_or_tokens == CostCap("usd", 0) and p.channel_caps["cost_usd"] == 0
+    assert any("channel's cap 0" in w for w in p.warnings)
+    plan_sweep(**good(surface, decision, profile=prof))                      # no ledger at all
+    e = refused(**good(surface, decision, profile=prof, ledger=SimpleNamespace(P=0, usd=0.01)))
+    assert "already spent" in text(e)

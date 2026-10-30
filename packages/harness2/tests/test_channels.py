@@ -613,3 +613,29 @@ def test_the_readme_worked_example_is_a_valid_profile():
     p = channels.parse_text(block.group(1), source="README.md")
     assert set(p.channels) == {"local-ollama", "openrouter", "claude-harness", "antigravity"}
     assert p.channels["claude-harness"].retention == "unknown" and p.channels["claude-harness"].max_classification == "open"
+
+
+# ── a zero USD cap: meaningful only for a local model ─────────────────────────────
+
+def test_a_local_channel_may_declare_a_zero_usd_cap():
+    raw = mutated("channels.local-ollama.caps.cost_usd", 0)
+    c = validate(raw, source="/p/c.toml").channels["local-ollama"]
+    assert c.caps.cost_usd == 0 and c.caps.sessions == 30
+
+
+@pytest.mark.parametrize("retention", ["zdr-attested"])
+def test_a_zero_usd_cap_is_still_refused_for_a_channel_that_can_spend(retention):
+    raw = mutated("channels.local-ollama.caps.cost_usd", 0)
+    raw["channels"]["local-ollama"]["retention"] = retention
+    assert "greater than zero" in problems(raw)
+    assert "greater than zero" in problems(mutated("channels.openrouter.caps.cost_usd", 0))
+
+
+@pytest.mark.parametrize("bad", [-0.01, -1, math.nan, math.inf, True, False, "0"])
+def test_a_local_channel_still_refuses_a_negative_or_malformed_usd_cap(bad):
+    problems(mutated("channels.local-ollama.caps.cost_usd", bad))
+
+
+def test_wall_and_sessions_stay_strictly_positive_on_a_local_channel():
+    assert "greater than zero" in problems(mutated("channels.local-ollama.caps.wall_s", 0))
+    assert "positive integer" in problems(mutated("channels.local-ollama.caps.sessions", 0))

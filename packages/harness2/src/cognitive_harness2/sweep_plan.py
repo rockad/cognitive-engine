@@ -228,6 +228,12 @@ def _ledger_numbers(ledger: Any) -> tuple[int, float] | None:
     return p, float(usd)
 
 
+def _spent_to_cap(spent: float, cap: float) -> bool:
+    """The ledger has used up a USD cap. A cap of 0 (a local channel that must spend nothing) is used up only by
+    spending something; any other cap is used up on reaching it."""
+    return spent > 0 if cap <= 0 else spent >= cap
+
+
 def _clip(requested: float | int | None, cap: float | int, name: str, notes: list[str]) -> float | int | None:
     """min(requested, channel cap); a request above the channel's cap is clipped and recorded."""
     if requested is None:
@@ -326,10 +332,10 @@ def plan_sweep(*, surface: Any, candidates: Any, k: Any, n_tasks: Any = 1, max_s
                 out.append(f"the plan needs {planned_sessions} proposer sessions (P = 3k per task) plus {spent_p} "
                            f"already in the ledger, over max_sessions {sessions_cap}"
                            + (" (the channel's cap)" if ch is not None and sessions_cap == ch.caps.sessions else ""))
-            if cost_cap is not None and cost_cap.unit == "usd" and spent_usd >= cost_cap.amount:
+            if cost_cap is not None and cost_cap.unit == "usd" and _spent_to_cap(spent_usd, cost_cap.amount):
                 out.append(f"the ledger has already spent {spent_usd:g} usd, at or over max_cost_or_tokens "
                            f"{cost_cap.amount:g} usd")
-            if ch is not None and spent_usd >= ch.caps.cost_usd:
+            if ch is not None and _spent_to_cap(spent_usd, ch.caps.cost_usd):
                 out.append(f"the ledger has already spent {spent_usd:g} usd, at or over channel {ch.name!r}'s "
                            f"cost_usd cap {ch.caps.cost_usd:g}")
 

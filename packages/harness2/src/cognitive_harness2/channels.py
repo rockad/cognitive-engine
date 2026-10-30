@@ -8,7 +8,8 @@ Every channel a Proposer session could use is DECLARED in one TOML file, under o
     model              the exact model id
     retention          local | zdr-attested | unknown
     max_classification open < gated < restricted: the most sensitive content the channel may carry
-    caps               {sessions, wall_s, cost_usd}: hard per-sweep caps, all three required
+    caps               {sessions, wall_s, cost_usd}: hard per-sweep caps, all three required, above zero;
+                       cost_usd = 0 ("this sweep must spend nothing") is accepted for retention=local only
     approval           per-sweep (a human approves each sweep; the only value)
 
 A channel is allowed only if its retention satisfies the zdr mode (`strict`: only `local` or
@@ -348,7 +349,8 @@ def _number(v: Any) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
-def _caps(p: _Problems, at: str, raw: Any) -> Caps | None:
+def _caps(p: _Problems, at: str, raw: Any, *, zero_usd: bool = False) -> Caps | None:
+    """`zero_usd`: a cost_usd of exactly 0 is a real cap ("spend nothing"), allowed only where the model is local."""
     if not isinstance(raw, Mapping):
         p.add(f"{at} must be a table with sessions, wall_s and cost_usd, found {_describe(raw)}")
         return None
@@ -375,8 +377,9 @@ def _caps(p: _Problems, at: str, raw: Any) -> Caps | None:
             p.add(f"{at}.{key} must be a positive finite number, found {_describe(v)}")
         elif isinstance(v, float) and not math.isfinite(v):
             p.add(f"{at}.{key} must be finite (NaN and infinity are refused)")
-        elif v <= 0:
-            p.add(f"{at}.{key} must be greater than zero (zero and negative are refused)")
+        elif v < 0 or (v == 0 and not (key == "cost_usd" and zero_usd)):
+            p.add(f"{at}.{key} must be greater than zero (zero and negative are refused"
+                  + ("; a zero cost_usd is accepted only for retention=local" if key == "cost_usd" else "") + ")")
         elif v > ceiling:
             p.add(f"{at}.{key} is above the sanity ceiling {ceiling:g} {unit}")
         elif key == "wall_s":
@@ -486,7 +489,7 @@ def _channel(p: _Problems, name: str, raw: Any) -> Channel | None:
     approval = _enum(p, f"{at}.approval", raw["approval"], APPROVALS) if "approval" in raw else None
     if "approval" not in raw:
         p.add(f"{at}.approval is missing (one of {', '.join(APPROVALS)})")
-    caps = _caps(p, f"{at}.caps", raw["caps"]) if "caps" in raw else None
+    caps = _caps(p, f"{at}.caps", raw["caps"], zero_usd=retention == "local") if "caps" in raw else None
     if "caps" not in raw:
         p.add(f"{at}.caps is missing: hard sessions, wall_s and cost_usd caps are required")
 
