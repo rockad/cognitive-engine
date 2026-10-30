@@ -135,25 +135,32 @@ def test_an_unrecognised_surface_is_refused_at_construction(bad):
         CognitiveSubstrate(bad)
 
 
-# ── execute and read_trajectory are not enabled ───────────────────────────────────
+# ── execute is gated by an ExecutionGrant (see test_solver_execution.py for the grant itself) ───
 
-def test_execute_refuses_and_starts_nothing(opencode):
+def test_execute_without_a_grant_refuses_and_starts_nothing(opencode):
     calls: list = []
     s = make(opencode, run=fake_docker(calls=calls))
-    with pytest.raises(NotImplementedError, match="^slice 3b, not enabled$"):
+    with pytest.raises(sub.ExecutionRefused, match="^execution is not enabled: no ExecutionGrant$"):
         s.execute("task-1", StagedInstall(Path("/nonexistent"), "f", {}), ["r1"], 60)
     assert calls == []
 
 
-def test_read_trajectory_refuses(opencode):
-    with pytest.raises(NotImplementedError, match="^slice 3b, not enabled$"):
-        make(opencode).read_trajectory(Path("/nonexistent"), obs_trunc=100, max_chars=1000)
+def test_read_trajectory_is_pure_code_and_needs_no_grant(opencode, tmp_path):
+    assert make(opencode).read_trajectory(tmp_path / "nothing", obs_trunc=100, max_chars=1000).startswith(
+        "(failed to read trajectory")
+    stream = tmp_path / "s.jsonl"
+    stream.write_text(json.dumps({"type": "text", "part": {"type": "text", "text": "hi"}}) + "\n")
+    assert make(opencode).read_trajectory(stream, obs_trunc=100, max_chars=1000) == "[ASSISTANT] hi"
 
 
 def test_there_is_no_way_to_enable_execution_by_argument(opencode):
-    with pytest.raises(TypeError):
-        CognitiveSubstrate(opencode, enable_execution=True)  # type: ignore[call-arg]
-    with pytest.raises(NotImplementedError):
+    for flag in ({"enable_execution": True}, {"enabled": True}):
+        with pytest.raises(TypeError):
+            CognitiveSubstrate(opencode, **flag)  # type: ignore[arg-type]
+    for not_a_wiring in (True, 1, "grant", object()):
+        with pytest.raises(TypeError, match="no boolean switch"):
+            CognitiveSubstrate(opencode, execution=not_a_wiring)  # type: ignore[arg-type]
+    with pytest.raises(sub.ExecutionRefused):
         make(opencode).execute("t", StagedInstall(Path("/x"), "f", {}), [], 1)
 
 

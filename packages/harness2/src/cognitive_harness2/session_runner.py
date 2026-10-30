@@ -16,7 +16,11 @@ The runner FAILS CLOSED. `run` refuses before creating anything unless all of th
 
     * the rootless gate passes now (`verify_rootless_docker`, against the pinned image id);
     * the channel decision (`channels.decide`, re-run here from zdr and classification) is allowed;
-    * for an opencode or claude_cli channel, the caller's `upstream_egress.Decision` is present and allowed;
+    * for a PROPOSER session on an opencode or claude_cli channel, the caller's `upstream_egress.Decision` is present
+      and allowed (a SOLVER session, `role="solver"`, needs none: it is the same session, same hardening, same
+      channel decision, and its command line is built here, not read from an upstream Proposer);
+    * with a `sweep_budget.SweepBudget`, a session is reserved from it first, its timeout is clipped to the
+      reservation, and it is released with how it ended;
     * the image is a pinned `ImageRef`; the wall clock is within the channel's cap;
     * argv[0] is the mounted CLI path; the workspace is a safe absolute directory; no secret is in argv or env.
 
@@ -34,6 +38,7 @@ private is the 0700 parent on the host and the fact that only the session contai
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import os
 import re
@@ -53,6 +58,7 @@ from . import channels, egress, sandbox, upstream_egress, workspace_harvest
 from .egress_proxy import PROXY_PORT_DEFAULT, READY_LINE
 from .host_bridge import HostBridge, validate_target
 from .image import PROXY_PATH_IN_IMAGE, ImageRef
+from .sweep_budget import ROLES, SweepBudget
 
 LABEL = "cognitive-harness2.session"
 PROXY_ALIAS = "harness2-proxy"
@@ -176,6 +182,7 @@ class SessionResult:
     harvest: workspace_harvest.HarvestReport | None = None
     reclaimed: bool | None = None
     leftovers: tuple[str, ...] = ()
+    role: str = "proposer"                    # which kind of session ran: "proposer" or "solver"
 
 
 def container_cli_path(cli_host_path: str) -> str:
@@ -424,7 +431,17 @@ class ProposerSessionRunner:
                  zdr: str, classification: str | None,
                  proposer_decision: upstream_egress.Decision | None = None,
                  workspace_roots: Sequence[str] = (), egress_network: str | None = None,
+                 role: str = "proposer", budget: SweepBudget | None = None,
                  _test_allow_cidrs: Sequence[str] = ()):
+        """`role` is "proposer" (the default, every existing caller) or "solver". A solver session is the same
+        contained session with the same hardening and the same channel decision; it differs only in that no
+        `upstream_egress.Decision` is demanded (that decision vets an upstream Proposer's configuration, and a
+        solver's command line is built by this code, not read from a Proposer). `budget`, when given, is the
+        sweep's shared `SweepBudget`: every `run` reserves from it first and records how it ended."""
+        if role not in ROLES:
+            raise SessionRefused(f"the session role must be one of {ROLES}")
+        if budget is not None and not isinstance(budget, SweepBudget):
+            raise SessionRefused("budget must be a SweepBudget")
         if not isinstance(verified, sandbox.VerifiedDocker) or not sandbox._is_local_unix(verified.host):
             raise SessionRefused("the runner needs the endpoint the rootless gate verified (a local unix socket)")
         if not isinstance(image, ImageRef):
@@ -438,6 +455,7 @@ class ProposerSessionRunner:
         self.zdr, self.classification, self.proposer_decision = zdr, classification, proposer_decision
         self.workspace_roots, self.egress_network = tuple(workspace_roots), egress_network
         self._test_allow_cidrs = tuple(_test_allow_cidrs)
+        self.role, self.budget = role, budget
 
     # ── authorisation: everything that can be checked without touching docker, then the gate ─────────
 
@@ -455,7 +473,11 @@ class ProposerSessionRunner:
         verdict = channels.decide(ch, zdr=self.zdr, classification=self.classification)
         if not verdict.allowed:
             raise SessionRefused("the channel decision is a refusal: " + "; ".join(verdict.reasons))
-        if ch.kind in upstream_egress.KINDS:
+        if self.role == "solver":
+            d = self.proposer_decision
+            if d is not None and not (isinstance(d, upstream_egress.Decision) and d.allowed is True):
+                raise SessionRefused("the proposer decision is a refusal")
+        elif ch.kind in upstream_egress.KINDS:
             d = self.proposer_decision
             if not isinstance(d, upstream_egress.Decision) or d.allowed is not True:
                 raise SessionRefused("the proposer decision (upstream_egress.check_proposer) is missing or a refusal")
@@ -565,10 +587,41 @@ class ProposerSessionRunner:
     # ── a session ─────────────────────────────────────────────────────────────────
 
     def run(self, spec: SessionSpec) -> SessionResult:
+        """Authorise, reserve from the sweep budget (if any), pass the docker gate, then run one session.
+
+        Raises `SessionRefused` (or `sweep_budget.BudgetExhausted`) before anything is created when a
+        precondition fails. With a budget, `spec.timeout_s` is clipped to the reservation's, so a session that
+        starts before the sweep's deadline also ends by it; the reservation is released however the session ends,
+        and refunded only if it never started (the gate failed).
+        """
         plan = self.authorize(spec)
-        # The gate runs again for every session: the daemon can be stopped or swapped between runs. It is checked
-        # against the pinned image id, and pins every later call to the endpoint it verified.
-        self._gate()
+        reservation = None
+        if self.budget is not None:
+            reservation = self.budget.reserve_session(self.role)
+            clipped = min(spec.timeout_s, reservation.timeout_s)
+            plan = dataclasses.replace(plan, spec=dataclasses.replace(spec, timeout_s=clipped))
+        started, outcome = False, "error"
+        try:
+            # The gate runs again for every session: the daemon can be stopped or swapped between runs. It is checked
+            # against the pinned image id, and pins every later call to the endpoint it verified.
+            self._gate()
+            started = True
+            result = self._execute(plan)
+            outcome = "timed_out" if result.timed_out else "ok"
+            return result
+        except SessionCleanupError:
+            outcome = "leftovers"
+            raise
+        except BaseException:
+            if not started:
+                outcome = "refused"
+            raise
+        finally:
+            if reservation is not None:
+                self.budget.release(reservation, started=started, outcome=outcome)  # type: ignore[union-attr]
+
+    def _execute(self, plan: Plan) -> SessionResult:
+        spec = plan.spec
         run_id = secrets.token_hex(6)
         names = Names(run_id)
         secrets_ = [spec.credential.value] if spec.credential else []
@@ -670,7 +723,8 @@ class ProposerSessionRunner:
         report = None
         if spec.harvest is not None:
             report = workspace_harvest.inspect_workspace(plan.workspace, spec.harvest, credentials=secrets_)
-        result = SessionResult(**{**result.__dict__, "harvest": report, "reclaimed": reclaimed, "leftovers": leftovers})
+        result = SessionResult(**{**result.__dict__, "harvest": report, "reclaimed": reclaimed, "leftovers": leftovers,
+                                        "role": self.role})
         if leftovers:
             raise SessionCleanupError(leftovers, result)
         return result

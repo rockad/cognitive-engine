@@ -20,6 +20,16 @@ tryw() { if ( : > "$1" ) 2>/dev/null; then echo WROTE; else echo DENIED; fi; }
 tryw_append() { if ( echo x >> "$1" ) 2>/dev/null; then echo WROTE; else echo DENIED; fi; }
 try() { if "$@" >/dev/null 2>&1; then echo ALLOWED; else echo DENIED; fi; }
 
+# ── a FAKE solver (WS-E): reads input.txt, writes output/answer.txt, prints opencode-shaped JSONL events ──
+jstr() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | awk 'BEGIN{ORS="\\n"} {print}' | sed 's/\\n$//'; }
+ev_text() { printf '{"type":"text","part":{"type":"text","text":"%s"}}\n' "$(jstr "$1")"; }
+ev_tool() { printf '{"type":"tool_use","part":{"type":"tool","tool":"%s","state":{"status":"completed","input":{"command":"%s"},"output":"%s"}}}\n' "$1" "$(jstr "$2")" "$(jstr "$3")"; }
+cents_of() {  # $1 file, $2 "all" or "positive": whole cents of the signed sum
+  awk -v mode="$2" '{ s=$0; neg=0; if (substr(s,1,1)=="-") { neg=1; s=substr(s,2) }
+                       split(s,p,"."); c=p[1]*100+p[2]; if (neg && mode=="positive") next; t += neg ? -c : c }
+                     END { printf "%d\n", t }' "$1"; }
+money() { awk -v t="$1" 'BEGIN { n=(t<0); a=n?-t:t; printf "%s%d.%02d\n", n?"-":"", int(a/100), a%100 }'; }
+
 case "$1" in
   probe-all)
     # $2 = the upstream container's IP (on the egress network), $3 = the workspace
@@ -120,5 +130,41 @@ case "$1" in
     echo "in_workspace=$(grep -rlsF "$P" "$WS" 2>/dev/null | wc -l)"
     ;;
   leak-cred) { echo "my token is:"; cat "$2"; } > "$3/notes.md"; echo "wrote" ;;
+  solve)
+    # $2 = mode, $3 = the workspace. Modes: right wrong malformed none outside hang mess tamper tmpexec noevents
+    MODE="$2"; WS="$3"
+    cd "$WS" || exit 70
+    if [ "$MODE" = noevents ]; then echo "plain text, no events"; exit 1; fi
+    ev_text "starting ($MODE)"
+    ev_text "AGENTS: $(head -n 3 AGENTS.md 2>/dev/null | tr '\n' ' ')"
+    ev_tool bash "cat input.txt" "$(cat input.txt)"
+    case "$MODE" in
+      right)     printf 'Total: %s\n' "$(money "$(cents_of input.txt all)")" > output/answer.txt ;;
+      wrong)     printf 'Total: %s\n' "$(money "$(cents_of input.txt positive)")" > output/answer.txt ;;
+      malformed) echo "The total is about 97" > output/answer.txt ;;
+      none)      : ;;
+      outside)   printf 'Total: %s\n' "$(money "$(cents_of input.txt all)")" > "$WS/answer.txt" ;;
+      hang)      sleep 600 ;;
+      mess)
+        printf 'Total: %s\n' "$(money "$(cents_of input.txt all)")" > output/answer.txt
+        ln -s /etc/passwd output/passwd; mkfifo output/pipe
+        printf '#!/bin/sh\n' > output/run.sh; chmod 755 output/run.sh
+        echo suid > output/su; chmod 4755 output/su
+        echo h > output/h1; ln output/h1 output/h2
+        head -c 600000 /dev/zero > output/big.md
+        printf 'x' > "$WS/$(printf 'esc\033name')"; mkdir -p .git && echo "[x]" > .git/config
+        echo "outside output" > notes.txt ;;
+      tamper)
+        ev_text "overwrite input.txt: $(tryw_append input.txt)"
+        ev_text "overwrite AGENTS.md: $(tryw_append AGENTS.md)"
+        ev_text "rm input.txt: $(try rm -f input.txt) $( [ -f input.txt ] && echo still-there || echo gone )"
+        printf 'Total: %s\n' "$(money "$(cents_of input.txt all)")" > output/answer.txt ;;
+      tmpexec)
+        ev_text "exec_tmp=$(cp /bin/true /tmp/t 2>/dev/null && /tmp/t >/dev/null 2>&1 && echo ALLOWED || echo DENIED)"
+        ev_text "exec_home=$(cp /bin/true /home/agent/t 2>/dev/null && /home/agent/t >/dev/null 2>&1 && echo ALLOWED || echo DENIED)" ;;
+      *) echo "unknown solve mode $MODE" >&2; exit 64 ;;
+    esac
+    ev_tool write "output/answer.txt" "done"
+    ;;
   *) echo "unknown probe $1" >&2; exit 64 ;;
 esac

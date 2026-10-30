@@ -37,7 +37,8 @@ from h2_profiles import PROFILE, WORK, WORKSPACE_ROOT
 from cognitive_harness2 import channels, settings, sweep_plan
 from cognitive_harness2.invariants import InvariantViolation
 from cognitive_harness2.quota import QuotaVerdict
-from cognitive_harness2.substrate import CognitiveSubstrate, PreflightError, StagedInstall, openrouter_quota_check
+from cognitive_harness2.substrate import (CognitiveSubstrate, ExecutionRefused, PreflightError, StagedInstall,
+                                          openrouter_quota_check)
 from cognitive_harness2.sweep_plan import CostCap, SweepCandidate, SweepRefused, plan_sweep
 from cognitive_harness2.upstream_egress import check_proposer
 from cognitive_harness2.upstream_surface import check_surface
@@ -194,7 +195,7 @@ def exercise_every_seam(surface, tmp_path, profile) -> dict[str, int]:
         fn()
         done["happy"] += 1
 
-    def refuses(fn, exc=(InvariantViolation, ValueError, SweepRefused, PreflightError, NotImplementedError)):
+    def refuses(fn, exc=(InvariantViolation, ValueError, SweepRefused, PreflightError, ExecutionRefused)):
         try:
             fn()
         except exc:
@@ -245,7 +246,7 @@ def exercise_every_seam(surface, tmp_path, profile) -> dict[str, int]:
     refuses(lambda: s.materialise(tree, BENCH, {"file:../x": "n"}))
     refuses(lambda: s.materialise(tree, SimpleNamespace(install_mode="nope"), {}))
     refuses(lambda: s.execute("t", StagedInstall(tree, "f", {}), ["r"], 1))
-    refuses(lambda: s.read_trajectory(tree / "x", obs_trunc=1, max_chars=1))
+    happy(lambda: s.read_trajectory(tree / "x", obs_trunc=1, max_chars=1))   # pure: reads one file
     happy(s.preflight)
     refuses(CognitiveSubstrate(surface, which=lambda _: None, run=fake_docker([])).preflight)
     refuses(CognitiveSubstrate(surface, which=lambda _: "/usr/bin/docker", environ={"DOCKER_HOST": SOCK},
@@ -291,12 +292,12 @@ def test_a_real_preflight_reaches_the_process_trap_and_nothing_else(traps, surfa
     assert traps.attempts == ["subprocess.run"]
 
 
-def test_execute_and_read_trajectory_never_reach_a_trap(traps, surface):
+def test_execute_without_a_grant_and_read_trajectory_never_reach_a_trap(traps, surface):
+    from cognitive_harness2.substrate import ExecutionRefused
     s = CognitiveSubstrate(surface)
-    for call in (lambda: s.execute("t", StagedInstall(Path("/x"), "f", {}), ["r"], 1),
-                 lambda: s.read_trajectory(Path("/x"), obs_trunc=1, max_chars=1)):
-        with pytest.raises(NotImplementedError, match="slice 3b, not enabled"):
-            call()
+    with pytest.raises(ExecutionRefused, match="no ExecutionGrant"):
+        s.execute("t", StagedInstall(Path("/x"), "f", {}), ["r"], 1)
+    assert s.read_trajectory(Path("/x"), obs_trunc=1, max_chars=1).startswith("(failed to read trajectory")
     assert traps.attempts == []
 
 
