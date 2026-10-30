@@ -14,11 +14,11 @@ uv run cognitive-harness2 experience approve ID --by NAME
 | tool | what it does |
 | --- | --- |
 | `harness2_propose` | Generate mutation candidates. Refuses protected or unknown components and any endpoint the ZDR/classification policy forbids **before** anything is sent. `dry_run` reports the verdict without calling a model. |
-| `harness2_probe` | Run each candidate in a local `sbx` microVM, or an ephemeral rootless Docker container when `sbx` is absent (below). With neither it **fails closed** and runs nothing; `allow_worktree_diff` opts in to static diffs, which execute no code. |
+| `harness2_probe` | Run each candidate in an ephemeral rootless Docker container (by default), or in a local `sbx` microVM only when opted in, verified and usable (below). With neither it **fails closed** and runs nothing; `allow_worktree_diff` opts in to static diffs, which execute no code. |
 | `harness2_compose` | Contrast outcomes without labels and propose a patch. Output always has `requires_human_approval: true`. |
 | `harness2_reflect` | Stage a lesson as **pending**. Nothing is committed. |
 | `harness2_trigger` | Read-only pull check: evaluates a failure summary and recommends whether to probe, with readiness, cost class and `requires_human_approval` (see Triggers). Starts nothing. Not in the RFC 004 §2.7 list; it is the pull tool of §2.3. |
-| `harness2_status` | Read-only, offline readiness report (sandbox, key configured, storage, protected set). Not in RFC 004; added for Track 4's Gate 3 and the conformance probe. |
+| `harness2_status` | Read-only, offline readiness report (sandbox and the `sbx` verdict, key configured, storage, protected set). Not in RFC 004; added for Track 4's Gate 3 and the conformance probe. |
 
 ## Rules enforced, and where
 
@@ -77,12 +77,12 @@ It is **documented, not installed**. To enable it, merge this into `~/.claude/se
 
 Leave out `onFailure: "block"`: without it a crashing hook is fail-open (verified in the captured payload notes), which is what an advisory wants. `PostToolUse` fires on every tool call, so the script exits early when there is no count to reset.
 
-## Sandbox: sbx, else rootless Docker, else nothing
+## Sandbox: rootless Docker, else nothing (sbx is opt-in)
 
 `harness2_probe` runs candidate code only in a local sandbox, chosen in this order:
 
-1. `sbx` microVM, when `sbx` is on `PATH`.
-2. An **ephemeral rootless Docker container**, when it is not. It is used only if every one of these holds, checked on every run:
+1. `sbx` microVM, **only** when opted in, verified and usable (see "sbx (Docker Sandboxes)" below). `sbx` being on `PATH` changes nothing.
+2. An **ephemeral rootless Docker container**, otherwise. This is the default. It is used only if every one of these holds, checked on every run:
    - `docker` exists and the endpoint (`DOCKER_HOST` or the active context) is a **local unix socket**.
    - `docker info` lists `name=rootless` in its SecurityOptions. A rootful daemon is refused.
    - The pinned image (`alpine:3` plus digest, in `sandbox.DEFAULT_IMAGE`) is already local. It is never pulled at run time.
@@ -92,6 +92,28 @@ Leave out `onFailure: "block"`: without it a crashing hook is fail-open (verifie
 Each container gets `--network none`, `--read-only`, `--cap-drop ALL`, `--security-opt no-new-privileges`, pid, memory and cpu limits, a `noexec` tmpfs for scratch, user `65534`, the candidate mounted read-only at `/candidate`, and `--rm`. The home directory and the Docker socket are never mounted and no host environment is passed in. Candidate file names must already be clean relative paths: `./payload.py`, `a//b`, `a/./b`, `a/../b`, absolute paths, backslashes, empty names, trailing slashes, NUL and other control characters are refused as written, before anything is staged, and files are staged under exactly the name given. On timeout the container is killed and removed; output is capped at 1 MiB per stream.
 
 Host setup is rootless Docker (`dockerd-rootless-setuptool.sh install`), then `docker pull alpine:3` once. The integration tests (`-m requires_rootless_docker`) run real containers and **do not skip**: without a rootless daemon they fail.
+
+### sbx (Docker Sandboxes)
+
+`sbx` is Docker Sandboxes: a standalone CLI that runs AI agents in local microVMs (`sbx create`, `run`, `exec`, `policy`, `daemon`, `diagnose`). RFC 004 names it as the preferred isolation.
+
+**It is not selected by default**, because `SbxRunner._argv` (the `sbx` command line) is a guess that has never been checked against a real `sbx`, and a guessed command line must not decide where candidate code runs. Until now having `sbx` on `PATH` was enough to select it; it no longer is. `default_runner` returns `SbxRunner` only if **all** hold:
+
+- You opted in: `COGNITIVE_HARNESS2_SANDBOX=sbx`. Unset, empty, `auto` and `docker` mean rootless Docker. Any other value is refused (fail closed), not ignored.
+- The installed version is in `sandbox.VERIFIED_SBX_VERSIONS`. **It is empty**, so `sbx` is unselectable today.
+- A read-only usability probe passes: `/dev/kvm` is accessible to the user, the `sbx` daemon is reachable, and the global network policy is initialised. The probe never starts the daemon: `sbx version` and `sbx policy ls` run only once the daemon socket already answers.
+
+Anything else gets rootless Docker exactly as above, and with no usable Docker either, the usual fail-closed refusal. There is no fallback to rootful Docker or to the host.
+
+`harness2_status` keeps its `sandbox` string (the selected runner, or the refusal) and adds an `sbx` object: `state` (`absent`, `present-but-unusable` or `usable-and-selected`), `path`, `version`, `opted_in`, `verified_versions` and `reasons` (for example: not opted in, version not in the verified set, daemon not reachable, `/dev/kvm` permission denied, policy not initialised).
+
+To enable it, the user does (these change the host, so they are yours to run):
+
+1. Give the user `/dev/kvm` access: `sudo usermod -aG kvm "$USER"`, then log out and in again.
+2. Start the daemon: `sbx daemon start`.
+3. Initialise the global network policy: `sbx policy init <allow-all|balanced|deny-all>` (pick the profile deliberately).
+4. **The missing step:** verify `SbxRunner._argv` against the real version (`sbx version`) by running a real probe through it and checking its isolation and output, fix `_argv` if the command line differs, then add the version to `VERIFIED_SBX_VERSIONS`. Only then does step 5 do anything.
+5. Export `COGNITIVE_HARNESS2_SANDBOX=sbx` for the daemon.
 
 ## Upstream
 
@@ -183,7 +205,7 @@ For a local channel the CLI must be configured with `runner.local_endpoint` (`ht
 - DNS to the allow-listed name is resolved by the proxy container through Docker's resolver, so the allowed hostname (and nothing else) is visible to the host's resolver.
 - The egress side trusts the container runtime's networking; a kernel or runc escape defeats all of this (rootless limits the blast radius to the host user).
 - Output is stripped of escape sequences and control characters and redacted by exact credential value; a transformed (encoded) secret is not recognised.
-- `SbxRunner` (microVM) is still unverified; this path is rootless Docker only.
+- `SbxRunner` (microVM) is unverified and never selected; this path is rootless Docker only.
 - Verified here: opencode v2.0.25 only, against a stub model (see **First-contact findings**); it starts and works with a read-only root and noexec tmpfs `HOME` and `/tmp`. Not verified: `claude` and `agy` inside this container. A CLI that needs to execute from `HOME` or `/tmp` (native code unpacking) needs `SessionSpec(tmp_exec=True)`; one that writes next to its token needs `tmpfs_dirs`.
 - The wall cap compared against is the channel's `wall_s`, which the profile defines per sweep; per-session budgeting is the caller's.
 - **The workspace is a rw bind mount to host disk** with no total-size quota (see the coverage notes below).
@@ -549,7 +571,7 @@ The API key is read from `JEV_OPENROUTER_API_KEY` or `OPENROUTER_API_KEY` and is
 
 ## What is not done
 
-- **`sbx` is not installed on this machine**, so real microVM isolation is unverified. `SbxRunner._argv` is an assumption about the `sbx` command line; the fail-closed path is tested and does not depend on it. The rootless Docker fallback below is verified against a real daemon.
+- **`sbx` microVM isolation is unverified.** `sbx` (v0.50.1) is installed here but `SbxRunner._argv` is an assumption about its command line, so `sbx` is never selected (see "sbx (Docker Sandboxes)"); the fail-closed path is tested and does not depend on it. Rootless Docker is verified against a real daemon.
 - **The engine does not yet call upstream.** Upstream is pinned and import-tested (see Upstream), but `engine.py`'s propose, probe and compose are still the slice 1 local baseline, and the composer is a heuristic (exit status, timeouts, output, stderr). The safety seams to upstream's `Substrate` exist (see Upstream seams); binding the stages themselves to upstream's execution is slice 3b.
 - The OpenRouter quota field names follow RFC 004 and are unverified against the live API.
 - The push hook counts tool failures only. It does not see `jev_judge` verdicts (the shape of that tool result in a PostToolUse payload has not been captured), and there is no `/probe` slash command or `engine probe`; the pull tool covers on-demand requests. The `PostToolUseFailure` payload is also uncaptured: the hook relies on the documented `hook_event_name`, `session_id` and `is_interrupt` fields.

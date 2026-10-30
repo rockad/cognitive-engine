@@ -2,9 +2,13 @@
 
 Candidate code runs ONLY in one of two local runtimes, chosen in this order:
 
-  1. a Docker Sandbox microVM driven by the standalone `sbx` CLI, when `sbx` is on PATH;
+  1. a Docker Sandbox microVM driven by the standalone `sbx` CLI, ONLY when ALL of: the user
+     opted in (`COGNITIVE_HARNESS2_SANDBOX=sbx`), the installed version is in
+     `VERIFIED_SBX_VERSIONS` (empty today), and a read-only probe passes (daemon reachable,
+     /dev/kvm accessible, global network policy initialised). `sbx` being on PATH is NOT enough;
   2. otherwise an EPHEMERAL ROOTLESS DOCKER container (`DockerRunner`), and only when the
-     daemon itself reports `name=rootless` in `docker info` SecurityOptions.
+     daemon itself reports `name=rootless` in `docker info` SecurityOptions. This is the default,
+     and what `COGNITIVE_HARNESS2_SANDBOX` unset, `auto` or `docker` all mean.
 
 With neither, the prober refuses to run anything (fail closed): a missing `docker`, an
 unreachable or stopped daemon and a rootful daemon all raise `SandboxUnavailable`. There is
@@ -15,18 +19,22 @@ an explicit opt-in that writes candidates to a temp directory and returns a diff
 inspection; it never executes code.
 
 ⚠️ `SbxRunner._argv` is the single place that knows the `sbx` command line, and it is
-UNVERIFIED against a real `sbx` (none is installed on this host). The fail-closed
-behaviour does not depend on it and is fully tested; real microVM isolation is an open
-acceptance item until `sbx` exists on the host. `DockerRunner` IS verified end to end
-against a real rootless daemon (tests/test_docker_runner.py).
+UNVERIFIED against a real `sbx` version, which is why `VERIFIED_SBX_VERSIONS` is empty and
+`SbxRunner` cannot be selected: adding a version there is the act of verifying `_argv`
+against that version (and nothing else should do it). The fail-closed behaviour does not
+depend on it and is fully tested; real microVM isolation is an open acceptance item.
+`DockerRunner` IS verified end to end against a real rootless daemon
+(tests/test_docker_runner.py).
 """
 from __future__ import annotations
 
 import difflib
 import json
 import os
+import re
 import secrets
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -34,7 +42,7 @@ import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, Protocol
+from typing import IO, NamedTuple, Protocol
 
 from . import invariants
 
@@ -69,6 +77,15 @@ def require_sbx(which: Callable[[str], str | None] = shutil.which) -> str:
             "the `sbx` runtime is not installed, so candidate code will not be run (fail closed). "
             "Install sbx, or pass allow_worktree_diff to get static diffs only.")
     return path
+
+
+# The `sbx` versions whose command line `SbxRunner._argv` has been checked against a real install.
+# EMPTY on purpose: until someone runs a real probe through `_argv` on a given version and adds
+# it here, `default_runner` cannot return an `SbxRunner`, whatever is on PATH.
+VERIFIED_SBX_VERSIONS: frozenset[str] = frozenset()
+
+# `sbx` is selected only when this is `sbx`. Unset, empty, `auto` and `docker` mean rootless Docker.
+ENV_SANDBOX = "COGNITIVE_HARNESS2_SANDBOX"
 
 
 class SbxRunner:
@@ -370,25 +387,219 @@ class DockerRunner:
         return SandboxResult(code, stdout, err.decode("utf-8", "replace"))
 
 
-def default_runner(which: Callable[[str], str | None] = shutil.which) -> SandboxRunner:
-    """`sbx` when installed, else a verified rootless Docker, else raise (fail closed)."""
-    sbx = which("sbx")
-    if sbx:
-        return SbxRunner(sbx)
+# ── choosing between sbx and rootless Docker ───────────────────────────────────────
+
+SBX_ABSENT = "absent"
+SBX_UNUSABLE = "present-but-unusable"
+SBX_SELECTED = "usable-and-selected"
+
+_NO_REQUEST = ("", "auto", "docker", "rootless-docker")
+
+
+class SbxProbes(NamedTuple):
+    """The read-only questions asked about a present `sbx`. Injectable, so selection is testable without one.
+
+    Each returns None (or a value) when fine. `version` and `policy_problem` run an `sbx` process and are called ONLY
+    once `daemon_reachable` is true: asking a CLI while its daemon is down can start the daemon, and nothing in this
+    module may be what starts it.
+    """
+    kvm_problem: Callable[[], str | None]
+    daemon_reachable: Callable[[], bool]
+    version: Callable[[str], str | None]
+    policy_problem: Callable[[str], str | None]
+
+
+_SBX_VERSION = re.compile(r"\bv?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.]+)?)")
+
+
+def _sbx_socket(environ: Mapping[str, str]) -> Path:
+    # The location `sbx daemon status` reports on Linux (v0.50.1). Anywhere else the daemon reads as unreachable.
+    base = environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base) / "sandboxes" / "sandboxes" / "sandboxd" / "sandboxd.sock"
+
+
+def _run_readonly(argv: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(argv, capture_output=True, text=True, timeout=_PROBE_TIMEOUT_S, stdin=subprocess.DEVNULL)
+
+
+def real_sbx_probes(environ: Mapping[str, str]) -> SbxProbes:
+    def kvm() -> str | None:
+        if not os.path.exists("/dev/kvm"):
+            return "/dev/kvm does not exist (no virtualization interface)"
+        if not os.access("/dev/kvm", os.R_OK | os.W_OK):
+            return "/dev/kvm: permission denied (add the user to the kvm group and log in again)"
+        return None
+
+    def daemon() -> bool:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.settimeout(2)
+            s.connect(str(_sbx_socket(environ)))
+            return True
+        except OSError:
+            return False
+        finally:
+            s.close()
+
+    def version(path: str) -> str | None:
+        p = _run_readonly([path, "version"])
+        m = _SBX_VERSION.search(p.stdout) if p.returncode == 0 else None
+        return m.group(1) if m else None
+
+    def policy(path: str) -> str | None:
+        p = _run_readonly([path, "policy", "ls"])
+        if p.returncode == 0:
+            return None
+        text = _first_line(p.stderr or p.stdout)
+        return ("global network policy is not initialised (`sbx policy init <profile>`)"
+                if "not been initialized" in text else f"`sbx policy ls` failed: {text}")
+
+    return SbxProbes(kvm, daemon, version, policy)
+
+
+@dataclass(frozen=True)
+class SbxReport:
+    state: str                      # SBX_ABSENT | SBX_UNUSABLE | SBX_SELECTED
+    path: str | None
+    version: str | None
+    opted_in: bool
+    verified_versions: tuple[str, ...]
+    reasons: tuple[str, ...]        # empty only when usable and selected
+
+    @property
+    def selected(self) -> bool:
+        return self.state == SBX_SELECTED
+
+    def as_dict(self) -> dict:
+        return {"state": self.state, "path": self.path, "version": self.version, "opted_in": self.opted_in,
+                "verified_versions": list(self.verified_versions), "reasons": list(self.reasons)}
+
+
+def _opt_in(environ: Mapping[str, str]) -> tuple[bool, str | None]:
+    """(opted in to sbx, a problem with the setting). Only an exact `sbx` opts in; a typo is a refusal, not a default."""
+    raw = environ.get(ENV_SANDBOX) or ""
+    value = raw.strip().lower()
+    if value == "sbx":
+        return True, None
+    if value in _NO_REQUEST:
+        return False, None
+    return False, f"{ENV_SANDBOX}={raw!r} is not recognised (use sbx, docker or auto)"
+
+
+_FAILED = object()
+
+
+def inspect_sbx(which: Callable[[str], str | None] = shutil.which, *, environ: Mapping[str, str] | None = None,
+                probes: SbxProbes | None = None, verified: frozenset[str] | None = None,
+                probe: bool = True) -> SbxReport:
+    """Everything that stands between a present `sbx` and being selected. Read-only; never starts `sbx` itself.
+
+    `probe=False` stops after the checks that need no process and no filesystem access, which is all
+    `default_runner` needs once it already knows `sbx` is not opted in or not verified.
+    """
+    environ = os.environ if environ is None else environ
+    verified = VERIFIED_SBX_VERSIONS if verified is None else verified
+    listed = tuple(sorted(verified))
+    opted, bad = _opt_in(environ)
+    path = which("sbx")
+    if not path:
+        return SbxReport(SBX_ABSENT, None, None, opted, listed, ("`sbx` is not on PATH",))
+    reasons: list[str] = []
+    version: str | None = None
+    if bad:
+        reasons.append(bad)
+    elif not opted:
+        reasons.append(f"not opted in (set {ENV_SANDBOX}=sbx)")
+    if not verified:
+        reasons.append("sbx version is not in the verified set (the verified set is empty: "
+                       "SbxRunner._argv is unverified against any real version)")
+
+    def ask(label: str, fn: Callable, *args):
+        try:
+            return fn(*args)
+        except Exception as e:  # noqa: BLE001 - a probe that cannot answer means unusable, never a crash
+            reasons.append(f"{label} probe failed: {type(e).__name__}: {e}")
+            return _FAILED
+
+    if probe:
+        pr = probes or real_sbx_probes(environ)
+        kvm = ask("/dev/kvm", pr.kvm_problem)
+        if isinstance(kvm, str):
+            reasons.append(kvm)
+        up = ask("daemon", pr.daemon_reachable)
+        if up is False:
+            reasons.append("sbx daemon is not reachable (`sbx daemon start`); its version and policy were not "
+                           "checked, so that no sbx command can start it")
+        elif up is True:
+            version = ask("version", pr.version, path)
+            if version is _FAILED:
+                version = None
+            elif version is None:
+                reasons.append("could not read the sbx version")
+            elif verified and version not in verified:
+                reasons.append(f"sbx version {version} is not in the verified set ({', '.join(listed)})")
+            policy = ask("policy", pr.policy_problem, path)
+            if isinstance(policy, str):
+                reasons.append(policy)
+    elif not reasons:
+        reasons.append("not probed")
+    return SbxReport(SBX_UNUSABLE if reasons else SBX_SELECTED, path, version, opted, listed, tuple(reasons))
+
+
+def _docker_or_refuse(which: Callable[[str], str | None], sbx: SbxReport) -> DockerRunner:
     try:
         verified = verify_rootless_docker(which)
         return DockerRunner(verified.path, docker_host=verified.host)
     except SandboxUnavailable as e:
-        raise SandboxUnavailable(f"the `sbx` runtime is not installed and the Docker fallback is unusable: {e}") from e
+        if sbx.state == SBX_ABSENT:
+            raise SandboxUnavailable(f"the `sbx` runtime is not installed and the Docker fallback is unusable: {e}") from e
+        raise SandboxUnavailable(f"the `sbx` runtime is not selected ({'; '.join(sbx.reasons)}) "
+                                 f"and the Docker fallback is unusable: {e}") from e
 
 
-def sandbox_status(which: Callable[[str], str | None] = shutil.which) -> str:
+def default_runner(which: Callable[[str], str | None] = shutil.which, *, environ: Mapping[str, str] | None = None,
+                   probes: SbxProbes | None = None, verified: frozenset[str] | None = None) -> SandboxRunner:
+    """Rootless Docker, unless `sbx` is opted in AND verified AND usable; else raise (fail closed).
+
+    `sbx` merely being on PATH changes nothing. Never rootful Docker, never the host.
+    """
+    environ = os.environ if environ is None else environ
+    verified = VERIFIED_SBX_VERSIONS if verified is None else verified
+    opted, bad = _opt_in(environ)
+    if bad:
+        raise SandboxUnavailable(f"{bad} (fail closed)")
+    # No sbx process, and no probe at all, unless the two cheap gates already pass.
+    rep = inspect_sbx(which, environ=environ, probes=probes, verified=verified, probe=opted and bool(verified))
+    if rep.selected:
+        return SbxRunner(rep.path or "sbx")
+    return _docker_or_refuse(which, rep)
+
+
+def sandbox_report(which: Callable[[str], str | None] = shutil.which, *, environ: Mapping[str, str] | None = None,
+                   probes: SbxProbes | None = None, verified: frozenset[str] | None = None) -> dict:
+    """For harness2_status: `sandbox` is the selected runner (or the refusal), `sbx` says why sbx is or is not it.
+
+    Local only: no model, no network. Runs read-only `sbx` commands only when its daemon is already up.
+    """
+    environ = os.environ if environ is None else environ
+    rep = inspect_sbx(which, environ=environ, probes=probes, verified=verified, probe=True)
+    _, bad = _opt_in(environ)
+    if bad:
+        sandbox = f"unavailable (fail closed): {bad}"
+    elif rep.selected:
+        sandbox = "sbx"
+    else:
+        try:
+            _docker_or_refuse(which, rep)
+            sandbox = "rootless-docker"
+        except SandboxUnavailable as e:
+            sandbox = f"unavailable (fail closed): {e}"
+    return {"sandbox": sandbox, "sbx": rep.as_dict()}
+
+
+def sandbox_status(which: Callable[[str], str | None] = shutil.which, **kw) -> str:
     """One line for harness2_status. Local only: no model, no network."""
-    try:
-        runner = default_runner(which)
-    except SandboxUnavailable as e:
-        return f"unavailable (fail closed): {e}"
-    return "sbx" if isinstance(runner, SbxRunner) else "rootless-docker"
+    return sandbox_report(which, **kw)["sandbox"]
 
 
 def static_diff(name: str, original: str, candidate: str, *, allow_worktree_diff: bool) -> str:

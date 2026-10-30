@@ -129,10 +129,11 @@ def test_the_pinned_image_is_a_tag_plus_digest():
 
 # ── runtime selection ────────────────────────────────────────────────────────────
 
-def test_sbx_wins_when_installed(monkeypatch):
-    monkeypatch.setattr(sandbox, "require_rootless_docker", lambda *a, **k: pytest.fail("docker must not be probed"))
-    r = sandbox.default_runner(lambda n: f"/x/{n}")
-    assert isinstance(r, SbxRunner)
+def test_sbx_on_path_no_longer_wins(monkeypatch):
+    """Was `test_sbx_wins_when_installed`. Selection is now opt-in + verified + usable: tests/test_sbx_selection.py."""
+    monkeypatch.setattr(sandbox, "verify_rootless_docker", lambda which=None, **k: VerifiedDocker("/usr/bin/docker", SOCK))
+    r = sandbox.default_runner(lambda n: f"/x/{n}", environ={})
+    assert isinstance(r, DockerRunner) and not isinstance(r, SbxRunner)
 
 
 def test_docker_is_the_fallback_when_sbx_is_absent(monkeypatch):
@@ -153,7 +154,6 @@ def test_neither_runtime_fails_closed_and_names_both(monkeypatch):
 def test_status_reports_the_runtime_or_the_refusal(monkeypatch):
     monkeypatch.setattr(sandbox, "verify_rootless_docker", lambda *a, **k: VerifiedDocker("/usr/bin/docker", SOCK))
     assert sandbox.sandbox_status(lambda n: None if n == "sbx" else "/d") == "rootless-docker"
-    assert sandbox.sandbox_status(lambda n: "/x/sbx") == "sbx"
     monkeypatch.setattr(sandbox, "verify_rootless_docker",
                         lambda *a, **k: (_ for _ in ()).throw(SandboxUnavailable("nope")))
     assert sandbox.sandbox_status(lambda _: None).startswith("unavailable (fail closed)")

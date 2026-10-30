@@ -5,6 +5,7 @@ import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
+from cognitive_harness2 import server as server_mod
 from cognitive_harness2 import settings
 from cognitive_harness2.engine import Engine
 from cognitive_harness2.experience import ExperienceStore
@@ -16,6 +17,10 @@ from cognitive_harness2.server import build_server
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("JEV_OPENROUTER_API_KEY", "sk-secret-123")
+    # The real report runs read-only `sbx` commands when a daemon is up; this suite starts no host process.
+    monkeypatch.setattr(server_mod, "sandbox_report", lambda: {"sandbox": "rootless-docker", "sbx": {
+        "state": "present-but-unusable", "path": "/usr/bin/sbx", "version": None, "opted_in": False,
+        "verified_versions": [], "reasons": ["not opted in (set COGNITIVE_HARNESS2_SANDBOX=sbx)"]}})
     s = settings.from_env({settings.ENV_EXPERIENCE_ROOT: str(tmp_path)})
     async def q():
         return QuotaVerdict(True, "ok")
@@ -84,6 +89,12 @@ async def test_status_never_returns_the_api_key(client):
     assert out["api_key_configured"] is True
     assert "sk-secret-123" not in json.dumps(out)
     assert "egress_policy" in out["protected_components"] and "prompt" in out["mutable_components"]
+
+
+async def test_status_keeps_the_sandbox_string_and_reports_sbx_separately(client):
+    out = await call(client, "harness2_status", {})
+    assert out["sandbox"] == "rootless-docker"
+    assert out["sbx"]["state"] == "present-but-unusable" and out["sbx"]["reasons"]
 
 
 async def test_status_rejects_unknown_arguments(client):
