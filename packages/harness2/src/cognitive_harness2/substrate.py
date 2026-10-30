@@ -58,6 +58,7 @@ from .sandbox import (
     _validate_stage_names,
     require_rootless_docker,
 )
+from .model_gate import GateTimeout, ModelGate
 from .sweep_budget import BudgetExhausted, SweepBudget
 from .upstream_surface import AllowedSurface, check_surface
 
@@ -255,6 +256,8 @@ class SolverExecution:
     tmpfs_dirs: tuple[str, ...] = ()
     tmp_exec: bool = False                                     # a bun-compiled CLI may need True: settled by the first real call
     harvest: workspace_harvest.HarvestLimits = workspace_harvest.HarvestLimits()
+    gate: ModelGate | None = None                              # the one-slot model gate: one model call at a time
+    gate_wait_s: float | None = None                           # how long a session may wait for it (None: 4 x its timeout)
     clock: Callable[[], float] = time.time
     stream_name: str = "opencode_session.jsonl"
 
@@ -549,8 +552,13 @@ class CognitiveSubstrate:
                                   env=dict(ex.env_builder(job)) if ex.env_builder else {}, credential=ex.credential,
                                   limits=ex.limits, tmpfs_dirs=ex.tmpfs_dirs, tmp_exec=ex.tmp_exec, harvest=ex.harvest)
             try:
-                result = ex.runner.run(spec)
-            except (BudgetExhausted, sr.SessionRefused, sr.SessionError, SandboxUnavailable) as e:
+                if ex.gate is None:
+                    result = ex.runner.run(spec)
+                else:           # a single GPU serves one model call at a time, whoever makes it
+                    wait = ex.gate_wait_s if ex.gate_wait_s is not None else 4 * spec.timeout_s
+                    with ex.gate.hold(wait, label=f"solver:{run_id[:40]}"):
+                        result = ex.runner.run(spec)
+            except (BudgetExhausted, GateTimeout, sr.SessionRefused, sr.SessionError, SandboxUnavailable) as e:
                 _error_json(run_dir, e)
                 return run_dir
             except sr.SessionCleanupError as e:

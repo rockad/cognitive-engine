@@ -400,3 +400,33 @@ def test_make_selector_prop_is_what_schedule_uses_and_a_plain_proposer_never_is(
     assert up.schedule._selector_for(adapter, p, sel) is sel                  # passed explicitly: used as is
     plain = up.schedule._selector_for(adapter, p, None)                       # NOT passed: upstream builds a host Proposer
     assert type(plain) is up.proposer.Proposer and not isinstance(plain, type(p))
+
+
+# ── the shared sweep budget and the audit observer reach every proposer session ───────────────
+
+def test_the_session_config_carries_the_budget_and_observer_into_every_runner(pure):
+    from cognitive_harness2.sweep_budget import SweepBudget
+    b = SweepBudget(600, 120, 7, role_caps={"proposer": 3, "solver": 4})
+    seen = []
+    prop = pure.prop(session_kw=dict(budget=b, observer=lambda n, f: seen.append(n)))
+    r = prop._runner(None)
+    assert r.budget is b and r.observer is not None and r.role == "proposer"
+    sel = make_selector_prop(prop)
+    assert sel._runner(None).budget is b
+
+
+def test_an_exhausted_budget_stops_a_proposer_session_before_anything_is_created(pure, monkeypatch):
+    from cognitive_harness2.sweep_budget import SweepBudget
+    t = [100.0]
+    b = SweepBudget(10, 5, 3, clock=lambda: t[0])
+    t[0] += 50                                                     # the sweep's wall clock is spent
+    events = []
+    prop = pure.prop(session_kw=dict(budget=b, observer=lambda n, f: events.append((n, dict(f)))))
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: calls.append(a) or (_ for _ in ()).throw(AssertionError("docker")))
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: calls.append(a) or (_ for _ in ()).throw(AssertionError("docker")))
+    with pytest.raises(Exception) as ei:
+        pure.call(prop, "FAKE:marker")
+    assert "wall-clock" in str(ei.value) or "budget" in str(ei.value).lower()
+    assert calls == [] and not any(pure.scratch.iterdir())
+    assert [n for n, _ in events] == ["session_refused"] and events[0][1]["reason"] == "budget:deadline"

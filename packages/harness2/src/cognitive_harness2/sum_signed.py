@@ -314,6 +314,23 @@ def is_complete(where: Path, *, harness_dir: Path | None = None) -> bool:
     return m.get("harness") == fingerprint(harness_dir)
 
 
+# ── run ids ─────────────────────────────────────────────────────────────────────────────
+
+_FLAT_RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def flat_run_id(run_id: str) -> str:
+    """The run id as ONE safe path component. Upstream names a rollout `<namespace>/<task>/<label>` (it contains
+    `/`), but `CognitiveSubstrate.execute` only accepts letters, digits and `. _ -`. `/` becomes `__`; an id that
+    already contains `__` is refused, because it would collide with a `/`."""
+    if not isinstance(run_id, str) or not run_id or "__" in run_id:
+        raise ValueError("a run id must be a non-empty string without a double underscore")
+    flat = run_id.replace("/", "__")
+    if not _FLAT_RUN_ID.fullmatch(flat):
+        raise ValueError("a run id may contain only letters, digits and . _ - / and be at most 128 characters flat")
+    return flat
+
+
 # ── the adapter ──────────────────────────────────────────────────────────────────────────────
 
 def spec_fields(root: Path) -> dict[str, Any]:
@@ -390,7 +407,7 @@ class SumSignedAdapter:
 
     # ── running ──────────────────────────────────────────────────────────────────────
     def _run_dir(self, run_id: str) -> Path:
-        return self.results_root / run_id
+        return self.results_root / flat_run_id(run_id)
 
     def _safe_rmtree(self, d: Path) -> None:
         d = d.resolve()
@@ -420,7 +437,7 @@ class SumSignedAdapter:
             staged = self.substrate.materialise(Path(harness_dir), self.spec, {})
             install = type(staged)(staged.staging_dir, staged.fingerprint, {**staged.extras, "harness": "staged"})
         try:
-            self.substrate.execute(task_id, install, [run_id], int(timeout or self.timeout))
+            self.substrate.execute(task_id, install, [flat_run_id(run_id)], int(timeout or self.timeout))
         finally:
             if install.extras.get("harness") == "staged":
                 self.substrate.release(install)

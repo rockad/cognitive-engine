@@ -512,3 +512,40 @@ def test_solver_task_hands_the_substrate_the_prompt_and_the_input():
     assert dict(t.files) == {"input.txt": ss.instance(FIRST).input_text}
     with pytest.raises(ValueError):
         ss.solver_task("nope/sum-1")
+
+
+# ── upstream's run ids contain "/": the adapter flattens them for the substrate ─────────────
+
+def test_an_upstream_style_run_id_is_flattened_for_the_substrate_and_its_run_dir(tmp_path):
+    from types import SimpleNamespace
+    seen = {}
+
+    class Sub:
+        name = "cognitive"
+
+        def surface(self):
+            return SimpleNamespace(always_on=("systemprompt.md",))
+
+        def execute(self, task_ref, install, run_ids, timeout):
+            seen["ids"] = list(run_ids)
+            d = tmp_path / "results" / run_ids[0]
+            (d / "output").mkdir(parents=True)
+            (d / "output" / "answer.txt").write_text(ss.instance(task_ref).expected_line + "\n")
+            (d / "metrics.json").write_text("{}")
+            return [d]
+    ad = ss.SumSignedAdapter(tmp_path, SimpleNamespace(name=ss.SPEC_NAME), Sub(), results_root=tmp_path / "results")
+    rid = "sum-signed-cognitive-agg1/household/sum-1/base1"
+    d = ad.execute("household/sum-1", None, rid)
+    assert seen["ids"] == ["sum-signed-cognitive-agg1__household__sum-1__base1"]
+    assert d == tmp_path / "results" / "sum-signed-cognitive-agg1__household__sum-1__base1" and d.is_dir()
+    assert ad.score(d, "household/sum-1")["all_pass"] is True
+    assert ad.execute("household/sum-1", None, rid) == d                      # marked complete: a cache hit, same dir
+
+
+def test_flat_run_ids_are_safe_distinct_and_refuse_the_impossible():
+    ok = ss.flat_run_id("a-b/household/sum-1/inv1")
+    assert ok == "a-b__household__sum-1__inv1"
+    assert ss.flat_run_id("plain-1") == "plain-1"
+    for bad in ("", "/", "../x", "a b", "a\nb", "x" * 300, "a__b"):          # "a__b" would collide with "a/b"
+        with pytest.raises(ValueError):
+            ss.flat_run_id(bad)

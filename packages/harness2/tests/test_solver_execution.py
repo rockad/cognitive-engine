@@ -560,3 +560,30 @@ def test_the_budgeted_runner_clips_even_a_long_request_to_the_remaining_wall(wor
     world.mono.t += 2400                                       # 300s of the sweep are left
     s.execute(TASK, install(world), ["r1"], 3600)
     assert sess.plans[0].spec.timeout_s == pytest.approx(300.0)
+
+
+# ── the model gate around a solver session ─────────────────────────────────────────
+
+def test_a_solver_session_holds_the_model_gate_and_a_busy_gate_leaves_error_json(world, monkeypatch):
+    from cognitive_harness2.model_gate import ModelGate
+    gate = ModelGate()
+    held = []
+
+    def write(ws):
+        held.append(gate.locked())
+        (ws / "output" / "answer.txt").write_text(GOOD)
+    s = Session(write=write)
+    substrate, ex, _ = make_substrate(world, monkeypatch, s, gate=gate, gate_wait_s=0.2)
+    d = substrate.execute(TASK, install(world), ["g1"], 60)[0]
+    assert held == [True] and not gate.locked() and (d / "metrics.json").is_file()
+    with gate.hold(5, label="someone else"):
+        d2 = substrate.execute(TASK, install(world), ["g2"], 60)[0]
+    assert not (d2 / "metrics.json").exists() and "gate" in json.loads((d2 / "error.json").read_text())["error"].lower()
+    assert len(s.plans) == 1 and not gate.locked()
+
+
+def test_without_a_gate_nothing_changes(world, monkeypatch):
+    s = Session(write=lambda ws: (ws / "output" / "answer.txt").write_text(GOOD))
+    substrate, ex, _ = make_substrate(world, monkeypatch, s)
+    assert ex.gate is None
+    assert (substrate.execute(TASK, install(world), ["n1"], 60)[0] / "metrics.json").is_file()

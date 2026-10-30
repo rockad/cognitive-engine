@@ -39,7 +39,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -48,6 +48,7 @@ from . import channels, upstream_egress, workspace_harvest
 from .image import ImageRef
 from .model_gate import GATE, ModelGate
 from .sandbox import VerifiedDocker
+from .sweep_budget import SweepBudget
 from .session_runner import (HOME, Credential, ProposerSessionRunner, SessionLimits, SessionResult, SessionSpec,
                              container_cli_path)
 from .upstream_import import Upstream
@@ -175,6 +176,8 @@ class SessionConfig:
     harvest_limits: workspace_harvest.HarvestLimits = DEFAULT_HARVEST
     gate: ModelGate = GATE
     gate_wait_s: float | None = None       # None: four times the session's wall clock
+    budget: SweepBudget | None = None      # the sweep's shared budget: every session reserves from it (and ends by its deadline)
+    observer: Callable[[str, Mapping[str, Any]], None] | None = None   # told what happens to each session (audit)
     max_budget_usd: float | None = None    # claude only
     test_allow_cidrs: tuple[str, ...] = ()   # TESTS ONLY: let the proxy reach a throwaway upstream
 
@@ -245,7 +248,8 @@ def _build_class(up: Upstream) -> type:
             assert s is not None
             return ProposerSessionRunner(s.verified, s.image, s.channel_obj, zdr=s.zdr, classification=s.classification,
                                          proposer_decision=decision, workspace_roots=s.profile.workspace_roots,
-                                         egress_network=s.egress_network, _test_allow_cidrs=s.test_allow_cidrs)
+                                         egress_network=s.egress_network, budget=s.budget, observer=s.observer,
+                                         _test_allow_cidrs=s.test_allow_cidrs)
 
         def _base_url(self) -> str | None:
             if self.real_kind != "opencode":

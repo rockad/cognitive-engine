@@ -679,3 +679,65 @@ def test_a_failed_gate_gives_the_slot_back(world, monkeypatch):
     stub_execute(monkeypatch, r)
     r.run(spec(world))                                       # the single slot was still there
 
+
+
+# ── the observer: what the stage-1 audit trail is built from ──────────────────────────
+
+def watched(**kw):
+    events: list = []
+    return events, solver(observer=lambda name, f: events.append((name, dict(f))), **kw)
+
+
+def test_the_observer_sees_a_reservation_and_nothing_that_could_hold_a_prompt(world, monkeypatch):
+    b, _ = budget()
+    events, r = watched(budget=b)
+    stub_execute(monkeypatch, r)
+    r.run(spec(world, env={"MY_VAR": "SENTINEL-env-value"}, argv=(sr.container_cli_path(world.cli), "run", "SENTINEL-prompt")))
+    assert [n for n, _ in events] == ["session_reserved"]
+    f = events[0][1]
+    assert f["role"] == "solver" and f["timeout_s"] == 60 and isinstance(f["reservation"], int)
+    assert "SENTINEL" not in repr(events)
+
+
+def test_the_observer_sees_every_refusal_with_its_reason_and_nothing_starts(world, monkeypatch):
+    trap = Trap(monkeypatch)
+    b, clock = budget(n=1)
+    events, r = watched(budget=b)
+    with pytest.raises(SessionRefused):
+        r.run(spec(world, argv=("/bin/sh", "-c", "id")))
+    stub_execute(monkeypatch, r)
+    r.run(spec(world))
+    with pytest.raises(BudgetExhausted):
+        r.run(spec(world))
+    names = [n for n, _ in events]
+    assert names == ["session_refused", "session_reserved", "session_refused"]
+    assert events[0][1]["reason"].startswith("refused") and events[2][1]["reason"] == "budget:sessions"
+    assert trap.calls == []
+
+
+def test_a_gate_failure_is_reported_as_a_refusal_and_gives_the_slot_back(world, monkeypatch):
+    b, _ = budget()
+    events, r = watched(budget=b)
+
+    def closed():
+        raise sandbox.SandboxUnavailable("down")
+    monkeypatch.setattr(r, "_gate", closed)
+    with pytest.raises(sandbox.SandboxUnavailable):
+        r.run(spec(world))
+    assert [n for n, _ in events] == ["session_reserved", "session_refused"]
+    assert events[1][1]["reason"] == "gate:SandboxUnavailable"
+
+
+def test_a_failing_observer_never_breaks_a_session_and_is_counted(world, monkeypatch):
+    def boom(name, fields):
+        raise RuntimeError("audit disk full")
+    b, _ = budget()
+    r = solver(observer=boom, budget=b)
+    stub_execute(monkeypatch, r)
+    assert r.run(spec(world)).exit_code == 0
+    assert r.observer_errors >= 1
+
+
+def test_the_observer_must_be_callable(world):
+    with pytest.raises(SessionRefused, match="observer"):
+        solver(observer="not callable")

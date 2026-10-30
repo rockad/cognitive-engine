@@ -58,7 +58,7 @@ from . import channels, egress, sandbox, upstream_egress, workspace_harvest
 from .egress_proxy import PROXY_PORT_DEFAULT, READY_LINE
 from .host_bridge import HostBridge, validate_target
 from .image import PROXY_PATH_IN_IMAGE, ImageRef
-from .sweep_budget import ROLES, SweepBudget
+from .sweep_budget import ROLES, BudgetExhausted, SweepBudget
 
 LABEL = "cognitive-harness2.session"
 PROXY_ALIAS = "harness2-proxy"
@@ -432,16 +432,23 @@ class ProposerSessionRunner:
                  proposer_decision: upstream_egress.Decision | None = None,
                  workspace_roots: Sequence[str] = (), egress_network: str | None = None,
                  role: str = "proposer", budget: SweepBudget | None = None,
+                 observer: Callable[[str, Mapping[str, object]], None] | None = None,
                  _test_allow_cidrs: Sequence[str] = ()):
         """`role` is "proposer" (the default, every existing caller) or "solver". A solver session is the same
         contained session with the same hardening and the same channel decision; it differs only in that no
         `upstream_egress.Decision` is demanded (that decision vets an upstream Proposer's configuration, and a
         solver's command line is built by this code, not read from a Proposer). `budget`, when given, is the
-        sweep's shared `SweepBudget`: every `run` reserves from it first and records how it ended."""
+        sweep's shared `SweepBudget`: every `run` reserves from it first and records how it ended.
+        `observer(event, fields)`, when given, is told what happened to each session (`session_refused`,
+        `session_reserved`, `session_start`, `session_end`) for an audit trail. The fields are numbers, short words
+        and the session's run id: never an argv, an environment, a prompt or a model's output. An observer that
+        raises never affects a session (the failure is counted in `observer_errors`)."""
         if role not in ROLES:
             raise SessionRefused(f"the session role must be one of {ROLES}")
         if budget is not None and not isinstance(budget, SweepBudget):
             raise SessionRefused("budget must be a SweepBudget")
+        if observer is not None and not callable(observer):
+            raise SessionRefused("observer must be a callable (event, fields)")
         if not isinstance(verified, sandbox.VerifiedDocker) or not sandbox._is_local_unix(verified.host):
             raise SessionRefused("the runner needs the endpoint the rootless gate verified (a local unix socket)")
         if not isinstance(image, ImageRef):
@@ -456,6 +463,15 @@ class ProposerSessionRunner:
         self.workspace_roots, self.egress_network = tuple(workspace_roots), egress_network
         self._test_allow_cidrs = tuple(_test_allow_cidrs)
         self.role, self.budget = role, budget
+        self.observer, self.observer_errors = observer, 0
+
+    def _notify(self, event: str, **fields: object) -> None:
+        if self.observer is None:
+            return
+        try:
+            self.observer(event, {"role": self.role, **fields})
+        except Exception:  # noqa: BLE001 - an audit failure never changes what a session does
+            self.observer_errors += 1
 
     # ── authorisation: everything that can be checked without touching docker, then the gate ─────────
 
@@ -594,17 +610,30 @@ class ProposerSessionRunner:
         starts before the sweep's deadline also ends by it; the reservation is released however the session ends,
         and refunded only if it never started (the gate failed).
         """
-        plan = self.authorize(spec)
+        try:
+            plan = self.authorize(spec)
+        except SessionRefused as e:
+            self._notify("session_refused", reason="refused: " + sanitize_terminal(str(e))[:160])
+            raise
         reservation = None
         if self.budget is not None:
-            reservation = self.budget.reserve_session(self.role)
+            try:
+                reservation = self.budget.reserve_session(self.role)
+            except BudgetExhausted as e:
+                self._notify("session_refused", reason=f"budget:{e.reason}")
+                raise
             clipped = min(spec.timeout_s, reservation.timeout_s)
             plan = dataclasses.replace(plan, spec=dataclasses.replace(spec, timeout_s=clipped))
+            self._notify("session_reserved", reservation=reservation.id, timeout_s=clipped)
         started, outcome = False, "error"
         try:
             # The gate runs again for every session: the daemon can be stopped or swapped between runs. It is checked
             # against the pinned image id, and pins every later call to the endpoint it verified.
-            self._gate()
+            try:
+                self._gate()
+            except BaseException as e:
+                self._notify("session_refused", reason=f"gate:{type(e).__name__}")
+                raise
             started = True
             result = self._execute(plan)
             outcome = "timed_out" if result.timed_out else "ok"
@@ -632,6 +661,7 @@ class ProposerSessionRunner:
         reclaimed: bool | None = None
         stack = contextlib.ExitStack()
         t0 = time.monotonic()
+        self._notify("session_start", session=run_id, timeout_s=spec.timeout_s, tmp_exec=spec.tmp_exec)
         try:
             os.chmod(base, 0o700)
             proxy_dir = base / "proxy"
@@ -715,6 +745,11 @@ class ProposerSessionRunner:
             if spec.reclaim_workspace:
                 reclaimed = self._reclaim(plan, names)
             leftovers = tuple(self._leftovers(names, base))
+        self._notify("session_end", session=run_id, exit_code=None if result is None else result.exit_code,
+                     timed_out=None if result is None else result.timed_out,
+                     truncated=None if result is None else result.truncated,
+                     duration_s=round(time.monotonic() - t0, 3), reclaimed=reclaimed, leftovers=len(leftovers),
+                     error=None if error is None else type(error).__name__)
         if error is not None:
             if leftovers:
                 raise SessionCleanupError(leftovers) from error
