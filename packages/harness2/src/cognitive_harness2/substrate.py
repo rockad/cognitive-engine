@@ -598,6 +598,8 @@ class CognitiveSubstrate:
                 "ok": report.ok, "total_bytes": report.total_bytes, "n_files": len(report.files),
                 "findings": [{"path": f.path, "rule": f.rule} for f in report.findings][:100]},
             "egress": list(result.egress_log)[:100],
+            "errors": trajectory.error_events(stream),
+            **{k: v for k, v in sr.egress_summary(result.egress_log).items() if k in ("model_requests", "denied_hosts")},
             "stderr_tail": result.stderr[-2000:],
         }
         _write_private(run_dir / "metrics.json", json.dumps(metrics, indent=2, sort_keys=True))

@@ -768,3 +768,31 @@ def test_a_local_channel_routes_the_proxy_alias_to_the_bridge_socket_and_a_hoste
                                   {"host": sr.PROXY_ALIAS, "port": 11434, "unix": sock}]
     assert cfg["listeners"] == [{"port": 11434, "unix": sock}] and cfg["allow"] == []
     assert "unix_routes" not in sr.proxy_config(runner("claude").authorize(spec(world)))
+
+
+# ── what the proxy log says about a session, as numbers and host:port only ───────
+
+LOG = ("ACCESS decision=allow host=harness2-proxy port=11434 reason=unix-route",
+       "ACCESS decision=allow host=unix-listener:11434 port=0 reason=unix-listener",
+       "ACCESS decision=allow host=upstream.example port=443 reason=allow-listed",
+       "ACCESS decision=deny host=127.0.0.1 port=34175 reason=not-allow-listed",
+       "ACCESS decision=deny host=127.0.0.1 port=34175 reason=not-allow-listed",
+       "ACCESS decision=deny host=github.com port=443 reason=not-allow-listed",
+       "ACCESS decision=deny host=<none> port=0 reason=rate-limit",
+       "something else entirely")
+
+
+def test_egress_summary_counts_model_requests_and_names_denied_hosts_only():
+    s = sr.egress_summary(LOG)
+    assert s == {"model_requests": 2, "egress_allowed": 3, "egress_denied": 4,
+                 "denied_hosts": ["127.0.0.1:34175", "github.com:443", "<none>:0"],
+                 "denied_reasons": ["not-allow-listed", "rate-limit"]}
+    assert sr.egress_summary(()) == {"model_requests": 0, "egress_allowed": 0, "egress_denied": 0,
+                                     "denied_hosts": [], "denied_reasons": []}
+
+
+def test_egress_summary_is_bounded_and_ignores_anything_that_is_not_a_decision_line():
+    many = [f"ACCESS decision=deny host=h{i}.example port=443 reason=not-allow-listed" for i in range(50)]
+    s = sr.egress_summary(many)
+    assert s["egress_denied"] == 50 and len(s["denied_hosts"]) == 10
+    assert sr.egress_summary(["ACCESS decision=allow host=x port=1 reason=unix-route extra=1", "", "ACCESS"])["model_requests"] == 0

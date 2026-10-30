@@ -18,7 +18,7 @@ import pytest
 from h2_upstream import isolated_upstream
 from real_cli_probe import AGENTS_MARKER, MODEL_ID, OPENCODE, SCENARIOS, TASK, StubModel, enabled, run_session
 
-from cognitive_harness2 import contained_proposer as cp, sum_signed
+from cognitive_harness2 import contained_proposer as cp, session_runner as sr, sum_signed
 
 pytestmark = [
     pytest.mark.real_cli, pytest.mark.requires_rootless_docker,
@@ -64,6 +64,8 @@ def test_a_text_reply_round_trip_through_bridge_and_proxy(verified, proposer_ima
     # the model was reached, through the proxy only: every egress line is the proxy alias (an allow), nothing denied
     assert r.egress_log and all(re.fullmatch(r"ACCESS decision=allow host=harness2-proxy port=\d+ reason=unix-route", x)
                                 for x in r.egress_log), r.egress_log
+    summary = sr.egress_summary(r.egress_log)
+    assert summary["model_requests"] == 2 and summary["egress_denied"] == 0 and summary["denied_hosts"] == []   # GET + POST
     # what opencode asked the model: GET /api/tags once, then ONE chat request (the --title word skips title generation)
     assert [(x["method"], x["path"]) for x in p.stub] == [("GET", "/api/tags"), ("POST", "/v1/chat/completions")]
     chat = p.stub[1]
@@ -138,3 +140,34 @@ def test_a_model_the_server_does_not_have_fails_fast_with_the_servers_message(ve
     # the proposer parser keeps only the old `error.data.message` shape: it returns no error text for a v2 stream
     with isolated_upstream(tmp_path / "up") as up:
         assert up.proposer._opencode_stdout(p.result.stdout)[1] == ""
+
+
+# ── the proposer's shape: MISSION.md, the old opencode.json, the answer in output/answer.md ─────────────────────────
+
+def test_a_proposer_style_session_with_the_upstream_workspace_files_and_prompt(verified, proposer_image, tmp_path):
+    """upstream's workspace: MISSION.md plus `opencode.json` (`agent.build.steps`, a v1 key). The prompt asks for the
+    answer both as the final message and as output/answer.md."""
+    turns = [{"tool": "read", "args": {"path": "MISSION.md"}},
+             {"tool": "write", "args": {"path": "output/answer.md", "content": "<notes>stub proposer</notes>\n"}},
+             {"text": "<notes>stub proposer</notes>"}]
+    p, _ = go(verified, proposer_image, tmp_path, turns, prompt=cp.OPENCODE_PROMPT, agents_md=None,
+              extra_files={"MISSION.md": "# mission\nsynthetic\n", "opencode.json": json.dumps({"agent": {"build": {"steps": 120}}})})
+    assert p.result.exit_code == 0, (p.result.stderr, p.events[-1:])
+    assert [e["part"]["tool"] for e in p.events if e["type"] == "tool_use"] == ["read", "write"]
+    assert p.output_files == {"answer.md": "<notes>stub proposer</notes>\n"} and "output/answer.md" in p.result.harvest.files
+    assert set(p.workspace_files) == {"MISSION.md", "opencode.json", "input.txt", "output/answer.md"}
+    with isolated_upstream(tmp_path / "up") as up:
+        assert up.proposer._opencode_stdout(p.result.stdout) == ("<notes>stub proposer</notes>", "")
+        assert up.proposer._opencode_cost(p.result.stdout) == 0.0
+
+
+def test_the_trajectory_renderer_understands_the_real_event_shapes(verified, proposer_image, tmp_path):
+    """`trajectory.render_events` feeds the next proposer stage. It must render the real v2 tool events, not drop them."""
+    from cognitive_harness2 import trajectory
+    p, _ = go(verified, proposer_image, tmp_path, [{"tool": "read", "args": {"path": "input.txt"}}, *SCENARIOS["write"]])
+    f = tmp_path / "stream.jsonl"
+    f.write_text(p.result.stdout)
+    text = trajectory.render_events(f, obs_trunc=400, max_chars=4000)
+    assert trajectory.count_events(p.result.stdout) == len(p.events)
+    print(text)
+    assert "read" in text and "373.25" in text and "write" in text and "Created file successfully" in text, text

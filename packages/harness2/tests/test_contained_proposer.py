@@ -473,3 +473,15 @@ def test_the_opencode_provider_block_is_the_shape_the_real_binary_accepts_and_de
 
 def test_tmp_exec_is_off_for_opencode_because_the_real_binary_ran_without_it():
     assert cp.TMP_EXEC == {"opencode": False, "claude_cli": False, "agy_cli": False}
+
+
+def test_a_v2_error_event_becomes_the_proposers_error_text_not_empty_reply(pure):
+    """The first real stage-1 run reported `rc=1: empty reply` for `{"type":"error","error":{"message":"UnexpectedStatus: 403"}}`
+    because upstream's parser knows only the old `error.data.message` shape."""
+    p = pure.prop("local")
+    stdout = ('{"type":"error","timestamp":1793361530115,"sessionID":"","error":{"type":"unknown","message":"UnexpectedStatus: 403"}}\n')
+    res = sr.SessionResult("rid", 1, stdout, "", False, False, 1.0, ())
+    text, cost, err = p._parse(res, pure.scratch, None)
+    assert (text, cost) == ("", 0.0) and err == "rc=1: UnexpectedStatus: 403"
+    ok = sr.SessionResult("rid", 0, '{"type":"text","part":{"type":"text","text":"hello"}}\n', "", False, False, 1.0, ())
+    assert p._parse(ok, pure.scratch, None) == ("hello", 0.0, "")

@@ -11,6 +11,7 @@ clipped to `obs_trunc`, tool arguments to `args_trunc`, and the whole text to `m
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 _TRUNC_FMT = "…(+{n} chars — render truncation)"
@@ -96,3 +97,41 @@ def count_events(text: str) -> int:
             except json.JSONDecodeError:
                 continue
     return n
+
+
+_ESC = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b.", re.DOTALL)
+
+
+def error_events(text: str, *, limit: int = 3, width: int = 200) -> list[str]:
+    """The messages of the `error` events in a session stream, as short clean one-line strings.
+
+    opencode v2.0.25 writes `{"type":"error","error":{"type":"provider.no-route","message":"..."}}`; older builds wrote
+    `error.data.message`. Both are read. Upstream's own `_opencode_stdout` knows only the old shape, so for a v2 failure it
+    reports "empty reply" and the real cause (`UnexpectedStatus: 403`, `Unsupported package ...`, `model ... not found`) is
+    lost. The stream is untrusted: control characters and escape sequences are stripped, each message is cut to `width`."""
+    out: list[str] = []
+    for ln in (text or "").splitlines():
+        ln = ln.strip()
+        if not ln.startswith("{"):
+            continue
+        try:
+            ev = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict) or ev.get("type") != "error":
+            continue
+        err = ev.get("error")
+        if isinstance(err, dict):
+            data = err.get("data") if isinstance(err.get("data"), dict) else {}
+            msg = str(err.get("message") or data.get("message") or err.get("name") or "").strip()
+            kind = str(err.get("type") or "").strip()
+            if kind and kind != "unknown" and msg and not msg.startswith(kind):
+                msg = f"{kind}: {msg}"
+        else:
+            msg = str(err or "").strip()
+        msg = "".join(c for c in _ESC.sub("", msg) if c.isprintable()).strip()[:width].strip()
+        if msg:
+            out.append(msg)
+            if len(out) >= limit:
+                break
+    return out

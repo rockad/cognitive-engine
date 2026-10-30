@@ -325,7 +325,10 @@ def test_an_approved_run_builds_the_grant_before_the_sweep_and_audits_both(rig, 
     assert kw["libraries"] is None and tuple(kw["modes"]) == ("agg",) and kw["selector_prop"] is not None
     assert kw["adapter"].substrate.name == "cognitive" and kw["prop"].attempts == 1
     assert up.recursion.STAGE_ATTEMPTS == 1 and up.recursion.TRANSPORT_ATTEMPTS == 1 and up.config.TRANSPORT_ATTEMPTS == 1
-    assert json.loads((run_dir / "report.json").read_text())["real_model_call"] is True
+    rep = json.loads((run_dir / "report.json").read_text())
+    # approved for a real model, but this fake run_task started no session: nothing reached a model, and the report says so
+    assert rep["approved_for_real_model"] is True and rep["real_model_call"] is False
+    assert rep["cli_sessions_started"] == 0 and rep["model_sessions_reached"] == 0 and rep["sessions_summary"]["started"] == 0
     assert (run_dir / "audit.jsonl").stat().st_mode & 0o777 == 0o600 and (run_dir / "report.json").stat().st_mode & 0o777 == 0o600
 
 
@@ -488,9 +491,13 @@ def test_the_selftest_runs_the_whole_pipeline_with_clean_teardown(tmp_path, veri
     (tmp_path / "st").mkdir()
     for d in (tmp_path / "st",):
         d.chmod(0o755)
-    outcome = run_selftest(base=tmp_path / "st", out=io.StringIO())
+    outcome = run_selftest(base=tmp_path / "st", out=(printed := io.StringIO()))
     r = outcome.report
     assert selftest_problems(outcome) == [], r
+    assert r["approved_for_real_model"] is False and r["real_model_call"] is False                # a fake endpoint is not a real model
+    assert (r["cli_sessions_started"], r["model_sessions_reached"]) == (7, 7)                     # all seven reached the (fake) endpoint
+    assert r["sessions_summary"]["exit_codes"] == {"0": 7} and r["sessions_summary"]["denied_hosts"] == {}
+    assert "outcome   7 sessions started, 7 reached the model, all exited rc=0" in printed.getvalue()
     assert (r["ledger"]["P"], r["ledger"]["R"]) == (3, 4) and r["budget_identity"]["ok"] and r["real_model_call"] is False
     assert r["sessions"]["counts"] == {"proposer": 3, "solver": 4, "total": 7}
     assert sorted(x["label"] for x in r["rollouts"]) == ["agg1", "base1", "dom1", "inv1"]
@@ -633,4 +640,53 @@ def test_the_selftest_catches_a_runner_that_leaves_no_proxy_empty(tmp_path, veri
     assert selftest_problems(outcome) and r["rollouts_passed"] == 0
     first = next(e for e in events(Path(r["_run_dir"])) if e["event"] == "session_end")
     assert first["exit_code"] == 3
+    # the report says what happened: sessions started, none reached the model, the proxy denied the CLI's own loopback
+    sv = r["sessions_summary"]
+    assert sv["started"] >= 1 and sv["reached_model"] == 0 and sv["exit_codes"] == {"3": sv["started"]}
+    assert sv["denied_hosts"] and all(h.startswith("127.0.0.1:") for h in sv["denied_hosts"]) and sv["denied_reasons"] == ["not-allow-listed"]
+    assert r["real_model_call"] is False and r["model_sessions_reached"] == 0 and r["cli_sessions_started"] == sv["started"]
+    assert first["model_requests"] == 0 and first["denied_hosts"] and first["denied_hosts"][0] in sv["denied_hosts"]
     assert r["teardown"]["docker_leftovers"] == [] and settle(before) == set()
+
+
+# ── what the report says about the sessions (first real run: "real_model_call": true although no model was reached) ──
+
+def _end(model_requests=0, exit_code=0, denied=(), reasons=(), timed_out=False):
+    return {"event": "session_end", "exit_code": exit_code, "timed_out": timed_out, "model_requests": model_requests,
+            "denied_hosts": list(denied), "denied_reasons": list(reasons), "egress_denied": len(denied)}
+
+
+FIRST_RUN_ENDS = [_end(0, 1, ["127.0.0.1:34175"], ["not-allow-listed"]) for _ in range(7)]
+
+
+def test_sessions_view_of_the_first_real_run_says_seven_started_none_reached_the_model():
+    v = stage1.sessions_view([{"event": "session_start"}] * 7, FIRST_RUN_ENDS,
+                             rollout_errors=["UnexpectedStatus: 403"], stage_errors=["[inv1.a1] rc=1: empty reply"])
+    assert v["started"] == 7 and v["reached_model"] == 0 and v["exit_codes"] == {"1": 7} and v["timed_out"] == 0
+    assert v["denied_hosts"] == {"127.0.0.1:34175": 7} and v["denied_reasons"] == ["not-allow-listed"]
+    assert v["first_error"] == "UnexpectedStatus: 403"
+    ok = stage1.sessions_view([{"event": "session_start"}] * 2, [_end(3), _end(1)], rollout_errors=[], stage_errors=[])
+    assert ok["reached_model"] == 2 and ok["exit_codes"] == {"0": 2} and ok["denied_hosts"] == {} and ok["first_error"] is None
+    assert stage1.sessions_view([], [], rollout_errors=[], stage_errors=["x"])["first_error"] == "x"
+
+
+def test_the_summary_line_names_what_happened_in_plain_words():
+    v = stage1.sessions_view([{"event": "session_start"}] * 7, FIRST_RUN_ENDS, rollout_errors=["UnexpectedStatus: 403"], stage_errors=[])
+    text = "\n".join(stage1.sessions_lines({"sessions_summary": v}))
+    assert ("7 sessions started, 0 reached the model: 7 exited rc=1; first error: UnexpectedStatus: 403; "
+            "proxy denied: 127.0.0.1:34175 (7 sessions, not-allow-listed)") in text.replace("outcome   ", "")
+    assert "no session reached the model" in text
+    good = stage1.sessions_view([{"event": "session_start"}] * 7, [_end(2)] * 7, rollout_errors=[], stage_errors=[])
+    line = "\n".join(stage1.sessions_lines({"sessions_summary": good}))
+    assert line.strip() == "outcome   7 sessions started, 7 reached the model, all exited rc=0"
+
+
+def test_the_summary_caps_how_many_denied_hosts_it_prints_and_never_prints_a_url_or_body():
+    ends = [_end(1, 0, [f"h{i}.example:443" for i in range(10)], ["not-allow-listed"])]
+    v = stage1.sessions_view([{"event": "session_start"}], ends, rollout_errors=[], stage_errors=[])
+    text = "\n".join(stage1.sessions_lines({"sessions_summary": v}))
+    assert "h0.example:443" in text and "+5 more" in text and "http" not in text
+    mixed = stage1.sessions_view([{"event": "session_start"}] * 3, [_end(1, 0), _end(0, None, timed_out=True), _end(1, 2)],
+                                 rollout_errors=[], stage_errors=[])
+    assert mixed["timed_out"] == 1 and mixed["exit_codes"] == {"0": 1, "2": 1, "none": 1}
+    assert "1 timed out" in "\n".join(stage1.sessions_lines({"sessions_summary": mixed}))

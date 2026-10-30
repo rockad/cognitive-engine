@@ -550,7 +550,7 @@ class AuditedAdapter(ss.SumSignedAdapter):
         metrics: dict = {}
         with contextlib.suppress(OSError, ValueError):
             metrics = json.loads((out / "metrics.json").read_text())
-        rec.update(ok=True, passed=None if verdict is None else bool(verdict["all_pass"]),
+        rec.update(ok=True, passed=None if verdict is None else bool(verdict["all_pass"]), errors=list(metrics.get("errors") or []),
                    n_passed=None if verdict is None else verdict["n_passed"],
                    n_criteria=None if verdict is None else verdict["n_criteria"],
                    delivered=self.delivered(out), exit_code=metrics.get("exit_code"), timed_out=metrics.get("timed_out"),
@@ -620,7 +620,7 @@ class SweepContext:
     surface: Any
     run_dir: Path
     audit: Audit
-    real_model_call: bool = True
+    approved_for_real_model: bool = True          # approved by the user to call a REAL model (False: the selftest, a fake)
     run_task: Callable[..., Any] | None = None      # tests may replace upstream's run_task
 
 
@@ -658,6 +658,59 @@ def _stage_view(res: Any) -> list[dict]:
             for st in (mode.get("stages") or []) if isinstance(st, dict)]
 
 
+def sessions_view(starts: Sequence[Mapping[str, Any]], ends: Sequence[Mapping[str, Any]], *,
+                  rollout_errors: Sequence[str], stage_errors: Sequence[str]) -> dict:
+    """What happened to the sessions, from the runner's own `session_start` / `session_end` events (numbers and
+    `host:port` strings; no prompt, no model output). `reached_model` counts sessions during which the egress proxy opened
+    a connection to the host bridge, i.e. to the local model endpoint: the CLI got as far as the model's door. It does
+    not say the model answered. `first_error` is the first CLI-reported cause (an `error` event of a solver session, else
+    a proposer stage's error text)."""
+    exit_codes: dict[str, int] = {}
+    denied: dict[str, int] = {}
+    reasons: set[str] = set()
+    reached = timed_out = 0
+    for e in ends:
+        key = "none" if e.get("exit_code") is None else str(e["exit_code"])
+        exit_codes[key] = exit_codes.get(key, 0) + 1
+        timed_out += bool(e.get("timed_out"))
+        reached += bool(e.get("model_requests"))
+        for h in e.get("denied_hosts") or []:
+            denied[h] = denied.get(h, 0) + 1
+        reasons.update(e.get("denied_reasons") or [])
+    first = next((sr.sanitize_terminal(x)[:160] for x in (*rollout_errors, *stage_errors) if x), None)
+    return {"started": len(starts), "ended": len(ends), "reached_model": reached, "exit_codes": dict(sorted(exit_codes.items())),
+            "timed_out": timed_out, "denied_hosts": dict(sorted(denied.items(), key=lambda kv: (-kv[1], kv[0]))),
+            "denied_reasons": sorted(reasons), "first_error": first}
+
+
+def _n(n: int, word: str) -> str:
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def sessions_lines(report: Mapping[str, Any], *, max_hosts: int = 5) -> list[str]:
+    """The sessions summary printed at the end of a run. On a failure it says what happened instead of just a status."""
+    v = report.get("sessions_summary") or {}
+    started, reached = v.get("started", 0), v.get("reached_model", 0)
+    head = f"outcome   {_n(started, 'session')} started, {reached} reached the model"
+    codes = v.get("exit_codes") or {}
+    bad = [f"{n} exited rc={c}" for c, n in codes.items() if c not in ("0", "none")]
+    if v.get("timed_out"):
+        bad.append(f"{v['timed_out']} timed out")
+    parts = [head + (": " + ", ".join(bad) if bad else (", all exited rc=0" if started and codes.get("0") == started else ""))]
+    if v.get("first_error"):
+        parts.append(f"first error: {v['first_error']}")
+    denied = v.get("denied_hosts") or {}
+    if denied:
+        why = ", " + ", ".join(v["denied_reasons"]) if v.get("denied_reasons") else ""
+        shown = [f"{h} ({_n(n, 'session')}{why})" for h, n in list(denied.items())[:max_hosts]]
+        more = len(denied) - max_hosts
+        parts.append("proxy denied: " + ", ".join(shown) + (f", +{more} more" if more > 0 else ""))
+    lines = ["; ".join(parts) + "\n"]
+    if started and not reached:
+        lines.append("          no session reached the model: nothing was asked of it. Fix the cause above, then run again.\n")
+    return lines
+
+
 def execute_sweep(ctx: SweepContext) -> SweepOutcome:
     """Run the approved sweep and tear everything down, whatever happens. Returns the report; never leaves a file out.
 
@@ -669,6 +722,8 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
     t0 = time.monotonic()
     started_at = now_iso()
     session_ids: list[str] = []
+    starts: list[dict] = []
+    ends: list[dict] = []
     ids_lock = threading.Lock()
     before_entries = runtime_entries()
     scratch = Path(s.profile.workspace_roots[0]) / g.sweep_id
@@ -678,13 +733,15 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
     budget = g.make_budget()
 
     def observer(event: str, fields: Mapping[str, Any]) -> None:
-        if event == "session_start":
+        if event in ("session_start", "session_end"):
             with ids_lock:
-                session_ids.append(str(fields.get("session")))
+                if event == "session_start":
+                    session_ids.append(str(fields.get("session")))
+                (starts if event == "session_start" else ends).append(dict(fields))
         audit.emit(event, **fields)
 
     audit.emit("sweep_start", sweep_id=g.sweep_id, channel=g.channel, model=ch.model, endpoint=ch.endpoints[0],
-               real_model_call=ctx.real_model_call, k=K, modes=list(MODES), task=s.task, caps=ch.caps.to_dict(),
+               approved_for_real_model=ctx.approved_for_real_model, k=K, modes=list(MODES), task=s.task, caps=ch.caps.to_dict(),
                per_session_s=g.per_session_s, max_wall_s=g.max_wall_s,
                max_proposer_sessions=g.max_proposer_sessions, max_solver_sessions=g.max_solver_sessions)
     try:
@@ -742,9 +799,20 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
     if dirty:
         status = f"{status}+dirty"
     rollouts = sorted((adapter.rollouts.values() if adapter else []), key=lambda r: r["label"])
+    with ids_lock:
+        summary = sessions_view(list(starts), list(ends),
+                                rollout_errors=[x for r in rollouts for x in (r.get("errors") or [])],
+                                stage_errors=[st["error"] for st in stages if st.get("error")])
+    # A real run in which sessions started but none reached the model is a failure, whatever else the report says.
+    no_model = ctx.approved_for_real_model and summary["started"] > 0 and summary["reached_model"] == 0
     snapshot = budget.snapshot()
     report = {
-        "schema": 1, "kind": "stage1", "sweep_id": g.sweep_id, "real_model_call": ctx.real_model_call, "status": status,
+        "schema": 1, "kind": "stage1", "sweep_id": g.sweep_id, "status": status,
+        # `real_model_call` used to be the approval flag, so a run where no session got past a proxy denial claimed a model call.
+        # It is now true only when a session really reached the model endpoint; the approval is its own field.
+        "approved_for_real_model": ctx.approved_for_real_model, "cli_sessions_started": summary["started"],
+        "model_sessions_reached": summary["reached_model"],
+        "real_model_call": bool(ctx.approved_for_real_model and summary["reached_model"] > 0), "sessions_summary": summary,
         "approved_by": g.approved_by, "approval_mode": ctx.approval.mode, "approved_at": ctx.approval.at,
         "started_at": started_at, "finished_at": now_iso(), "wall_s": round(time.monotonic() - t0, 3),
         "channel": {"name": ch.name, "kind": ch.kind, "model": ch.model, "endpoint": ch.endpoints[0],
@@ -754,7 +822,8 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
         "ledger": ledger, "budget_identity": {"expected_P": EXPECTED_P, "expected_R": EXPECTED_R, "ok": identity_ok},
         "stages": stages,
         "rollouts": [{k: r.get(k) for k in ("label", "run_id", "ok", "passed", "n_passed", "n_criteria", "delivered",
-                                              "exit_code", "timed_out", "n_events", "duration_s", "error", "answer_excerpt")}
+                                              "exit_code", "timed_out", "n_events", "duration_s", "error", "errors",
+                                              "answer_excerpt")}
                      for r in rollouts],
         "rollouts_passed": sum(1 for r in rollouts if r.get("passed") is True),
         "rollouts_failed": sum(1 for r in rollouts if r.get("passed") is False or not r.get("ok")),
@@ -773,7 +842,7 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
     audit.emit("sweep_end", status=status, wall_s=report["wall_s"], ledger=ledger, rollouts_passed=report["rollouts_passed"],
                rollouts_failed=report["rollouts_failed"], report=str(report_path))
     code = (130 if isinstance(error, KeyboardInterrupt) else 3 if dirty else
-            1 if error is not None or res is None or not identity_ok else 0)
+            1 if error is not None or res is None or not identity_ok or no_model else 0)
     return SweepOutcome(report, code)
 
 
@@ -881,20 +950,21 @@ def _approved(s: Settings, plan: SweepPlan, pre: Preflight, up: Any, surface: An
     try:
         audit.emit("plan", plan=plan.to_dict(), preflight={c.name: c.ok for c in pre.checks})
         audit.emit("approval", approved_by=approval.approved_by, mode=approval.mode, sweep_id=sweep_id,
-                   channel=s.channel, real_model_call=real)
+                   channel=s.channel, approved_for_real_model=real)
         g = grant or make_grant(plan, sweep_id=sweep_id, approval=approval, per_session_s=s.per_session_s)
         audit.emit("grant", **g.to_dict())
         assert pre.verified is not None and pre.image is not None and pre.cli is not None
         ctx = SweepContext(settings=s, plan=plan, grant=g, approval=approval, verified=pre.verified, image=pre.image,
-                           cli=pre.cli, up=up, surface=surface, run_dir=run_dir, audit=audit, real_model_call=real,
+                           cli=pre.cli, up=up, surface=surface, run_dir=run_dir, audit=audit, approved_for_real_model=real,
                            run_task=run_task)
         outcome = execute_sweep(ctx)
     finally:
         audit.close()
     r = outcome.report
     out.write(f"\nstatus {r['status']}  wall {r['wall_s']:g} s  ledger {r['ledger'] and (r['ledger']['P'], r['ledger']['R'])}  "
-              f"rollouts passed {r['rollouts_passed']}, failed {r['rollouts_failed']}\n"
-              f"audit  {audit.path}\nreport {run_dir / 'report.json'}\n")
+              f"rollouts passed {r['rollouts_passed']}, failed {r['rollouts_failed']}\n")
+    out.writelines(sessions_lines(r))
+    out.write(f"audit  {audit.path}\nreport {run_dir / 'report.json'}\n")
     return outcome.exit_code
 
 
@@ -1007,8 +1077,12 @@ def selftest_problems(outcome: SweepOutcome) -> list[str]:
     t = r["teardown"]
     if t["scratch_left"] or t["docker_leftovers"] or t["gate_locked"]:
         bad.append(f"teardown left something: {t}")
-    if r.get("real_model_call"):
+    if r.get("real_model_call") or r.get("approved_for_real_model"):
         bad.append("a selftest report claims a real model call")
+    sv = r.get("sessions_summary") or {}
+    if sv.get("started") != EXPECTED_P + EXPECTED_R or sv.get("reached_model") != sv.get("started"):
+        bad.append(f"the fake model endpoint was reached by {sv.get('reached_model')} of {sv.get('started')} sessions, "
+                   f"expected all {EXPECTED_P + EXPECTED_R}")
     return bad
 
 

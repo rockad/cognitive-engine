@@ -209,6 +209,37 @@ def redact(text: str, secrets_: Sequence[str]) -> str:
     return text
 
 
+_ACCESS_LINE = re.compile(r"ACCESS decision=(allow|deny) host=(\S+) port=(\d+) reason=([a-z-]+)")
+_MODEL_ROUTES = frozenset({"unix-route", "unix-listener"})      # the proxy's two ways to the host bridge (the local model)
+
+
+def egress_summary(lines: Sequence[str]) -> dict[str, object]:
+    """What the proxy decided during one session, as numbers and `host:port` strings. Nothing else of the log is kept.
+
+    `model_requests` counts the connections the proxy opened to the host bridge, i.e. to the local model endpoint
+    (`unix-route`, or the direct listener). It is connection-level evidence that the CLI got as far as the model's
+    door: it says nothing about whether the model answered. `denied_hosts` is deduplicated, in first-seen order, capped."""
+    model = allowed = denied = 0
+    hosts: list[str] = []
+    reasons: list[str] = []
+    for line in lines:
+        m = _ACCESS_LINE.fullmatch(line.strip())
+        if not m:
+            continue
+        decision, host, port, reason = m.groups()
+        if decision == "allow":
+            allowed += 1
+            model += reason in _MODEL_ROUTES
+            continue
+        denied += 1
+        if f"{host}:{port}" not in hosts and len(hosts) < 10:
+            hosts.append(f"{host}:{port}")
+        if reason not in reasons and len(reasons) < 10:
+            reasons.append(reason)
+    return {"model_requests": model, "egress_allowed": allowed, "egress_denied": denied,
+            "denied_hosts": hosts, "denied_reasons": sorted(reasons)}
+
+
 def _overlap(a: str, b: str) -> bool:
     pa, pb = PurePosixPath(a), PurePosixPath(b)
     return pa == pb or pa in pb.parents or pb in pa.parents
@@ -767,7 +798,8 @@ class ProposerSessionRunner:
                      timed_out=None if result is None else result.timed_out,
                      truncated=None if result is None else result.truncated,
                      duration_s=round(time.monotonic() - t0, 3), reclaimed=reclaimed, leftovers=len(leftovers),
-                     error=None if error is None else type(error).__name__)
+                     error=None if error is None else type(error).__name__,
+                     **(egress_summary(result.egress_log) if result is not None else {}))
         if error is not None:
             if leftovers:
                 raise SessionCleanupError(leftovers) from error

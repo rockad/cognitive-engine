@@ -99,3 +99,31 @@ def test_count_events_counts_json_objects_only():
 
 def test_rendering_reads_only_the_one_file_and_does_not_follow_a_missing_path(tmp_path):
     assert "failed to read" in trajectory.render_events(tmp_path, obs_trunc=1, max_chars=1)   # a directory
+
+
+# ── error events of opencode v2.0.25 (real shapes, taken from the first stage-1 run and the stub-model probe) ─────
+
+V2_403 = '{"type":"error","timestamp":1793361530115,"sessionID":"","error":{"type":"unknown","message":"UnexpectedStatus: 403"}}'
+V2_404 = ('{"type":"error","timestamp":1,"sessionID":"ses_x","error":{"type":"provider.invalid-request","message":'
+          '"model \\"gemma4:12b\\" not found, try pulling it first","status":404,"response":{"body":"{...}"}}}')
+V2_NOROUTE = '{"type":"error","error":{"type":"provider.no-route","message":"Unsupported package for ollama/gemma4:12b: "}}'
+
+
+def test_error_events_reads_the_v2_error_message_and_type():
+    from cognitive_harness2 import trajectory
+    assert trajectory.error_events(V2_403) == ["UnexpectedStatus: 403"]
+    assert trajectory.error_events("\n".join(["not json", '{"type":"step_start"}', V2_404])) == [
+        'provider.invalid-request: model "gemma4:12b" not found, try pulling it first']
+    assert trajectory.error_events(V2_NOROUTE) == ["provider.no-route: Unsupported package for ollama/gemma4:12b:"]
+
+
+def test_error_events_also_reads_the_older_data_message_shape_and_is_bounded_and_clean():
+    from cognitive_harness2 import trajectory
+    old = '{"type":"error","error":{"name":"APIError","data":{"message":"old shape"}}}'
+    assert trajectory.error_events(old) == ["old shape"]
+    many = "\n".join(V2_403 for _ in range(20))
+    assert len(trajectory.error_events(many, limit=3)) == 3
+    nasty = '{"type":"error","error":{"type":"x","message":"\\u001b[31mred\\u001b[0m' + "y" * 500 + '"}}'
+    (msg,) = trajectory.error_events(nasty)
+    assert "\x1b" not in msg and len(msg) <= 200
+    assert trajectory.error_events("") == [] and trajectory.error_events('{"type":"text","part":{"text":"hi"}}') == []

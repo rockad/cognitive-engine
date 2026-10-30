@@ -587,3 +587,22 @@ def test_without_a_gate_nothing_changes(world, monkeypatch):
     substrate, ex, _ = make_substrate(world, monkeypatch, s)
     assert ex.gate is None
     assert (substrate.execute(TASK, install(world), ["n1"], 60)[0] / "metrics.json").is_file()
+
+
+def test_metrics_carry_the_error_events_and_the_proxy_facts_of_a_session_that_failed(world, monkeypatch):
+    """The first real stage-1 run left `rc=1` and a bare egress line; the cause (an `error` event) and the number of
+    requests that reached the model are now in the metrics."""
+    stdout = '{"type":"error","timestamp":1,"sessionID":"","error":{"type":"unknown","message":"UnexpectedStatus: 403"}}\n'
+    log = ("ACCESS decision=deny host=127.0.0.1 port=34175 reason=not-allow-listed",)
+    sess = Session(stdout=stdout, exit_code=1, egress_log=log)
+    s, _, _ = make_substrate(world, monkeypatch, sess)
+    (d,) = s.execute(TASK, install(world), ["bad"], 60)
+    m = json.loads((d / "metrics.json").read_text())
+    assert m["errors"] == ["UnexpectedStatus: 403"] and m["exit_code"] == 1 and m["delivered"] is False
+    assert m["model_requests"] == 0 and m["denied_hosts"] == ["127.0.0.1:34175"] and m["egress"] == list(log)
+    ok = Session(write=lambda ws: (ws / "output" / "answer.txt").write_text(GOOD),
+                 egress_log=("ACCESS decision=allow host=harness2-proxy port=1 reason=unix-route",) * 2)
+    s2, _, _ = make_substrate(world, monkeypatch, ok)
+    (d2,) = s2.execute(TASK, install(world), ["good"], 60)
+    m2 = json.loads((d2 / "metrics.json").read_text())
+    assert m2["errors"] == [] and m2["model_requests"] == 2 and m2["denied_hosts"] == []

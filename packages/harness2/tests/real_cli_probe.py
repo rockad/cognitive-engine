@@ -253,7 +253,8 @@ def run_session(verified: sandbox.VerifiedDocker, img: image.ImageRef, workdir: 
                 timeout_s: float = 90.0, prompt: str | None = None, agents_md: str | None = AGENTS_MD,
                 env_edit: Callable[[dict[str, str]], None] | None = None,
                 config_merge: Mapping[str, Any] | None = None,
-                argv_edit: Callable[[tuple[str, ...]], tuple[str, ...]] | None = None) -> Probe:
+                argv_edit: Callable[[tuple[str, ...]], tuple[str, ...]] | None = None,
+                extra_files: Mapping[str, str] | None = None) -> Probe:
     """Run the real opencode once, as a stage-1 SOLVER session, against `stub`. Never touches a real model."""
     ws_root = workdir / "workspaces"
     ws_root.mkdir(parents=True, exist_ok=True)
@@ -273,6 +274,9 @@ def run_session(verified: sandbox.VerifiedDocker, img: image.ImageRef, workdir: 
         (ws / name).chmod(0o644)
     (ws / "output").mkdir()
     (ws / "output").chmod(0o1777)
+    for name, body in (extra_files or {}).items():
+        (ws / name).write_text(body)
+        (ws / name).chmod(0o644)
     cli_in = sr.container_cli_path(str(OPENCODE))
     job = stage1.SolverJob(TASK, "probe", prompt or task.prompt, str(ws), ch.model, cli_in)
     argv = stage1.solver_argv(job)

@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import channels, upstream_egress, workspace_harvest
+from . import channels, trajectory, upstream_egress, workspace_harvest
 from .image import ImageRef
 from .model_gate import GATE, ModelGate
 from .sandbox import VerifiedDocker
@@ -374,6 +374,8 @@ def _build_class(up: Upstream) -> type:
                     return body, cost, ""
             if kind == "opencode":
                 text, err = P._opencode_stdout(result.stdout)
+                if not err:           # upstream reads only the old `error.data.message`; opencode v2 writes `error.message`
+                    err = "; ".join(trajectory.error_events(result.stdout))
             else:
                 text, err = result.stdout.strip(), ""
             if text.strip():
