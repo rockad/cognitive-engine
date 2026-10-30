@@ -82,7 +82,8 @@ class Sandbox:
         if offset is not None or limit is not None:
             lines = text.splitlines(keepends=True)
             start = max(0, (offset or 1) - 1)
-            end = len(lines) if limit is None else start + max(0, limit)
+            # limit <= 0 (for example -1) is the common spelling of "no limit"; it is not "zero lines"
+            end = len(lines) if (limit is None or limit <= 0) else start + limit
             text = "".join(lines[start:end])
         if len(text) > MAX_READ_CHARS:
             text = text[:MAX_READ_CHARS] + "\n[truncated]"

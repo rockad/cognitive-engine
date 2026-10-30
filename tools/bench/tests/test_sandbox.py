@@ -92,3 +92,10 @@ def test_validate_args_types_enums_unknown():
     assert validate_args("read_file", {"path": "a", "bogus": 1})
     assert validate_args("nope", {})
     assert validate_args("list_dir", {"path": "a", "recursive": "true"})
+
+
+def test_non_positive_limit_means_no_limit(sb):
+    sb.execute("write_file", {"path": "f.txt", "content": "a\nb\nc\n"})
+    for limit in (-1, 0):
+        assert sb.execute("read_file", {"path": "f.txt", "offset": 1, "limit": limit}).text == "a\nb\nc\n"
+    assert sb.execute("read_file", {"path": "f.txt", "offset": -3}).text == "a\nb\nc\n"
