@@ -14,6 +14,14 @@ from typing import Any
 DEFAULT_HOST = "http://127.0.0.1:11434"
 
 
+def same_model(a: str | None, b: str | None) -> bool:
+    """Ollama lists a model installed without a tag as `name:latest`."""
+    def norm(x: str | None) -> str:
+        x = x or ""
+        return x[:-7] if x.endswith(":latest") else x
+    return norm(a) == norm(b)
+
+
 class OllamaError(Exception):
     """A request failed (HTTP error, connection error, bad JSON) or timed out."""
 
@@ -120,11 +128,11 @@ class Ollama:
         self._request("/api/generate", {"model": model, "keep_alive": 0}, timeout)
 
     def wait_unloaded(self, model: str | None = None, wait_s: float = 30, poll_s: float = 0.5) -> bool:
-        """True once /api/ps lists no model (or not `model`)."""
+        """True once /api/ps lists no model (or not `model`; `x` and `x:latest` are the same model)."""
         deadline = time.monotonic() + wait_s
         while True:
             names = [m.get("name") or m.get("model") for m in self.ps()]
-            if (model is None and not names) or (model is not None and model not in names):
+            if (model is None and not names) or (model is not None and not any(same_model(model, n) for n in names)):
                 return True
             if time.monotonic() >= deadline:
                 return False

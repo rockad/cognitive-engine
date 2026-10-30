@@ -17,9 +17,9 @@ THINK_OFF_TOOLS_MARGIN = 0.05    # T(think:false) >= T(default) - margin
 # Run-wide constants (also in the pre-registration document).
 TOTAL_BUDGET_S = 3600
 REPORT_RESERVE_S = 300
-PHASE_ORDER = ("perf", "tools_t0", "tools_t06", "agent_t0", "tools_nothink", "agent_nothink")
-PHASE_CUM_FRACTION = {"perf": 0.10, "tools_t0": 0.35, "tools_t06": 0.55, "agent_t0": 0.80,
-                      "tools_nothink": 0.88, "agent_nothink": 1.00}
+PHASE_ORDER = ("perf", "tools_t0", "agent_t0", "tools_t06", "tools_nothink", "agent_nothink")
+PHASE_CUM_FRACTION = {"perf": 0.10, "tools_t0": 0.30, "agent_t0": 0.60, "tools_t06": 0.78,
+                      "tools_nothink": 0.86, "agent_nothink": 1.00}
 NUM_CTX = 16384
 NUM_PREDICT = {"tools": 2048, "agent": 4096, "perf": 160}
 REQUEST_TIMEOUT_S = 240

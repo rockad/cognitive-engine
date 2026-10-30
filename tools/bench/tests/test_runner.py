@@ -24,7 +24,7 @@ def chatty(body, fake):
 
 
 def test_end_to_end_with_a_fake_server(tmp_path):
-    with FakeOllama(chatty) as f:
+    with FakeOllama(chatty, ps_suffix=":latest") as f:      # ollama lists untagged models as name:latest
         r = make_runner(f, tmp_path)
         summary = r.run()
         assert set(summary["models"]) == {"m1", "m2"}

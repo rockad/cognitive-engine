@@ -17,8 +17,10 @@ def git_info(repo: Path) -> dict[str, Any]:
             return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=20).stdout.strip()
         except (OSError, subprocess.SubprocessError):
             return ""
+    added = run("log", "--diff-filter=A", "--format=%H", "--", "tools/bench/PREREGISTRATION.md").splitlines()
     return {"head": run("rev-parse", "HEAD"), "branch": run("rev-parse", "--abbrev-ref", "HEAD"),
-            "prereg_commit": run("log", "-n1", "--format=%H", "--", "tools/bench/PREREGISTRATION.md"),
+            "prereg_commit": added[-1] if added else "",
+            "prereg_latest_commit": run("log", "-n1", "--format=%H", "--", "tools/bench/PREREGISTRATION.md"),
             "dirty_bench": bool(run("status", "--porcelain", "--", "tools/bench"))}
 
 
@@ -72,7 +74,7 @@ def render(summary: dict[str, Any], git: dict[str, Any]) -> str:
     A("")
     A("## Pre-registered rules (committed before any result)")
     A("")
-    A(f"- Pre-registration commit: `{git.get('prereg_commit', '')[:12]}` (tools/bench/PREREGISTRATION.md, tools/bench/ollama_bench/scoring.py); "
+    A(f"- Pre-registration commit: `{git.get('prereg_commit', '')[:12]}`, amended once before the main run (phase order and time shares only, see Amendment 1) in `{git.get('prereg_latest_commit', '')[:12]}` (tools/bench/PREREGISTRATION.md, tools/bench/ollama_bench/scoring.py); "
       f"code under test: `{git.get('head', '')[:12]}` on `{git.get('branch', '')}`"
       + (" (WARNING: tools/bench had uncommitted changes)" if git.get("dirty_bench") else " (clean)"))
     A("- Score = 100 x (0.50 agent success + 0.25 tool-suite pass rate + 0.15 speed + 0.10 robustness).")

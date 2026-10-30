@@ -251,7 +251,7 @@ def run_agent_task(task: Task, chat: ChatFn, *, max_steps: int = MAX_STEPS, task
     category = None if passed else classify_failure(stop, grade_cat, steps, outcome_cats)
     stats = [s["stats"] for s in steps]
     return {
-        "task_id": task.id, "kind": task.kind, "passed": passed, "category": category, "detail": detail,
+        "task_id": task.id, "task_kind": task.kind, "passed": passed, "category": category, "detail": detail,
         "stop": stop, "error": err, "steps_used": len(steps), "wall_s": round(wall, 3),
         "prompt_tokens": sum(s.get("prompt_eval_count") or 0 for s in stats),
         "gen_tokens": sum(s.get("eval_count") or 0 for s in stats),

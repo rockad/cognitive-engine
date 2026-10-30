@@ -15,7 +15,7 @@ from typing import Any
 from . import scoring as sc
 from .agent import Task, build_tasks, run_agent_task
 from .cases import SYSTEM_TOOLS, Case, build_cases
-from .client import ChatResult, Ollama, is_malformed_tool_call
+from .client import ChatResult, Ollama, is_malformed_tool_call, same_model
 from .perf import build_perf_request
 from .system import GpuSampler, gpu_total_mib, gpu_used_mib, load_state, wait_for_quiet
 from .tools import agent_tools, tool_definitions
@@ -158,7 +158,7 @@ class Runner:
         st.perf["cold_load_duration_s"] = _spread([x["load_duration_s"] for x in ok_loads])
         if not ok_loads:
             raise ModelFailed("no cold load succeeded")
-        ps = [m for m in self.client.ps() if (m.get("name") or m.get("model")) == st.name]
+        ps = [m for m in self.client.ps() if same_model(m.get("name") or m.get("model"), st.name)]
         st.ps_16k = ps[0] if ps else None
         if st.ps_16k:
             st.perf["ps"] = {k: st.ps_16k.get(k) for k in ("size", "size_vram", "context_length", "expires_at")}
@@ -366,7 +366,7 @@ def summarize_agent(recs: list[dict[str, Any]], skipped: int) -> dict[str, Any]:
     cats = Counter(r["category"] or "gave_up" for r in recs if not r["passed"])
     by_kind: dict[str, list[int]] = {}
     for r in recs:
-        k = by_kind.setdefault(r["kind"], [0, 0])
+        k = by_kind.setdefault(r["task_kind"], [0, 0])
         k[1] += 1
         k[0] += 1 if r["passed"] else 0
     passed = [r for r in recs if r["passed"]]

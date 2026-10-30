@@ -25,10 +25,11 @@ def chat_response(content: str = "", tool_calls: list[tuple[str, dict[str, Any]]
 
 
 class FakeOllama:
-    def __init__(self, responder: Responder, *, size: int = 3_000_000_000, size_vram: int | None = None):
+    def __init__(self, responder: Responder, *, size: int = 3_000_000_000, size_vram: int | None = None, ps_suffix: str = ""):
         self.responder = responder
         self.size = size
         self.size_vram = size if size_vram is None else size_vram
+        self.ps_suffix = ps_suffix
         self.loaded: list[str] = []
         self.requests: list[dict[str, Any]] = []
         self.unloads: list[str] = []
@@ -50,7 +51,7 @@ class FakeOllama:
                 if self.path == "/api/tags":
                     self._send(200, {"models": [{"name": n, "size": 1} for n in ("m1", "m2")]})
                 elif self.path == "/api/ps":
-                    self._send(200, {"models": [{"name": n, "size": fake.size, "size_vram": fake.size_vram,
+                    self._send(200, {"models": [{"name": n + fake.ps_suffix, "size": fake.size, "size_vram": fake.size_vram,
                                                  "context_length": 16384} for n in fake.loaded]})
                 elif self.path == "/api/version":
                     self._send(200, {"version": "0.0-fake"})

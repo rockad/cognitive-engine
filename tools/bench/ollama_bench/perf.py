@@ -5,7 +5,7 @@ from typing import Any
 
 from .tools import tool_definitions
 
-CHARS_PER_TOKEN = 3.6      # calibrated against the models' own prompt_eval_count in a pilot run
+CHARS_PER_TOKEN = 4.2      # calibrated against the models' own prompt_eval_count in a pilot run
 
 SYSTEM_CORE = (
     "You are opencode, an interactive coding agent running in a terminal. You help the user with software "

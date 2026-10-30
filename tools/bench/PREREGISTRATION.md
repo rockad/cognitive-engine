@@ -32,14 +32,14 @@ using 2-4 GB), 16k context. The answer picks the model for stage 1 of the Harnes
    ~4k prompt tokens (a fresh nonce at the start of every prompt defeats the prompt cache). nvidia-smi is sampled
    every second for the whole batch; the GPU baseline is read before the first load.
 2. B. Tool suite, thinking default, temperature 0 (>= 24 cases x 2 repetitions).
-3. B'. Tool suite, thinking default, temperature 0.6 / top_p 0.95 (robustness).
-4. C. Mini-agent tasks, thinking default, temperature 0 (6 `sum-signed` instances + 4 `edit-prompt` tasks).
+3. C. Mini-agent tasks, thinking default, temperature 0 (6 `sum-signed` instances + 4 `edit-prompt` tasks).
+4. B'. Tool suite, thinking default, temperature 0.6 / top_p 0.95 (robustness).
 5. B''. Tool suite, `think:false`, temperature 0.
 6. C'. Mini-agent tasks, `think:false`, temperature 0.
 
 Wall-clock budget for the whole run: 60 minutes (55 for models, 5 reserved for the report). Each model gets an
 equal share of the time left when it starts. Phase deadlines are cumulative shares of the model's budget
-(A 10%, B 35%, B' 55%, C 80%, B'' 88%, C' 100%), so unused time rolls forward. Items not started by a phase
+(A 10%, B 30%, C 60%, B' 78%, B'' 86%, C' 100%), so unused time rolls forward. Items not started by a phase
 deadline are recorded as `skipped_budget` and excluded from that phase's pass rate; the report flags the model as
 incomplete. Tool-suite items run repetition 1 of every case before repetition 2; agent tasks are interleaved
 (sum, edit, sum, edit, ...), so a truncated phase is still representative.
@@ -92,3 +92,13 @@ Failure categories: `timeout`, `no_tool_call`, `malformed_args`, `wrong_file`, `
 `sum-signed` uses the instances and the pure-Python verdict of `cognitive_harness2.sum_signed` (pass = all three
 criteria). `edit-prompt` passes when the new line is present exactly once, in the right place, every other line
 is unchanged byte for byte, and no frontmatter appeared.
+
+## Amendment 1 (before the main run; no benchmark result existed)
+
+A two-minute pilot on `qwen3-4b-16k` (4 phases limited to 6 tool cases and 2 agent tasks, results discarded) showed
+5-6 s per thinking tool-suite call and 33 s for a runaway-thinking agent step, so the full plan does not fit 55
+minutes for three models. The mini-agent success rate carries 50% of the score, so its phase now runs before the
+temperature 0.6 robustness pass and the `think:false` passes, and the cumulative phase shares became
+A 10%, B 30%, C 60%, B' 78%, B'' 86%, C' 100%. The pilot also fixed two harness defects (`name:latest` matching
+in `/api/ps`; the task kind being overwritten in the record) and recalibrated the prompt-size constant.
+Weights, gates, the tie rule, the think:false rule, caps, timeouts and the case list are unchanged.
