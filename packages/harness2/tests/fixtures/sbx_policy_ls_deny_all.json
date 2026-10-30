@@ -1,0 +1,69 @@
+{
+  "rules": [
+    {
+      "id": "default-fs-read-allow-all",
+      "name": "default-fs-read-allow-all",
+      "policy_id": "local-policy",
+      "scope": "global",
+      "applies_to": "all",
+      "resource_type": "filesystem:read",
+      "decision": "allow",
+      "resources": [
+        "**"
+      ],
+      "origin": "local",
+      "layer": "local",
+      "status": "active",
+      "editable": false,
+      "provenance": {
+        "created_via": "default"
+      },
+      "actions": [
+        "fs:mount:read"
+      ]
+    },
+    {
+      "id": "default-fs-write-allow-all",
+      "name": "default-fs-write-allow-all",
+      "policy_id": "local-policy",
+      "scope": "global",
+      "applies_to": "all",
+      "resource_type": "filesystem:write",
+      "decision": "allow",
+      "resources": [
+        "**"
+      ],
+      "origin": "local",
+      "layer": "local",
+      "status": "active",
+      "editable": false,
+      "provenance": {
+        "created_via": "default"
+      },
+      "actions": [
+        "fs:mount:read",
+        "fs:mount:write"
+      ]
+    },
+    {
+      "id": "default-deny-all",
+      "name": "default-deny-all",
+      "policy_name": "default-deny-all",
+      "scope": "global",
+      "applies_to": "all",
+      "resource_type": "network",
+      "decision": "deny",
+      "resources": [
+        "**"
+      ],
+      "origin": "local",
+      "layer": "local",
+      "status": "active",
+      "editable": false,
+      "actions": [
+        "net:connect:tcp",
+        "net:connect:udp"
+      ]
+    }
+  ]
+}

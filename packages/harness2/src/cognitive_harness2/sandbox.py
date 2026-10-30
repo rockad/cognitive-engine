@@ -18,11 +18,14 @@ docker call the runner makes afterwards, so it cannot change between the check a
 an explicit opt-in that writes candidates to a temp directory and returns a diff for static
 inspection; it never executes code.
 
-⚠️ `SbxRunner._argv` is the single place that knows the `sbx` command line, and it is
-UNVERIFIED against a real `sbx` version, which is why `VERIFIED_SBX_VERSIONS` is empty and
-`SbxRunner` cannot be selected: adding a version there is the act of verifying `_argv`
-against that version (and nothing else should do it). The fail-closed behaviour does not
-depend on it and is fully tested; real microVM isolation is an open acceptance item.
+⚠️ `SbxRunner` (create -> cp in -> exec -> rm --force) is written against `sbx --help` and a
+fake `sbx`, and is NOT verified end to end against a live microVM: on the host it was written on,
+the sbx daemon could not start a VM (`KVM error: Permission denied`: the daemon process lacked
+the `kvm` group). That is why `VERIFIED_SBX_VERSIONS` is empty and `SbxRunner` cannot be
+selected: adding a version there is the act of verifying the flow against that version (run the
+`requires_sbx_live` test with COGNITIVE_HARNESS2_SBX_LIVE=1 first), and nothing else should do it.
+`SbxRunner` itself also refuses to run for a version outside the set it was given. The
+fail-closed behaviour does not depend on the live verification and is fully tested.
 `DockerRunner` IS verified end to end against a real rootless daemon
 (tests/test_docker_runner.py).
 """
@@ -34,7 +37,9 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import socket
+import stat
 import subprocess
 import tempfile
 import threading
@@ -86,23 +91,6 @@ VERIFIED_SBX_VERSIONS: frozenset[str] = frozenset()
 
 # `sbx` is selected only when this is `sbx`. Unset, empty, `auto` and `docker` mean rootless Docker.
 ENV_SANDBOX = "COGNITIVE_HARNESS2_SANDBOX"
-
-
-class SbxRunner:
-    def __init__(self, sbx_path: str):
-        self.sbx_path = sbx_path
-
-    def _argv(self, spec: SandboxSpec) -> list[str]:
-        # UNVERIFIED against a real sbx: the subcommand and flags are assumptions.
-        return [self.sbx_path, "run", "--", *spec.command]
-
-    def run(self, spec: SandboxSpec) -> SandboxResult:
-        try:
-            p = subprocess.run(self._argv(spec), capture_output=True, text=True, timeout=spec.timeout_s)
-        except subprocess.TimeoutExpired as e:
-            return SandboxResult(None, (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or ""),
-                                 "timed out", True)
-        return SandboxResult(p.returncode, p.stdout, p.stderr)
 
 
 # ── ephemeral rootless Docker (the fallback when sbx is absent) ───────────────────
@@ -387,6 +375,267 @@ class DockerRunner:
         return SandboxResult(code, stdout, err.decode("utf-8", "replace"))
 
 
+# ── Docker Sandboxes (sbx) microVMs ───────────────────────────────────────────────
+
+SBX_PARENT_DIR = "/tmp"
+SBX_CANDIDATE_DIR = "/tmp/candidate"  # `sbx cp <stage>/candidate NAME:/tmp` puts the directory inside /tmp
+# Asked of the policy engine in the context of the new sandbox, before any file or command reaches it.
+SBX_DENIED_TARGETS = ("example.com:443", "example.com:80", "127.0.0.1:80", "localhost:80")
+_SBX_ENV_PREFIXES = ("DOCKER_SANDBOXES_", "SBX_")
+_SBX_POLICY_ACTIONS = frozenset({"net:connect:tcp", "net:connect:udp"})
+_SBX_CREATE_TIMEOUT_S = 600  # the daemon may pull the agent image on first use
+
+
+def sbx_network_policy_problem(policy_json: str) -> str | None:
+    """None only when `sbx policy ls --json` says: an active deny-all (`**`, tcp and udp) network rule exists
+    and NO network rule allows anything (whatever its status). Anything unparseable or unexpected is a problem."""
+    try:
+        doc = json.loads(policy_json)
+    except ValueError:
+        return "`sbx policy ls --json` did not return JSON"
+    rules = doc.get("rules") if isinstance(doc, dict) else None
+    if not isinstance(rules, list):
+        return "`sbx policy ls --json` has no `rules` list"
+    deny_all = False
+    for rule in rules:
+        if not isinstance(rule, dict):
+            return "`sbx policy ls --json` has a malformed rule"
+        kind = rule.get("resource_type")
+        if not isinstance(kind, str):
+            return "`sbx policy ls --json` has a rule without a resource_type"
+        if not kind.startswith("network"):
+            continue
+        decision = rule.get("decision")
+        if decision == "allow":
+            return f"a network allow rule exists ({rule.get('name') or rule.get('id')!r}): the policy is not deny-all"
+        if decision != "deny":
+            return f"a network rule has the unknown decision {decision!r}"
+        resources, actions = rule.get("resources"), rule.get("actions")
+        if (rule.get("status") == "active" and isinstance(resources, list) and "**" in resources
+                and isinstance(actions, list) and _SBX_POLICY_ACTIONS <= set(actions)):
+            deny_all = True
+    if not deny_all:
+        return "no active network deny-all rule (`**`, tcp and udp): the policy is not deny-all"
+    return None
+
+
+def _sbx_env(environ: Mapping[str, str]) -> dict[str, str]:
+    """The environment for every `sbx` call: minus the variables that can re-point the CLI or its settings."""
+    return {k: v for k, v in environ.items() if not k.upper().startswith(_SBX_ENV_PREFIXES)}
+
+
+def _stage_for_sbx(spec: SandboxSpec) -> Path | None:
+    """Write the files under `<tmp>/candidate/`; returns `<tmp>` (the caller removes it) or None when there are none."""
+    _validate_stage_names(spec.files)  # before mkdtemp: a bad key leaves nothing behind
+    if not spec.files:
+        return None
+    parent = Path(tempfile.mkdtemp(prefix="harness2-sbx-")).resolve()
+    try:
+        root = parent / "candidate"
+        root.mkdir()
+        for name, content in spec.files.items():
+            target = root / _stage_name(name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            target.chmod(0o444)
+    except BaseException:
+        shutil.rmtree(parent, ignore_errors=True)
+        raise
+    return parent
+
+
+class SbxRunner:
+    """One throwaway Docker Sandbox microVM per run, driven only by the `sbx` CLI, no shell, never the host.
+
+    Flow (`run`): preflight (the daemon socket is the user's own, `sbx version` is in the verified set the
+    runner was given, the GLOBAL network policy is deny-all) -> `sbx create shell` with NO workspace (no host
+    bind mount) -> `sbx policy check network --sandbox` must deny every target in `SBX_DENIED_TARGETS` ->
+    `sbx cp` the staged files in and `sbx exec find` to confirm exactly those files arrived -> `sbx exec` the
+    command with a host-side wall clock -> ALWAYS (`finally`) `sbx rm --force`, and confirm with `sbx ls -q`
+    that it is gone. Any surprise (unknown version, unexpected output, exit 125 from `sbx`, a policy that is
+    not deny-all, a sandbox that will not go away) raises `SandboxUnavailable`: nothing runs on the host.
+
+    ⚠️ NOT verified against a live microVM: see the module docstring. The preflight, the `create` flags
+    and the refusal paths have been checked against the real CLI and the fake in the tests; `cp` and
+    `exec` against a running VM have not, because the sandbox daemon on the development host could not start VMs.
+    """
+
+    def __init__(self, sbx_path: str, *, environ: Mapping[str, str] | None = None,
+                 verified: frozenset[str] | None = None, cpus: int = 1, memory: str = "512m",
+                 create_timeout_s: int = _SBX_CREATE_TIMEOUT_S, control_timeout_s: int = 60,
+                 max_output_bytes: int = MAX_OUTPUT_BYTES):
+        self.sbx_path = sbx_path
+        self.environ = dict(os.environ if environ is None else environ)
+        self.verified = VERIFIED_SBX_VERSIONS if verified is None else verified
+        self.cpus, self.memory = cpus, memory
+        self.create_timeout_s, self.control_timeout_s = create_timeout_s, control_timeout_s
+        self.max_output_bytes = max_output_bytes
+
+    # ── the command lines: the only place that knows them ─────────────────────────
+
+    def _argv(self, *args: str) -> list[str]:
+        return [self.sbx_path, *args]
+
+    def _create_argv(self, name: str) -> list[str]:
+        return self._argv("create", "shell", "--name", name, "--no-progress", "--cpus", str(self.cpus),
+                          "--memory", self.memory, "--pull", "missing", "--skills", "off")
+
+    def _check_argv(self, name: str, target: str) -> list[str]:
+        return self._argv("policy", "check", "network", "--sandbox", name, "--json", target)
+
+    def _cp_in_argv(self, stage: Path, name: str) -> list[str]:
+        return self._argv("cp", str(stage / "candidate"), f"{name}:{SBX_PARENT_DIR}")
+
+    def _list_staged_argv(self, name: str) -> list[str]:
+        return self._argv("exec", "--", name, "find", SBX_CANDIDATE_DIR, "-type", "f")
+
+    def _exec_argv(self, spec: SandboxSpec, name: str, staged: bool) -> list[str]:
+        # `--` before NAME: nothing in the candidate command can be read as a flag of `sbx` itself.
+        return self._argv("exec", "-w", SBX_CANDIDATE_DIR if staged else SBX_PARENT_DIR, "--", name, *spec.command)
+
+    def _rm_argv(self, name: str) -> list[str]:
+        return self._argv("rm", "--force", name)
+
+    def _ls_argv(self) -> list[str]:
+        return self._argv("ls", "-q")
+
+    # ── helpers ───────────────────────────────────────────────────────────────────
+
+    def _ctl(self, argv: list[str], timeout: int, what: str) -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
+                                  env=_sbx_env(self.environ))
+        except subprocess.TimeoutExpired:
+            raise SandboxUnavailable(f"`sbx {what}` timed out after {timeout}s (fail closed)") from None
+        except OSError as e:
+            raise SandboxUnavailable(f"cannot execute {argv[0]!r}: {e} (fail closed)") from e
+
+    def _must(self, argv: list[str], what: str, timeout: int | None = None) -> subprocess.CompletedProcess:
+        p = self._ctl(argv, self.control_timeout_s if timeout is None else timeout, what)
+        if p.returncode != 0:
+            raise SandboxUnavailable(f"`sbx {what}` failed (exit {p.returncode}): "
+                                     f"{_first_line(p.stderr or p.stdout)} (fail closed)")
+        return p
+
+    def _preflight(self) -> None:
+        sock = _sbx_socket(self.environ)
+        try:
+            st = sock.stat()
+        except OSError:
+            raise SandboxUnavailable(f"the sbx daemon socket {sock} does not exist: it is not running (fail closed; "
+                                     "this runner never starts it)") from None
+        if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
+            raise SandboxUnavailable(f"{sock} is not a socket owned by this user (fail closed)")
+        p = self._must(self._argv("version"), "version")
+        m = _SBX_VERSION.search(p.stdout)
+        version = m.group(1) if m else None
+        if version is None:
+            raise SandboxUnavailable("could not read the sbx version (fail closed)")
+        if version not in self.verified:
+            raise SandboxUnavailable(f"sbx version {version} is not in the verified set "
+                                     f"({', '.join(sorted(self.verified)) or 'empty'}) (fail closed)")
+        problem = sbx_network_policy_problem(self._must(self._argv("policy", "ls", "--json"), "policy ls").stdout)
+        if problem:
+            raise SandboxUnavailable(f"{problem} (fail closed)")
+
+    def _check_sandbox_denies_network(self, name: str) -> None:
+        for target in SBX_DENIED_TARGETS:
+            p = self._ctl(self._check_argv(name, target), self.control_timeout_s, "policy check network")
+            try:
+                verdict = json.loads(p.stdout)
+            except ValueError:
+                verdict = None
+            # A denied check exits 1 (observed on v0.50.1). Anything but exit 1 AND allowed == false is a surprise.
+            if not (isinstance(verdict, dict) and verdict.get("allowed") is False and p.returncode == 1):
+                raise SandboxUnavailable(f"the sandbox's network policy does not deny {target} "
+                                         f"(exit {p.returncode}: {_first_line(p.stderr or p.stdout)}) (fail closed)")
+
+    def _verify_staged(self, spec: SandboxSpec, name: str) -> None:
+        p = self._must(self._list_staged_argv(name), "exec find")
+        got = {line for line in p.stdout.splitlines() if line}
+        want = {f"{SBX_CANDIDATE_DIR}/{key}" for key in spec.files}
+        if got != want:
+            raise SandboxUnavailable(f"the staged files in the sandbox are not exactly the requested ones "
+                                     f"(missing {sorted(want - got)}, extra {sorted(got - want)}) (fail closed)")
+
+    def _exec(self, argv: list[str], timeout_s: int) -> SandboxResult:
+        out, err, cut = bytearray(), bytearray(), [False]
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                env=_sbx_env(self.environ), start_new_session=True)
+        try:
+            readers = [threading.Thread(target=_drain, args=(s, self.max_output_bytes, b, cut), daemon=True)
+                       for s, b in ((proc.stdout, out), (proc.stderr, err))]
+            for t in readers:
+                t.start()
+            timed_out = False
+            try:
+                code: int | None = proc.wait(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                timed_out, code = True, None
+                self._kill_client(proc)
+            for t in readers:
+                t.join(timeout=_PROBE_TIMEOUT_S)
+        finally:
+            if proc.poll() is None:
+                self._kill_client(proc)
+        note = f"\n[output truncated at {self.max_output_bytes} bytes]\n" if cut[0] else ""
+        stdout = out.decode("utf-8", "replace") + note
+        if timed_out:
+            # The in-VM process may outlive the killed client: the caller's `rm --force` destroys the VM.
+            return SandboxResult(None, stdout, "timed out", True)
+        if code == 125:
+            raise SandboxUnavailable(f"`sbx exec` could not run the command (exit 125): "
+                                     f"{_first_line(err.decode('utf-8', 'replace'))} (fail closed)")
+        return SandboxResult(code, stdout, err.decode("utf-8", "replace"))
+
+    @staticmethod
+    def _kill_client(proc: subprocess.Popen) -> None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        try:
+            proc.wait(timeout=_PROBE_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            pass
+
+    def _destroy(self, name: str) -> None:
+        """`rm --force`, then prove with `ls -q` that the sandbox is gone. A sandbox that stays is an error."""
+        rm = self._ctl(self._rm_argv(name), self.control_timeout_s, "rm --force")
+        ls = self._ctl(self._ls_argv(), self.control_timeout_s, "ls")
+        if ls.returncode != 0:
+            raise SandboxUnavailable(f"could not confirm that sandbox {name} was removed (`sbx ls` exit "
+                                     f"{ls.returncode}); remove it with `sbx rm --force {name}`")
+        if name in ls.stdout.split():
+            raise SandboxUnavailable(f"sandbox {name} was NOT removed (`sbx rm --force` exit {rm.returncode}: "
+                                     f"{_first_line(rm.stderr or rm.stdout)}); remove it with `sbx rm --force {name}`")
+
+    # ── the run ───────────────────────────────────────────────────────────────────
+
+    def run(self, spec: SandboxSpec) -> SandboxResult:
+        if not spec.command or not all(isinstance(a, str) and "\0" not in a for a in spec.command):
+            raise ValueError("command must be a non-empty list of strings without NUL")
+        _validate_stage_names(spec.files)  # cheapest refusal first: no sbx process for a bad key
+        self._preflight()
+        stage = _stage_for_sbx(spec)
+        name = f"harness2-{secrets.token_hex(6)}"
+        try:
+            self._must(self._create_argv(name), "create", self.create_timeout_s)
+            if name not in self._must(self._ls_argv(), "ls").stdout.split():
+                raise SandboxUnavailable(f"sandbox {name} is not listed by `sbx ls -q` after create (fail closed)")
+            self._check_sandbox_denies_network(name)
+            if stage is not None:
+                self._must(self._cp_in_argv(stage, name), "cp")
+                self._verify_staged(spec, name)
+            return self._exec(self._exec_argv(spec, name, stage is not None), spec.timeout_s)
+        finally:
+            try:
+                self._destroy(name)  # also when create failed half way: `rm --force` of a missing name is harmless
+            finally:
+                if stage is not None:
+                    shutil.rmtree(stage, ignore_errors=True)
+
+
 # ── choosing between sbx and rootless Docker ───────────────────────────────────────
 
 SBX_ABSENT = "absent"
@@ -447,9 +696,9 @@ def real_sbx_probes(environ: Mapping[str, str]) -> SbxProbes:
         return m.group(1) if m else None
 
     def policy(path: str) -> str | None:
-        p = _run_readonly([path, "policy", "ls"])
+        p = _run_readonly([path, "policy", "ls", "--json"])
         if p.returncode == 0:
-            return None
+            return sbx_network_policy_problem(p.stdout)
         text = _first_line(p.stderr or p.stdout)
         return ("global network policy is not initialised (`sbx policy init <profile>`)"
                 if "not been initialized" in text else f"`sbx policy ls` failed: {text}")
@@ -512,7 +761,7 @@ def inspect_sbx(which: Callable[[str], str | None] = shutil.which, *, environ: M
         reasons.append(f"not opted in (set {ENV_SANDBOX}=sbx)")
     if not verified:
         reasons.append("sbx version is not in the verified set (the verified set is empty: "
-                       "SbxRunner._argv is unverified against any real version)")
+                       "SbxRunner is not verified end to end against any real version)")
 
     def ask(label: str, fn: Callable, *args):
         try:
@@ -571,7 +820,7 @@ def default_runner(which: Callable[[str], str | None] = shutil.which, *, environ
     # No sbx process, and no probe at all, unless the two cheap gates already pass.
     rep = inspect_sbx(which, environ=environ, probes=probes, verified=verified, probe=opted and bool(verified))
     if rep.selected:
-        return SbxRunner(rep.path or "sbx")
+        return SbxRunner(rep.path or "sbx", environ=environ, verified=verified)
     return _docker_or_refuse(which, rep)
 
 

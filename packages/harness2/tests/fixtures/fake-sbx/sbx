@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# A FAKE `sbx` for tests/test_sbx_runner.py. It emulates only what `SbxRunner` calls, with the outputs and exit
+# codes observed on a real v0.50.1 (version, policy ls --json, policy check network, ls -q, missing sandbox => 125
+# for exec and 1 for the rest) and records every call. It never starts a VM and touches nothing but $FAKE_SBX_DIR.
+#
+# Behaviour knobs (environment): FAKE_SBX_POLICY_FILE (policy ls --json output), FAKE_SBX_CREATE=fail,
+# FAKE_SBX_CHECK=allowed|garbage, FAKE_SBX_CP=fail|drop, FAKE_SBX_EXEC_RC/OUT/ERR, FAKE_SBX_EXEC_HANG=1 (sleeps 60s),
+# FAKE_SBX_RM=leak (rm --force succeeds but the sandbox stays), FAKE_SBX_LS=fail, FAKE_SBX_VERSION.
+set -u
+D="${FAKE_SBX_DIR:?FAKE_SBX_DIR is required}"
+mkdir -p "$D/sb"; touch "$D/sandboxes"
+{ printf '%s\x1f' "$@"; printf '\n'; } >> "$D/calls"
+env | sort > "$D/env.last"
+
+exists() { grep -qx -- "$1" "$D/sandboxes"; }
+missing() { echo "error: sandbox '$1' not found" >&2; echo "  try: sbx ls" >&2; }
+
+case "${1:-}" in
+  version)
+    echo "Client Version:  ${FAKE_SBX_VERSION:-v9.9.9} deadbeef" ;;
+  policy)
+    case "${2:-}" in
+      ls) cat "${FAKE_SBX_POLICY_FILE:?}" ;;
+      check)
+        # policy check network --sandbox N --json TARGET
+        n="$5"; t="$7"
+        exists "$n" || { echo "error: check network policy: request failed: 404 Not Found: sandbox \"$n\" not found" >&2; exit 1; }
+        case "${FAKE_SBX_CHECK:-denied}" in
+          allowed) echo "{\"allowed\":true,\"target\":\"$t\"}"; exit 0 ;;
+          garbage) echo "not json"; exit 1 ;;
+          *) echo "{\"allowed\":false,\"target\":\"$t\",\"reason\":\"No matching allow rule (default deny)\"}"; exit 1 ;;
+        esac ;;
+    esac ;;
+  create)
+    # create shell --name N ...
+    if [ "${FAKE_SBX_CREATE:-}" = fail ]; then echo "error: request failed: 500 Internal Server Error: failed to run sandbox container" >&2; exit 1; fi
+    n="$4"; echo "$n" >> "$D/sandboxes"; mkdir -p "$D/sb/$n" ;;
+  ls)
+    [ "${FAKE_SBX_LS:-}" = fail ] && { echo "error: daemon unreachable" >&2; exit 1; }
+    cat "$D/sandboxes" ;;
+  cp)
+    [ "${FAKE_SBX_CP:-}" = fail ] && { echo "error: cp failed" >&2; exit 1; }
+    src="$2"; n="${3%%:*}"; dst="${3#*:}"
+    exists "$n" || { missing "$n"; exit 1; }
+    mkdir -p "$D/sb/$n$dst"
+    if [ "${FAKE_SBX_CP:-}" = drop ]; then mkdir -p "$D/sb/$n$dst/candidate"; else cp -r "$src" "$D/sb/$n$dst/"; fi ;;
+  exec)
+    shift
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -w) shift 2 ;;
+        --) shift; break ;;
+        -*) shift ;;
+        *) break ;;
+      esac
+    done
+    n="$1"; shift
+    exists "$n" || { missing "$n"; exit 125; }
+    if [ "$1" = find ]; then
+      root="$D/sb/$n$2"
+      (cd "$root/.." 2>/dev/null && find "$(basename "$2")" -type f | while IFS= read -r f; do echo "$(dirname "$2")/$f"; done)
+      exit 0
+    fi
+    echo "$*" >> "$D/exec_commands"
+    [ "${FAKE_SBX_EXEC_HANG:-}" = 1 ] && sleep 60
+    printf '%s' "${FAKE_SBX_EXEC_OUT:-}"
+    printf '%s' "${FAKE_SBX_EXEC_ERR:-}" >&2
+    exit "${FAKE_SBX_EXEC_RC:-0}" ;;
+  rm)
+    n="$3"
+    exists "$n" || { missing "$n"; exit 1; }
+    [ "${FAKE_SBX_RM:-}" = leak ] && exit 0
+    grep -vx -- "$n" "$D/sandboxes" > "$D/sandboxes.new"; mv "$D/sandboxes.new" "$D/sandboxes" ;;
+  *)
+    echo "fake sbx: unsupported: $*" >&2; exit 2 ;;
+esac

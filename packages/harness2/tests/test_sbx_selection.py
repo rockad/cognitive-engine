@@ -1,6 +1,6 @@
 """`sbx` on PATH must never, by itself, change which sandbox runs candidate code.
 
-`SbxRunner._argv` is an unverified guess at the `sbx` command line, so `default_runner` picks `SbxRunner` only when ALL of:
+`SbxRunner` has not been verified end to end against a live microVM, so `default_runner` picks `SbxRunner` only when ALL of:
 the user opted in (`COGNITIVE_HARNESS2_SANDBOX=sbx`), the installed version is in `VERIFIED_SBX_VERSIONS` (empty today),
 and a read-only usability probe passes (daemon reachable, /dev/kvm accessible, global policy initialised). Anything else
 is rootless Docker exactly as before, and with no usable Docker either, the existing fail-closed refusal.
@@ -124,6 +124,13 @@ def test_sbx_cannot_be_returned_while_the_verified_set_is_empty(monkeypatch, set
     assert calls == []
     rep = sandbox.sandbox_report(which_with(True), environ={ENV_SANDBOX: setting}, probes=probes())["sbx"]
     assert rep["state"] == "present-but-unusable" and any("verified set is empty" in x for x in rep["reasons"])
+
+
+def test_default_runner_hands_its_environment_and_verified_set_to_the_runner(monkeypatch):
+    fake_docker(monkeypatch, True)
+    env = {ENV_SANDBOX: "sbx", "XDG_STATE_HOME": "/x"}
+    r = sandbox.default_runner(which_with(True), environ=env, probes=probes(), verified=frozenset({VERSION}))
+    assert isinstance(r, SbxRunner) and r.verified == frozenset({VERSION}) and r.environ == env
 
 
 def test_the_module_constant_is_what_default_runner_consults_when_not_overridden(monkeypatch):

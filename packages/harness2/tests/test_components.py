@@ -79,14 +79,18 @@ def test_static_diff_needs_an_explicit_opt_in():
     assert "-a" in d and "+b" in d and "a/p" in d
 
 
-def test_sbx_runner_wraps_the_command_and_reports_a_timeout(monkeypatch):
-    r = sandbox.SbxRunner("/x/sbx")
-    assert r._argv(SandboxSpec(command=["echo", "hi"]))[-2:] == ["echo", "hi"]
+def test_sbx_runner_builds_argv_without_a_shell_and_refuses_when_nothing_is_verified(monkeypatch):
+    r = sandbox.SbxRunner("/x/sbx", verified=frozenset({"1.2.3"}))
+    spec = SandboxSpec(command=["echo", "hi"])
+    assert r._exec_argv(spec, "harness2-x", False) == ["/x/sbx", "exec", "-w", "/tmp", "--", "harness2-x", "echo", "hi"]
+    assert r._rm_argv("harness2-x") == ["/x/sbx", "rm", "--force", "harness2-x"]
+
     def boom(*a, **k):
-        raise subprocess.TimeoutExpired(cmd="sbx", timeout=1, output=b"partial")
+        raise AssertionError("no process may start: the daemon socket check refuses first")
     monkeypatch.setattr(subprocess, "run", boom)
-    out = r.run(SandboxSpec(command=["sleep", "9"], timeout_s=1))
-    assert out.timed_out and out.exit_code is None
+    monkeypatch.setattr(subprocess, "Popen", boom)
+    with pytest.raises(SandboxUnavailable):
+        sandbox.SbxRunner("/x/sbx", environ={"XDG_STATE_HOME": "/nonexistent"}).run(spec)
 
 
 # ── experience ───────────────────────────────────────────────────────────────────
