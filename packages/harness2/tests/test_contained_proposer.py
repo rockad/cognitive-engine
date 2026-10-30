@@ -129,7 +129,7 @@ def test_the_argv_built_for_each_kind_passes_check_proposer(pure, name):
     ws.mkdir()
     cli = "/opt/cli/" + CLI[ch.kind]
     argv = build_command(ch.kind, cli_container=cli, model=ch.model, effort="high", max_budget_usd=2)
-    env = session_env(ch.kind, model=ch.model, base_url="http://harness2-proxy:11434/v1")
+    env = session_env(ch.kind, model=ch.model, base_url="http://harness2-proxy.internal:11434/v1")
     d = upstream_egress.check_proposer(
         upstream_egress.ProposerConfig(kind=ch.kind, model=ch.model, base_url=ch.endpoints[0], env=env, cwd=str(ws),
                                        command=argv),
@@ -173,7 +173,7 @@ def test_the_opencode_env_points_the_provider_at_the_runner_endpoint_only(pure):
     e = pure.prop("local").env()
     cfg = json.loads(e["OPENCODE_CONFIG_CONTENT"])
     (prov, body), = cfg["provider"].items()
-    assert prov == "ollama" and body["options"]["baseURL"] == "http://harness2-proxy:11434/v1"
+    assert prov == "ollama" and body["options"]["baseURL"] == "http://harness2-proxy.internal:11434/v1"
     assert e["OPENCODE_DISABLE_MODELS_FETCH"] == "1" and e["XDG_DATA_HOME"].startswith(sr.HOME)
 
 
@@ -292,9 +292,9 @@ def test_a_session_per_kind_returns_the_reply_and_the_harvest(world, monkeypatch
     # the container environment: closed, no Vertex, no host variable
     env = harvested(r, "env.txt")
     assert CANARY not in env and "VERTEX" not in env and "GOOGLE_CLOUD" not in env
-    assert "HTTPS_PROXY=http://harness2-proxy:" in env and "HOME=/home/agent" in env
+    assert "HTTPS_PROXY=http://harness2-proxy.internal:" in env and "HOME=/home/agent" in env
     if kind == "opencode":
-        assert "http://harness2-proxy:11434/v1" in env
+        assert "http://harness2-proxy.internal:11434/v1" in env
     # audit trail and cache: the second identical call is served from the audit directory
     again = world.call(p, "FAKE:record FAKE:edit")
     assert again.cached and again.channel == kind and again.text.strip() == text
@@ -462,10 +462,10 @@ def test_the_opencode_argv_carries_the_fixed_title_word_and_nothing_else_new():
 
 
 def test_the_opencode_provider_block_is_the_shape_the_real_binary_accepts_and_dead_tools_are_denied():
-    cfg = json.loads(cp.opencode_config("ollama/gemma4:12b", "http://harness2-proxy:11434/v1"))
+    cfg = json.loads(cp.opencode_config("ollama/gemma4:12b", "http://harness2-proxy.internal:11434/v1"))
     body = cfg["provider"]["ollama"]
     assert body["npm"] == "@ai-sdk/openai-compatible"                      # required: without it `provider.no-route`
-    assert body["options"]["baseURL"] == "http://harness2-proxy:11434/v1" and "gemma4:12b" in body["models"]
+    assert body["options"]["baseURL"] == "http://harness2-proxy.internal:11434/v1" and "gemma4:12b" in body["models"]
     assert cfg["permission"] == {t: "deny" for t in ("grep", "glob", "webfetch", "websearch", "question", "subagent")}
     assert cfg["autoupdate"] is False and cfg["share"] == "disabled"
     assert "OPENCODE_PERMISSION" not in cp.session_env("opencode", model="ollama/gemma4:12b", base_url="http://x/v1")

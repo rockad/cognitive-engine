@@ -1,7 +1,7 @@
 #!/bin/bash
 # A FAKE agent CLI for the contained-session tests. It never talks to a model. Each subcommand is one probe
 # and prints key=value lines. It is bind-mounted read-only at /opt/cli/fake-cli.
-PROXY_HOST=harness2-proxy
+PROXY_HOST=harness2-proxy.internal
 PROXY_PORT=3128
 
 tcp() { if timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; then echo CONNECTED; else echo FAILED; fi; }

@@ -62,7 +62,11 @@ from .image import PROXY_PATH_IN_IMAGE, ImageRef
 from .sweep_budget import ROLES, BudgetExhausted, SweepBudget
 
 LABEL = "cognitive-harness2.session"
-PROXY_ALIAS = "harness2-proxy"
+# The proxy container's network alias, the CLI's model host AND the `Host` header Ollama sees. A loopback Ollama answers 403
+# to any Host that is not a loopback/private IP, `localhost`, its machine's name or a `.localhost`/`.local`/`.internal` name
+# (DNS-rebinding guard, see `ollama_guard`), and this name is what the proxy forwards as Host. It was `harness2-proxy`: the
+# second real stage-1 run died on a 403 from Ollama. Docker resolves a dotted alias on the --internal network (measured).
+PROXY_ALIAS = "harness2-proxy.internal"
 PROXY_PORT = PROXY_PORT_DEFAULT
 CLI_DIR = "/opt/cli"
 HOME = "/home/agent"
@@ -321,7 +325,7 @@ def session_env(plan: Plan) -> dict[str, str]:
     proxy-aware client; without this its own traffic went to the proxy and was denied (the first real stage-1 run).
     That loopback is empty of everything but what the session starts itself: the host's loopback is unreachable from
     the container, and the proxy, the model endpoint and every external name are NOT in the list, so they are reached
-    only through the proxy (or not at all). For a local channel the model endpoint is `http://harness2-proxy:<port>`:
+    only through the proxy (or not at all). For a local channel the model endpoint is `http://harness2-proxy.internal:<port>`:
     it is not bypassed, it goes THROUGH the proxy as a request for that exact name and port (see `proxy_config`)."""
     proxy = f"http://{PROXY_ALIAS}:{PROXY_PORT}"
     env = {"HOME": HOME, "TMPDIR": "/tmp", "HTTP_PROXY": proxy, "HTTPS_PROXY": proxy, "ALL_PROXY": proxy,

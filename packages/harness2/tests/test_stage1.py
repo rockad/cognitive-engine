@@ -412,7 +412,7 @@ def test_the_solver_gets_a_provider_config_pointing_at_the_proxy_alias_and_no_se
     job = stage1.SolverJob("t", "r", "p", str(rig.ws), "ollama/gemma4:12b", "/opt/cli/opencode")
     env = stage1.solver_env_builder(runner)(job)
     cfg = json.loads(env["OPENCODE_CONFIG_CONTENT"])
-    assert cfg["provider"]["ollama"]["options"]["baseURL"] == f"http://harness2-proxy:{rig.fake.port}/v1"
+    assert cfg["provider"]["ollama"]["options"]["baseURL"] == f"http://harness2-proxy.internal:{rig.fake.port}/v1"
     assert not any(upstream_egress._is_secret_name(k) for k in env) and "OPENCODE_PERMISSION" not in env
     sr._check_env(env, [])                                                    # what the runner accepts
 
@@ -690,3 +690,57 @@ def test_the_summary_caps_how_many_denied_hosts_it_prints_and_never_prints_a_url
                                  rollout_errors=[], stage_errors=[])
     assert mixed["timed_out"] == 1 and mixed["exit_codes"] == {"0": 1, "2": 1, "none": 1}
     assert "1 timed out" in "\n".join(stage1.sessions_lines({"sessions_summary": mixed}))
+
+
+# ── second real run: every session reached ollama, ollama answered 403 (its Host guard), the proxy denied nothing ──
+
+SECOND_RUN_ERR = "provider.auth: Provider request failed with HTTP 403"
+
+
+def test_the_summary_tells_a_model_endpoint_refusal_from_a_proxy_denial_at_a_glance():
+    v = stage1.sessions_view([{"event": "session_start"}] * 7, [_end(2, 1) for _ in range(7)], rollout_errors=[SECOND_RUN_ERR], stage_errors=[])
+    assert v["reached_model"] == 7 and v["denied_hosts"] == {} and v["first_error_http"] == 403
+    text = "\n".join(stage1.sessions_lines({"sessions_summary": v}))
+    assert ("7 sessions started, 7 reached the model: 7 exited rc=1; first error: " + SECOND_RUN_ERR +
+            "; the proxy denied nothing, the model endpoint itself refused (HTTP 403)") in text.replace("outcome   ", "")
+    assert "no session reached the model" not in text and "proxy denied:" not in text
+    assert "Host" in text and "Origin" in text                      # for ollama a 403 is its Host/Origin guard: say where to look
+
+
+def test_a_401_is_a_model_endpoint_refusal_too_and_other_errors_are_not_labelled():
+    v = stage1.sessions_view([{"event": "session_start"}], [_end(1, 1)], rollout_errors=["provider.auth: HTTP 401 Unauthorized"], stage_errors=[])
+    assert v["first_error_http"] == 401 and "model endpoint itself refused (HTTP 401)" in "\n".join(stage1.sessions_lines({"sessions_summary": v}))
+    for err in ("provider.no-route: Unsupported package", "UnexpectedStatus: 403", None):
+        w = stage1.sessions_view([{"event": "session_start"}], [_end(1, 1)], rollout_errors=[err] if err else [], stage_errors=[])
+        assert w["first_error_http"] is None and "refused" not in "\n".join(stage1.sessions_lines({"sessions_summary": w}))
+    h500 = stage1.sessions_view([{"event": "session_start"}], [_end(1, 1)], rollout_errors=["Provider request failed with HTTP 500"], stage_errors=[])
+    assert "refused" not in "\n".join(stage1.sessions_lines({"sessions_summary": h500}))
+
+
+def test_a_403_beside_a_proxy_denial_is_not_blamed_on_the_endpoint():
+    v = stage1.sessions_view([{"event": "session_start"}] * 2, [_end(1, 1, ["evil.example:443"], ["not-allow-listed"]), _end(1, 1)],
+                             rollout_errors=[SECOND_RUN_ERR], stage_errors=[])
+    text = "\n".join(stage1.sessions_lines({"sessions_summary": v}))
+    assert "proxy denied: evil.example:443" in text and "the proxy denied nothing" not in text and "itself refused" not in text
+    none_reached = stage1.sessions_view([{"event": "session_start"}], [_end(0, 1)], rollout_errors=[SECOND_RUN_ERR], stage_errors=[])
+    assert "itself refused" not in "\n".join(stage1.sessions_lines({"sessions_summary": none_reached}))
+
+
+def test_the_fake_endpoint_refuses_what_real_ollama_refuses_so_the_selftest_would_catch_a_bad_host_name(rig):
+    import http.client
+
+    def get(host, origin=None):
+        c = http.client.HTTPConnection("127.0.0.1", rig.fake.port, timeout=5)
+        c.putrequest("GET", "/api/tags", skip_host=True)
+        c.putheader("Host", host)
+        if origin:
+            c.putheader("Origin", origin)
+        c.endheaders()
+        r = c.getresponse()
+        body = r.read()
+        c.close()
+        return r.status, body
+    assert get(f"127.0.0.1:{rig.fake.port}")[0] == 200 and get(f"{sr.PROXY_ALIAS}:{rig.fake.port}")[0] == 200
+    assert get("harness2-proxy:11434") == (403, b"") and get("evil.example.com") == (403, b"")
+    assert get("127.0.0.1", "http://evil.example.com")[0] == 403
+    assert rig.fake.hits == 2 and [s for s, _ in rig.fake.rejected] == [403, 403, 403]

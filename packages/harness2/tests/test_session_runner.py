@@ -119,7 +119,7 @@ class Trap:
 def test_a_local_channel_is_authorised_with_a_bridge_and_no_allow_list(world):
     plan = runner().authorize(spec(world))
     assert plan.bridge_target == ("127.0.0.1", 11434) and plan.allow == () and plan.local
-    assert runner().local_endpoint == "http://harness2-proxy:11434"
+    assert runner().local_endpoint == "http://harness2-proxy.internal:11434"
 
 
 def test_a_hosted_channel_gets_exactly_the_profiles_endpoints(world):
@@ -190,7 +190,7 @@ def test_the_session_environment_cannot_override_proxy_or_smuggle_secrets(world,
 
 
 def test_a_clean_environment_is_accepted_and_values_are_checked(world):
-    runner().authorize(spec(world, env={"OPENCODE_PERMISSION": '{"bash":"allow"}', "OLLAMA_BASE_URL": "http://harness2-proxy:11434"}))
+    runner().authorize(spec(world, env={"OPENCODE_PERMISSION": '{"bash":"allow"}', "OLLAMA_BASE_URL": "http://harness2-proxy.internal:11434"}))
     for v in ("a\nb", "a\0b", "x" * 5000):
         with pytest.raises(SessionRefused):
             runner().authorize(spec(world, env={"FOO": v}))
@@ -327,7 +327,7 @@ def test_no_secret_is_anywhere_in_any_argv(world):
 def test_the_session_environment_is_closed_and_forces_the_proxy(world):
     plan, argv = session_argv(world, env={"OPENCODE_PERMISSION": "{}"})
     env = dict(e.split("=", 1) for e in flags(argv, "-e"))
-    proxy = "http://harness2-proxy:3128"
+    proxy = "http://harness2-proxy.internal:3128"
     assert env["HTTP_PROXY"] == env["HTTPS_PROXY"] == env["http_proxy"] == env["https_proxy"] == proxy
     assert env["NO_PROXY"] == env["no_proxy"] == "127.0.0.1,localhost,::1" and env["HOME"] == "/home/agent" and env["OPENCODE_PERMISSION"] == "{}"
     assert not any(k.startswith("DOCKER_") for k in env) and not any(k in env for k in ("SSH_AUTH_SOCK", "GITHUB_TOKEN"))
@@ -359,7 +359,7 @@ def test_the_proxy_container_command_line(world):
     local = sr.build_proxy_create(plan, names(), docker=V.path, host=V.host, proxy_dir="/p", bridge_dir="/b")
     assert local[:4] == [V.path, "-H", SOCK, "create"]
     for pair in (("--user", "0:0"), ("--cap-drop", "ALL"), ("--security-opt", "no-new-privileges"), ("--network", names().internal),
-                 ("--network-alias", "harness2-proxy"), ("--pids-limit", "64"), ("--memory", "128m")):
+                 ("--network-alias", "harness2-proxy.internal"), ("--pids-limit", "64"), ("--memory", "128m")):
         assert pair[1] in flags(local, pair[0]), pair
     assert "--read-only" in local and flags(local, "--network") == [names().internal]       # egress is connected later, never here
     assert mounts(local) == ["type=bind,src=/p,dst=/proxy,readonly", "type=bind,src=/b,dst=/bridge,readonly"]
@@ -757,7 +757,7 @@ def test_no_proxy_is_the_sessions_own_loopback_only_on_every_channel(world, name
 def test_the_callers_config_still_cannot_set_any_proxy_variable_in_either_case(world):
     for name in ("NO_PROXY", "no_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NODE_USE_ENV_PROXY", "MY_PROXY"):
         with pytest.raises(SessionRefused):
-            runner().authorize(spec(world, env={name: "127.0.0.1,harness2-proxy,example.com"}))
+            runner().authorize(spec(world, env={name: "127.0.0.1,harness2-proxy.internal,example.com"}))
 
 
 def test_a_local_channel_routes_the_proxy_alias_to_the_bridge_socket_and_a_hosted_one_routes_nothing(world):
@@ -772,7 +772,7 @@ def test_a_local_channel_routes_the_proxy_alias_to_the_bridge_socket_and_a_hoste
 
 # ── what the proxy log says about a session, as numbers and host:port only ───────
 
-LOG = ("ACCESS decision=allow host=harness2-proxy port=11434 reason=unix-route",
+LOG = ("ACCESS decision=allow host=harness2-proxy.internal port=11434 reason=unix-route",
        "ACCESS decision=allow host=unix-listener:11434 port=0 reason=unix-listener",
        "ACCESS decision=allow host=upstream.example port=443 reason=allow-listed",
        "ACCESS decision=deny host=127.0.0.1 port=34175 reason=not-allow-listed",

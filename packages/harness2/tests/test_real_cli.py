@@ -4,7 +4,7 @@ COGNITIVE_HARNESS2_REAL_CLI=1, so the normal suite stays hermetic and starts not
     COGNITIVE_HARNESS2_REAL_CLI=1 uv run pytest -q packages/harness2/tests/test_real_cli.py
 
 No model and no ollama is ever called: the "model" is `real_cli_probe.StubModel` on this host's loopback, reached the way
-stage 1 reaches ollama (host bridge, proxy container, `http://harness2-proxy:<port>/v1`). The session is the one stage 1
+stage 1 reaches ollama (host bridge, proxy container, `http://harness2-proxy.internal:<port>/v1`). The session is the one stage 1
 builds (`stage1.solver_argv`, `stage1.solver_env_builder`, `TMP_EXEC`, the same hardening and workspace layout). What these
 tests pin is what only a real binary can show; what only a real gemma can show (quality, speed, context truncation) is NOT
 here. Findings are written up in the README ("First-contact findings (stub-model probe)").
@@ -35,7 +35,11 @@ def text_of(events):
 def go(verified, proposer_image, tmp_path, turns, **kw):
     with StubModel(turns) as stub:
         stub.chat_status = kw.pop("chat_status", None)
-        return run_session(verified, proposer_image, tmp_path, stub, **kw), stub
+        probe = run_session(verified, proposer_image, tmp_path, stub, **kw)
+    # the stub enforces ollama's Host/Origin guard (ollama_guard): a session whose request real Ollama would answer with an
+    # empty 403 (the second real stage-1 run: Host `harness2-proxy.internal`) fails here, whatever else the test looks at
+    assert stub.rejected == [], stub.rejected
+    return probe, stub
 
 
 # ── the provider block ────────────────────────────────────────────────────────────
@@ -62,7 +66,7 @@ def test_a_text_reply_round_trip_through_bridge_and_proxy(verified, proposer_ima
     assert [e["type"] for e in p.events] == ["text"] and text_of(p.events) == ["THE-STUB-SAYS-HI"]
     assert {"type", "timestamp", "sessionID", "part"} <= set(p.events[0]) and p.events[0]["part"]["type"] == "text"
     # the model was reached, through the proxy only: every egress line is the proxy alias (an allow), nothing denied
-    assert r.egress_log and all(re.fullmatch(r"ACCESS decision=allow host=harness2-proxy port=\d+ reason=unix-route", x)
+    assert r.egress_log and all(re.fullmatch(r"ACCESS decision=allow host=harness2-proxy\.internal port=\d+ reason=unix-route", x)
                                 for x in r.egress_log), r.egress_log
     summary = sr.egress_summary(r.egress_log)
     assert summary["model_requests"] == 2 and summary["egress_denied"] == 0 and summary["denied_hosts"] == []   # GET + POST

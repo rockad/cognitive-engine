@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from cognitive_harness2 import channels, contained_proposer as cp, image, sandbox, session_runner as sr, stage1, sum_signed, upstream_egress
+from cognitive_harness2 import channels, contained_proposer as cp, image, ollama_guard, sandbox, session_runner as sr, stage1, sum_signed, upstream_egress
 
 OPENCODE = Path(os.environ.get("COGNITIVE_HARNESS2_OPENCODE", str(Path.home() / ".opencode" / "bin" / "opencode")))
 ENABLE_ENV = "COGNITIVE_HARNESS2_REAL_CLI"
@@ -81,6 +81,7 @@ class StubModel:
         self.last_body: dict | None = None
         self.bodies: list[dict] = []
         self.chat_status: int | None = None        # when set, every chat completion fails with this status
+        self.rejected: list[dict] = []             # requests the Ollama Host/Origin guard refused (never in `requests`)
         outer = self
 
         class H(http.server.BaseHTTPRequestHandler):
@@ -93,7 +94,20 @@ class StubModel:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _refused(self) -> bool:
+                """A loopback Ollama answers an empty 403 to a foreign Host or Origin before any route runs (ollama_guard)."""
+                status = ollama_guard.refusal(self.headers)
+                if status:
+                    outer.rejected.append({"status": status, "host": self.headers.get("Host") or "",
+                                           "origin": self.headers.get("Origin"), "method": self.command, "path": self.path})
+                    self.send_response(status)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                return bool(status)
+
             def do_GET(self) -> None:           # noqa: N802
+                if self._refused():
+                    return
                 outer._log(self, None)
                 if self.path.rstrip("/").endswith("/models"):
                     self._send(200, json.dumps({"object": "list", "data": [{"id": outer.model_id, "object": "model",
@@ -106,6 +120,8 @@ class StubModel:
             def do_POST(self) -> None:          # noqa: N802
                 n = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(n) if n else b""
+                if self._refused():
+                    return
                 try:
                     body = json.loads(raw or b"{}")
                 except ValueError:
@@ -113,6 +129,12 @@ class StubModel:
                 outer._log(self, body)
                 if not self.path.rstrip("/").endswith("/chat/completions"):
                     self._send(404, b'{"error":"not found"}')
+                    return
+                bad = ollama_guard.chat_request_error(raw, [outer.model_id])      # what real Ollama refuses before generating
+                if bad:
+                    outer.rejected.append({"status": bad[0], "host": self.headers.get("Host") or "", "origin": None,
+                                           "method": "POST", "path": self.path, "error": json.loads(bad[1])["error"]["message"]})
+                    self._send(*bad)
                     return
                 if outer.chat_status:
                     self._send(outer.chat_status, json.dumps({"error": {"message": f"model \"{outer.model_id}\" not found, try pulling it first" if outer.chat_status == 404 else "stub failure",

@@ -48,7 +48,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
-from . import channels, egress, image, sandbox, sum_signed as ss, upstream_egress, upstream_import
+from . import channels, egress, image, ollama_guard, sandbox, sum_signed as ss, upstream_egress, upstream_import
 from . import session_runner as sr
 from .contained_proposer import (OPENCODE_PROMPT, SessionConfig, build_command, make_proposer, make_selector_prop,
                                  session_env, TMP_EXEC)
@@ -678,9 +678,13 @@ def sessions_view(starts: Sequence[Mapping[str, Any]], ends: Sequence[Mapping[st
             denied[h] = denied.get(h, 0) + 1
         reasons.update(e.get("denied_reasons") or [])
     first = next((sr.sanitize_terminal(x)[:160] for x in (*rollout_errors, *stage_errors) if x), None)
+    # the status of a provider HTTP error in the CLI's own words ("... failed with HTTP 403"), to tell a refusal by the model
+    # endpoint from a denial by the proxy (which has its own `denied_hosts`)
+    http_status = re.search(r"\bHTTP (\d{3})\b", first or "")
     return {"started": len(starts), "ended": len(ends), "reached_model": reached, "exit_codes": dict(sorted(exit_codes.items())),
             "timed_out": timed_out, "denied_hosts": dict(sorted(denied.items(), key=lambda kv: (-kv[1], kv[0]))),
-            "denied_reasons": sorted(reasons), "first_error": first}
+            "denied_reasons": sorted(reasons), "first_error": first,
+            "first_error_http": int(http_status.group(1)) if http_status else None}
 
 
 def _n(n: int, word: str) -> str:
@@ -705,6 +709,10 @@ def sessions_lines(report: Mapping[str, Any], *, max_hosts: int = 5) -> list[str
         shown = [f"{h} ({_n(n, 'session')}{why})" for h, n in list(denied.items())[:max_hosts]]
         more = len(denied) - max_hosts
         parts.append("proxy denied: " + ", ".join(shown) + (f", +{more} more" if more > 0 else ""))
+    elif v.get("first_error_http") in (401, 403) and reached:
+        # the second real run: every session reached ollama, the proxy denied nothing, ollama itself answered 403
+        parts.append(f"the proxy denied nothing, the model endpoint itself refused (HTTP {v['first_error_http']}); "
+                     "a local Ollama answers 403 to a Host name or Origin header it does not accept")
     lines = ["; ".join(parts) + "\n"]
     if started and not reached:
         lines.append("          no session reached the model: nothing was asked of it. Fix the cause above, then run again.\n")
@@ -972,16 +980,26 @@ def _approved(s: Settings, plan: SweepPlan, pre: Preflight, up: Any, surface: An
 
 class FakeOllama:
     """A throwaway stand-in for Ollama on a free loopback port: `GET /api/tags` lists the model, anything else answers 200.
-    It records only request-line counts, never a body."""
+    It records only request-line counts, never a body. Like a real loopback Ollama it refuses, with an empty 403, a `Host`
+    that is not a loopback/private address, `localhost`, this machine's name or a `.localhost`/`.local`/`.internal` name,
+    and a foreign `Origin` (`ollama_guard`); the refused requests are counted in `rejected`, not in `hits`."""
 
     def __init__(self, model: str = "gemma4:12b"):
         self.model, self.hits = model, 0
+        self.rejected: list[tuple[int, str]] = []        # (status, the Host header) of every refused request
         outer = self
 
         import http.server
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self) -> None:           # noqa: N802
+                refused = ollama_guard.refusal(self.headers)
+                if refused:
+                    outer.rejected.append((refused, self.headers.get("Host") or ""))
+                    self.send_response(refused)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 outer.hits += 1
                 body = json.dumps({"models": [{"name": outer.model}]} if self.path.startswith("/api/tags") else {"data": []}).encode()
                 self.send_response(200)
@@ -1053,6 +1071,7 @@ def run_selftest(*, base: Path | None = None, out: TextIO | None = None, probes:
             report = json.loads((run_dir / "report.json").read_text())
             report["_run_dir"] = str(run_dir)
             report["_fake_endpoint_hits"] = fake.hits
+            report["_fake_endpoint_rejected"] = [list(x) for x in fake.rejected]
             return SweepOutcome(report, code)
     finally:
         if base is None:                                  # a caller-supplied base (a test's tmp_path) is its own to clean
@@ -1079,6 +1098,8 @@ def selftest_problems(outcome: SweepOutcome) -> list[str]:
         bad.append(f"teardown left something: {t}")
     if r.get("real_model_call") or r.get("approved_for_real_model"):
         bad.append("a selftest report claims a real model call")
+    for status, host in r.get("_fake_endpoint_rejected") or []:
+        bad.append(f"the fake model endpoint refused a request with HTTP {status} as a real Ollama would: Host {host!r}")
     sv = r.get("sessions_summary") or {}
     if sv.get("started") != EXPECTED_P + EXPECTED_R or sv.get("reached_model") != sv.get("started"):
         bad.append(f"the fake model endpoint was reached by {sv.get('reached_model')} of {sv.get('started')} sessions, "

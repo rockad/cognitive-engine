@@ -272,7 +272,7 @@ def test_the_session_environment_is_closed(probe):
     v = probe.values
     assert v["env_docker"] == "0" and v["env_canary"] == "0"
     proxies = v["env_proxy"]
-    assert proxies.count("http://harness2-proxy:3128") == 6 and "attacker.example" not in proxies
+    assert proxies.count("http://harness2-proxy.internal:3128") == 6 and "attacker.example" not in proxies
     assert "NO_PROXY=127.0.0.1,localhost,::1 " in proxies and "no_proxy=127.0.0.1,localhost,::1 " in proxies
     assert CANARY not in probe.stdout
 
@@ -342,7 +342,7 @@ def test_the_local_channel_reaches_the_host_model_only_through_the_bridge_and_th
         issued = []
         real_must = r._must
         monkeypatch.setattr(r, "_must", lambda args: (issued.append(list(args)), real_must(args))[1])
-        res = r.run(spec(ws, "raw", "harness2-proxy", str(echo.port), "hello"))
+        res = r.run(spec(ws, "raw", "harness2-proxy.internal", str(echo.port), "hello"))
         assert "ECHO:hello" in res.stdout, res
         probes = [r.run(spec(ws, "connect", "127.0.0.1", str(echo.port))), r.run(spec(ws, "connect", "127.0.0.1", str(other.port))),
                   r.run(spec(ws, "connect", "example.com", "443")), r.run(spec(ws, "tcp", "127.0.0.1", str(echo.port)))]
@@ -350,7 +350,7 @@ def test_the_local_channel_reaches_the_host_model_only_through_the_bridge_and_th
         assert "403" in probes[1].stdout and "403" in probes[2].stdout           # no other loopback service, no internet
         assert "FAILED" in probes[3].stdout                                       # the session's own loopback is empty
         assert other.accepted == 0 and echo.accepted >= 2
-        assert r.local_endpoint == f"http://harness2-proxy:{echo.port}"
+        assert r.local_endpoint == f"http://harness2-proxy.internal:{echo.port}"
         creates = [a for a in issued if a[:2] == ["network", "create"]]
         assert len(creates) == 5 and all("--internal" in a for a in creates)       # one internal network per session, NO egress network
         proxy_created = [a for a in issued if a[0] == "create"]
@@ -678,11 +678,11 @@ def test_the_bypass_covers_the_sessions_own_loopback_only_every_other_name_still
 def test_the_local_model_endpoint_is_reached_through_the_proxy_and_the_hosts_other_loopback_is_not(verified, proposer_image, ws):
     with HttpStub() as model, HttpStub() as other:
         r = local_runner(verified, proposer_image, model)
-        got = r.run(spec(ws, "pget", f"http://harness2-proxy:{model.port}/v1/models"))
+        got = r.run(spec(ws, "pget", f"http://harness2-proxy.internal:{model.port}/v1/models"))
         assert "pget=200 MODEL-STUB-OK" in got.stdout, got
         assert model.hits == 1
-        assert f"ACCESS decision=allow host=harness2-proxy port={model.port} reason=unix-route" in got.egress_log
-        for url in (f"http://127.0.0.1:{model.port}/", f"http://127.0.0.1:{other.port}/", f"http://harness2-proxy:{other.port}/"):
+        assert f"ACCESS decision=allow host=harness2-proxy.internal port={model.port} reason=unix-route" in got.egress_log
+        for url in (f"http://127.0.0.1:{model.port}/", f"http://127.0.0.1:{other.port}/", f"http://harness2-proxy.internal:{other.port}/"):
             res = r.run(spec(ws, "pget", url))
             assert "pget=200" not in res.stdout, (url, res)                              # the session's own loopback is empty; no other port is routed
         assert model.hits == 1 and other.hits == 0

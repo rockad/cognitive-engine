@@ -601,7 +601,7 @@ def test_metrics_carry_the_error_events_and_the_proxy_facts_of_a_session_that_fa
     assert m["errors"] == ["UnexpectedStatus: 403"] and m["exit_code"] == 1 and m["delivered"] is False
     assert m["model_requests"] == 0 and m["denied_hosts"] == ["127.0.0.1:34175"] and m["egress"] == list(log)
     ok = Session(write=lambda ws: (ws / "output" / "answer.txt").write_text(GOOD),
-                 egress_log=("ACCESS decision=allow host=harness2-proxy port=1 reason=unix-route",) * 2)
+                 egress_log=("ACCESS decision=allow host=harness2-proxy.internal port=1 reason=unix-route",) * 2)
     s2, _, _ = make_substrate(world, monkeypatch, ok)
     (d2,) = s2.execute(TASK, install(world), ["good"], 60)
     m2 = json.loads((d2 / "metrics.json").read_text())
