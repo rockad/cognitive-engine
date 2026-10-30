@@ -299,6 +299,7 @@ def _build_class(up: Upstream) -> type:
                         (ws / "opencode.json").write_text(json.dumps({"agent": {"build": {"steps": self.spec.steps}}}),
                                                           encoding="utf-8")
                 _open_up(str(ws))
+                staged_protected = workspace_harvest.protected_manifest(str(ws))      # upstream stages the whole harness
                 argv = build_command(kind, cli_container=cli_container, model=self.spec.model, effort=self.spec.effort,
                                      max_budget_usd=s.max_budget_usd)
                 env = self.env()
@@ -318,6 +319,12 @@ def _build_class(up: Upstream) -> type:
                 if result.timed_out:
                     raise subprocess.TimeoutExpired(cli_container, eff)
                 report = result.harvest
+                if report is not None and staged_protected:
+                    after_protected = workspace_harvest.protected_manifest(str(ws))
+                    if workspace_harvest.protected_changes(staged_protected, after_protected):
+                        raise WorkspaceRefused("a staged protected file was changed or removed (staged protected-path); "
+                                               "nothing was copied back")
+                    report = workspace_harvest.accept_unchanged_protected(report, staged_protected, after_protected)
                 if report is not None and (not report.ok or report.links):
                     rules = sorted({f.rule for f in report.findings} | ({"symlink"} if report.links else set()))
                     raise WorkspaceRefused("the session workspace failed inspection (" + ", ".join(rules)

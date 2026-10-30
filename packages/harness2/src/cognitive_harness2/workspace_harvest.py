@@ -24,7 +24,7 @@ from __future__ import annotations
 import os
 import stat
 import unicodedata
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
 from . import invariants
@@ -175,3 +175,76 @@ def inspect_workspace(root: str, limits: HarvestLimits = HarvestLimits(), *,
 
     walk(root, "", 0)
     return HarvestReport(tuple(files), tuple(links), tuple(findings), total)
+
+
+# ── protected files that the CALLER staged ────────────────────────────────────────
+#
+# `inspect_workspace` refuses every protected-named path, which is right for what a model CREATES. But a caller may
+# stage protected-named files on purpose: upstream's proposer context holds the whole harness, `guardrails.md`
+# included. Those are acceptable exactly when they come back byte-identical, so the caller takes a manifest of them
+# before the session and another after, and `accept_unchanged_protected` clears only the findings those prove harmless.
+
+def protected_manifest(root: str, limit: int = 4 * 1024 * 1024) -> dict[str, str]:
+    """rel path -> sha256 of every file whose path is protected by name (itself or under a protected directory).
+
+    A protected-named entry that is not a plain regular file (a link, FIFO, hard-linked, executable or setuid file,
+    or one over `limit`) maps to `"!"`, which never equals a hash, so it can neither be staged nor accepted."""
+    import hashlib
+
+    root = os.path.realpath(root)
+    out: dict[str, str] = {}
+    for base, dirs, names in os.walk(root, followlinks=False):
+        dirs.sort()
+        rel_base = os.path.relpath(base, root)
+        for name in sorted([*dirs, *names]):
+            rel = name if rel_base == "." else f"{rel_base}/{name}"
+            try:
+                invariants.assert_path_unprotected(rel)
+                continue
+            except invariants.InvariantViolation:
+                pass
+            p = os.path.join(base, name)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                out[rel] = "!"
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                continue                                  # its files are listed on their own
+            if (not stat.S_ISREG(st.st_mode) or st.st_nlink > 1 or st.st_mode & (SUID_MASK | EXEC_MASK)
+                    or st.st_size > limit):
+                out[rel] = "!"
+                continue
+            try:
+                with open(p, "rb") as f:
+                    out[rel] = hashlib.sha256(f.read(limit + 1)).hexdigest()
+            except OSError:
+                out[rel] = "!"
+    return out
+
+
+def protected_changes(before: Mapping[str, str], after: Mapping[str, str]) -> list[str]:
+    """The staged protected files that were changed, replaced or removed."""
+    return sorted(rel for rel, digest in before.items() if digest == "!" or after.get(rel) != digest)
+
+
+def accept_unchanged_protected(report: HarvestReport, before: Mapping[str, str], after: Mapping[str, str]) -> HarvestReport:
+    """`report` without the `protected-path` findings that the manifests prove are the caller's own, unchanged files.
+
+    A finding is cleared only if everything staged at or under its path is present and identical afterwards and
+    nothing was added there. The cleared files are returned among `files`. `total_bytes` is not adjusted."""
+    if not before:
+        return report
+    files, kept = list(report.files), []
+    for f in report.findings:
+        if f.rule != "protected-path":
+            kept.append(f)
+            continue
+        under = f.path + "/"
+        was = {k: v for k, v in before.items() if k == f.path or k.startswith(under)}
+        now = {k: v for k, v in after.items() if k == f.path or k.startswith(under)}
+        if was and now == was and "!" not in was.values():
+            files.extend(was)
+        else:
+            kept.append(f)
+    return HarvestReport(tuple(sorted(set(files))), report.links, tuple(kept), report.total_bytes)

@@ -430,3 +430,24 @@ def test_an_exhausted_budget_stops_a_proposer_session_before_anything_is_created
     assert "wall-clock" in str(ei.value) or "budget" in str(ei.value).lower()
     assert calls == [] and not any(pure.scratch.iterdir())
     assert [n for n, _ in events] == ["session_refused"] and events[0][1]["reason"] == "budget:deadline"
+
+
+# ── upstream stages the WHOLE harness, guardrails.md included: unchanged is fine, anything else is not ──────
+
+@pytest.mark.requires_rootless_docker
+def test_a_staged_guardrails_file_that_comes_back_unchanged_does_not_fail_the_session(world):
+    (world.context / "harness" / "guardrails.md").write_text("never guess\n")
+    r = world.call(world.prop("local"), "FAKE:edit")
+    assert harvested(r, "guardrails.md") == "never guess\n" and harvested(r, "edited.md").startswith("edited")
+    assert harvested(r, "seed.md") == "SEED-CONTENT"
+
+
+@pytest.mark.requires_rootless_docker
+@pytest.mark.parametrize("directive,why", [("FAKE:tamper-guardrails", "protected-path"),
+                                           ("FAKE:delete-guardrails", "staged protected"),
+                                           ("FAKE:new-guardrails", "protected-path")])
+def test_a_session_that_touches_a_protected_file_fails_and_copies_nothing_back(world, directive, why):
+    (world.context / "harness" / "guardrails.md").write_text("never guess\n")
+    with pytest.raises(world.up.proposer.ProposerError, match=why):
+        world.call(world.prop("local"), directive + " FAKE:edit")
+    assert not list(world.audit.glob("*.workspace"))

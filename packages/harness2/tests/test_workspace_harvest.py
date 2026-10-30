@@ -143,3 +143,84 @@ def test_the_root_must_be_a_directory(tmp_path):
     f = w(tmp_path, "f")
     with pytest.raises(NotADirectoryError):
         inspect_workspace(str(f))
+
+
+# ── protected files that were STAGED by the caller: unchanged is fine, anything else is not ──────
+
+from cognitive_harness2.workspace_harvest import accept_unchanged_protected, protected_changes, protected_manifest  # noqa: E402
+
+
+def staged(tmp_path):
+    w(tmp_path, "context/harness/systemprompt.md", b"prompt")
+    w(tmp_path, "context/harness/guardrails.md", b"never guess")
+    w(tmp_path, "context/harness/hooks/x.md", b"hook text")
+    return protected_manifest(str(tmp_path))
+
+
+def test_the_manifest_lists_protected_named_regular_files_by_hash(tmp_path):
+    m = staged(tmp_path)
+    assert set(m) == {"context/harness/guardrails.md", "context/harness/hooks/x.md"}
+    assert all(len(v) == 64 for v in m.values())
+
+
+def test_unchanged_staged_protected_files_are_accepted_and_returned_as_files(tmp_path):
+    before = staged(tmp_path)
+    w(tmp_path, "output/answer.md", b"done")
+    rep = inspect_workspace(str(tmp_path))
+    assert rules(rep) == ["protected-path", "protected-path"] and "context/harness/guardrails.md" not in rep.files
+    after = protected_manifest(str(tmp_path))
+    assert protected_changes(before, after) == []
+    fixed = accept_unchanged_protected(rep, before, after)
+    assert fixed.ok and {"context/harness/guardrails.md", "context/harness/hooks/x.md"} <= set(fixed.files)
+    assert "output/answer.md" in fixed.files and fixed.files == tuple(sorted(fixed.files))
+
+
+@pytest.mark.parametrize("how", ["edit", "delete", "replace-by-link", "make-exec", "hardlink"])
+def test_a_changed_or_removed_staged_protected_file_is_never_accepted(tmp_path, how):
+    before = staged(tmp_path)
+    g = tmp_path / "context/harness/guardrails.md"
+    if how == "edit":
+        g.write_bytes(b"always guess")
+    elif how == "delete":
+        g.unlink()
+    elif how == "replace-by-link":
+        g.unlink()
+        g.symlink_to("systemprompt.md")
+    elif how == "make-exec":
+        g.chmod(0o755)
+    else:
+        os.link(g, tmp_path / "copy.md")
+    rep = inspect_workspace(str(tmp_path))
+    after = protected_manifest(str(tmp_path))
+    assert protected_changes(before, after) == ["context/harness/guardrails.md"]
+    fixed = accept_unchanged_protected(rep, before, after)
+    assert "context/harness/guardrails.md" not in fixed.files
+    if how != "delete":
+        assert any(f.rule == "protected-path" and f.path == "context/harness/guardrails.md" for f in fixed.findings)
+
+
+def test_a_new_protected_name_is_still_a_finding(tmp_path):
+    before = staged(tmp_path)
+    w(tmp_path, "context/harness/guard.md", b"new")
+    w(tmp_path, ".git/config", b"[x]")
+    rep = inspect_workspace(str(tmp_path))
+    fixed = accept_unchanged_protected(rep, before, protected_manifest(str(tmp_path)))
+    bad = sorted(f.path for f in fixed.findings if f.rule == "protected-path")
+    assert bad == [".git", "context/harness/guard.md"]
+
+
+def test_a_protected_directory_is_accepted_only_if_everything_under_it_is_unchanged(tmp_path):
+    before = staged(tmp_path)
+    w(tmp_path, "context/harness/hooks/extra.md", b"planted")
+    rep = inspect_workspace(str(tmp_path))
+    after = protected_manifest(str(tmp_path))
+    fixed = accept_unchanged_protected(rep, before, after)
+    assert any(f.path == "context/harness/hooks" for f in fixed.findings)
+    assert "context/harness/hooks/x.md" not in fixed.files
+
+
+def test_an_empty_manifest_changes_nothing(tmp_path):
+    w(tmp_path, "a.md", b"a")
+    w(tmp_path, ".git/config", b"x")
+    rep = inspect_workspace(str(tmp_path))
+    assert accept_unchanged_protected(rep, {}, protected_manifest(str(tmp_path))) == rep

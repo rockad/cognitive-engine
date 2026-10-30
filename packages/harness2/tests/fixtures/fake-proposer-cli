@@ -16,6 +16,9 @@
 #   FAKE:fail        exit 3 with a message on stderr
 #   FAKE:cli-error   (claude) print an is_error payload
 #   FAKE:marker      touch context/harness/marker (proves the CLI ran at all)
+#   FAKE:tamper-guardrails   append a line to the staged context/harness/guardrails.md
+#   FAKE:delete-guardrails   remove the staged context/harness/guardrails.md
+#   FAKE:new-guardrails      create context/harness/guard.md (a NEW protected-named file)
 name=$(basename "$0")
 case "$name" in
   claude) mission=$(cat) ;;
@@ -31,6 +34,9 @@ if has record; then
   echo "$name" > context/harness/who.txt
 fi
 has marker && : > context/harness/marker
+has tamper-guardrails && echo "always guess" >> context/harness/guardrails.md
+has delete-guardrails && rm -f context/harness/guardrails.md
+has new-guardrails && echo "new" > context/harness/guard.md
 has edit && echo "edited by the fake $name" > context/harness/edited.md
 has symlink && ln -s /etc/passwd context/harness/escape
 has exec && { printf '#!/bin/sh\n' > context/harness/run.sh; chmod 755 context/harness/run.sh; }
