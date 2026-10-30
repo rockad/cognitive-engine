@@ -72,6 +72,7 @@ OLLAMA_TIMEOUT_S = 3.0
 EXCERPT = 160
 FAKE_CLI = Path(__file__).with_name("selftest_fake_opencode.sh")
 EXPECTED_P, EXPECTED_R = 3, 4                # upstream's budget identity at k=1 (P = 3k, R = 4k)
+HOST_SESSION_WARNINGS = ("the session runs agent tools (shell and file access) on this host", "HOME and any file-based credentials")
 CANDIDATES = (("systemprompt", "systemprompt.md"), ("memory", "LongTermMEMORY.md"),
               ("tool_guidance", "tool_descriptions/tool_guidance.md"))
 
@@ -376,8 +377,13 @@ def format_plan(s: Settings, pre: Preflight, plan: SweepPlan | None, refusals: S
                   "  " + approve_command(s, pre.cli, profile_path, plan.max_wall_seconds), ""]
         L.append(f"A run writes under {s.runs_dir}/<sweep id>/ : audit.jsonl and report.json.")
         for w in plan.warnings:
-            if not w.startswith("max_cost_or_tokens"):       # the nominal cost request is clipped to the zero cap by design
-                L.append(f"note: {w}")
+            if w.startswith("max_cost_or_tokens"):            # the nominal cost request is clipped to the zero cap by design
+                continue
+            if w.startswith(HOST_SESSION_WARNINGS):            # written for a session on the host; these are contained
+                continue
+            L.append(f"note: {w}")
+        L.append("note: check_proposer's two warnings about host tool access and HOME credentials are not shown: "
+                 "every session here runs in a container with a tmpfs HOME and no credential")
     else:
         L.append("NOT READY. Nothing can be approved until these are fixed:")
         for r in refusals:

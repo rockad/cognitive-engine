@@ -611,3 +611,11 @@ def test_the_selftest_subcommand_passes_on_the_real_daemon_and_removes_its_scrat
     out = capsys.readouterr()
     assert code == 0 and "selftest passed: P=3 R=4, rollouts 4/4 correct, teardown clean: True" in out.out, out
     assert {p.name for p in tmp.glob("h2-stage1-selftest-*")} <= before
+
+
+def test_the_plan_does_not_alarm_with_host_session_warnings_that_do_not_apply_to_a_container(rig, up):
+    out = io.StringIO()
+    assert run_plan(rig.parse("plan"), environ={}, probes=rig.probes(), out=out) == 0
+    text = out.getvalue()
+    assert "on this host in its working directory" not in text and "gcloud ADC" not in text
+    assert "tmpfs HOME and no credential" in text and "max_cost_or_tokens" not in text
