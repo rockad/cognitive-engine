@@ -151,7 +151,7 @@ The proposer's agent CLI (shell and file tools) runs in a **rootless Docker cont
 
 **What `run` checks before anything is created (fail closed).** The rootless gate against the pinned image id; `channels.decide` recomputed from `zdr` and `classification`; for `opencode` and `claude_cli`, an allowed `upstream_egress.Decision`; a wall clock within the channel's `wall_s`; `argv[0]` equal to the mounted CLI path (`/opt/cli/<name>`), with the rest of argv data and never a shell string; a workspace that is a normalised, symlink-free, non-system directory (never the home directory or an ancestor); an environment of `UPPER_SNAKE` names that cannot override the proxy variables and cannot look like a credential; no credential value in argv or env.
 
-**Session container.** `--read-only`, tmpfs `HOME` (`/home/agent`) and `/tmp` (size-capped, `noexec,nosuid`), `--cap-drop ALL`, `no-new-privileges`, user 65534, pids/memory/cpu limits (defaults 256, 2g, 2 cpus: stage-1 proposals), the CLI bind-mounted read-only, the workspace read-write at the same absolute path, one `--internal` network, `--dns 127.0.0.1`, `HTTP(S)_PROXY` at the proxy container and an empty `NO_PROXY`. Nothing else is mounted: never the home directory, never the docker socket. The **proxy container** is read-only, cap-dropped and limited too; it is attached to the internal network and, for a hosted channel only, an egress network. The local channel has no egress network at all.
+**Session container.** `--read-only`, tmpfs `HOME` (`/home/agent`) and `/tmp` (size-capped, `noexec,nosuid`), `--cap-drop ALL`, `no-new-privileges`, user 65534, pids/memory/cpu limits (defaults 256, 2g, 2 cpus: stage-1 proposals), the CLI bind-mounted read-only, the workspace read-write at the same absolute path, one `--internal` network, `--dns 127.0.0.1`, `HTTP(S)_PROXY` at the proxy container and `NO_PROXY=127.0.0.1,localhost,::1` (the session's OWN loopback only: opencode serves itself on a random loopback port and asks it through a proxy-aware client, which the proxy would otherwise deny; set by the runner, never by the caller; the proxy, the host and every external name are never bypassed). Nothing else is mounted: never the home directory, never the docker socket. The **proxy container** is read-only, cap-dropped and limited too; it is attached to the internal network and, for a hosted channel only, an egress network. The local channel has no egress network at all.
 
 **Credentials** go only into the session container, as a read-only file mounted at a path the caller names (`Credential`), never argv, `-e VALUE`, `docker inspect` or `ps`. The value is redacted from stdout and stderr, and harvest refuses workspace files that contain it. Deviation from a "0400 file": under rootless Docker the container user 65534 is not the file's owner, so the file is `0444` with a random 24-hex name in a `0711` directory inside a `0700` parent, removed in `finally`; the secrecy comes from the private parent and from only the session container mounting it.
 
@@ -170,7 +170,7 @@ result = runner.run(SessionSpec(argv=("/opt/cli/opencode", "run", ...), workspac
 # result.stdout / .stderr (capped, escape-stripped, redacted), .egress_log, .harvest, .timed_out
 ```
 
-For a local channel the CLI must be configured with `runner.local_endpoint` (`http://harness2-proxy:<port>`), because the session's own `127.0.0.1` is empty.
+For a local channel the CLI must be configured with `runner.local_endpoint` (`http://harness2-proxy:<port>`), because the session's own `127.0.0.1` is empty. That name is NOT in `NO_PROXY`: a proxy-aware client sends the request THROUGH the proxy, whose config routes exactly (`harness2-proxy`, port) and (`127.0.0.1`, port) to the bridge socket (log line `reason=unix-route`); a client that connects to the listener directly lands on the same socket. Measured with the real opencode: it goes through the proxy.
 
 **Rebuild the image.** `packages/harness2/containers/proposer/build.sh` (or `uv run python -m cognitive_harness2.image build`; `status` only checks). It builds from a context of two files with the pinned socket. Any change to the Dockerfile or `egress_proxy.py` changes the tag, so rebuild after editing either; old tags are removed by hand (`docker rmi cognitive-harness2-proposer:<old>`). The base digest is in the Dockerfile; to move it, pull the new base once, edit the `FROM`, rebuild. Packages are installed from the Ubuntu archive at build time, so the digest pins the base, not the package set.
 
@@ -184,7 +184,7 @@ For a local channel the CLI must be configured with `runner.local_endpoint` (`ht
 - The egress side trusts the container runtime's networking; a kernel or runc escape defeats all of this (rootless limits the blast radius to the host user).
 - Output is stripped of escape sequences and control characters and redacted by exact credential value; a transformed (encoded) secret is not recognised.
 - `SbxRunner` (microVM) is still unverified; this path is rootless Docker only.
-- Not verified here: any real CLI (opencode, `claude`, `agy`) inside this container. A CLI that needs to execute from `HOME` or `/tmp` (native code unpacking) needs `SessionSpec(tmp_exec=True)`; one that writes next to its token needs `tmpfs_dirs`. Stage 1 is where that is found out.
+- Verified here: opencode v2.0.25 only, against a stub model (see **First-contact findings**); it starts and works with a read-only root and noexec tmpfs `HOME` and `/tmp`. Not verified: `claude` and `agy` inside this container. A CLI that needs to execute from `HOME` or `/tmp` (native code unpacking) needs `SessionSpec(tmp_exec=True)`; one that writes next to its token needs `tmpfs_dirs`.
 - The wall cap compared against is the channel's `wall_s`, which the profile defines per sweep; per-session budgeting is the caller's.
 - **The workspace is a rw bind mount to host disk** with no total-size quota (see the coverage notes below).
 - If the Python process is killed with SIGKILL, containers and networks labelled `cognitive-harness2.session` can remain; `runner.reap_all()` removes exactly those.
@@ -241,7 +241,7 @@ The SOLVER half of a k=1 run: the rollouts. Upstream at k=1 (`modes=('agg',)`) r
 
 Honest limits:
 
-- **Fake CLI only.** (The stage-1 runner replaces the argv and environment below: see "Running stage 1".) The opencode `--format json` event shape, its provider configuration (`opencode.json` or environment) and the argv in `substrate.opencode_argv` are assumptions copied from upstream's reference launcher and have never met a real binary. A bun-compiled opencode may need `SolverExecution(tmp_exec=True)` (default off) and `tmpfs_dirs`; that, and the provider schema, are settled only by the first real call.
+- **Fake CLI only.** (The stage-1 runner replaces the argv and environment below: see "Running stage 1".) The opencode `--format json` event shape, its provider configuration (`opencode.json` or environment) and the argv in `substrate.opencode_argv` are assumptions copied from upstream's reference launcher and have never met a real binary. Settled since, against the real v2.0.25 and a stub model (**First-contact findings**): opencode needs neither `tmp_exec` nor `tmpfs_dirs`, and the provider block is right; what a real gemma does with it is not.
 - `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX` cannot be set: the runner refuses environment names that look like credentials (`TOKEN`). Upstream sets it to 64000.
 - Only the always-on files are rendered into `AGENTS.md`. Skills, subagents, scripts and plugins of the harness tree are not installed in the workspace (upstream's `workspace_agents_md` mode installs them under `.opencode/`).
 - The solver can delete nothing it was given (sticky bit), but it can still write anything it likes under `output/` and the workspace; only `output/` is read back.
@@ -296,8 +296,8 @@ up.schedule.run_task(task_id, k, adapter=adapter, prop=prop, runs_root=runs, mod
 
 **Honest limits.**
 
-- **The opencode provider schema is unconfirmed.** `OPENCODE_CONFIG_CONTENT` follows the documented `@ai-sdk/openai-compatible` provider shape and was NOT run against opencode v2.0.25 with a model. The first real call is where it is confirmed or fixed (`contained_proposer.opencode_config`). `opencode.json` (`agent.build.steps`) is still written as upstream did; v2 may ignore it. `--variant` (effort) does not exist in v2, so effort has no effect on opencode.
-- **Unverified in the container:** that opencode, claude or agy start with a read-only root and a tmpfs `HOME` at all; `TMP_EXEC` (opencode `True`, the others `False`) is a guess about native-code unpacking.
+- **The opencode provider schema is confirmed** against the real v2.0.25 and a stub model (**First-contact findings**): `npm: "@ai-sdk/openai-compatible"` is required, `options.baseURL` works. `opencode.json` (`agent.build.steps`) is still written as upstream did; v2 ignores it harmlessly. `--variant` (effort) does not exist in v2, so effort has no effect on opencode.
+- **Unverified in the container:** that claude or agy start with a read-only root and a tmpfs `HOME` at all; `TMP_EXEC` is `False` for all three (measured for opencode, a guess for the others).
 - **claude's token.** The runner exposes a credential as a file and, with `env_var`, sets the variable to the file's PATH, not its value. `CLAUDE_CODE_OAUTH_TOKEN` expects the value, so a claude subscription session needs either runner support for that or a credentials file mounted where claude reads it (`~/.claude/.credentials.json`, unverified). Not solved here. agy's token is a file (`~/.gemini/antigravity-cli/antigravity-oauth-token`) and fits the credential mechanism as is. The caller reads the token; this package never touches the host's credential files.
 - **agy** prints its final answer on stdout (taken as plain text) or in `output/answer.md`; its retention is unknown, so the profile caps it at `open` content, and the container is its only boundary.
 - `--max-budget-usd` is passed to claude only when `SessionConfig.max_budget_usd` is set; a subscription's cost is notional.
@@ -311,7 +311,7 @@ up.schedule.run_task(task_id, k, adapter=adapter, prop=prop, runs_root=runs, mod
 
 Stage 1 is the first run of the method against a real model: a local smoke run, `k = 1`, on the synthetic `sum-signed` task, with `opencode` in a rootless container talking to **your Ollama on loopback**. 3 proposer sessions (inv1, dom1, agg1) and 4 solver rollouts (base1, inv1, dom1, agg1), one model call at a time, `modes=('agg',)`, upstream's reflection session skipped (`run_task(..., libraries=None)`), attempts forced to 1. $0, nothing leaves the machine, a human approves the sweep. Code: `stage1.py`; profile template: `examples/harness2-channels.stage1.toml`.
 
-**Nothing in this repository has made a real model call.** The only place one can happen is the `run` command below, which you type.
+**Nothing in this repository has made a real model call.** The only place one can happen is the `run` command below, which you type. (The first `run`, 2026-10-30, made none either: all seven sessions died in about two seconds on a proxy denial of opencode's own loopback traffic, fixed in `session_runner.session_env`; see **First-contact findings**.)
 
 ### What to check first
 
@@ -373,25 +373,52 @@ ls "$XDG_RUNTIME_DIR" | grep -E '^h2(s|bridge)-'     # stray bridge/session dire
 | file | what |
 | --- | --- |
 | `audit.jsonl` | one JSON line per event, flushed as it happens: `plan`, `approval`, `grant`, `sweep_start`, `session_reserved`, `session_start` (timeout), `session_end` (exit code, timed out, duration, leftovers), `session_refused` (budget, gate or authorisation, with the reason), `rollout_start`, `rollout_verdict`, `error`, `teardown`, `sweep_end`. Numbers and short words only: never a prompt, an argv, an environment, a credential or model output beyond a 160-character excerpt of a rollout's answer. |
-| `report.json` | the final result: status, total wall, the ledger (`P`, `R`, expected 3 and 4), pass or fail per rollout (all three criteria, the answer excerpt, exit code, timed out), the proposer stages, session counts and outcomes, the teardown result. Written even when the sweep failed. |
+| `report.json` | the final result: status, total wall, the ledger (`P`, `R`, expected 3 and 4), pass or fail per rollout (all three criteria, the answer excerpt, exit code, timed out, the CLI's `error` events), the proposer stages, session counts and outcomes, the teardown result. Written even when the sweep failed. It says what reached the model, in these fields: `approved_for_real_model` (you approved a real run; false in the selftest), `cli_sessions_started`, `model_sessions_reached` (sessions during which the egress proxy opened a connection to the host bridge, i.e. to Ollama's door; it does not say the model answered), `real_model_call` (true only if approved AND at least one session reached the model; it used to be the approval flag and was misleading), and `sessions_summary` (exit codes, timeouts, denied `host:port` with how many sessions hit each, the first CLI error). |
 | `results/`, `upstream-runs/`, `proposer-audit/` | upstream's and the solver's own artifacts: each rollout's `opencode_session.jsonl` stream and `output/`, upstream's summary, and **upstream's own mission and response files** for each proposer session. These are the method's working records and DO hold prompts and model text; keep the directory private (it is 0700) and delete it when done. |
 
-Exit codes: 0 clean and the ledger is 3 and 4; 1 the sweep failed or the identity did not hold; 2 refused before anything started; 3 the teardown left something behind (named in the report); 130 interrupted.
+The run ends with an `outcome` line, for example `outcome   7 sessions started, 0 reached the model: 7 exited rc=1; first error: UnexpectedStatus: 403; proxy denied: 127.0.0.1:34175 (7 sessions, not-allow-listed)`, and, when nothing reached the model, a line saying nothing was asked of it. Denied hosts are `host:port` only.
 
-### What is unverified until the first real call
+Exit codes: 0 clean and the ledger is 3 and 4; 1 the sweep failed, the identity did not hold, or sessions started and none reached the model; 2 refused before anything started; 3 the teardown left something behind (named in the report); 130 interrupted.
 
-The following are assumptions, not observations. Each is where the first run is most likely to fail, and the fake run cannot tell:
+### What only a real gemma call can settle
 
-- **opencode's provider configuration schema.** `OPENCODE_CONFIG_CONTENT` is built as `{"provider": {"ollama": {"npm": "@ai-sdk/openai-compatible", "name": ..., "options": {"baseURL": ...}, "models": {...}}}}` (`contained_proposer.opencode_config`). A probe of the real binary (v2.0.25, isolated XDG and HOME, no model call) found that `opencode debug config` **does not validate** `OPENCODE_CONFIG_CONTENT`: three variants (`options.baseURL`, `name`, `api` as the URL key), invalid JSON and a wrong-typed `provider` all returned the same output with no error. So the schema is unconfirmed, and so is which of those key forms is right. If opencode says it has no such provider or model, the evidence is in `report.json` (`stages[].error`), `proposer-audit/*.meta.json` (`error`) and each rollout's `results/*/metrics.json` (`stderr_tail`).
-- **The command line** `opencode run --standalone --auto --format json --model ollama/gemma4:12b "<prompt>"` is taken from `opencode run --help` in that probe (flags `--auto`, `--format json`, `--model provider/model`, `--standalone` listed; not executed). The probe did not verify whether `run` takes a directory (the runner sets the container working directory instead) and found that the prompt is positional text.
-- **`tmp_exec`**: `TMP_EXEC["opencode"] = True`, i.e. HOME and `/tmp` are mounted executable because a bun-compiled binary may unpack native code there. If opencode starts without it, switching it off would be safer; the probe saw its tmp directory at `/tmp/opencode`, which XDG overrides do not move.
-- **`AGENTS.md` pickup**: the solver relies on opencode reading `AGENTS.md` from its working directory to receive the harness. Not observed.
-- **The `--format json` event shape** that `trajectory.read_trajectory` and the event counter expect (text and tool-use events). A stream with no parseable event is treated as a dead rollout, so if the shape differs every rollout will show `n_events` 0.
-- **The prompt reaches the solver as one flattened line** (the command-line gate refuses control characters, so newlines become spaces).
-- **Whether opencode starts at all** with a read-only root and a tmpfs HOME in a container, with the proxy as its only route, and how it behaves when its model server is slow.
-- **GPU time and memory** for a 12B model, and the first-token latency while it loads.
+The real opencode binary has now been run in the stage-1 session against a stub model (next section). What is still an assumption, and where the first real run is likeliest to disappoint:
+
+- **Whether gemma4:12b emits well-formed tool calls** through Ollama's OpenAI-compatible `/v1/chat/completions`, and whether it uses `write` on `output/answer.txt` (solver) or `output/answer.md` (proposer) at all, or just talks. The stub always does exactly what the script says.
+- **Context truncation.** Each step sends about 15 KB (about 4,000 tokens: 6 tool definitions, the system prompt, `AGENTS.md`, the task) plus the tool results so far. Ollama's default context window may be smaller than that and silently drops the START of the prompt, which is where the instructions are. After the first call, look at the `CONTEXT` column of `ollama ps`; if it is small, set the model's `num_ctx` (a Modelfile `PARAMETER num_ctx`, or `OLLAMA_CONTEXT_LENGTH`) before trusting any result.
+- **Speed and memory**: tokens per second, model load time (the first call may spend minutes before its first token), VRAM, and so how many of the 600 s per session and 2,700 s per sweep are really needed.
+- **Whether Ollama accepts the request body** opencode sends (`store`, `stream_options.include_usage`, `max_completion_tokens: 32000`, tools). The stub accepted everything; Ollama may ignore or reject a key.
+- **A failing or absent Ollama behaves like a 5xx**: opencode retries about 85 s and then exits 1 with the server's message. A model Ollama does not have is a fast exit 1 (404).
 - **Whether a 12B model can do the work.** The method asks the proposer to edit harness files and answer in `output/answer.md`; a small model may well produce nothing usable, in which case the stages fall back to the base harness and the report says so. That is a result, not a fault of the runner.
-- opencode v2 has no permission variable and `--variant` (effort) does not exist, so neither is set; the container is the only fence.
+- **The prompt reaches the solver as one flattened line** (the command-line gate refuses control characters, so newlines become spaces). The stub sees it intact enough to detect the task text; whether gemma copes is open.
+- opencode v2 has no permission environment variable and `--variant` (effort) does not exist, so neither is set; the container is the only fence.
+
+### First-contact findings (stub-model probe)
+
+`tests/real_cli_probe.py` and `tests/test_real_cli.py` (pytest marker `real_cli`) run the REAL opencode v2.0.25 in the exact contained stage-1 solver session: `stage1.solver_argv`, `stage1.solver_env_builder`, `TMP_EXEC`, the stage-1 workspace layout (`AGENTS.md`, `input.txt`, `output/`), the same hardening, host bridge and egress proxy. The "model" is a stub OpenAI-compatible server on this host's loopback that answers from a script and logs what it is asked (paths, header NAMES, the model field, which tools were offered, whether `AGENTS.md` reached the prompt). No Ollama, no model.
+
+```bash
+COGNITIVE_HARNESS2_REAL_CLI=1 uv run pytest -q packages/harness2/tests/test_real_cli.py     # skipped without the variable or the binary
+uv run python packages/harness2/tests/real_cli_probe.py --scenario write --config api       # one session, prints the events and the stub's log
+```
+
+Measured, 2026-10-30, opencode v2.0.25:
+
+| question | finding |
+| --- | --- |
+| the first real run's failure | opencode `--standalone` starts a private HTTP server on a random port of its OWN `127.0.0.1` and calls it with a proxy-aware client. `NO_PROXY` was empty, so the call went to the egress proxy, which denied it (`host=127.0.0.1`, 403, `UnexpectedStatus: 403`) before the model was ever contacted. Fixed: `NO_PROXY=127.0.0.1,localhost,::1`, set by the runner. |
+| model traffic | goes THROUGH the proxy (`http://harness2-proxy:<port>/v1`, log `reason=unix-route`), as a proxy-aware client does. Per session: one `GET /api/tags`, then one `POST /v1/chat/completions` per model step (streaming, `stream_options.include_usage`, `store: false`, `max_completion_tokens: 32000`). No `Authorization` header: no key is needed. |
+| provider block | `npm: "@ai-sdk/openai-compatible"` is **required** (without it: `provider.no-route: Unsupported package for ollama/gemma4:12b`, exit 1, the model never contacted). `options.baseURL` works, and so does `api` in its place; `name` is optional; `baseURL`-only and `api`-only (no `npm`) fail. The existing block was right. |
+| `TMP_EXEC` | **False** works (both `/tmp` and `HOME` mounted `noexec`): text reply, `shell`, `read`, `write` all ran. Changed from True. |
+| where it writes | `HOME` (tmpfs): about 0.5 MB, a sqlite `~/.local/share/opencode/opencode.db` (+ `-wal`, `-shm`), `log/`, `shell/`, `repos/`, `~/.cache/opencode/bin`, `~/.config/opencode`, `~/.local/state/opencode`. `/tmp`: about 19 MB, three `.bun-*.so/.node` files and `/tmp/opencode`. The workspace gets nothing but what the model writes (no stray files). Both tmpfs are capped at 256 MB. |
+| start time | a whole contained session (network, proxy, bridge, opencode start, one model round trip, teardown) took 2.9 to 3.3 s. About 2 s of that is the container machinery (the failed first run spent 2.2 s per session). |
+| `AGENTS.md` | picked up from the working directory: its text is in the system prompt of every step. |
+| tools | opencode offers 12; **`grep` and `glob` fail** (`ripgrep execution failed`: opencode tries to download `rg` from github.com, the proxy rightly denies it, the image has none). `webfetch`, `websearch`, `question` and `subagent` cannot do useful work here. All six are now denied in the config (`permission`), leaving `edit`, `read`, `shell`, `skill`, `write`, `execute`: the request shrinks from 22 KB to 15 KB. The tool is `shell`, not `bash`. |
+| `--title` | with `--title adapt` opencode skips a separate title-generation model call, so one chat request per step instead of two (`COMMAND_SHAPES` allows `--title <word>`). |
+| events (`--format json`) | one JSON object per line, each with `type`, `timestamp`, `sessionID`, `part`. A tool round is `step_start`, `tool_use` (`part.tool`, `part.state.status` `completed` or `error`, `state.input`, `state.output` or `state.error`), `step_finish` (`reason: "tool-calls"`, `cost`, `tokens`); the final answer is one `text` event (`part.text`, the whole text, not deltas). Errors are `{"type":"error","error":{"type":..., "message":..., "status"?}}`. `trajectory.render_events` and upstream's `_opencode_stdout` and `_opencode_cost` read these streams correctly, except upstream's error text (below). |
+| the answer file | a stubbed `write` tool call to `output/answer.txt` executes inside the workspace, the file is harvested, copied to the run's `output/` and passes `sum_signed.grade_answer` (all three criteria). The proposer shape (`MISSION.md`, `opencode.json`, `output/answer.md`, the upstream prompt) works the same; `opencode.json` is ignored. |
+| exit codes | 0 after a normal end; 1 after an `error` event. A model the server does not have (404): exit 1 at once with the server's message. A 5xx or 429: about 85 s of retries (11 requests), then exit 1. |
+| failure text | upstream's parser reads only the old `error.data.message`, so a v2 failure was reported as `rc=1: empty reply`. `trajectory.error_events` reads `error.message` and is used for the proposer's error text and in each solver run's `metrics.json` (`errors`). |
 
 ## Channel profile
 
@@ -531,4 +558,10 @@ The API key is read from `JEV_OPENROUTER_API_KEY` or `OPENROUTER_API_KEY` and is
 
 ```bash
 uv run pytest packages/harness2
+```
+
+The `real_cli` tests (the real opencode binary against a stub model, no Ollama) are skipped unless `~/.opencode/bin/opencode` exists AND `COGNITIVE_HARNESS2_REAL_CLI=1`, so the normal suite is hermetic. Run them on their own:
+
+```bash
+COGNITIVE_HARNESS2_REAL_CLI=1 uv run pytest -q packages/harness2/tests/test_real_cli.py
 ```
