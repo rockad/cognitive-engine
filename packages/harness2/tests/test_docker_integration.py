@@ -227,6 +227,11 @@ def test_a_pinned_runner_ignores_an_ambient_switch_made_after_the_gate(monkeypat
     r = sandbox.default_runner(_no_sbx)                       # the gate ran here and recorded the endpoint
     assert isinstance(r, DockerRunner) and r.docker_host.startswith("unix://")
     verified = r.docker_host
+    # DOCKER_HOST outranks DOCKER_CONTEXT, so an ambient DOCKER_HOST (an operator who exported the rootless
+    # socket) would mask the context-only case and the control below would find no redirect. Start from a
+    # clean slate so the test means the same thing whichever way the daemon was selected.
+    for k in ("DOCKER_HOST", "DOCKER_CONTEXT"):
+        monkeypatch.delenv(k, raising=False)
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     # Control: the same switched environment really does redirect (here: break) an unpinned docker call.
