@@ -241,7 +241,7 @@ The SOLVER half of a k=1 run: the rollouts. Upstream at k=1 (`modes=('agg',)`) r
 
 Honest limits:
 
-- **Fake CLI only.** The opencode `--format json` event shape, its provider configuration (`opencode.json` or environment) and the argv in `substrate.opencode_argv` are assumptions copied from upstream's reference launcher and have never met a real binary. A bun-compiled opencode may need `SolverExecution(tmp_exec=True)` (default off) and `tmpfs_dirs`; that, and the provider schema, are settled only by the first real call.
+- **Fake CLI only.** (The stage-1 runner replaces the argv and environment below: see "Running stage 1".) The opencode `--format json` event shape, its provider configuration (`opencode.json` or environment) and the argv in `substrate.opencode_argv` are assumptions copied from upstream's reference launcher and have never met a real binary. A bun-compiled opencode may need `SolverExecution(tmp_exec=True)` (default off) and `tmpfs_dirs`; that, and the provider schema, are settled only by the first real call.
 - `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX` cannot be set: the runner refuses environment names that look like credentials (`TOKEN`). Upstream sets it to 64000.
 - Only the always-on files are rendered into `AGENTS.md`. Skills, subagents, scripts and plugins of the harness tree are not installed in the workspace (upstream's `workspace_agents_md` mode installs them under `.opencode/`).
 - The solver can delete nothing it was given (sticky bit), but it can still write anything it likes under `output/` and the workspace; only `output/` is read back.
@@ -304,6 +304,94 @@ up.schedule.run_task(task_id, k, adapter=adapter, prop=prop, runs_root=runs, mod
 - The scratch workspace is a rw bind mount to host disk with no quota (see the contained-session limits above), and a hostile model can still send anything in its workspace to the allow-listed endpoint.
 - `import_upstream` proves that importing read no `.env`. It cannot prove upstream never reads one LATER (config's `load_dotenv` runs only at import).
 - A harvest finding fails the whole session, including a harmless one (an executable bit on a script the harness tree contains). Widen `SessionConfig.harvest_limits` deliberately if a real tree needs it.
+- **Staged protected files.** Upstream stages the WHOLE harness under `context/harness/`, `guardrails.md` included, and the harvest refuses every protected-named path. `ContainedProposer` therefore takes a manifest (`workspace_harvest.protected_manifest`) of the protected-named files it staged and another after the session: files that come back byte-identical are accepted; a staged one that was edited, removed, replaced by a link or made executable fails the session, and so does a NEW protected-named path. (Found by the stage-1 selftest: without it every real proposer stage failed with `protected-path`.)
+- `SessionConfig.budget` and `SessionConfig.observer` put the proposer sessions on the same `SweepBudget` as the rollouts and into the same audit trail.
+
+## Running stage 1
+
+Stage 1 is the first run of the method against a real model: a local smoke run, `k = 1`, on the synthetic `sum-signed` task, with `opencode` in a rootless container talking to **your Ollama on loopback**. 3 proposer sessions (inv1, dom1, agg1) and 4 solver rollouts (base1, inv1, dom1, agg1), one model call at a time, `modes=('agg',)`, upstream's reflection session skipped (`run_task(..., libraries=None)`), attempts forced to 1. $0, nothing leaves the machine, a human approves the sweep. Code: `stage1.py`; profile template: `examples/harness2-channels.stage1.toml`.
+
+**Nothing in this repository has made a real model call.** The only place one can happen is the `run` command below, which you type.
+
+### What to check first
+
+- **Ollama is up and has the model**: `ollama list` shows `gemma4:12b` (else `ollama pull gemma4:12b`). `plan` checks this with one `GET /api/tags` and loads nothing.
+- **GPU memory is free**: `nvidia-smi` (or your equivalent). A 12B model needs several GB of VRAM on top of whatever else holds the GPU; `ollama ps` shows what is loaded now. Nothing here measures this for you, and the first call may spend minutes loading the model before its first token (the bridge allows up to 15 minutes idle, but the per-session timeout is still 600 s).
+- **The image exists**: `uv run python -m cognitive_harness2.image status` (build once with `... image build`; a run never builds or pulls).
+- **The profile**: copy the template somewhere you own and point `workspace_roots` at a directory that exists (the runner makes its scratch directories there and removes them):
+
+```bash
+mkdir -p ~/h2-stage1 ~/h2-workspaces
+cp packages/harness2/examples/harness2-channels.stage1.toml ~/h2-stage1/channels.toml   # edit workspace_roots if yours differs
+export COGNITIVE_HARNESS2_CHANNELS_FILE=~/h2-stage1/channels.toml                         # or pass --profile on every command
+```
+
+The runner reads the profile from `--profile` or that variable, never from the default `~/.config` file, and never writes under `~/.config`.
+
+### The commands
+
+```bash
+# 1. The plan. Read-only: it changes nothing and prints the command that approves the sweep.
+uv run python -m cognitive_harness2.stage1 plan --opencode ~/.opencode/bin/opencode
+
+# 2. The run. Needs --approve <channel> AND a phrase you type on this terminal; a pipe or a script cannot approve it.
+uv run python -m cognitive_harness2.stage1 run --approve local-ollama --opencode ~/.opencode/bin/opencode
+
+# Rehearsal with a FAKE opencode and a FAKE Ollama on the real daemon (no model, safe to run any time):
+uv run python -m cognitive_harness2.stage1 selftest            # --keep-in DIR keeps the audit and report
+```
+
+Options: `--wall-s N` (total wall clock; it can only LOWER the profile's `wall_s`, raise that in the profile), `--per-session-s N` (default 600), `--runs-dir DIR` (the PARENT of the per-sweep directory, default `~/.local/state/cognitive-engine/harness2-stage1`), `--classification` (default `open`: the task, the harness and every prompt are synthetic), `--channel` (default `local-ollama`).
+
+`plan` prints the channel, endpoint, model, caps, expected P and R, timeouts, classification, that nothing leaves the machine, each preflight result and the exact `run` command. What `plan` does: read the profile, ask the channel policy, run the pinned read-only `docker info` and `docker image inspect`, send one `GET /api/tags` to the loopback Ollama. It creates no file, directory, container, network or socket, and `plan` is the default command.
+
+`run` refuses (exit 2, nothing started, nothing created) unless: `--approve` names the channel, stdin and stdout are a terminal, every preflight check passes (rootless Docker, the pinned image, `opencode` found, Ollama answering with the model, the workspace root), `plan_sweep` accepts, and you type `approve local-ollama <sweep id>` exactly. Only then does it create the run directory and the `ExecutionGrant` (channel, sweep id, who approved, expiry, caps: 3 proposer + 4 solver sessions, the wall clock, the per-session timeout), and start the first session; the host bridge opens per session, so nothing listens before the grant exists.
+
+### Expected duration against the caps
+
+- Sessions run **one at a time** (the model gate). The caps are 600 s per session and **2700 s (45 min) for the whole sweep**.
+- The worst case, 7 sessions all running to their timeout, is 4200 s, **more than the 45 minutes**. The budget then refuses to start sessions in the last second before the deadline and ends every running one by it, so a slow model produces a **partial** result (some rollouts or proposals missing), not an overrun. Raise `wall_s` in the profile if you want to give it longer.
+- How long a 12B model really takes per session is **unknown** until the first call. The fake run takes about 14 seconds in all.
+
+### How to abort
+
+- **Ctrl-C** in the run's terminal. The teardown runs in a `finally`: the current container and its proxy are killed and removed, the networks and the host bridge are closed, the scratch workspaces are deleted, the report is written with status `aborted` (exit code 130).
+- From another terminal: `kill -INT <pid>` does the same. `kill -9` skips the teardown; then remove what carries the label and the scratch by hand:
+
+```bash
+D="docker -H unix:///run/user/1000/docker.sock"
+$D ps -a -q --filter label=cognitive-harness2.session | xargs -r $D rm -f
+$D network ls -q --filter label=cognitive-harness2.session | xargs -r $D network rm
+rm -rf ~/h2-workspaces/stage1-*          # the sweep's scratch under your workspace root
+ls "$XDG_RUNTIME_DIR" | grep -E '^h2(s|bridge)-'     # stray bridge/session directories, if any
+```
+
+### Where the audit and the report go
+
+`<runs-dir>/<sweep id>/` (mode 0700), created only after you approve:
+
+| file | what |
+| --- | --- |
+| `audit.jsonl` | one JSON line per event, flushed as it happens: `plan`, `approval`, `grant`, `sweep_start`, `session_reserved`, `session_start` (timeout), `session_end` (exit code, timed out, duration, leftovers), `session_refused` (budget, gate or authorisation, with the reason), `rollout_start`, `rollout_verdict`, `error`, `teardown`, `sweep_end`. Numbers and short words only: never a prompt, an argv, an environment, a credential or model output beyond a 160-character excerpt of a rollout's answer. |
+| `report.json` | the final result: status, total wall, the ledger (`P`, `R`, expected 3 and 4), pass or fail per rollout (all three criteria, the answer excerpt, exit code, timed out), the proposer stages, session counts and outcomes, the teardown result. Written even when the sweep failed. |
+| `results/`, `upstream-runs/`, `proposer-audit/` | upstream's and the solver's own artifacts: each rollout's `opencode_session.jsonl` stream and `output/`, upstream's summary, and **upstream's own mission and response files** for each proposer session. These are the method's working records and DO hold prompts and model text; keep the directory private (it is 0700) and delete it when done. |
+
+Exit codes: 0 clean and the ledger is 3 and 4; 1 the sweep failed or the identity did not hold; 2 refused before anything started; 3 the teardown left something behind (named in the report); 130 interrupted.
+
+### What is unverified until the first real call
+
+The following are assumptions, not observations. Each is where the first run is most likely to fail, and the fake run cannot tell:
+
+- **opencode's provider configuration schema.** `OPENCODE_CONFIG_CONTENT` is built as `{"provider": {"ollama": {"npm": "@ai-sdk/openai-compatible", "name": ..., "options": {"baseURL": ...}, "models": {...}}}}` (`contained_proposer.opencode_config`). A probe of the real binary (v2.0.25, isolated XDG and HOME, no model call) found that `opencode debug config` **does not validate** `OPENCODE_CONFIG_CONTENT`: three variants (`options.baseURL`, `name`, `api` as the URL key), invalid JSON and a wrong-typed `provider` all returned the same output with no error. So the schema is unconfirmed, and so is which of those key forms is right. If opencode says it has no such provider or model, the evidence is in `report.json` (`stages[].error`), `proposer-audit/*.meta.json` (`error`) and each rollout's `results/*/metrics.json` (`stderr_tail`).
+- **The command line** `opencode run --standalone --auto --format json --model ollama/gemma4:12b "<prompt>"` is taken from `opencode run --help` in that probe (flags `--auto`, `--format json`, `--model provider/model`, `--standalone` listed; not executed). The probe did not verify whether `run` takes a directory (the runner sets the container working directory instead) and found that the prompt is positional text.
+- **`tmp_exec`**: `TMP_EXEC["opencode"] = True`, i.e. HOME and `/tmp` are mounted executable because a bun-compiled binary may unpack native code there. If opencode starts without it, switching it off would be safer; the probe saw its tmp directory at `/tmp/opencode`, which XDG overrides do not move.
+- **`AGENTS.md` pickup**: the solver relies on opencode reading `AGENTS.md` from its working directory to receive the harness. Not observed.
+- **The `--format json` event shape** that `trajectory.read_trajectory` and the event counter expect (text and tool-use events). A stream with no parseable event is treated as a dead rollout, so if the shape differs every rollout will show `n_events` 0.
+- **The prompt reaches the solver as one flattened line** (the command-line gate refuses control characters, so newlines become spaces).
+- **Whether opencode starts at all** with a read-only root and a tmpfs HOME in a container, with the proxy as its only route, and how it behaves when its model server is slow.
+- **GPU time and memory** for a 12B model, and the first-token latency while it loads.
+- **Whether a 12B model can do the work.** The method asks the proposer to edit harness files and answer in `output/answer.md`; a small model may well produce nothing usable, in which case the stages fall back to the base harness and the report says so. That is a result, not a fault of the runner.
+- opencode v2 has no permission variable and `--variant` (effort) does not exist, so neither is set; the container is the only fence.
 
 ## Channel profile
 
@@ -322,7 +410,7 @@ model = "ollama/qwen3:30b"
 retention = "local"                    # local | zdr-attested | unknown
 max_classification = "restricted"      # open < gated < restricted
 approval = "per-sweep"                 # the only value: a human approves each sweep
-[channels.local-ollama.caps]           # hard per-sweep caps; all three required, > 0
+[channels.local-ollama.caps]           # hard per-sweep caps; all three required, > 0 (cost_usd = 0 only for retention = "local")
 sessions = 30
 wall_s = 3600
 cost_usd = 1.0
