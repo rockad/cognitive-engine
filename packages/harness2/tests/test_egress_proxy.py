@@ -422,14 +422,84 @@ async def test_a_redirect_to_a_private_address_is_refused_when_the_client_follow
         assert len(up.received) == 1
 
 
-async def test_oversized_request_line_and_header_blocks_are_cut_off():
-    async with Running([["allowed.test", 80]]) as px:
-        out = await talk(px.port, b"GET http://allowed.test/" + b"a" * 20000)
-        assert out.startswith(b"HTTP/1.1 414 ")
-        out = await talk(px.port, b"GET http://allowed.test/ HTTP/1.1\r\n" + b"X-A: " + b"b" * 40000)
-        assert out.startswith(b"HTTP/1.1 431 ")
-        out = await talk(px.port, b"GET http://allowed.test/ HTTP/1.1\r\n" + b"".join(b"X-%d: v\r\n" % i for i in range(200)) + b"\r\n")
-        assert out.startswith(b"HTTP/1.1 431 ")
+class Exchange:
+    """What a client saw after sending one request: the bytes, and HOW the connection ended."""
+
+    def __init__(self, data: bytes, eof: bool, reset: bool):
+        self.data, self.eof, self.reset = data, eof, reset
+
+    @property
+    def response(self) -> tuple[bytes, bytes] | None:
+        """(status line, body) once a COMPLETE response (head plus Content-Length bytes) arrived, else None."""
+        head, sep, body = self.data.partition(b"\r\n\r\n")
+        if not sep:
+            return None
+        lengths = [int(line.split(b":", 1)[1]) for line in head.split(b"\r\n")[1:] if line.lower().startswith(b"content-length:")]
+        if len(lengths) != 1 or len(body) < lengths[0]:
+            return None
+        return head.split(b"\r\n")[0], body[:lengths[0]]
+
+
+async def exchange(port: int, payload: bytes, *, read_delay: float = 0.0, timeout: float = 5.0) -> Exchange:
+    """Send `payload` in the background and read the reply, tolerating a reset the way a real client must.
+
+    The writer runs concurrently, so a refusal that arrives while we are still sending is read, not lost. A
+    reset is reported (`reset`), never raised: whether it is acceptable is the caller's assertion."""
+    r, w = await asyncio.open_connection("127.0.0.1", port)
+
+    async def send() -> None:
+        try:
+            w.write(payload)
+            await w.drain()
+        except (ConnectionError, OSError):
+            pass
+    sender = asyncio.ensure_future(send())
+    await asyncio.sleep(read_delay)
+    data, eof, reset = b"", False, False
+    try:
+        async with asyncio.timeout(timeout):
+            while True:
+                chunk = await r.read(65536)
+                if not chunk:
+                    eof = True
+                    break
+                data += chunk
+    except (ConnectionError, OSError):
+        reset = True
+    except TimeoutError:
+        pass
+    sender.cancel()
+    w.close()
+    return Exchange(data, eof, reset)
+
+
+OVERSIZED = {
+    "request line": (b"GET http://allowed.test/" + b"a" * 20000, b"HTTP/1.1 414 ", "request-line-too-long"),
+    "header block": (b"GET http://allowed.test/ HTTP/1.1\r\n" + b"X-A: " + b"b" * 40000, b"HTTP/1.1 431 ", "headers-too-large"),
+    "header count": (b"GET http://allowed.test/ HTTP/1.1\r\n" + b"".join(b"X-%d: v\r\n" % i for i in range(200)) + b"\r\n",
+                     b"HTTP/1.1 431 ", None),
+}
+
+
+def assert_refused_and_nothing_forwarded(ex: Exchange, status: bytes, up, px, reason: str | None) -> None:
+    """The security property, strictly: a complete refusal, the connection is over, nothing reached the upstream."""
+    assert ex.response is not None, f"no complete refusal (data={ex.data[:60]!r}, reset={ex.reset})"
+    assert ex.response[0].startswith(status.rstrip()), ex.response
+    assert ex.eof or ex.reset, "the connection was left open"
+    assert up.received == [], "request bytes were forwarded upstream"
+    assert [x for x in px.log if "decision=allow" in x] == []
+    denies = [x for x in px.log if "decision=deny" in x]
+    assert len(denies) == 1 and (reason is None or f"reason={reason}" in denies[0]), px.log
+
+
+@pytest.mark.parametrize("name", OVERSIZED)
+async def test_oversized_request_line_and_header_blocks_are_cut_off(name):
+    """Refused (414/431), nothing forwarded, connection closed. A RST AFTER the complete refusal is tolerated here
+    (the client may still be writing)."""
+    payload, status, reason = OVERSIZED[name]
+    async with Upstream() as up, Running([["allowed.test", up.port]]) as px:
+        ex = await exchange(px.port, payload)
+        assert_refused_and_nothing_forwarded(ex, status, up, px, reason)
 
 
 async def test_a_slowloris_client_is_timed_out_on_the_whole_head_not_per_byte():
