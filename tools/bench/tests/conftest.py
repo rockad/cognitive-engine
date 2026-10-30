@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
-BENCH = Path(__file__).resolve().parents[1]
-if str(BENCH) not in sys.path:
-    sys.path.insert(0, str(BENCH))
+TESTS = Path(__file__).resolve().parent
+BENCH = TESTS.parent
+for p in (BENCH, TESTS):
+    if str(p) not in sys.path:
+        sys.path.insert(0, str(p))
