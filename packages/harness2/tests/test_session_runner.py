@@ -181,7 +181,7 @@ def test_a_credential_value_in_argv_or_env_is_refused(world):
     assert SECRET not in repr(cred) and SECRET not in str(cred) and SECRET not in repr(spec(world, credential=cred))
 
 
-@pytest.mark.parametrize("name", ["HTTP_PROXY", "https_proxy", "NO_PROXY", "ALL_PROXY", "FOO_PROXY", "HOME", "PATH", "TMPDIR",
+@pytest.mark.parametrize("name", ["HTTP_PROXY", "https_proxy", "NO_PROXY", "no_proxy", "ALL_PROXY", "FOO_PROXY", "HOME", "PATH", "TMPDIR",
                                   "DOCKER_HOST", "DOCKER_CONFIG", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY", "GITHUB_TOKEN",
                                   "MY_SECRET", "lower", "A B", "1X", "X=Y", ""])
 def test_the_session_environment_cannot_override_proxy_or_smuggle_secrets(world, name):
@@ -329,7 +329,7 @@ def test_the_session_environment_is_closed_and_forces_the_proxy(world):
     env = dict(e.split("=", 1) for e in flags(argv, "-e"))
     proxy = "http://harness2-proxy:3128"
     assert env["HTTP_PROXY"] == env["HTTPS_PROXY"] == env["http_proxy"] == env["https_proxy"] == proxy
-    assert env["NO_PROXY"] == "" and env["no_proxy"] == "" and env["HOME"] == "/home/agent" and env["OPENCODE_PERMISSION"] == "{}"
+    assert env["NO_PROXY"] == env["no_proxy"] == "127.0.0.1,localhost,::1" and env["HOME"] == "/home/agent" and env["OPENCODE_PERMISSION"] == "{}"
     assert not any(k.startswith("DOCKER_") for k in env) and not any(k in env for k in ("SSH_AUTH_SOCK", "GITHUB_TOKEN"))
     assert "-e" not in [a for a in argv if a in ("-e",) and False]
     assert "-i" not in argv
@@ -741,3 +741,30 @@ def test_a_failing_observer_never_breaks_a_session_and_is_counted(world, monkeyp
 def test_the_observer_must_be_callable(world):
     with pytest.raises(SessionRefused, match="observer"):
         solver(observer="not callable")
+
+
+# ── NO_PROXY: the session's own loopback, set by the runner, nothing else ────────
+
+@pytest.mark.parametrize("name", ["agy", "claude", "local", "router"])
+def test_no_proxy_is_the_sessions_own_loopback_only_on_every_channel(world, name):
+    plan, argv = session_argv(world, name)
+    env = dict(e.split("=", 1) for e in flags(argv, "-e"))
+    entries = env["NO_PROXY"].split(",")
+    assert entries == ["127.0.0.1", "localhost", "::1"] and env["no_proxy"] == env["NO_PROXY"]
+    assert sr.PROXY_ALIAS not in env["NO_PROXY"]                  # the proxy, the host and external names are never bypassed
+
+
+def test_the_callers_config_still_cannot_set_any_proxy_variable_in_either_case(world):
+    for name in ("NO_PROXY", "no_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NODE_USE_ENV_PROXY", "MY_PROXY"):
+        with pytest.raises(SessionRefused):
+            runner().authorize(spec(world, env={name: "127.0.0.1,harness2-proxy,example.com"}))
+
+
+def test_a_local_channel_routes_the_proxy_alias_to_the_bridge_socket_and_a_hosted_one_routes_nothing(world):
+    plan = runner("local").authorize(spec(world))
+    cfg = sr.proxy_config(plan)
+    sock = f"{sr.BRIDGE_MOUNT}/ollama.sock"
+    assert cfg["unix_routes"] == [{"host": "127.0.0.1", "port": 11434, "unix": sock},
+                                  {"host": sr.PROXY_ALIAS, "port": 11434, "unix": sock}]
+    assert cfg["listeners"] == [{"port": 11434, "unix": sock}] and cfg["allow"] == []
+    assert "unix_routes" not in sr.proxy_config(runner("claude").authorize(spec(world)))

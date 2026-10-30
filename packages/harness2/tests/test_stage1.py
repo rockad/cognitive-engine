@@ -619,3 +619,18 @@ def test_the_plan_does_not_alarm_with_host_session_warnings_that_do_not_apply_to
     text = out.getvalue()
     assert "on this host in its working directory" not in text and "gcloud ADC" not in text
     assert "tmpfs HOME and no credential" in text and "max_cost_or_tokens" not in text
+
+
+@pytest.mark.requires_rootless_docker
+def test_the_selftest_catches_a_runner_that_leaves_no_proxy_empty(tmp_path, verified, proposer_image, up, monkeypatch):
+    """The first real run (2026-10-30) died because opencode's own loopback server was sent to the proxy. The fake
+    opencode now does what the real one does, so the pre-fix runner (empty NO_PROXY) fails the selftest."""
+    before = runtime_entries()
+    (tmp_path / "st").mkdir()
+    monkeypatch.setattr(sr, "SESSION_NO_PROXY", "")
+    outcome = run_selftest(base=tmp_path / "st", out=io.StringIO())
+    r = outcome.report
+    assert selftest_problems(outcome) and r["rollouts_passed"] == 0
+    first = next(e for e in events(Path(r["_run_dir"])) if e["event"] == "session_end")
+    assert first["exit_code"] == 3
+    assert r["teardown"]["docker_leftovers"] == [] and settle(before) == set()

@@ -3,7 +3,8 @@
 One session is TWO containers on two networks, started and torn down together:
 
     session container   the agent CLI. Network: ONE `--internal` network (no default route, no egress, no
-                        external DNS). Its HTTP(S)_PROXY is the proxy container; NO_PROXY is empty.
+                        external DNS). Its HTTP(S)_PROXY is the proxy container; NO_PROXY is the session's OWN
+                        loopback (127.0.0.1,localhost,::1), so a CLI that serves itself works.
     proxy container     `egress_proxy.py` from the same image. Attached to the internal network AND (for a hosted
                         channel only) an egress network. Allows exactly the channel profile's endpoint(s).
                         For the LOCAL channel it has no egress network at all and a read-only mount of the
@@ -266,18 +267,35 @@ def proxy_config(plan: Plan) -> dict:
     if plan.bridge_target is not None:
         sock = f"{BRIDGE_MOUNT}/ollama.sock"
         host, port = plan.bridge_target
-        cfg["unix_routes"] = [{"host": host, "port": port, "unix": sock}]
+        # Two names, one socket: the loopback address a forward-proxy client names (a CONNECT or absolute-URI request),
+        # and the proxy alias the CLI's provider base URL uses (`runner.local_endpoint`), which a proxy-aware client sends
+        # THROUGH the proxy now that the alias is not in NO_PROXY. A client that connects to the alias directly lands on
+        # the listener below, which relays to the same socket. Nothing else is routed.
+        cfg["unix_routes"] = [{"host": host, "port": port, "unix": sock},
+                              {"host": PROXY_ALIAS, "port": port, "unix": sock}]
         cfg["listeners"] = [{"port": port, "unix": sock}]
     if plan.test_allow_cidrs:
         cfg["test_allow_cidrs"] = list(plan.test_allow_cidrs)
     return cfg
 
 
+SESSION_NO_PROXY = "127.0.0.1,localhost,::1"
+
+
 def session_env(plan: Plan) -> dict[str, str]:
-    """The complete environment of the session container. Nothing is inherited from the host."""
+    """The complete environment of the session container. Nothing is inherited from the host.
+
+    NO_PROXY is the session container's OWN loopback and nothing else, set here and never by the caller (F3). A CLI such
+    as `opencode run --standalone` starts a private HTTP server on a random 127.0.0.1 port and talks to it with a
+    proxy-aware client; without this its own traffic went to the proxy and was denied (the first real stage-1 run).
+    That loopback is empty of everything but what the session starts itself: the host's loopback is unreachable from
+    the container, and the proxy, the model endpoint and every external name are NOT in the list, so they are reached
+    only through the proxy (or not at all). For a local channel the model endpoint is `http://harness2-proxy:<port>`:
+    it is not bypassed, it goes THROUGH the proxy as a request for that exact name and port (see `proxy_config`)."""
     proxy = f"http://{PROXY_ALIAS}:{PROXY_PORT}"
     env = {"HOME": HOME, "TMPDIR": "/tmp", "HTTP_PROXY": proxy, "HTTPS_PROXY": proxy, "ALL_PROXY": proxy,
-           "http_proxy": proxy, "https_proxy": proxy, "all_proxy": proxy, "NO_PROXY": "", "no_proxy": "",
+           "http_proxy": proxy, "https_proxy": proxy, "all_proxy": proxy,
+           "NO_PROXY": SESSION_NO_PROXY, "no_proxy": SESSION_NO_PROXY,
            "NODE_USE_ENV_PROXY": "1", "TERM": "dumb", "NO_COLOR": "1", "LANG": "C.UTF-8",
            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
     cred = plan.spec.credential

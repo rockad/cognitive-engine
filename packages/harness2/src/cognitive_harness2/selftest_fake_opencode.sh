@@ -12,6 +12,12 @@
 # OPENCODE_CONFIG_CONTENT (the proxy alias on the internal network), which the proxy relays over the host bridge to
 # whatever listens on the channel's loopback port (in the selftest, a throwaway fake). A session that cannot reach
 # it prints no events and exits 3, so a broken bridge fails the sweep instead of passing silently.
+#
+# Like the real `opencode run --standalone` (v2.0.25), it ALSO starts a private HTTP server on a random port of its own
+# loopback and calls it, and it calls the model endpoint, both with a PROXY-AWARE client (python's urllib honours
+# HTTP_PROXY and NO_PROXY, as opencode's HTTP stack does). The first real stage-1 run died here: the runner set no NO_PROXY,
+# so the CLI's own loopback request went to the egress proxy and was denied (403), while an earlier version of this fake
+# used a raw /dev/tcp socket that never looked at the proxy variables and so could not have caught it.
 
 jstr() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | awk 'BEGIN{ORS="\\n"} {print}' | sed 's/\\n$//'; }
 ev_text() { printf '{"type":"text","part":{"type":"text","text":"%s"}}\n' "$(jstr "$1")"; }
@@ -26,12 +32,33 @@ MODEL="$7"
 
 # the model endpoint, via the base URL of the configured provider
 BASE=$(printf '%s' "$OPENCODE_CONFIG_CONTENT" | sed -n 's/.*"baseURL":"\([^"]*\)".*/\1/p')
-HP=${BASE#http://}; HP=${HP%%/*}; HOST=${HP%%:*}; PORT=${HP##*:}
-if ! exec 3<>"/dev/tcp/$HOST/$PORT" 2>/dev/null; then echo "fake opencode: cannot reach $HOST:$PORT" >&2; exit 3; fi
-printf 'GET /api/tags HTTP/1.0\r\nHost: model\r\n\r\n' >&3
-STATUS=$(timeout 10 head -n 1 <&3 | tr -d '\r')
-exec 3>&- 3<&-
-case "$STATUS" in *" 200 "*) ;; *) echo "fake opencode: the model endpoint answered '$STATUS'" >&2; exit 3 ;; esac
+[ -n "$BASE" ] || { echo "fake opencode: no baseURL in OPENCODE_CONFIG_CONTENT" >&2; exit 3; }
+STATUS=$(python3 -I - "$BASE" <<'PY'
+import http.server, sys, threading, urllib.error, urllib.request
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):                                                   # noqa: N802
+        self.send_response(200); self.send_header("Content-Length", "2"); self.end_headers(); self.wfile.write(b"ok")
+    def log_message(self, *a): pass
+
+def get(url):
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            return "HTTP %d" % r.status
+    except urllib.error.HTTPError as e:
+        return "HTTP %d" % e.code
+    except Exception as e:                                              # noqa: BLE001
+        return "ERR %s" % type(e).__name__
+
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)              # opencode's private server: random port, own loopback
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+own = get("http://127.0.0.1:%d/" % srv.server_address[1])
+if own != "HTTP 200":
+    print("own-loopback server answered " + own); sys.exit(3)
+print(get(sys.argv[1].rstrip("/") + "/models"))                         # the model endpoint, via the proxy
+PY
+) || { echo "fake opencode: $STATUS" >&2; exit 3; }
+case "$STATUS" in "HTTP 200") ;; *) echo "fake opencode: the model endpoint answered '$STATUS'" >&2; exit 3 ;; esac
 
 echo '{"type":"step_start","part":{"type":"step-start"}}'
 ev_text "model endpoint answered: $STATUS"

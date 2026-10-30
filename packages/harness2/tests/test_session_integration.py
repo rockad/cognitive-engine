@@ -273,7 +273,7 @@ def test_the_session_environment_is_closed(probe):
     assert v["env_docker"] == "0" and v["env_canary"] == "0"
     proxies = v["env_proxy"]
     assert proxies.count("http://harness2-proxy:3128") == 6 and "attacker.example" not in proxies
-    assert "NO_PROXY= " in proxies and "no_proxy= " in proxies
+    assert "NO_PROXY=127.0.0.1,localhost,::1 " in proxies and "no_proxy=127.0.0.1,localhost,::1 " in proxies
     assert CANARY not in probe.stdout
 
 
@@ -617,3 +617,74 @@ def test_a_single_file_cannot_exceed_the_file_size_limit_on_the_host_backed_work
     r = hosted_runner(verified, proposer_image, egress_world)
     res = r.run(spec(ws, "fsfill", str(ws), "20", limits=SessionLimits(file_bytes=4 * 1024 * 1024)))
     assert "rc=0" not in res.stdout and int(kv(res.stdout)["size"]) <= 4 * 1024 * 1024
+
+
+# ── the session's own loopback is not the proxy's business (first real stage-1 run, 2026-10-30) ───────────────────
+#
+# `opencode run --standalone` starts a private HTTP server on a random port of the SESSION's own 127.0.0.1 and talks to
+# it with a proxy-aware client. With HTTP_PROXY set and NO_PROXY empty that traffic went to the proxy, which denied it
+# (403, host=127.0.0.1): all 7 sessions died in ~2 s and the model was never called. The runner now sets NO_PROXY to the
+# container's own loopback (and nothing else).
+
+class HttpStub:
+    """A throwaway HTTP server on this host's loopback standing in for the model endpoint. Counts requests."""
+
+    def __enter__(self):
+        import http.server
+        outer = self
+        self.hits = 0
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):                                     # noqa: N802
+                outer.hits += 1
+                body = b"MODEL-STUB-OK"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a): pass
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        return self
+
+    def __exit__(self, *a):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def test_a_cli_that_serves_itself_on_its_own_loopback_reaches_it_despite_the_proxy_variables(verified, proposer_image, egress_world, ws):
+    res = hosted_runner(verified, proposer_image, egress_world).run(spec(ws, "selfserve"))
+    out = kv(res.stdout)
+    assert out["selfserve[127.0.0.1]"] == "200 SELF-SERVER-OK" and out["selfserve[localhost]"] == "200 SELF-SERVER-OK", res
+    assert out["no_proxy"] == "127.0.0.1,localhost,::1"
+    assert not [line for line in res.egress_log if "host=127.0.0.1" in line or "host=localhost" in line], res.egress_log
+
+
+def test_the_bypass_covers_the_sessions_own_loopback_only_every_other_name_still_goes_through_the_proxy(verified, proposer_image, egress_world, ws):
+    r = hosted_runner(verified, proposer_image, egress_world)
+    ok = r.run(spec(ws, "pget", f"http://{UPSTREAM_HOST}:9000/"))
+    assert "pget=200 UPSTREAM-OK-9000" in ok.stdout, ok                                  # an allow-listed name still works, via the proxy
+    assert f"ACCESS decision=allow host={UPSTREAM_HOST} port=9000 reason=allow-listed" in ok.egress_log
+    for url in ("http://example.com/", f"http://{UPSTREAM_HOST}:9001/", "http://169.254.169.254/", f"http://{egress_world.ip}:9000/"):
+        denied = r.run(spec(ws, "pget", url))
+        assert "pget=HTTP403" in denied.stdout and any("decision=deny" in line for line in denied.egress_log), (url, denied)
+    own = r.run(spec(ws, "pget", "http://127.0.0.1:9000/"))                              # bypassed, so it is the session's own (empty) loopback
+    assert "pget=ERR" in own.stdout and not own.egress_log, own
+    assert "CONN 9001" not in egress_world.log()
+
+
+def test_the_local_model_endpoint_is_reached_through_the_proxy_and_the_hosts_other_loopback_is_not(verified, proposer_image, ws):
+    with HttpStub() as model, HttpStub() as other:
+        r = local_runner(verified, proposer_image, model)
+        got = r.run(spec(ws, "pget", f"http://harness2-proxy:{model.port}/v1/models"))
+        assert "pget=200 MODEL-STUB-OK" in got.stdout, got
+        assert model.hits == 1
+        assert f"ACCESS decision=allow host=harness2-proxy port={model.port} reason=unix-route" in got.egress_log
+        for url in (f"http://127.0.0.1:{model.port}/", f"http://127.0.0.1:{other.port}/", f"http://harness2-proxy:{other.port}/"):
+            res = r.run(spec(ws, "pget", url))
+            assert "pget=200" not in res.stdout, (url, res)                              # the session's own loopback is empty; no other port is routed
+        assert model.hits == 1 and other.hits == 0
+        own = kv(r.run(spec(ws, "selfserve")).stdout)
+        assert own["selfserve[127.0.0.1]"] == "200 SELF-SERVER-OK"                       # a local-channel CLI can still serve itself

@@ -93,6 +93,44 @@ case "$1" in
     echo "pids_max=$(cat /sys/fs/cgroup/pids.max)"; echo "mem_max=$(cat /sys/fs/cgroup/memory.max)"
     echo "swap_max=$(cat /sys/fs/cgroup/memory.swap.max)"; echo "cpu_max=$(cat /sys/fs/cgroup/cpu.max)"
     ;;
+  selfserve)
+    # What the real `opencode run --standalone` does: start a private HTTP server on this container's own loopback
+    # (a random port) and talk to it with a PROXY-AWARE client (python's urllib honours http_proxy / no_proxy).
+    # Prints the HTTP status or the error, plus the env it ran under.
+    python3 -I - <<'PY'
+import http.server, os, threading, urllib.request, urllib.error
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"SELF-SERVER-OK"
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+port = srv.server_address[1]
+for host in ("127.0.0.1", "localhost"):
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/", timeout=5) as r:
+            print(f"selfserve[{host}]={r.status} {r.read().decode()}")
+    except urllib.error.HTTPError as e:
+        print(f"selfserve[{host}]=HTTP{e.code}")
+    except Exception as e:
+        print(f"selfserve[{host}]=ERR {type(e).__name__}")
+print("no_proxy=" + os.environ.get("NO_PROXY", "<unset>"))
+PY
+    ;;
+  pget)
+    # $2 = URL: one proxy-aware GET (urllib honours http_proxy / no_proxy). Prints "pget=<status> <body head>" or the error.
+    python3 -I - "$2" <<'PY'
+import sys, urllib.request, urllib.error
+try:
+    with urllib.request.urlopen(sys.argv[1], timeout=8) as r:
+        print("pget=%d %s" % (r.status, r.read(200).decode("utf-8", "replace").replace("\n", " ")))
+except urllib.error.HTTPError as e:
+    print("pget=HTTP%d" % e.code)
+except Exception as e:
+    print("pget=ERR %s" % type(e).__name__)
+PY
+    ;;
   tcp) tcp "$2" "$3" ;;
   connect) connect "$2" "$3" ;;
   raw) raw_tcp "$2" "$3" "$4" ;;
