@@ -302,7 +302,7 @@ The SOLVER half of a k=1 run: the rollouts. Upstream at k=1 (`modes=('agg',)`) r
                                 SumSignedAdapter.execute ──► metrics.json ──► .adapt_complete ──► score (pure) / verifier container
 ```
 
-**The task, `sum-signed`** (`sum_signed.py`). `input.txt` holds five signed amounts; the solver writes `Total: X.XX` (the signed sum, two decimals) to `output/answer.txt`. Three domains (household, retail, payroll) of two tasks each, amounts derived from sha256 of the task id, so they never drift; a positives-only sum is wrong on every instance.
+**The task, `sum-signed`** (`sum_signed.py`). `input.txt` holds five signed amounts; the solver writes `Total: X.XX` (the signed sum, two decimals) to `output/answer.txt`. Three domains (household, retail, payroll) of two tasks each, amounts derived from sha256 of the task id, so they never drift; a positives-only sum is wrong on every instance. A harder family, `sum-signed-hard` (twelve amounts in mixed notations, a base harness that does not explain them), is described under "Stage 1b (hard task set)".
 
 **The verifier**, two implementations of one verdict, kept equal by running 46 shared cases through both (malformed, missing, extra text, whitespace, negative zero, rounding, huge numbers, unicode digits, NUL, oversize):
 
@@ -418,7 +418,7 @@ uv run python -m cognitive_harness2.stage1 run --approve local-ollama --opencode
 uv run python -m cognitive_harness2.stage1 selftest            # --keep-in DIR keeps the audit and report
 ```
 
-Options: `--wall-s N` (total wall clock; it can only LOWER the profile's `wall_s`, raise that in the profile), `--per-session-s N` (default 600), `--runs-dir DIR` (the PARENT of the per-sweep directory, default `~/.local/state/cognitive-engine/harness2-stage1`), `--classification` (default `open`: the task, the harness and every prompt are synthetic), `--channel` (default `local-ollama`).
+Options: `--wall-s N` (total wall clock; it can only LOWER the profile's `wall_s`, raise that in the profile), `--per-session-s N` (default 600), `--runs-dir DIR` (the PARENT of the per-sweep directory, default `~/.local/state/cognitive-engine/harness2-stage1`), `--classification` (default `open`: the task, the harness and every prompt are synthetic), `--channel` (default `local-ollama`), `--task-set easy|hard` (default `easy`; `hard` is stage 1b, below).
 
 `plan` prints the channel, endpoint, model, caps, expected P and R, timeouts, classification, that nothing leaves the machine, each preflight result and the exact `run` command. What `plan` does: read the profile, ask the channel policy, run the pinned read-only `docker info` and `docker image inspect`, send one `GET /api/tags` to the loopback Ollama. It creates no file, directory, container, network or socket, and `plan` is the default command.
 
@@ -499,6 +499,80 @@ Measured, 2026-10-30, opencode v2.0.25:
 | the answer file | a stubbed `write` tool call to `output/answer.txt` executes inside the workspace, the file is harvested, copied to the run's `output/` and passes `sum_signed.grade_answer` (all three criteria). The proposer shape (`MISSION.md`, `opencode.json`, `output/answer.md`, the upstream prompt) works the same; `opencode.json` is ignored. |
 | exit codes | 0 after a normal end; 1 after an `error` event. A model the server does not have (404): exit 1 at once with the server's message. A 5xx or 429: about 85 s of retries (11 requests), then exit 1. |
 | failure text | upstream's parser reads only the old `error.data.message`, so a v2 failure was reported as `rc=1: empty reply`. `trajectory.error_events` reads `error.message` and is used for the proposer's error text and in each solver run's `metrics.json` (`errors`). |
+
+## Stage 1b (hard task set)
+
+**Why.** Stage 1 run #4 (2026-10-31) went end to end, but on `sum-signed` the base harness already scores 3 of 3 on all four rollouts, so every proposer stage kept the base and the improvement loop (propose, harvest, accepted edit, candidate rollout, selection) was never exercised with an ACCEPTED edit. `--task-set hard` runs the same sweep (P=3 proposer sessions, R=4 rollouts, k=1, `modes=('agg',)`, the profile's caps, $0, nothing leaves the machine) on a task family the base harness is built to get wrong.
+
+**The task family, `sum-signed-hard`** (`sum_signed_hard.py`). Nine fixed instances (household, retail, payroll, three each; the default is `household/hard-1`), each a ledger of **twelve** amounts in the notations of an export from several systems, one of each in every instance, in a hash-shuffled order, six instances with CRLF line endings:
+
+| notation | example | reads as |
+| --- | --- | --- |
+| plain | `-12.50`, `130.05` | itself |
+| thousands separator | `1,234.56`, `-1,234.56` | `1234.56`, `-1234.56` |
+| parentheses | `(45.00)`, `($1,234.50)` | negative |
+| currency | `$45.10`, `-$12.30` | the number, sign kept |
+| short forms | `12.3`, `7`, `+0.5` | `12.30`, `7.00`, `0.50` |
+| trailing spaces | `45.10␠␠` | ignore them |
+
+The output contract is `sum-signed`'s, unchanged: `Total: X.XX` as the one line of `output/answer.txt`, two decimals, a minus sign for a negative total, no sign on zero, so the grader is shared. The same two implementations of one verdict as before: a busybox `sh` + `awk` verifier that parses the messy input itself, and the Python reference parser behind `grade_answer`; the tests run a shared table through both in a real container (41 answer cases, 14 edge inputs the awk must total to the hand-written value, 27 unusable inputs that give no verdict from either).
+
+**The weak base harness.** `systemprompt.md` is "You are a bookkeeper... add up the amounts and write the total to the answer file." It says nothing about parentheses, currency symbols, thousands separators, short forms, carriage returns or rounding, and neither does the task prompt (it says only that the lines "are not all written the same way"). `guardrails.md` holds one real protected line. `LongTermMEMORY.md` and `tool_guidance.md` are empty. The files are valid slot-table material: c1, c3 and c4 are mutable (no frontmatter), c2 is protected. The rules a good proposer would write down are `sum_signed_hard.FORMAT_RULES`; a reader that ignores the notations writes `sum_signed_hard.naive_total` (for `household/hard-1`: `Total: -638.11` against the right `Total: -1291.27`), which fails on the total alone (2 of 3 criteria).
+
+**The slot table is applied inside the pipeline on this set.** `SumSignedAdapter.validate_tree`, which upstream calls on every proposed harness, also runs `upstream_surface.check_mutation` on each file changed against the base (so a `guardrails.md` edit, a frontmatter block, a script or any off-surface file is refused with the reason fed back as retry text, and a new skill is refused because c6 frontmatter is frozen). Upstream's own trigger lines appended to `guardrails.md` for a new skill are not blamed on the proposer. The easy set does NOT enforce this (its behaviour is exactly what run #4 had). Every proposal's verdict is audited as a `mutation_check` event (files changed, slots, accepted or refused; never a line the model wrote).
+
+### How to run it
+
+```bash
+# Rehearsal with the fakes on the real daemon (no model; 5 sweeps of about 20 s each, one per scenario):
+uv run python -m cognitive_harness2.stage1 selftest --task-set hard                   # --scenario NAME runs one; --keep-in DIR keeps the audit and report
+
+# The plan: read-only, shows "task set hard" and prints the approve command with --task-set hard in it.
+uv run python -m cognitive_harness2.stage1 plan --task-set hard --opencode ~/.opencode/bin/opencode
+
+# The run: the same approval gate as stage 1 (--approve and a phrase typed on this terminal).
+uv run python -m cognitive_harness2.stage1 run --approve local-ollama --task-set hard --opencode ~/.opencode/bin/opencode
+```
+
+The default is `--task-set easy`, so every command above this section means what it did; `plan` and `run` print the set, the audit's `sweep_start` and `report.json` record it, and the approve command spells `--task-set` out only when it is not the default. Read the result:
+
+```bash
+R=~/.local/state/cognitive-engine/harness2-stage1/<sweep id>          # or <runs-dir>/<sweep id>
+jq '{task_set, task, selection, stages: [.stages[] | {label, kept_base, fell_back, error}]}' $R/report.json
+jq '.rollouts[] | {label, passed, n_passed, answer_excerpt}' $R/report.json
+jq -c 'select(.event == "mutation_check")' $R/audit.jsonl              # the slot-table verdict on each proposal
+```
+
+The run ends with a `selection` line, for example `selection improved: final agg1 (an edited harness was adopted); base1 failed, agg1 passed`.
+
+### How selection decides at k=1 (read this before believing a verdict)
+
+At k=1 upstream does **not** choose between the base and a candidate. `run_task` calls `selection.trivial_selection`, whose pool is exactly the k composed finals of the mode, here only `agg1` (the base, `inv1` and `dom1` are not in it by construction). It drops `agg1` only if its rollout delivered nothing or the artifact renders empty; otherwise it delivers it, with `chosen_is_base` always false, no selector session and no score read. So `adopted` in `report.json` (`selection.adopted`) means only that the delivered `agg1` harness is not the base (`chosen_tree_is_base` false, which needs the `agg1` stage to have an accepted edit: `kept_base` false, not `fell_back`). **An edit that makes things worse is adopted just the same.** Whether an adopted edit helped is a separate fact, from this runner's own verdicts on the base and chosen rollouts, which selection never sees: `selection.verdict` is `improved` (base1 failed, final passed), `regressed`, `unchanged`, `base-kept` (no accepted edit reached the final) or `unknown`. A test pins this upstream behaviour so a change of the pinned upstream cannot silently change the claim.
+
+### What the selftest proves, and what it does not
+
+`selftest --task-set hard` runs five sweeps on the real rootless daemon with a fake opencode that plays a SCRIPTED proposer and a solver that reads a ledger correctly only when its `AGENTS.md` says "parentheses" (otherwise it reads each line's leading number, like `naive_total`):
+
+| scenario | the scripted proposer | what is asserted |
+| --- | --- | --- |
+| `format-rules` | appends `FORMAT_RULES` to `systemprompt.md` (a legal c1 edit, body only) in all three stages | the edit is HARVESTED (the on-disk `inv1`, `dom1`, `agg1` harnesses differ from the base in `systemprompt.md` only and carry the rules); it passed the slot table (an independent `check_mutation` after the fact, plus three accepted `mutation_check` events); it RAN as a candidate and changed the outcome (`base1` fails with the weak reader's exact answer, 2 of 3 criteria; `inv1`, `dom1`, `agg1` pass with the exact line); upstream's selection ADOPTED it (`agg1` delivered, `kept_base` false, `adopted` true, verdict `improved`) |
+| `forbid-guardrails` | edits `guardrails.md` (c2) | every stage `fell_back` with the harvest's "staged protected file was changed"; no harness differs from the base; no slot-table event (the harvest refused first); base kept |
+| `forbid-executable` | adds `scripts/helper.py` with the executable bit | harvest refusal ("executable"); base kept |
+| `forbid-frontmatter` | prepends a frontmatter block to `systemprompt.md` | slot-table refusal (three refused `mutation_check` events, "frontmatter"); base kept |
+| `forbid-script` | adds a plain `scripts/helper.py` (c7) | slot-table refusal ("slot c7 ... not mutable"); base kept |
+
+In a refusal scenario every rollout fails (a base harness fails this task), the delivered `agg1` is base-equal, and the verdict is `base-kept`. Each sweep also asserts what stage 1's does: P=3, R=4, seven sessions all reaching the fake endpoint, clean teardown, no real model claimed. The easy selftest is unchanged (`selftest` with no flag; its report now also carries the `selection` block).
+
+It proves the pipeline CAN run the loop: harvest, validation, candidate rollout and adoption all work when a proposer produces a legal edit, and the refusal layers hold. It does **not** show that any real model can produce that edit, or that the edit transfers: the "proposer" is a script and the "solver" is a switch on a keyword.
+
+### What to expect with a 4B model (honest version)
+
+- **The results will be noisy, and `k=1` with 4 rollouts is a smoke signal, not a measurement.** One instance, one rollout per harness, one sample each: a base that fails once may pass the next time, and a pass or fail of `agg1` says little about the edit. Nothing here is a statistical comparison.
+- **The base may already pass.** A 4B model may read `(45.00)` and `$` correctly with no instruction (the task prompt only says the lines differ). Then this run reads like run #4: all stages keep the base, `verdict` is `base-kept` or `unchanged`, and the set is not hard enough for that model. That is a result.
+- **The base may fail and the loop still not close.** The proposer sees the failing trajectories and the deliverable but never the expected total or the verdict, so it must infer the notation rules from an answer that does not match the input. A small model may edit nothing, edit something irrelevant, write a `<notes>` reply without touching `context/harness/`, or break a rule (every refusal is in `stages[].error`, and `mutation_check` shows slot-table refusals). Proposers cannot create skills on this set (c6 frontmatter is frozen), only edit `systemprompt.md`, `LongTermMEMORY.md` and `tool_guidance.md`.
+- **An adopted edit is not a better harness.** See the selection section: at k=1 it is adopted because it exists. Judge `improved` against the `answer_excerpt` of `base1` and `agg1` before believing it, and expect a candidate that passes by luck.
+- **The cost is the same as stage 1** (seven sessions, one model call at a time, the same caps, about the same duration; twelve lines of input instead of five change little).
+- What would be a real signal: repeating the run over several instances and sweeps. This runner runs one task per sweep (`household/hard-1`); the other eight instances are there for that, behind a future flag.
 
 ## Channel profile
 
