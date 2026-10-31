@@ -180,7 +180,7 @@ Slice 3b connects upstream Harness² recursive optimization to real execution un
 
 #### 1. Proposer Channels
 Optimization proposals originate from one of three supported channels:
-- **Local**: `opencode` -> `ollama` on loopback (currently `gemma4:12b` only).
+- **Local**: `opencode` -> `ollama` on loopback (Stage 1 measured: `gemma4:e4b` via a 16k-context variant; `gemma4:12b` does not load on the 8 GB GPU, see section 9).
 - **Agent Provider**: The harness's own CLI (`Claude` via `claude` CLI, `Antigravity` via `agy` CLI).
 - **OpenRouter**: Commercial models accessed via OpenRouter API under strict ZDR.
 All channels are subject to uniform zero-data-retention and classification policies.
@@ -266,6 +266,12 @@ flowchart TD
   - The candidate workspace is bind-mounted read-write at the **same absolute path** inside the container as on the host.
   - This is strictly required because agent tooling (`OPENCODE_PERMISSION` in particular) hard-codes and enforces exact host-absolute paths.
 - **Container Hardening**: Read-only root filesystem, tmpfs `HOME`, dropped capabilities (`--cap-drop ALL`), strict pids/memory/cpu limits, CLI mounted read-only, candidate workspace mounted read-write at host absolute path.
+- **Design changes from first contact (Stage 1, 2026-10-30/31)**:
+  - **Proxy environment**: `opencode --standalone` talks to its own loopback server through a proxy-aware client, so the session needs `NO_PROXY=127.0.0.1,localhost,::1` (run #1). The runner sets exactly that value and nothing wider; callers may not set proxy variables.
+  - **Network alias**: ollama 0.32.11 has a DNS-rebinding guard that returns 403 for any `Host` that is not a loopback or private IP, `localhost`, the machine hostname, or `*.localhost` / `*.local` / `*.internal`. The proxy container therefore carries the network alias `harness2-proxy.internal` (run #2). Every stub shares one measured model of ollama's Host, Origin and body refusals.
+  - **Model and context**: `gemma4:12b` (11.9B plus a speculative draft model) cannot load on the 8 GB GPU shared with the desktop (run #3). The channel uses `gemma4:e4b`, chosen by benchmark (section 9.2), with thinking ON. ollama's default context for gemma4 is 4096 tokens, which truncates opencode's roughly 4-6k-token steps, so a 16k variant (Modelfile `num_ctx 16384`, name `gemma4-e4b-16k`) is required.
+  - **opencode provider block**: opencode v2.0.25 needs the npm package `@ai-sdk/openai-compatible` named in the provider block of its config.
+  - **opencode footprint**: `TMP_EXEC` False works; the image has no `rg`, so grep, glob, webfetch, websearch, question and subagent tools are denied; it needs about 19 MB of `/tmp` and 0.5 MB of `HOME`; `--standalone` avoids the background service. Running opencode on the host auto-starts `opencode serve --service`, which must be stopped.
 - **Alternatives Considered & Rejected**:
   - *Bubblewrap (`bwrap`)*: Rejected as a secondary technology requiring independent maintenance without standard seccomp/cgroup defaults and lacking macOS portability.
   - *Host process with tool filtering*: Rejected because subscription agent CLIs store active credentials in `HOME`, presenting ambient token exfiltration risk.
@@ -315,7 +321,7 @@ Slice 3b executes through three strictly sequential, user-gated stages:
 1. **Stage 1: Local Smoke Test**:
    - Budget: $k=1$ (ledger parameters $P=3$k sessions, $R=4$k rollouts; max 3 sessions, 4 rollouts).
    - Task: Bundled minimal demo task.
-   - Channel: `opencode` -> `ollama` (`gemma4:12b` on loopback).
+   - Channel: `opencode` -> `ollama` (`gemma4-e4b-16k` on loopback; changed from `gemma4:12b`, see section 9). **Stage 1 completed 2026-10-31 (run #4).**
    - Resources: 45 min total wall clock, 10 min per session cap, container capped at 2 GB RAM, 2 CPUs, 256 pids, $0 cost. (All figures are proposals).
    - Gate: Explicit user approval before start.
 2. **Stage 2: OpenRouter Strict ZDR**:
@@ -339,11 +345,11 @@ Slice 3b executes through three strictly sequential, user-gated stages:
 - [x] Side-effect trap test suite proves zero network, subprocess, or filesystem side-effects occur during seam execution.
 
 ### Slice 3b Stage 1: Local Smoke (Gated on User Go)
-- [ ] Glibc-based rootless container image (`ubuntu:26.04`) built and verified on local daemon.
-- [ ] Host unix-socket bridge and forward proxy container successfully restrict container egress to loopback Ollama.
-- [ ] Upstream `Proposer` subclass launches containerized `opencode` session and captures output.
-- [ ] Frontmatter freeze validator rejects attempts to alter `model` or `tools` in candidate skills/subagents.
-- [ ] Complete k=1 smoke sweep completes within resource limits (2 GB, 2 CPU, 45m wall) without side-effects on host.
+- [x] Glibc-based rootless container image (`ubuntu:26.04`) built and verified on local daemon (run #4, 2026-10-31).
+- [x] Host unix-socket bridge and forward proxy container route container traffic to loopback Ollama only (7/7 sessions reached the model). Caveat: the ollama management API is still reachable through the unix route (route filter in progress, section 9.4).
+- [x] Containerized `opencode` session launched and output captured (7 sessions exit 0).
+- [x] Frontmatter freeze validator covered by slice 3a / WS-D tests. **Not exercised by a live accepted edit**: no proposer edit was accepted in run #4.
+- [x] Smoke sweep (P=3 proposer sessions, R=4 solver rollouts) completed in 127 s, $0, clean teardown. Resource caps were not stressed.
 
 ### Slice 3b Stage 2: OpenRouter Integration (Gated)
 - [ ] OpenRouter channel profile validates against schema with strict ZDR enforcement.
@@ -355,10 +361,60 @@ Slice 3b executes through three strictly sequential, user-gated stages:
 
 ---
 
-## 8. Unverified Assumptions & Spike Verifications
-The following architectural assumptions are tracked and verified across slice spikes:
+## 8. Assumptions & Spike Verifications
+The following architectural assumptions are tracked and verified across slice spikes and Stage 1 runs.
+
 1. **Proposer Subclassing**: **VERIFIED WITH CAVEATS**. Upstream callers rely on duck typing rather than `isinstance`. Subclassing works cleanly by overriding `_claude_cli`, `_opencode`, and `env()` with same-absolute-path workspace mounting. Caveats and couplings tracked: closed `CHANNELS` tuple in `spec.py`, `_selector_for` fallback construction in `schedule.py`, direct `Proposer` instantiation in `cli/run_sweep.py`, and opencode CLI v2 argument differences.
-2. **Headless Antigravity CLI (`agy`)**: **VERIFIED**. Headless non-interactive execution confirmed in container spike (`--print="..."`, read-only token injection `antigravity-oauth-token` mode 0400, single allow-list endpoint `daily-cloudcode-pa.googleapis.com:443`, tmpfs `HOME`, 9s execution).
-3. **Rootless Docker Host-Loopback Egress**: **DISPROVEN & REDESIGNED**. Direct container-to-host loopback via TCP is impossible under rootlesskit `gvisor-tap-vsock`. Replaced with host unix-socket bridge + forward proxy container architecture.
-4. **Native `sbx` MicroVMs**: Local `sbx` runtime remains unverified on host (not installed). Ephemeral rootless Docker is the verified active sandbox.
-5. **Live OpenRouter Quota Response Schema**: Field names for `GET /api/v1/key` are verified against mock schemas but pending validation against live endpoint responses.
+2. **Headless Antigravity CLI (`agy`)**: **VERIFIED (spike), not run in Stage 1**. Headless non-interactive execution confirmed in container spike (`--print="..."`, read-only token injection `antigravity-oauth-token` mode 0400, single allow-list endpoint `daily-cloudcode-pa.googleapis.com:443`, tmpfs `HOME`, 9s execution). Stage 3 will exercise it for real.
+3. **Rootless Docker Host-Loopback Egress**: **DISPROVEN & REDESIGNED**. Direct container-to-host loopback via TCP is impossible under rootlesskit `gvisor-tap-vsock`. Replaced with host unix-socket bridge + forward proxy container architecture. **The replacement is VERIFIED by run #4 (2026-10-31)**: 7/7 sessions in the contained `opencode` reached the model through egress proxy, host bridge and ollama.
+4. **Containerized opencode end to end**: **VERIFIED by run #4 (2026-10-31)**. opencode v2.0.25 in the contained session, `--standalone`, exit 0 in 7/7 sessions, JSON event stream captured, teardown clean (nothing left behind daemon-wide). Required fixes are in section 6.2 item 3 (NO_PROXY, network alias, provider block).
+5. **Local model viability**: **VERIFIED by run #4 and the benchmark (section 9.2)** for `gemma4:e4b` 16k with thinking ON. `gemma4:12b` is **DISPROVEN** on this host (8 GB GPU shared with the desktop).
+6. **Native `sbx` MicroVMs**: **STILL UNVERIFIED**. `sbx` (Docker Sandboxes v0.50.1) is now installed. The real command flow is `create` / `cp` / `exec` / `rm --force`, and its daemon needs the `kvm` gid (started via `sg kvm`). Live verification is in progress and `VERIFIED_SBX_VERSIONS` is still empty. The default runner no longer selects `sbx` merely because it is on `PATH`. Ephemeral rootless Docker remains the verified sandbox.
+7. **Live OpenRouter Quota Response Schema**: **STILL UNVERIFIED**. Field names for `GET /api/v1/key` are verified against mock schemas but pending validation against live endpoint responses (Stage 2).
+8. **Accepted proposer edit applied and re-scored**: **STILL UNVERIFIED**. No proposer edit has been accepted yet (section 9.3).
+9. **`claude_cli` token delivery (value vs file)**: **STILL UNVERIFIED / unsolved** (Stage 3).
+
+---
+
+## 9. Stage 1 Results and Lessons (2026-10-30/31)
+
+### 9.1 Runs
+
+| Run | Outcome | Cause and fix |
+|---|---|---|
+| #1 | Failed | `opencode --standalone` talks to its own loopback server through a proxy-aware client and the runner set no `NO_PROXY`. Fix: runner sets `NO_PROXY=127.0.0.1,localhost,::1` only; callers may not set proxy variables. |
+| #2 | Failed | ollama 0.32.11 returns 403 for `Host` values outside loopback/private IPs, `localhost`, machine hostname, `*.localhost` / `.local` / `.internal`. Fix: network alias `harness2-proxy.internal`; one shared measured model of ollama's Host/Origin/body refusals in every stub. |
+| #3 | Failed | ollama could not load `gemma4:12b` (11.9B plus speculative draft model, 8 GB GPU shared with the desktop): `Gemma4Assistant requires ctx_other`, `vector::_M_range_check`. Fix: change model (below). |
+| #4 | **Succeeded** | 7 sessions exit 0, 7/7 reached the model, P=3 proposer sessions plus R=4 solver rollouts, 127 s, $0, clean teardown. Solver pass rates: base1 3/3, dom1 3/3, agg1 3/3, inv1 2/3 (arithmetic noise). |
+
+### 9.2 Model benchmark
+
+Candidates `qwen3-4b-16k`, `gemma4:e4b` and `nemotron-3-nano:4b`, scored with a pre-registered scoring rule.
+
+- `gemma4:e4b` won with thinking ON: tool suite 91%, agent task 9/10.
+- `think:false` cripples gemma and nemotron.
+- qwen3 thinks too long at temperature 0.
+- ollama's default gemma4 context is 4096, which would truncate opencode steps; the 16k variant (`num_ctx 16384`) is required.
+
+### 9.3 What is and is not proven
+
+Proven by run #4:
+- The full containment path works for real: contained opencode -> egress proxy -> host bridge -> ollama.
+- Teardown leaves nothing behind.
+- The channel runs at $0 within a 127 s sweep.
+
+**Not proven:**
+- **No accepted proposer edit has been exercised.** All three proposer stages kept the base harness because the base already passes the task. The edit-apply, frontmatter-freeze-on-live-edit and re-score path has therefore never run on a real candidate.
+- The stage-1 task is too easy to discriminate harnesses; the inv1 2/3 result is noise, not signal.
+- Nothing about stages 2 and 3 (OpenRouter, subscription channels).
+
+### 9.4 Known gaps and open items
+
+- **Route filter**: the ollama management API is reachable through the unix route; hardening is in progress.
+- **Stage 1b**: a harder task set so that a proposer edit can be accepted; in progress.
+- **Test isolation**: real-daemon tests assert "nothing left behind" daemon-wide on a shared rootless Docker daemon, so concurrent agents must serialize Docker-backed runs; isolation work is open.
+- **sbx verification**: in progress (assumption 6).
+- **`claude_cli` token delivery** (value vs file): unsolved.
+- **Stages 2 and 3**: user-gated, not started.
+- **Locks**: `mkdir`-based locks are NOT exclusive under rapid create/remove cycling on this host. The hook uses a lock-free line-number position; `flock` works.
+- **`agy` headless feasibility** (single endpoint `daily-cloudcode-pa.googleapis.com:443`) remains a spike result only.

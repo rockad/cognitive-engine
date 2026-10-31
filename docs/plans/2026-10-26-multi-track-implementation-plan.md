@@ -227,7 +227,7 @@ Full list with evidence in [RFC 003 §4](../rfc/003-memory-lookup.md). The ones 
 Governed by user decisions made via `/clarify` on 2026-10-29. Slice 3b wires upstream Harness² optimization to real execution under a hardened rootless container topology with allow-list proxying and loud-failure configuration validation:
 
 1. **Proposer Channels & Uniform Policy**:
-   - **Supported Channels**: Local (`opencode` -> loopback `ollama`, `gemma4:12b`), agent provider (`claude` via Claude CLI, `agy` via Antigravity CLI), and `openrouter` (commercial models with ZDR).
+   - **Supported Channels**: Local (`opencode` -> loopback `ollama`, `gemma4-e4b-16k` after Stage 1; `gemma4:12b` does not load on the host GPU), agent provider (`claude` via Claude CLI, `agy` via Antigravity CLI), and `openrouter` (commercial models with ZDR).
    - **Declarative Channel Profiles (`proposer-channels.json`)**: Declares `kind`, `provider`, `endpoint`, `model`, `retention` (`local` | `zdr-attested` | `unknown`), `max_classification` (`open` < `gated` < `restricted`), `caps` {`sessions`, `wall_s`, `cost`}, and `approval` requirement.
    - **Loud-Failure Config Validation**: Any malformed, unparseable, or missing required field causes immediate fail-closed abort (identical to Jev config rules).
    - **ZDR Honest Disclosure**: ZDR represents the user's declaration and cannot be verified cryptographically against remote provider servers. Subscription tiers (Claude Code, Antigravity) default to `retention: unknown` and are restricted to `open` content.
@@ -255,8 +255,23 @@ Governed by user decisions made via `/clarify` on 2026-10-29. Slice 3b wires ups
    - **`WS-A` Channel Profile & Egress**: Implement `proposer-channels.json` schema, loud-failure validator, and per-channel egress filtering.
    - **`WS-B` Container Image & Proxy**: Build `ubuntu:26.04` rootless Docker base image, configure host unix-socket bridge and allow-list forward proxy container, and implement container session runner.
    - **`WS-C` Proposer Subclass & Binding**: Subclass upstream `Proposer` with duck-typing couplings workaround, explicit `selector_prop`, direct `schedule.run_sweep` entry point, container runner binding, and `agy_cli` adapter.
-   - **`WS-E` Stage 1 Local Smoke Runner**: Execute Stage 1 smoke test ($k=1$, 3 sessions, 4 rollouts, demo task, `opencode` -> `ollama gemma4:12b`, 2 GB / 2 CPU / 45m wall cap, $0 cost) under explicit user approval gate.
+   - **`WS-E` Stage 1 Local Smoke Runner**: Execute Stage 1 smoke test ($k=1$, 3 sessions, 4 rollouts, demo task, `opencode` -> `ollama gemma4-e4b-16k`, 2 GB / 2 CPU / 45m wall cap, $0 cost). **COMPLETE: run #4 succeeded 2026-10-31** (see 3.3.3).
    - *Adversarial Gate*: Each workstream step undergoes read-only adversarial review by Antigravity on its own quota prior to human approval gates.
+
+#### 3.3.3 Stage 1 Results and Open Items (2026-10-31)
+
+Full write-up: [RFC 004 section 9](../rfc/004-system2-harness2.md).
+
+- **Stage 1 DONE**: run #4 succeeded on 2026-10-31 (opencode v2.0.25 in the contained session -> egress proxy -> host bridge -> ollama `gemma4-e4b-16k`; P=3 proposer sessions, R=4 solver rollouts; 7/7 reached the model; 127 s; $0; clean teardown).
+- **Lessons**: runs #1-#3 failed on the missing `NO_PROXY`, ollama's Host-header guard (fix: `harness2-proxy.internal` alias) and `gemma4:12b` not loading on the 8 GB GPU. A benchmark picked `gemma4:e4b` (thinking ON; a 16k-context variant is required).
+- **Not proven**: no accepted proposer edit has been exercised. All three proposer stages kept the base harness because the stage-1 task is too easy.
+- **Open items**:
+  - Stage 1b: harder task set (in progress).
+  - Route filter: ollama management API reachable through the unix route (hardening in progress).
+  - Test isolation: leak checks must be per-run, not daemon-wide.
+  - sbx verification: live verification in progress; `VERIFIED_SBX_VERSIONS` empty.
+  - `claude_cli` token delivery (value vs file): unsolved.
+- **User-gated**: Stage 2 (OpenRouter ZDR) and Stage 3 (subscription channels) have not started.
 
 ---
 
@@ -348,7 +363,12 @@ WS5 and WS6 are independent. **WS6 is done and committed on `feat/track1-jev-ada
 | **WS-A** | **Track 3 (Slice 3b policy)** | `feat/track3-harness2` | `packages/harness2/src/cognitive_harness2/` | Declarative `proposer-channels.json` schema, loud-failure validator, and per-channel egress filtering | Claude Code (`code-engineer`) | `flash` |
 | **WS-B** | **Track 3 (Slice 3b runner)** | `feat/track3-harness2` | `packages/harness2/` | `ubuntu:26.04` rootless Docker base image, host unix-socket bridge, forward proxy container, and session runner | Claude Code (`code-engineer`) | `flash` |
 | **WS-C** | **Track 3 (Slice 3b binding)** | `feat/track3-harness2` | `packages/harness2/` | Upstream `Proposer` subclass with duck-typing couplings workaround, container runner binding, and `agy_cli` adapter | Claude Code (`code-engineer`) | `flash` |
-| **WS-E** | **Track 3 (Slice 3b smoke)** | `feat/track3-harness2` | `packages/harness2/` | Stage 1 local smoke runner (k=1, 3 sessions, 4 rollouts, demo task, `opencode` -> `ollama`) | Claude Code (`code-engineer`) | `flash` |
+| **WS-E** | **Track 3 (Slice 3b smoke)** | `feat/track3-harness2` | `packages/harness2/` | **Complete**: Stage 1 run #4 succeeded 2026-10-31 (P=3, R=4, 7/7 reached the model, 127 s, $0). No accepted proposer edit yet | Claude Code (`code-engineer`) | `flash` |
+| **WS-1b** | **Track 3 (Stage 1b)** | `feat/track3-harness2` | `packages/harness2/` | **Open**: harder task set so a proposer edit can be accepted and re-scored | Claude Code (`code-engineer`) | `flash` |
+| **WS-RF** | **Track 3 (hardening)** | `feat/track3-harness2` | `packages/harness2/` | **Open**: route filter (ollama management API reachable via unix route) | Claude Code (`code-engineer`) | `flash` |
+| **WS-TI** | **Track 3 (tests)** | `feat/track3-harness2` | `packages/harness2/tests/` | **Open**: per-run (not daemon-wide) leak checks on the shared rootless daemon | Claude Code (`qa-engineer`) | `flash` |
+| **WS-SBX** | **Track 3 (sbx)** | `feat/track3-harness2` | `packages/harness2/` | **Open**: live `sbx` verification (`VERIFIED_SBX_VERSIONS` empty); runner no longer auto-selects it | Claude Code (`code-engineer`) | `flash` |
+| **Stage 2 / 3** | **Track 3 (gated)** | n/a | n/a | **User-gated, not started**: OpenRouter ZDR; subscription channels (also needs `claude_cli` token delivery) | n/a | n/a |
 
 ---
 
