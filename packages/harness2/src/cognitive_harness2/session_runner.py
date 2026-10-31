@@ -45,6 +45,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -827,7 +828,7 @@ class ProposerSessionRunner:
         run_id = secrets.token_hex(6)
         names = Names(run_id)
         secrets_ = [spec.credential.value] if spec.credential else []
-        base = Path(tempfile.mkdtemp(prefix=run_scope.dir_prefix("h2s-"), dir=_runtime_base_dir())).resolve()
+        base: Path | None = None          # made inside the try below: whatever it raises still gets the teardown
         result: SessionResult | None = None
         error: BaseException | None = None
         created_networks: list[str] = []
@@ -836,6 +837,7 @@ class ProposerSessionRunner:
         t0 = time.monotonic()
         self._notify("session_start", session=run_id, timeout_s=spec.timeout_s, tmp_exec=spec.tmp_exec)
         try:
+            base = Path(tempfile.mkdtemp(prefix=run_scope.dir_prefix("h2s-"), dir=_runtime_base_dir())).resolve()
             os.chmod(base, 0o700)
             proxy_dir = base / "proxy"
             proxy_dir.mkdir(mode=0o755)
@@ -915,10 +917,18 @@ class ProposerSessionRunner:
         except BaseException as e:   # noqa: BLE001 - recorded, cleanup runs, then re-raised
             error = e
         finally:
-            self._teardown(names, base, created_networks, stack)
-            if spec.reclaim_workspace:
-                reclaimed = self._reclaim(plan, names)
-            leftovers = tuple(self._leftovers(names, base))
+            # Teardown cannot be aborted half way: a second Ctrl-C used to skip the rest (docker calls of up to 60 s, the
+            # reclaim, the sleeps) and leak a network or an `h2s-` directory without a SessionCleanupError. SIGINT and
+            # SIGTERM are ignored while it runs (main thread only), and an interrupt that still lands is remembered while
+            # the next step runs; the first one is re-raised at the end.
+            cleanup = _Cleanup()
+            with _shielded_from_interrupts():
+                self._teardown(names, base, created_networks, stack, cleanup)
+                if spec.reclaim_workspace:
+                    reclaimed = cleanup.run(self._reclaim, plan, names, default=False)
+                leftovers = tuple(cleanup.run(self._leftovers, names, base, default=[]))
+        if error is None and cleanup.interrupt is not None:
+            error = cleanup.interrupt
         self._notify("session_end", session=run_id, exit_code=None if result is None else result.exit_code,
                      timed_out=None if result is None else result.timed_out,
                      truncated=None if result is None else result.truncated,
@@ -941,21 +951,36 @@ class ProposerSessionRunner:
 
     # ── teardown ──────────────────────────────────────────────────────────────────
 
-    def _teardown(self, names: Names, base: Path, networks: list[str], stack: contextlib.ExitStack) -> None:
+    def _teardown(self, names: Names, base: Path | None, networks: list[str], stack: contextlib.ExitStack,
+                  cleanup: "_Cleanup | None" = None) -> None:
+        """Every step runs whatever happened to the one before it. With no `cleanup` given, the first interrupt is
+        re-raised after the last step; `_execute` passes its own and re-raises it after reclaim and the leftover check."""
+        own = cleanup is None
+        cleanup = cleanup or _Cleanup()
         for c in (names.session, names.proxy):
-            self._quiet(["kill", c])
-            self._quiet(["rm", "-f", c])
+            cleanup.run(self._quiet, ["kill", c])
+            cleanup.run(self._quiet, ["rm", "-f", c])
         for n in networks:
-            for _ in range(10):
-                try:
-                    if self._docker(["network", "rm", n]).returncode == 0:
-                        break
-                except (subprocess.TimeoutExpired, OSError):
-                    pass
-                time.sleep(0.5)
+            cleanup.run(self._remove_network, n)
+        cleanup.run(self._close_stack, stack)
+        if base is not None:
+            cleanup.run(shutil.rmtree, base, True)
+        if own:
+            cleanup.raise_first()
+
+    def _remove_network(self, n: str) -> None:
+        for _ in range(10):
+            try:
+                if self._docker(["network", "rm", n]).returncode == 0:
+                    return
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            time.sleep(0.5)
+
+    @staticmethod
+    def _close_stack(stack: contextlib.ExitStack) -> None:
         with contextlib.suppress(Exception):
             stack.close()
-        shutil.rmtree(base, ignore_errors=True)
 
     def _reclaim(self, plan: Plan, names: Names) -> bool:
         try:
@@ -967,10 +992,10 @@ class ProposerSessionRunner:
         self._quiet(["rm", "-f", names.reclaim])
         return ok
 
-    def _leftovers(self, names: Names, base: Path) -> list[str]:
+    def _leftovers(self, names: Names, base: Path | None) -> list[str]:
         left = [f"container {i}" for i in self._ids("containers", names.run_id)]
         left += [f"network {i}" for i in self._ids("networks", names.run_id)]
-        if base.exists():
+        if base is not None and base.exists():
             left.append(f"directory {base}")
         return left
 
@@ -992,6 +1017,49 @@ class ProposerSessionRunner:
             self._quiet(["network", "rm", n])
             removed.append(f"network {n}")
         return removed
+
+
+class _Cleanup:
+    """Runs cleanup steps so that an interrupt in one cannot skip the others. A `KeyboardInterrupt` in a step is remembered
+    (the first one), the step is retried once (every step is idempotent: kill, rm, network rm, reclaim), and the next step
+    runs. `interrupt` is what the caller re-raises when it is all done."""
+
+    def __init__(self) -> None:
+        self.interrupt: KeyboardInterrupt | None = None
+
+    def run(self, fn: Callable, *args, default=None):
+        for _ in (1, 2):
+            try:
+                return fn(*args)
+            except KeyboardInterrupt as e:
+                if self.interrupt is None:
+                    self.interrupt = e
+        return default
+
+    def raise_first(self) -> None:
+        if self.interrupt is not None:
+            raise self.interrupt
+
+
+@contextlib.contextmanager
+def _shielded_from_interrupts():
+    """Ignore SIGINT and SIGTERM for the duration, restoring the previous handlers after (also if the body raises). Only the
+    main thread can install signal handlers; anywhere else this does nothing."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    saved: dict[int, object] = {}
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            saved[sig] = signal.signal(sig, signal.SIG_IGN)
+        except (ValueError, OSError):
+            pass
+    try:
+        yield
+    finally:
+        for sig, handler in saved.items():
+            with contextlib.suppress(ValueError, OSError, TypeError):
+                signal.signal(sig, handler)
 
 
 def _runtime_base_dir() -> str:
