@@ -113,6 +113,17 @@ _MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")      # an ollam
 MAX_ALLOWED_MODELS = 32
 LOG_MODEL_MAX = 64
 
+# The proxy's running counters, printed as one `ACCESS-SUMMARY {json}` line every SUMMARY_EVERY decisions and once at graceful
+# exit. The reader of the access log cuts the log at a size cap, so a flood of denied requests used to hide the later lines
+# and the counts under-reported; the counters here cannot be cut.
+SUMMARY_PREFIX = "ACCESS-SUMMARY "
+SUMMARY_EVERY = 100
+SUMMARY_MAX_HOSTS = 10
+SUMMARY_MAX_REASONS = 10
+SUMMARY_MAX_REQUESTS = 20            # distinct `METHOD path` keys; the rest are summed under `other`
+_MODEL_REASONS = frozenset({"unix-route", "unix-listener"})
+_PATH_DETAIL = re.compile(r"method=([A-Z?]{1,16}) path=(\S+)")
+
 
 def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
     out: dict = {}
@@ -794,15 +805,57 @@ class Proxy:
     def __init__(self, policy: Policy, limits: Limits = Limits(), *,
                  resolver: Callable[[str, int], Awaitable[list[str]]] | None = None,
                  log: Callable[[str], None] | None = None,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic, summary_every: int = SUMMARY_EVERY):
         self.policy, self.limits, self.resolver = policy, limits, resolver
         self.log = log or (lambda line: print(line, file=sys.stderr, flush=True))
         self.bucket = TokenBucket(limits.rate_per_s, limits.burst, clock)
         self.active = 0
         self.route_requests = 0          # requests forwarded over unix routes: this proxy serves one session
+        # running counters, kept here so a flood of log lines cannot make them under-report (the reader of the log cuts it)
+        self.summary_every = summary_every
+        self.allowed = self.denied = self.model_requests = 0
+        self._denied_hosts: list[str] = []
+        self._denied_reasons: list[str] = []
+        self._denied_requests: dict[str, int] = {}
 
     def _log(self, decision: str, host: str, port: int, reason: str, detail: str = "") -> None:
         self.log(f"ACCESS decision={decision} host={host} port={port} reason={reason}" + (f" {detail}" if detail else ""))
+        self._count(decision, host, port, reason, detail)
+
+    def _count(self, decision: str, host: str, port: int, reason: str, detail: str) -> None:
+        if decision == "allow":
+            self.allowed += 1
+            self.model_requests += reason in _MODEL_REASONS
+        else:
+            self.denied += 1
+            hp = f"{host}:{port}"
+            if hp not in self._denied_hosts and len(self._denied_hosts) < SUMMARY_MAX_HOSTS:
+                self._denied_hosts.append(hp)
+            if reason not in self._denied_reasons and len(self._denied_reasons) < SUMMARY_MAX_REASONS:
+                self._denied_reasons.append(reason)
+            m = _PATH_DETAIL.fullmatch(detail) if reason == "unix-route-path-denied" else None
+            if m:
+                key = f"{m[1]} {m[2]}"
+                if key not in self._denied_requests and len(self._denied_requests) >= SUMMARY_MAX_REQUESTS:
+                    key = "other"
+                self._denied_requests[key] = self._denied_requests.get(key, 0) + 1
+        total = self.allowed + self.denied
+        if self.summary_every > 0 and total % self.summary_every == 0:
+            self.emit_summary()
+
+    def summary(self, *, final: bool = False) -> dict:
+        out: dict = {"v": 1, "final": final, "egress_allowed": self.allowed, "egress_denied": self.denied,
+                     "model_requests": self.model_requests, "denied_hosts": list(self._denied_hosts),
+                     "denied_reasons": sorted(self._denied_reasons)}
+        if self._denied_requests:
+            out["denied_requests"] = dict(self._denied_requests)
+        return out
+
+    def emit_summary(self, *, final: bool = False) -> None:
+        """One `ACCESS-SUMMARY {json}` line: the running counters. Printed every `summary_every` decisions and, with
+        `final`, once at graceful exit. Its JSON is built here from integers and already-validated tokens; nothing a session
+        wrote reaches it except the sanitised method and path tokens of a denied request."""
+        self.log(SUMMARY_PREFIX + json.dumps(self.summary(final=final), sort_keys=True, separators=(",", ":")))
 
     async def _respond(self, writer: asyncio.StreamWriter, status: int, code: str) -> None:
         body = f"{status} {code}\n".encode("ascii")
@@ -1258,6 +1311,7 @@ async def serve(config, *, ready: Callable[[], None] | None = None, stop: asynci
     try:
         await stop.wait()
     finally:
+        proxy.emit_summary(final=True)           # first: closing the servers may wait on a lingering connection
         for s in servers:
             s.close()
         for s in servers:

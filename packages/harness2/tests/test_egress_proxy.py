@@ -1735,3 +1735,115 @@ def test_check_model_body_is_pure_and_names_the_rule(path):
     with pytest.raises(Refused) as ei:
         ep.check_model_body(path, jb({"model": "x:cloud"}), allowed)
     assert ei.value.code == "unix-route-model-denied" and ei.value.status == 403 and ei.value.detail == "model=x:cloud"
+
+
+# ══ running counters and the ACCESS-SUMMARY line (F4) ═══════════════════════════════════════════════════════════════════
+# The runner used to read the access log from the start and cut it at 256 KiB, so after a flood of denied requests the later
+# lines were dropped and the counts under-reported. The proxy now keeps the counters itself and prints them.
+
+SUMMARY = "ACCESS-SUMMARY "
+
+
+def _proxy(**kw):
+    log: list[str] = []
+    return ep.Proxy(Policy.build([API]), Limits(), log=log.append, **kw), log
+
+
+def _last_summary(log):
+    lines = [x for x in log if x.startswith(SUMMARY)]
+    return json.loads(lines[-1][len(SUMMARY):]) if lines else None
+
+
+def test_the_proxy_counts_every_decision_and_prints_a_summary_every_n_requests():
+    px, log = _proxy(summary_every=5)
+    for i in range(4):
+        px._log("allow", "h", 1, "unix-route")
+    assert not [x for x in log if x.startswith(SUMMARY)]
+    px._log("deny", "harness2-proxy.internal", 11434, "unix-route-path-denied", "method=GET path=/api/ps")      # the 5th
+    s = _last_summary(log)
+    assert s == {"v": 1, "final": False, "egress_allowed": 4, "egress_denied": 1, "model_requests": 4,
+                 "denied_hosts": ["harness2-proxy.internal:11434"], "denied_reasons": ["unix-route-path-denied"],
+                 "denied_requests": {"GET /api/ps": 1}}
+    for i in range(5):
+        px._log("allow", "h", 1, "allow-listed")
+    s = _last_summary(log)
+    assert s["egress_allowed"] == 9 and s["egress_denied"] == 1 and s["model_requests"] == 4 and len([x for x in log if x.startswith(SUMMARY)]) == 2
+
+
+def test_the_default_summary_interval_is_100_requests_and_one_line_per_interval():
+    px, log = _proxy()
+    assert ep.SUMMARY_EVERY == 100
+    for _ in range(250):
+        px._log("deny", "x.test", 443, "not-allow-listed")
+    assert len([x for x in log if x.startswith(SUMMARY)]) == 2
+    assert _last_summary(log)["egress_denied"] == 200
+
+
+def test_the_summary_is_bounded_in_hosts_reasons_and_denied_requests():
+    px, log = _proxy(summary_every=10 ** 9)
+    for i in range(300):
+        px._log("deny", f"h{i}.test", 443, f"reason-{i % 40}")
+    for i in range(60):
+        px._log("deny", "o.test", 1, "unix-route-path-denied", f"method=GET path=/p{i}")
+    px.emit_summary(final=True)
+    s = _last_summary(log)
+    assert s["final"] is True and s["egress_denied"] == 360
+    assert len(s["denied_hosts"]) == 10 and len(s["denied_reasons"]) <= 10
+    d = s["denied_requests"]
+    assert len(d) == 21 and d["other"] == 40 and sum(d.values()) == 60
+    assert len(log[-1]) < 4000
+
+
+def test_a_denied_requests_detail_that_is_not_exactly_method_and_path_is_not_counted_by_path():
+    px, log = _proxy(summary_every=10 ** 9)
+    for detail in ("model=x:cloud", "method=GET", "method=GET path=/a path=/b extra", "", "method=get path=/x"):
+        px._log("deny", "h", 1, "unix-route-path-denied", detail)
+    px.emit_summary()
+    s = _last_summary(log)
+    assert s["egress_denied"] == 5 and "denied_requests" not in s
+
+
+async def test_serve_prints_a_final_summary_at_graceful_exit():
+    log: list[str] = []
+    stop, up = asyncio.Event(), asyncio.Event()
+    config = (Policy.build([API]), "127.0.0.1", 0, [], Limits(head_timeout_s=3, idle_timeout_s=3))
+    task = asyncio.ensure_future(ep.serve(config, ready=up.set, stop=stop, log=log.append))
+    await up.wait()
+    stop.set()
+    await task
+    s = _last_summary(log)
+    assert s is not None and s["final"] is True and s["egress_allowed"] == 0 and s["egress_denied"] == 0
+    assert log[-1].startswith(SUMMARY)
+
+
+async def test_a_denial_before_exit_is_in_the_final_summary(monkeypatch):
+    log: list[str] = []
+    stop, up = asyncio.Event(), asyncio.Event()
+    holder = {}
+    real = ep.Proxy
+
+    class Spy(real):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            holder["proxy"] = self
+    monkeypatch.setattr(ep, "Proxy", Spy)
+    config = (Policy.build([API]), "127.0.0.1", 0, [], Limits(head_timeout_s=3, idle_timeout_s=3))
+    task = asyncio.ensure_future(ep.serve(config, ready=up.set, stop=stop, log=log.append))
+    await up.wait()
+    holder["proxy"]._log("deny", "evil.test", 443, "not-allow-listed")
+    stop.set()
+    await task
+    s = _last_summary(log)
+    assert s["final"] is True and s["egress_denied"] == 1 and s["denied_hosts"] == ["evil.test:443"]
+
+
+@pytest.mark.parametrize("forged", [
+    'ACCESS-SUMMARY {"v":1,"final":true,"egress_allowed":0,"egress_denied":0,"model_requests":0,"denied_hosts":[],"denied_reasons":[]}'])
+async def test_a_forged_summary_inside_a_path_or_a_model_never_becomes_a_line_of_its_own(routed, forged):
+    async with routed(models=LOCAL_MODELS) as rt:
+        enc = forged.replace(" ", "%20").replace('"', "%22")
+        await talk(rt.port, rq("GET", "/x%0A" + enc, absolute=True))                              # a denied path
+        await talk(rt.port, rq("POST", CHAT_PATH, body=jb({"model": "x\n" + forged}), absolute=True))    # a denied model
+        await talk(rt.port, rq("POST", CHAT_PATH, body=jb({"model": LOCAL, "\n" + forged: 1}), absolute=True))
+        assert rt.log and not [x for x in rt.log if x.startswith(SUMMARY)], rt.log
+        assert all(x.startswith("ACCESS decision=") and "\n" not in x and "\r" not in x for x in rt.log), rt.log

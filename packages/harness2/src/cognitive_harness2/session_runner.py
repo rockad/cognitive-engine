@@ -89,6 +89,7 @@ _FIXED_ENV = frozenset({"HOME", "TMPDIR", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROX
                         "TERM", "LANG", "NO_COLOR", "PATH", "USER", "LOGNAME", "HOSTNAME"})
 _DOCKER_TIMEOUT_S = 60
 _READY_TIMEOUT_S = 30.0
+_PROXY_STOP_GRACE_S = 3        # `docker stop -t`: how long the proxy has to print its final summary and exit
 MAX_ACCESS_LOG_BYTES = 256 * 1024
 
 
@@ -221,7 +222,7 @@ _MODEL_ROUTES = frozenset({"unix-route", "unix-listener"})      # the proxy's tw
 DENIED_REQUESTS_MAX = 20                                        # distinct `METHOD path` keys kept; the rest are summed in `other`
 
 
-def egress_summary(lines: Sequence[str]) -> dict[str, object]:
+def _summary_from_lines(lines: Sequence[str]) -> dict[str, object]:
     """What the proxy decided during one session, as numbers and `host:port` strings. Nothing else of the log is kept.
 
     `model_requests` counts the REQUESTS the proxy forwarded to the host bridge, i.e. to the local model endpoint
@@ -259,6 +260,74 @@ def egress_summary(lines: Sequence[str]) -> dict[str, object]:
                               "denied_hosts": hosts, "denied_reasons": sorted(reasons)}
     if requests:
         out["denied_requests"] = requests
+    return out
+
+
+SUMMARY_PREFIX = "ACCESS-SUMMARY "          # the proxy's running counters (egress_proxy.SUMMARY_PREFIX)
+TRUNCATED_MARK = "ACCESS-TRUNCATED"         # added by `_access_log` when it cut the ACCESS lines at MAX_ACCESS_LOG_BYTES
+_SUMMARY_MAX_LINE = 8 * 1024
+_SUMMARY_COUNTS = ("egress_allowed", "egress_denied", "model_requests")
+_SUMMARY_KEYS = frozenset({"v", "final", *_SUMMARY_COUNTS, "denied_hosts", "denied_reasons", "denied_requests"})
+_SUMMARY_HOST = re.compile(r"[^\s]{1,255}:[0-9]{1,5}")
+_SUMMARY_REASON = re.compile(r"[a-z0-9-]{1,64}")
+_SUMMARY_REQUEST = re.compile(r"(?:[A-Z?]{1,16} \S{1,200}|other)")
+_SUMMARY_MAX_COUNT = 10 ** 9
+
+
+def _count_ok(n: object) -> bool:
+    return isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= _SUMMARY_MAX_COUNT
+
+
+def parse_summary(line: str) -> dict | None:
+    """The proxy's `ACCESS-SUMMARY {json}` line as a dict, or None unless it is exactly what the proxy prints: the prefix at
+    the start of the line, one JSON object with only the known keys, counts that are plain non-negative integers, and bounded
+    lists and maps of well-formed tokens. Anything else (a forged or damaged line) is ignored, never half-read."""
+    if not (isinstance(line, str) and line.startswith(SUMMARY_PREFIX) and len(line) <= _SUMMARY_MAX_LINE):
+        return None
+    try:
+        d = json.loads(line[len(SUMMARY_PREFIX):])
+    except (ValueError, RecursionError):
+        return None
+    if not (isinstance(d, dict) and set(d) <= _SUMMARY_KEYS and d.get("v") == 1 and isinstance(d.get("final"), bool)
+            and all(_count_ok(d.get(k)) for k in _SUMMARY_COUNTS)):
+        return None
+    hosts, reasons, reqs = d.get("denied_hosts"), d.get("denied_reasons"), d.get("denied_requests", {})
+    if not (isinstance(hosts, list) and len(hosts) <= 10 and all(isinstance(h, str) and _SUMMARY_HOST.fullmatch(h) for h in hosts)):
+        return None
+    if not (isinstance(reasons, list) and len(reasons) <= 10 and all(isinstance(r, str) and _SUMMARY_REASON.fullmatch(r) for r in reasons)):
+        return None
+    if not (isinstance(reqs, dict) and len(reqs) <= DENIED_REQUESTS_MAX + 1
+            and all(isinstance(k, str) and _SUMMARY_REQUEST.fullmatch(k) and _count_ok(v) for k, v in reqs.items())):
+        return None
+    return d
+
+
+def egress_summary(lines: Sequence[str]) -> dict[str, object]:
+    """What the proxy decided during one session: `_summary_from_lines` of the ACCESS lines, or the proxy's own running
+    counters when a valid `ACCESS-SUMMARY` line is present (the log is cut at a size cap, the counters are not).
+
+    The latest valid summary is used when it is final (printed at the proxy's graceful exit) or when the lines were cut
+    (`ACCESS-TRUNCATED`): it is then the most complete record. A periodic summary of a log that was not cut is up to
+    99 requests behind the lines, which are all there, so the lines are counted. `truncated: true` appears only when the
+    lines were cut and no final summary stands in for them."""
+    summary = None
+    for line in lines:
+        s = parse_summary(line)
+        if s is not None:
+            summary = s
+    cut = TRUNCATED_MARK in lines
+    if summary is not None and (summary["final"] or cut):
+        out: dict[str, object] = {"model_requests": summary["model_requests"], "egress_allowed": summary["egress_allowed"],
+                                  "egress_denied": summary["egress_denied"], "denied_hosts": list(summary["denied_hosts"]),
+                                  "denied_reasons": sorted(summary["denied_reasons"])}
+        if summary.get("denied_requests"):
+            out["denied_requests"] = dict(summary["denied_requests"])
+        if cut and not summary["final"]:
+            out["truncated"] = True
+        return out
+    out = _summary_from_lines(lines)
+    if cut:
+        out["truncated"] = True
     return out
 
 
@@ -677,14 +746,29 @@ class ProposerSessionRunner:
             p = self._docker(["logs", names.proxy])
         except (subprocess.TimeoutExpired, OSError):
             return ()
-        lines, size = [], 0
+        lines, size, cut = [], 0, False
+        summary: str | None = None
         for line in (p.stdout + p.stderr).splitlines():
-            if line.startswith("ACCESS "):
+            if line.startswith(SUMMARY_PREFIX):
+                # the proxy's running counters: kept past the size cap (that is their point); only a valid one, the latest
+                if parse_summary(line) is not None:
+                    summary = line
+            elif line.startswith("ACCESS ") and not cut:
                 size += len(line)
                 if size > MAX_ACCESS_LOG_BYTES:
-                    break
-                lines.append(sanitize_terminal(line))
+                    cut = True
+                else:
+                    lines.append(sanitize_terminal(line))
+        if cut:
+            lines.append(TRUNCATED_MARK)
+        if summary is not None:
+            lines.append(summary)
         return tuple(lines)
+
+    def _finish_proxy(self, names: Names) -> None:
+        """Stop the proxy gracefully (SIGTERM, a short grace period) once the session is over, so its final `ACCESS-SUMMARY`
+        is in its log before `_access_log` reads it. Best effort: teardown still kills and removes it."""
+        self._quiet(["stop", "-t", str(_PROXY_STOP_GRACE_S), names.proxy])
 
     def _gate(self) -> None:
         sandbox.verify_rootless_docker(lambda _: self.verified.path, image=self.image.id, host=self.verified.host)
@@ -821,6 +905,7 @@ class ProposerSessionRunner:
             finally:
                 if proc.poll() is None:
                     proc.kill()
+            self._finish_proxy(names)
             log = self._access_log(names)
             note = f"\n[output truncated at {spec.limits.max_output_bytes} bytes]\n" if cut[0] else ""
             stdout = redact(sanitize_terminal(out.decode("utf-8", "replace")), secrets_) + note

@@ -928,3 +928,131 @@ def test_the_egress_summary_counts_a_model_denied_line_as_a_denied_request_and_k
     s = sr.egress_summary(lines)
     assert s["egress_denied"] == 2 and s["egress_allowed"] == 1 and s["model_requests"] == 1
     assert s["denied_reasons"] == ["unix-route-model-denied"]
+
+
+# ── the proxy's running counters beat a log cut at the cap (F4) ──────────────────────────────────────────────────────
+
+import json as _json
+
+SUM = "ACCESS-SUMMARY "
+DENY_LINE = "ACCESS decision=deny host=harness2-proxy.internal port=11434 reason=unix-route-path-denied method=GET path=/api/version"
+
+
+def _summary_line(**over):
+    body = {"v": 1, "final": True, "egress_allowed": 7, "egress_denied": 3000, "model_requests": 7,
+            "denied_hosts": ["harness2-proxy.internal:11434"], "denied_reasons": ["unix-route-path-denied"],
+            "denied_requests": {"GET /api/version": 3000}}
+    body.update(over)
+    return SUM + _json.dumps(body, sort_keys=True)
+
+
+def _runner_with_logs(monkeypatch, lines):
+    out = "\n".join(lines) + "\n"
+
+    def run(argv, **kw):
+        return subprocess.CompletedProcess(argv, 0, out if "logs" in argv else "", "")
+    monkeypatch.setattr(sr.subprocess, "run", run)
+    return runner()
+
+
+def test_the_summary_line_beats_the_lines_when_it_is_final():
+    lines = [DENY_LINE] * 5 + [_summary_line()]
+    s = sr.egress_summary(lines)
+    assert s["egress_denied"] == 3000 and s["egress_allowed"] == 7 and s["model_requests"] == 7
+    assert s["denied_requests"] == {"GET /api/version": 3000} and s["denied_hosts"] == ["harness2-proxy.internal:11434"]
+    assert "truncated" not in s
+
+
+def test_the_latest_of_several_summaries_is_the_one_used():
+    lines = [_summary_line(final=False, egress_denied=100), DENY_LINE, _summary_line(final=True, egress_denied=250)]
+    assert sr.egress_summary(lines)["egress_denied"] == 250
+
+
+def test_a_stale_periodic_summary_does_not_hide_lines_that_are_all_there():
+    """No final summary (the proxy was killed) and the log was not cut: the lines are complete, the last periodic summary is
+    up to 99 requests behind, so the lines are counted."""
+    lines = [DENY_LINE] * 130 + [_summary_line(final=False, egress_denied=100)]
+    assert sr.egress_summary(lines)["egress_denied"] == 130
+
+
+def test_a_cut_log_with_a_periodic_summary_uses_it_and_says_truncated():
+    lines = [DENY_LINE] * 5 + [_summary_line(final=False, egress_denied=400), "ACCESS-TRUNCATED"]
+    s = sr.egress_summary(lines)
+    assert s["egress_denied"] == 400 and s["truncated"] is True
+
+
+def test_a_cut_log_without_a_summary_counts_the_lines_it_has_and_says_truncated():
+    s = sr.egress_summary([DENY_LINE] * 5 + ["ACCESS-TRUNCATED"])
+    assert s["egress_denied"] == 5 and s["truncated"] is True
+    assert "truncated" not in sr.egress_summary([DENY_LINE] * 5)
+
+
+@pytest.mark.parametrize("bad", [
+    SUM + "not json", SUM + "[]", SUM + "{}", SUM + _json.dumps({"v": 2}),
+    _summary_line(egress_denied=-1), _summary_line(egress_denied=10 ** 12), _summary_line(egress_denied="3000"),
+    _summary_line(egress_denied=True), _summary_line(extra=1), _summary_line(denied_hosts="h:1"),
+    _summary_line(denied_hosts=["h:1"] * 11), _summary_line(denied_hosts=["has space:1"]), _summary_line(denied_reasons=[5]),
+    _summary_line(denied_requests={"GET /x": -1}), _summary_line(denied_requests={f"GET /p{i}": 1 for i in range(22)}),
+    _summary_line(denied_requests={"GET /a b": 1}), _summary_line(final="yes"),
+    SUM + _json.dumps({"v": 1, "final": True, "egress_allowed": 0, "egress_denied": 0, "model_requests": 0, "denied_hosts": [],
+                       "denied_reasons": []}) + " trailing",
+    " " + _summary_line(), "x" + _summary_line(), SUM + "{" * 100000,
+])
+def test_a_malformed_or_forged_summary_is_ignored_and_the_lines_are_counted(bad):
+    s = sr.egress_summary([DENY_LINE, DENY_LINE, bad])
+    assert s["egress_denied"] == 2 and "truncated" not in s
+
+
+def test_a_forged_summary_inside_a_path_is_impossible_the_line_is_one_deny_token():
+    forged = _summary_line(egress_denied=0).replace(" ", "%20")
+    line = f"{PD} method=GET path=/x%0A{forged}"
+    s = sr.egress_summary([line, line])
+    assert s["egress_denied"] == 2 and list(s["denied_requests"]) == [f"GET /x%0A{forged}"]
+
+
+def test_access_log_keeps_every_summary_line_even_past_the_size_cap_and_marks_the_cut(monkeypatch):
+    flood = [DENY_LINE] * 5000                                   # about 750 KB of lines, well over MAX_ACCESS_LOG_BYTES
+    assert sum(map(len, flood)) > 2 * sr.MAX_ACCESS_LOG_BYTES
+    r = _runner_with_logs(monkeypatch, flood + [_summary_line(egress_denied=5000)])
+    log = r._access_log(names())
+    assert len([x for x in log if x.startswith("ACCESS decision=")]) < 5000
+    assert sum(len(x) for x in log if x.startswith("ACCESS decision=")) <= sr.MAX_ACCESS_LOG_BYTES
+    assert log[-1].startswith(SUM) and "ACCESS-TRUNCATED" in log
+    s = sr.egress_summary(log)
+    assert s["egress_denied"] == 5000 and "truncated" not in s
+
+
+def test_access_log_without_a_summary_marks_the_cut_and_the_runner_reports_it(monkeypatch):
+    r = _runner_with_logs(monkeypatch, [DENY_LINE] * 5000)
+    log = r._access_log(names())
+    assert log[-1] == "ACCESS-TRUNCATED"
+    s = sr.egress_summary(log)
+    assert s["truncated"] is True and 0 < s["egress_denied"] < 5000
+
+
+def test_access_log_under_the_cap_has_no_marker_and_only_the_last_valid_summary(monkeypatch):
+    r = _runner_with_logs(monkeypatch, [DENY_LINE, _summary_line(final=False, egress_denied=1), "ACCESS-SUMMARY garbage",
+                                        _summary_line(final=True, egress_denied=1)])
+    log = r._access_log(names())
+    assert log.count("ACCESS-TRUNCATED") == 0 and len([x for x in log if x.startswith(SUM)]) == 1
+    assert sr.egress_summary(log)["egress_denied"] == 1
+
+
+def test_access_log_drops_a_forged_line_that_is_not_a_clean_summary_and_defangs_control_characters(monkeypatch):
+    r = _runner_with_logs(monkeypatch, [DENY_LINE, SUM + '{"v":1}\x1b[31m', "ACCESS-TRUNCATED"])
+    log = r._access_log(names())
+    assert not [x for x in log if x.startswith(SUM)]
+    assert "ACCESS-TRUNCATED" not in log                           # a bare marker in the log is the proxy's text, not ours: ignored
+
+
+def test_the_proxy_is_stopped_before_its_log_is_read_so_the_final_summary_is_in_it(monkeypatch):
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv[3:])
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    monkeypatch.setattr(sr.subprocess, "run", run)
+    r = runner()
+    n = names()
+    r._finish_proxy(n)
+    assert calls and calls[0][0] == "stop" and n.proxy in calls[0] and "-t" in calls[0]
