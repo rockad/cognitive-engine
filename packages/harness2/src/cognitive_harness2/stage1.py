@@ -1307,7 +1307,7 @@ def harness_evidence(run_dir: Path, ts: ss.TaskSet, surface: Any) -> dict:
         for p in changed:
             try:
                 slot, _comp = us.classify_path(surface, p)
-                us.check_mutation(slot, p, base.get(p, ""), cur.get(p, ""))
+                us.check_mutation(slot, p, base.get(p, ""), cur.get(p, ""), spec=surface)
             except InvariantViolation as e:
                 problems.append(f"{p}: {str(e)[:120]}")
         ev["slot_table_problems"][label] = problems

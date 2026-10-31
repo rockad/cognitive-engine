@@ -137,11 +137,9 @@ class HostBridge:
                 loop.close()
 
     async def _start(self) -> None:
-        old = os.umask(0o177)               # the socket is born 0600; the 0700 directory already hides it
-        try:
-            self._server = await asyncio.start_unix_server(self._handle, path=str(self.socket_path))
-        finally:
-            os.umask(old)
+        # No `os.umask`: it is process-wide and other threads create files. The socket is bound inside the 0700 directory
+        # (nobody else can reach it there) and made 0600 explicitly straight after.
+        self._server = await asyncio.start_unix_server(self._handle, path=str(self.socket_path))
         os.chmod(self.socket_path, 0o600)
 
     async def _shutdown(self) -> None:

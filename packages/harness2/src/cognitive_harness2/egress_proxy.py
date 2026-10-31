@@ -1070,6 +1070,8 @@ class Proxy:
         while True:
             end = buf.find(b"\r\n\r\n")
             if end >= 0:
+                if end > lim.header_bytes:          # a head that arrived with its terminator in one read is checked too
+                    raise Refused("unix-route-bad-response", 502)
                 return buf[:end], buf[end + 4:]
             if len(buf) > lim.header_bytes:
                 raise Refused("unix-route-bad-response", 502)

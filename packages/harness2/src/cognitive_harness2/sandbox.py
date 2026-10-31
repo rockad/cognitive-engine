@@ -416,8 +416,12 @@ SBX_PARENT_DIR = "/tmp"
 SBX_CANDIDATE_DIR = "/tmp/candidate"  # `sbx cp <stage>/candidate NAME:/tmp` puts the directory inside /tmp
 # Asked of the policy engine in the context of the new sandbox, before any file or command reaches it.
 SBX_DENIED_TARGETS = ("example.com:443", "example.com:80", "127.0.0.1:80", "localhost:80")
-_SBX_ENV_PREFIXES = ("DOCKER_SANDBOXES_", "SBX_")
-_SBX_ENV_DROPPED = frozenset({"SSH_AUTH_SOCK"})
+# What an `sbx` process may inherit: an ALLOW-list (a deny-list let DOCKER_HOST, DOCKER_CONFIG, DOCKER_AUTH_CONFIG, credentials and
+# anything new through). Names are matched exactly and case-sensitively. `_SBX_ENV_ALLOW_EXTRA` is empty in production; tests that
+# run a fake `sbx` configured through its own variables extend it.
+_SBX_ENV_ALLOW = frozenset({"PATH", "HOME", "LANG", "TERM", "TMPDIR"})
+_SBX_ENV_ALLOW_PREFIXES = ("XDG_", "LC_")
+_SBX_ENV_ALLOW_EXTRA: tuple[str, ...] = ()
 _SBX_POLICY_ACTIONS = frozenset({"net:connect:tcp", "net:connect:udp"})
 _SBX_CREATE_TIMEOUT_S = 600  # the daemon may pull the agent image on first use
 _SBX_EXEC_FAILURE = re.compile(r"\s*(failed to start|error: |inspect exec: )")
@@ -457,10 +461,11 @@ def sbx_network_policy_problem(policy_json: str) -> str | None:
 
 
 def _sbx_env(environ: Mapping[str, str]) -> dict[str, str]:
-    """The environment for every `sbx` call: minus the variables that can re-point the CLI or its settings, and
-    minus `SSH_AUTH_SOCK` (the host's SSH agent is never offered to an sbx process this module starts)."""
-    return {k: v for k, v in environ.items()
-            if not k.upper().startswith(_SBX_ENV_PREFIXES) and k.upper() not in _SBX_ENV_DROPPED}
+    """The environment for every `sbx` call: an ALLOW-list (PATH, HOME, XDG_*, LANG, LC_*, TERM, TMPDIR), so nothing that
+    can re-point the CLI, its settings or the Docker client (`DOCKER_HOST`, `DOCKER_CONFIG`, `DOCKER_AUTH_CONFIG`,
+    `SBX_*`), no credential and not the host's SSH agent (`SSH_AUTH_SOCK`) ever reaches a process this module starts."""
+    allowed = _SBX_ENV_ALLOW_PREFIXES + _SBX_ENV_ALLOW_EXTRA
+    return {k: v for k, v in environ.items() if k in _SBX_ENV_ALLOW or k.startswith(allowed)}
 
 
 # The two host-reach settings of the sbx daemon (`sbx settings ls`, both default true on v0.50.1): the first lets
@@ -665,6 +670,9 @@ class SbxRunner:
                                      "this runner never starts it)") from None
         if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
             raise SandboxUnavailable(f"{sock} is not a socket owned by this user (fail closed)")
+        if not _sbx_daemon_reachable(self.environ):
+            raise SandboxUnavailable(f"the sbx daemon socket {sock} exists but nothing accepts a connection on it: the daemon "
+                                     "is not reachable (a stale socket file; fail closed; this runner never starts it)")
         p = self._must(self._argv("version"), "version")
         m = _SBX_VERSION.search(p.stdout)
         version = m.group(1) if m else None
@@ -878,6 +886,20 @@ def _sbx_socket(environ: Mapping[str, str]) -> Path:
     return Path(base) / "sandboxes" / "sandboxes" / "sandboxd" / "sandboxd.sock"
 
 
+def _sbx_daemon_reachable(environ: Mapping[str, str]) -> bool:
+    """True only if something ACCEPTS a connection on the sbx daemon socket. One check for selection and for the runner's
+    preflight: a socket file whose daemon died (a stale file) passes `stat` and fails here."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(2)
+        s.connect(str(_sbx_socket(environ)))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
 def _run_readonly(argv: list[str], env: Mapping[str, str] | None = None,
                   timeout: float | None = None) -> subprocess.CompletedProcess:
     """One bounded probe command. Own process group, killed whole on timeout, so a hung `sbx` (or a child of it that
@@ -911,15 +933,7 @@ def real_sbx_probes(environ: Mapping[str, str]) -> SbxProbes:
         return None
 
     def daemon() -> bool:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            s.settimeout(2)
-            s.connect(str(_sbx_socket(environ)))
-            return True
-        except OSError:
-            return False
-        finally:
-            s.close()
+        return _sbx_daemon_reachable(environ)
 
     def version(path: str) -> str | None:
         p = _run_readonly([path, "version"], env)

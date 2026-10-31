@@ -280,10 +280,12 @@ def check_surface(spec: Any, *, request: Iterable[str] | None = None,
 MAX_MUTATION_BYTES = 512 * 1024  # 512 KiB per editable file cap
 
 _FRONTMATTER_FENCE = "---"
-_SENSITIVE_KEYS = (
-    "model:", "tools:", "allowed-tools:", "permissions:", "permission-mode:",
-    "agent:", "effort:", "role:",
-)
+# Keys that, right after a stray `---` fence, make a body line look like the frontmatter a harness reads: upstream's own
+# (model, tools, ...) and opencode's (`permission:` singular, `mode:`, `tool:`, `disable...:`). A KEY, not a word prefix:
+# `Permissions of the build...` is prose. `[\w-]*` after permission and disable takes `permission-mode`, `disabled`,
+# `disable-tools`.
+_SENSITIVE_KEY = re.compile(
+    r"^(?:model|tools?|allowed[-_]?tools|permission[\w-]*|agent|effort|role|mode|disable[\w-]*)\s*:", re.IGNORECASE)
 _YAML_KEY_PATTERN = re.compile(r"^[a-zA-Z0-9_\-]+\s*:\s*\S")
 
 
@@ -383,16 +385,28 @@ def _check_no_secondary_frontmatter(body: str) -> None:
             continue
 
         if fence_line_idx is not None and (idx - fence_line_idx) <= 10:
-            lower = stripped.lower()
-            if any(lower.startswith(k) for k in _SENSITIVE_KEYS):
+            if _SENSITIVE_KEY.match(stripped):
                 raise InvariantViolation(
                     f"mutation body contains frontmatter key {stripped!r} following a '---' fence")
 
 
-def check_mutation(slot: str, path: str, old_text: str | bytes, new_text: str | bytes) -> None:
+class _DefaultSurface:
+    """The paths `check_mutation` classifies against when it is not given a surface: the always-on files and the opencode
+    layout (`skills/`, `plugin/`, no hooks file). Pass `spec=` for any other surface."""
+    name = "default"
+    always_on = tuple(_ALWAYS_ON_SLOT)
+    skill_dir = "skills"
+    plugin_dir = "plugin"
+    hooks_file = None
+
+
+def check_mutation(slot: str, path: str, old_text: str | bytes, new_text: str | bytes, *, spec: Any = None) -> None:
     """Validate that a proposed file mutation is permitted under the slot table and invariants.
 
     Enforces RFC 004 §6.5:
+    0. `slot` must be the slot `path` belongs to: it is derived from the path (`classify_path`, against `spec` or the
+       default opencode layout) and a caller's different claim is refused, so the rules of one slot cannot be run on a
+       file of another.
     1. `slot` must be a known, mutable slot (c1, c3, c4, c5, c6).
     2. `path` must be an unprotected path (refusing guardrails, hooks, git, escapes).
     3. Content must be valid UTF-8, within size limits (512 KiB), free of NUL and control characters.
@@ -408,6 +422,9 @@ def check_mutation(slot: str, path: str, old_text: str | bytes, new_text: str | 
         raise InvariantViolation(f"slot {slot} is not mutable: {SLOT_DENIAL.get(slot, 'denied by default')}")
 
     invariants.assert_path_unprotected(path)
+    derived = classify_path(spec if spec is not None else _DefaultSurface, path)[0]
+    if derived != slot:
+        raise InvariantViolation(f"{path!r} belongs to slot {derived}, not {slot}: the slot is derived from the path")
 
     old_clean = _to_clean_text(old_text, "original text")
     new_clean = _to_clean_text(new_text, "new text")

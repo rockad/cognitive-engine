@@ -63,6 +63,7 @@ def world():
     sd.mkdir(parents=True)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.bind(str(sd / "sandboxd.sock"))
+    s.listen(8)                       # a live daemon accepts: the runner now connects, as the selection probe does
     try:
         yield World(root, state, s)
     finally:
@@ -621,3 +622,87 @@ def test_the_runner_refuses_while_the_daemon_has_not_been_restarted_and_creates_
 
 def test_the_runner_runs_when_the_daemon_started_after_the_override(world):
     assert world.runner(env=_cfg_env(world, newer=False)).run(spec()).exit_code == 0
+
+
+# ── F9: the environment of every sbx call is an allow-list, not a deny-list ────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _fake_sbx_knobs_reach_the_fake(monkeypatch):
+    """The fake `sbx` is configured through FAKE_SBX_* variables. Production allows none of that prefix; the tests do."""
+    monkeypatch.setattr(sandbox, "_SBX_ENV_ALLOW_EXTRA", ("FAKE_SBX_",))
+
+
+ALLOWED = {"PATH": "/usr/bin", "HOME": "/home/u", "XDG_STATE_HOME": "/s", "XDG_RUNTIME_DIR": "/run/u", "XDG_CONFIG_HOME": "/c",
+           "LANG": "C.UTF-8", "LC_ALL": "C", "LC_CTYPE": "C", "TERM": "xterm", "TMPDIR": "/tmp"}
+NOT_ALLOWED = {"DOCKER_HOST": "tcp://evil:2375", "DOCKER_CONFIG": "/evil", "DOCKER_AUTH_CONFIG": '{"auths":{}}',
+               "DOCKER_CONTEXT": "evil", "DOCKER_TLS_VERIFY": "1", "SSH_AUTH_SOCK": "/tmp/a.sock", "SBX_CRED_X": "y",
+               "DOCKER_SANDBOXES_API": "http://evil", "ANTHROPIC_API_KEY": "k", "GITHUB_TOKEN": "t", "AWS_SECRET_ACCESS_KEY": "s",
+               "OPENAI_API_KEY": "k", "HTTP_PROXY": "http://p", "https_proxy": "http://p", "LD_PRELOAD": "/evil.so",
+               "LD_LIBRARY_PATH": "/evil", "PYTHONPATH": "/evil", "GIT_SSH_COMMAND": "evil", "FOO": "bar", "lang": "lower",
+               "path": "/lower", "xdg_state_home": "/lower", "NPM_TOKEN": "t", "KUBECONFIG": "/k", "EDITOR": "vi"}
+
+
+def test_the_sbx_environment_is_exactly_the_allow_list():
+    out = sandbox._sbx_env({**ALLOWED, **NOT_ALLOWED})
+    assert out == ALLOWED
+
+
+def test_the_allow_list_is_path_home_xdg_lang_lc_term_tmpdir_and_nothing_extra_in_production(monkeypatch):
+    monkeypatch.setattr(sandbox, "_SBX_ENV_ALLOW_EXTRA", ())
+    assert sandbox._SBX_ENV_ALLOW == frozenset({"PATH", "HOME", "LANG", "TERM", "TMPDIR"})
+    assert sandbox._SBX_ENV_ALLOW_PREFIXES == ("XDG_", "LC_")
+    assert sandbox._sbx_env({"FAKE_SBX_DIR": "/x", **ALLOWED}) == ALLOWED
+
+
+@pytest.mark.parametrize("name", sorted(NOT_ALLOWED))
+def test_no_denied_variable_reaches_an_sbx_process(world, name):
+    world.runner(env={name: "sentinel-" + name.lower()}).run(spec())
+    seen = (world.fake / "env.last").read_text()
+    assert ("sentinel-" + name.lower()) not in seen
+
+
+def test_the_allowed_variables_do_reach_it(world):
+    world.runner(env={"LANG": "C.UTF-8", "LC_ALL": "C", "TERM": "xterm", "TMPDIR": "/tmp", "XDG_CONFIG_HOME": "/c"}).run(spec())
+    seen = (world.fake / "env.last").read_text()
+    for needle in ("LANG=C.UTF-8", "LC_ALL=C", "TERM=xterm", "TMPDIR=/tmp", "XDG_CONFIG_HOME=/c", "XDG_STATE_HOME=", "PATH="):
+        assert needle in seen
+
+
+# ── F10: the runner's preflight uses the same connect() probe as selection ───────────────────────────────────────
+
+def _stale_world():
+    """A socket FILE with nobody listening: a daemon that died without removing it (stat passes, connect is refused)."""
+    root = Path(tempfile.mkdtemp(prefix="h2sbx"))
+    sd = root / "state" / "sandboxes" / "sandboxes" / "sandboxd"
+    sd.mkdir(parents=True)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(str(sd / "sandboxd.sock"))
+    s.close()                                              # bound, never listened, closed: the file remains
+    assert (sd / "sandboxd.sock").exists()
+    (root / "fake").mkdir()
+    return root
+
+
+def test_a_stale_socket_file_does_not_pass_the_preflight():
+    root = _stale_world()
+    try:
+        env = {"PATH": f"{FAKE_DIR}:{os.environ['PATH']}", "XDG_STATE_HOME": str(root / "state"), "FAKE_SBX_DIR": str(root / "fake"),
+               "FAKE_SBX_POLICY_FILE": str(DENY_ALL)}
+        r = SbxRunner(str(FAKE_DIR / "sbx"), environ=env, verified=frozenset({VERSION}))
+        with pytest.raises(SandboxUnavailable, match="not reachable|not running") as e:
+            r.run(spec())
+        assert "fail closed" in str(e.value)
+        calls = root / "fake" / "calls"
+        assert not calls.exists() or calls.read_text() == ""            # not even `sbx version` was started
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_the_runner_and_the_selection_probe_share_one_daemon_check(world):
+    assert sandbox._sbx_daemon_reachable(world.env) is True
+    assert sandbox.real_sbx_probes(world.env).daemon_reachable() is True
+    root = _stale_world()
+    try:
+        assert sandbox._sbx_daemon_reachable({"XDG_STATE_HOME": str(root / "state")}) is False
+    finally:
+        shutil.rmtree(root, ignore_errors=True)

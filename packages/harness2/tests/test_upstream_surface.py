@@ -475,3 +475,50 @@ def test_check_mutation_rejects_protected_paths(path):
     with pytest.raises(InvariantViolation):
         check_mutation("c1", path, "old", "new")
 
+
+
+# ── F7 and F8: the slot is derived from the path, and the stray-key list covers opencode's own keys ────────────────
+
+@pytest.mark.parametrize("slot,path", [
+    ("c1", "skills/x/SKILL.md"), ("c1", "sub_agents/helper/AGENT.md"), ("c1", "LongTermMEMORY.md"),
+    ("c3", "systemprompt.md"), ("c4", "systemprompt.md"), ("c5", "systemprompt.md"), ("c5", "skills/x/SKILL.md"),
+    ("c6", "sub_agents/helper/AGENT.md"), ("c6", "tool_descriptions/tool_guidance.md"),
+])
+def test_check_mutation_refuses_a_slot_that_does_not_match_the_path(slot, path):
+    """The caller used to pick the slot: `check_mutation("c1", "skills/x/SKILL.md", ...)` ran the c1 rules on a c6 file."""
+    with pytest.raises(InvariantViolation, match="slot"):
+        check_mutation(slot, path, "old", "new")
+
+
+def test_check_mutation_derives_the_slot_from_the_path_and_accepts_the_matching_one():
+    for slot, path in (("c1", "systemprompt.md"), ("c3", "LongTermMEMORY.md"), ("c4", "tool_descriptions/tool_guidance.md"),
+                       ("c5", "sub_agents/helper/AGENT.md"), ("c6", "skills/helper/SKILL.md")):
+        check_mutation(slot, path, "old\n", "new\n") if slot not in ("c5", "c6") else check_mutation(slot, path, VALID_AGENT_OLD, VALID_AGENT_NEW_BODY)
+
+
+def test_check_mutation_with_a_spec_classifies_against_that_surface(opencode):
+    check_mutation("c1", "systemprompt.md", "a", "b", spec=opencode)
+    check_mutation("c6", "skills/helper/SKILL.md", VALID_AGENT_OLD, VALID_AGENT_NEW_BODY, spec=opencode)
+    with pytest.raises(InvariantViolation, match="slot"):
+        check_mutation("c1", "skills/helper/SKILL.md", "a", "b", spec=opencode)
+    with pytest.raises(InvariantViolation):
+        check_mutation("c1", "notes/off.md", "a", "b", spec=opencode)           # not on the surface at all
+
+
+@pytest.mark.parametrize("key", [
+    "permission: allow", "permission:\n  bash: allow", "Permission: allow", "permissions: allow-all", "permission-mode: auto",
+    "mode: subagent", "Mode: primary", "tool: bash", "tools: [bash]", "tools:\n  - bash", "disable: true", "disabled: true",
+    "disable-tools: true", "model: opus", "model : opus", "agent: build", "effort: high", "role: system", "allowed-tools: [bash]",
+    "allowed_tools: [bash]",
+])
+def test_stray_frontmatter_keys_after_a_fence_include_opencodes_permission_mode_tool_and_disable(key):
+    with pytest.raises(InvariantViolation):
+        check_mutation("c5", "sub_agents/helper/AGENT.md", VALID_AGENT_OLD, VALID_AGENT_OLD + "\n---\n" + key + "\n")
+
+
+@pytest.mark.parametrize("prose", [
+    "Permissions of the build are listed below.", "Modeling the problem first helps.", "Toolbox notes follow.",
+    "Disabled paths are skipped in this run.", "Agents may be reused.", "Roles are explained in the guide.",
+])
+def test_ordinary_prose_after_a_horizontal_rule_is_not_mistaken_for_a_frontmatter_key(prose):
+    check_mutation("c5", "sub_agents/helper/AGENT.md", VALID_AGENT_OLD, VALID_AGENT_OLD + "\n---\n" + prose + "\n")

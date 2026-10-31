@@ -79,6 +79,12 @@ class Docker:
         return VerifiedDocker("/usr/bin/docker", SOCK)
 
 
+@pytest.fixture(autouse=True)
+def _fake_sbx_knobs_reach_the_fake(monkeypatch):
+    """The fake `sbx` is configured through FAKE_SBX_* variables. Production allows none of that prefix; the tests do."""
+    monkeypatch.setattr(sandbox, "_SBX_ENV_ALLOW_EXTRA", ("FAKE_SBX_",))
+
+
 @pytest.fixture
 def docker(monkeypatch):
     return Docker(monkeypatch)

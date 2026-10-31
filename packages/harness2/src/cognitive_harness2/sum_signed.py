@@ -486,7 +486,7 @@ class SumSignedAdapter:
                 problems.append(f"slot table: {path} is not on the harness surface; only the harness files may change")
                 continue
             try:
-                us.check_mutation(slot, path, self._base_text(path), tree.get(path, ""))
+                us.check_mutation(slot, path, self._base_text(path), tree.get(path, ""), spec=self.substrate.surface())
             except InvariantViolation as e:
                 problems.append(f"slot table: {path} (slot {slot}) cannot be changed this way: {e}")
         return problems

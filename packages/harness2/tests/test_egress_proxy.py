@@ -1847,3 +1847,22 @@ async def test_a_forged_summary_inside_a_path_or_a_model_never_becomes_a_line_of
         await talk(rt.port, rq("POST", CHAT_PATH, body=jb({"model": LOCAL, "\n" + forged: 1}), absolute=True))
         assert rt.log and not [x for x in rt.log if x.startswith(SUMMARY)], rt.log
         assert all(x.startswith("ACCESS decision=") and "\n" not in x and "\r" not in x for x in rt.log), rt.log
+
+
+# ── F13: the response head's size is checked after splitting too, not only while no terminator has arrived ─────────────
+
+@pytest.mark.parametrize("pad", [2001, 2500, 30_000])
+async def test_an_oversized_response_head_that_arrives_in_one_piece_is_a_502(routed, pad):
+    """Only a head still without its blank line was length-checked: a head AND its terminator in one read passed any size."""
+    big = b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * pad + b"\r\nContent-Length: 11\r\n\r\n" + JSON_OK
+    async with routed(lambda rec: big, header_bytes=2000) as rt:
+        out = await talk(rt.port, rq("GET", "/api/tags"))
+        (s, _, text), = responses(out)
+        assert s == 502 and b"unix-route-bad-response" in text, out[:200]
+
+
+async def test_a_response_head_just_under_the_limit_in_one_piece_is_relayed(routed):
+    ok = b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * 1500 + b"\r\nContent-Length: 11\r\n\r\n" + JSON_OK
+    async with routed(lambda rec: ok, header_bytes=2000) as rt:
+        (s, _, text), = responses(await talk(rt.port, rq("GET", "/api/tags")))
+        assert (s, text) == (200, JSON_OK)

@@ -176,3 +176,32 @@ def test_it_cannot_be_entered_twice(tmp_path):
     with Echo() as echo, HostBridge("127.0.0.1", echo.port, base_dir=tmp_path) as b:
         with pytest.raises(BridgeError):
             b.__enter__()
+
+
+# ── F12: no process-wide umask change; the socket is made inside the 0700 directory and chmod-ed 0600 ──────────────
+
+def test_starting_the_bridge_never_touches_the_process_umask_and_the_socket_is_still_0600(tmp_path, monkeypatch):
+    """`os.umask` is process-wide: another thread creating a file while it was 0o177 got a 0600 file it did not ask for
+    (and with the runner's threads, the reverse is possible too). It is not called at all now."""
+    def boom(mask):
+        raise AssertionError(f"os.umask({mask:#o}) was called: it is process-wide")
+    monkeypatch.setattr(os, "umask", boom)
+    with Echo() as echo, HostBridge("127.0.0.1", echo.port, base_dir=tmp_path) as b:
+        assert stat.S_IMODE(os.stat(b.directory).st_mode) == 0o700
+        assert stat.S_IMODE(os.stat(b.socket_path).st_mode) == 0o600
+        assert ask(b.socket_path, b"x") == b"ECHO:x"
+
+
+def test_the_socket_is_created_inside_the_private_directory_and_nowhere_else(tmp_path):
+    with Echo() as echo, HostBridge("127.0.0.1", echo.port, base_dir=tmp_path) as b:
+        assert os.path.dirname(b.socket_path) == str(b.directory) and sorted(os.listdir(b.directory)) == ["ollama.sock"]
+        assert [p.name for p in tmp_path.iterdir()] == [os.path.basename(b.directory)]
+
+
+def test_the_process_umask_is_unchanged_across_a_bridge_lifetime(tmp_path):
+    old = os.umask(0o022)
+    try:
+        with Echo() as echo, HostBridge("127.0.0.1", echo.port, base_dir=tmp_path):
+            assert os.umask(0o022) == 0o022
+    finally:
+        os.umask(old)
