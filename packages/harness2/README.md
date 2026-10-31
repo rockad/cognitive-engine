@@ -97,10 +97,10 @@ Host setup is rootless Docker (`dockerd-rootless-setuptool.sh install`), then `d
 
 `sbx` is Docker Sandboxes: a standalone CLI that runs AI agents in local microVMs (`sbx create`, `run`, `exec`, `policy`, `daemon`, `diagnose`). RFC 004 names it as the preferred isolation.
 
-**It is not selected by default**, because `SbxRunner` has not been verified end to end against a live microVM (see "Live findings" below: on the host it was written on, the sbx daemon could not create a VM), and an unverified runner must not decide where candidate code runs. Until now having `sbx` on `PATH` was enough to select it; it no longer is. `default_runner` returns `SbxRunner` only if **all** hold:
+**It is opt-in, not the default.** `SbxRunner` is verified end to end against a live sbx v0.50.1 microVM (see "Live findings" below), but that is a per-version fact, so only versions in `VERIFIED_SBX_VERSIONS` qualify. Having `sbx` on `PATH` is not enough to select it (it once was). `default_runner` returns `SbxRunner` only if **all** hold:
 
 - You opted in: `COGNITIVE_HARNESS2_SANDBOX=sbx`. Unset, empty, `auto` and `docker` mean rootless Docker. Any other value is refused (fail closed), not ignored.
-- The installed version is in `sandbox.VERIFIED_SBX_VERSIONS`. **It is empty**, so `sbx` is unselectable today.
+- The installed version is in `sandbox.VERIFIED_SBX_VERSIONS`. It holds exactly `0.50.1`, the version the live test passed on; any other version is refused.
 - A read-only usability probe passes: `/dev/kvm` is accessible to the user, the `sbx` daemon is reachable, and the global network policy is initialised **and deny-all** (an active `**` tcp+udp deny rule, and no network allow rule at all). The probe never starts the daemon: `sbx version` and `sbx policy ls --json` run only once the daemon socket already answers.
 
 Anything else gets rootless Docker exactly as above, and with no usable Docker either, the usual fail-closed refusal. There is no fallback to rootful Docker or to the host.
@@ -112,42 +112,48 @@ To enable it, the user does (these change the host, so they are yours to run):
 1. Give the user `/dev/kvm` access: `sudo usermod -aG kvm "$USER"`, then log out and in again.
 2. Start the daemon: `sbx daemon start`.
 3. Initialise the global network policy: `sbx policy init <allow-all|balanced|deny-all>` (pick the profile deliberately).
-4. **The missing step:** run the live test from a shell and daemon that really have the `kvm` group: `COGNITIVE_HARNESS2_SBX_LIVE=1 uv run pytest -q packages/harness2/tests/test_sbx_runner.py -m requires_sbx_live`. It creates, uses and removes throwaway `harness2-*` sandboxes (no model, no workspace mount, `shell` agent only) and asserts exit codes, stdout/stderr, a failing network call, and an empty `sbx ls` afterwards. Only if it passes, add the version to `VERIFIED_SBX_VERSIONS`. Only then does step 5 do anything.
+4. To verify another version, run the live test with the daemon started from a shell that really has the `kvm` group: `COGNITIVE_HARNESS2_SBX_LIVE=1 uv run pytest -q packages/harness2/tests/test_sbx_runner.py -m requires_sbx_live`. It creates, uses and removes throwaway `harness2-*` sandboxes (no model, no workspace mount, `shell` agent only) and asserts exit codes, stdout/stderr, the staged files, a network that gives 403 or no data, a wall-clock kill, and an empty `sbx ls` afterwards. Only if it passes, add that version to `VERIFIED_SBX_VERSIONS`.
 5. Export `COGNITIVE_HARNESS2_SANDBOX=sbx` for the daemon.
 
 #### How `SbxRunner` runs a candidate
 
-`preflight` (the daemon socket is a socket owned by this user at the path `sbx daemon status` reports; `sbx version` is in the verified set the runner was given; `sbx policy ls --json` is deny-all) -> `sbx create shell --name harness2-<hex> --no-progress --cpus N --memory M --pull missing --skills off` (no PATH: **no host bind mount**) -> `sbx ls -q` lists it -> `sbx policy check network --sandbox NAME --json` must deny `example.com:443`, `example.com:80`, `127.0.0.1:80` and `localhost:80` -> `sbx cp <stage>/candidate NAME:/tmp` and an `sbx exec find` that must list exactly the staged files -> `sbx exec -w /tmp/candidate -- NAME CMD...` under a host-side wall clock (the client process group is SIGKILLed on timeout) -> **always**, in a `finally`, `sbx rm --force NAME`, then `sbx ls -q` must not list it (a sandbox that stays is an error). The staging-key rules are `DockerRunner`'s (`_validate_stage_names`, checked before any process starts). Every `sbx` call is an argv list without a shell, with stdin closed, and with every `DOCKER_SANDBOXES_*` and `SBX_*` variable removed from its environment (the CLI reads its settings from them); nothing from the host environment is passed into the VM. Any surprise (unknown version, unparseable output, a policy that is not deny-all, `sbx exec` exiting 125, which `sbx` uses for "could not run it", a leaked sandbox) raises `SandboxUnavailable`: nothing runs on the host and there is no fallback.
+`preflight` (the daemon socket is a socket owned by this user at the path `sbx daemon status` reports; `sbx version` is in the verified set the runner was given; `sbx policy ls --json` is deny-all) -> `sbx create shell --name harness2-<hex> --no-progress --cpus N --memory M --pull missing --skills off` (no PATH: **no host bind mount**) -> `sbx ls -q` lists it -> `sbx policy check network --sandbox NAME --json` must deny `example.com:443`, `example.com:80`, `127.0.0.1:80` and `localhost:80` -> `sbx cp <stage>/candidate NAME:/tmp` and an `sbx exec find` that must list exactly the staged files -> `sbx exec -w /tmp/candidate -- NAME CMD...` under a host-side wall clock (the client process group is SIGKILLed on timeout) -> **always**, in a `finally`, `sbx rm --force NAME`, then `sbx ls -q` must not list it (a sandbox that stays is an error). The staging-key rules are `DockerRunner`'s (`_validate_stage_names`, checked before any process starts). Every `sbx` call is an argv list without a shell, with stdin closed, and with every `DOCKER_SANDBOXES_*` and `SBX_*` variable removed from its environment (the CLI reads its settings from them); nothing from the host environment is passed into the VM. Any surprise (unknown version, unparseable output, a policy that is not deny-all, `sbx exec` exiting 125, which `sbx` uses for "could not run it", or 255 with sbx-shaped stderr, a leaked sandbox) raises `SandboxUnavailable`: nothing runs on the host and there is no fallback.
 
-#### Live findings (sbx v0.50.1, Linux, 2026-10-30)
+#### Live findings (sbx v0.50.1, Linux, 2026-10-31)
 
-"Observed" means run against the real CLI and daemon on the development host. **The daemon could not start a VM there**: `sbx create` reached the container start and failed with `Hypervisor error: KVM error: Permission denied (os error 13)` because the `sbx daemon start` process had the groups `4 24 27 30 46 100 985 986 1000` and **not `kvm` (991)** while `/dev/kvm` is `root:kvm 0660` (`sbx diagnose`: "Virtualization — not accessible"). Everything that needs a running VM is therefore **not observed**.
+Run against the real CLI and a real microVM with throwaway `h2-verify-*` `shell` sandboxes (no agent, no model, no workspace mount, every one removed, `sbx ls` empty afterwards). The first attempt on 2026-10-30 failed at `create` with `Hypervisor error: KVM error: Permission denied` because the `sbx daemon start` process lacked the `kvm` group; after it was restarted with `sg kvm -c 'sbx daemon restart'` everything below worked.
 
 | Operation | Real command | Observed |
 | --- | --- | --- |
 | version | `sbx version` | exit 0, `v0.50.1 <commit>` |
-| global policy | `sbx policy ls --json` | exit 0, `{"rules":[{id,name,resource_type,decision,resources,status,actions,...}]}`; here `default-deny-all` (`network`, `deny`, `**`, actions `net:connect:tcp` + `net:connect:udp`, `active`) plus two filesystem allow-all rules |
-| policy check | `sbx policy check network --json [--sandbox N] TARGET` | a denied target prints `{"allowed":false,...}` and **exits 1**; a missing sandbox exits 1 (`404 ... not found`) |
-| create | `sbx create shell --name N --no-progress --cpus 1 --memory 512m --pull missing --skills off` | every flag accepted; on this host exit 1, `request failed: 500 Internal Server Error: failed to run sandbox container` (daemon log: the KVM error above); the failed sandbox is not listed afterwards |
-| create, bad name | `sbx create shell --name 'bad name'` | exit 1, `name must match regexp ^[a-zA-Z0-9][a-zA-Z0-9.-]+$` |
-| list | `sbx ls -q` / `sbx ls --json` / `sbx ls` | names one per line, empty output and exit 0 when none / `[]` / `No sandboxes found` |
-| exec, missing sandbox | `sbx exec NAME CMD` | **exit 125**, `error: sandbox 'NAME' not found` |
-| cp, missing sandbox | `sbx cp SRC NAME:/tmp` or `sbx cp NAME:/tmp/x DST` | exit 1, same message |
-| rm, missing sandbox | `sbx rm [--force] NAME` | exit 1, same message |
-| exec in a running VM: exit code, stdout/stderr, 127 for a missing command, cwd `-w` | `sbx exec -w DIR -- NAME CMD...` | **not observed** (documented: exit status is the command's, 125 = sbx could not run it, 127 = missing command) |
-| cp in and out, directory, symlink out | `sbx cp` | **not observed** (documented: a directory is placed inside an existing destination directory; links leading out of a workspace are refused) |
-| wall clock | host-side kill of the `sbx exec` client, then `sbx rm --force` | **not observed**; whether the in-VM process survives the client dying is unknown, which is why `rm --force` always follows |
-| network from inside under deny-all | `wget`/`curl` in the VM | **not observed**; only the policy engine's verdict (`policy check`: example.com, 127.0.0.1, localhost all denied, "no matching allow rule (default deny)") |
-| filesystem (read-only root? where can a command write?) | | **not observed** |
-| resource limits | `--cpus N`, `--memory M` (min 512m) on create | flags accepted; enforcement **not observed** |
+| global policy | `sbx policy ls --json` | exit 0, `{"rules":[{id,name,resource_type,decision,resources,status,actions,...}]}`; `default-deny-all` is `network`, `deny`, `**`, `net:connect:tcp`+`udp`, `active` |
+| policy check | `sbx policy check network --json [--sandbox N] TARGET` | a denied target prints `{"allowed":false,...}` and **exits 1**; a missing sandbox exits 1 |
+| create | `sbx create shell --name N --no-progress --cpus 1 --memory 512m --pull missing --skills off` | ~4 s with the image present, exit 0, no login prompt; `sbx ls --json` shows `cpus`, `memory_mib`, status `running` |
+| list | `sbx ls -q` | names one per line, nothing when empty |
+| exec | `sbx exec [-w DIR] -- N CMD...` | stdout and stderr stay separate, exit status is the command's, ~0.6 s overhead; stdin is closed when the client's is; flag-looking arguments after the name (`-x -y`) reach the command |
+| exec, missing command | `sbx exec N nope` | exit **127**, `OCI runtime exec failed: executable file ... not found` (a missing `-w` directory also exits 127) |
+| exec, missing sandbox | `sbx exec nope CMD` | exit **125**, `sandbox 'nope' not found` |
+| exec, wedged VM | after a 4000-process fork flood | `failed to start stdin stream: ... i/o timeout`, exit **255**, or `error: inspect exec: context deadline exceeded`; the sandbox still showed `running`, and `rm --force` still removed it |
+| cp in | `sbx cp DIR N:/tmp` | exit 0; the directory lands inside an existing destination, a repeat merges (no nesting); file modes (0444) kept; owner `agent` |
+| cp in, symlinks | `sbx cp DIR N:/tmp/c` (with and without `-L`) | links are copied **as links**, even ones pointing outside the stage and with `-L` (the refusal in `--help` applies to a *workspace*, which these sandboxes do not have) |
+| cp out | `sbx cp N:/tmp/out.txt DST/` | works, also directories; a candidate-made symlink to `/etc/passwd` arrives on the host **as a symlink**, which is why the runner copies nothing out |
+| cp, bad path | `sbx cp F N:/nope/` | exit 1, `destination directory ... does not exist`; `cp` writes as root, `exec` runs as `agent` |
+| rm | `sbx rm --force N` | ~0.7 s, also while an exec is running (the client then exits); removes the VM |
+| wall clock, client kill | SIGKILL or SIGTERM of the `sbx exec` client | **the process inside the VM keeps running** (`ps` still showed `sleep 300` 3 s later) and the sandbox stays `running`; only `rm --force` stops it. The runner therefore always kills the client AND removes the sandbox |
+| wall clock, inside | `sbx exec N timeout -s KILL 3 sleep 300` | `timeout` exists in the image; exits 124 after 3 s |
+| user | `id` | `uid=1000(agent)` in groups `sudo`, `docker`; **`sudo -n` works (root)**; default cwd `/home/agent/workspace`; Ubuntu 26.04, 1 vCPU and 488 MB RAM for `--cpus 1 --memory 512m` |
+| filesystem | `touch` | `/` is not writable by `agent` but is a **writable overlay for root** (`rw`, not read-only); `/tmp` and `$HOME` are writable; no `/candidate`, no workspace mount; 20 GB disk |
+| resources | `--cpus`, `--memory` | enforced by the VM size (`nproc` 1, `MemTotal` 488 MB); there is no cgroup or pid limit inside (`ulimit -u` 1896); an unbounded memory or process hog wedges **that VM**, not the host |
+| network, proxy path | `curl http://example.com/` (the VM's `HTTP_PROXY`) | **HTTP 403 from the sandbox gateway**, curl exit 0; the same for `host.docker.internal:11434` |
+| network, direct | `curl --noproxy '*'`, a raw socket | `connect()` **succeeds** (a transparent proxy accepts) but no data flows: `Empty reply from server`, `recv` returns nothing, including for the host's loopback ollama through `host.docker.internal`, `gateway.docker.internal`, `172.17.0.0` and the host's LAN IP; DNS does not resolve (`gethostbyname` fails); `sbx policy log` lists every attempt as BLOCKED, `no matching allow rule (default deny)` |
+| env inside | `env` | `HTTP(S)_PROXY`, `*_API_KEY=proxy-managed`, `GH_TOKEN=gho_sbxproxymanaged...` (placeholders, `SBX_CRED_*_MODE=none`; `sbx secret ls` is empty), `SSH_AUTH_SOCK=/run/ssh-agent.sock` (`ssh-add -l`: `communication with agent failed`, no host agent here) |
 
-Remaining caveats:
+What this means:
 
-- **kvm.** The user running `sbx daemon start` (or the login shell it is started from) must really have the `kvm` group: check with `grep Groups /proc/$(pgrep -u "$USER" -f 'sbx daemon start')/status`. Starting it from `sg kvm` or a fresh login fixes it; this module never starts, stops or restarts the daemon.
-- **The first `create` may pull the agent image.** That is done by the daemon, not by the candidate, and it needs network access outside the sandbox policy; `--pull missing` avoids repeated pulls.
-- **Settings the policy check does not cover** (read from `sbx settings ls`, defaults on this host): `ssh.agentForwardingEnabled=true` (sandboxes may list and use host SSH agent keys when one is forwarded) and `browser.enabled=true` (sandboxed processes may open URLs in the host browser). Set both to `false` (`sbx settings set ...`) before relying on sbx for hostile code; neither is changed or checked by `SbxRunner`.
-- The deny-all check is the policy engine's answer, not a measurement of the VM's network; the live test measures one real connection attempt.
-- `SandboxSpec` has no artefact-collection field, so nothing is copied out of the VM; only stdout, stderr and the exit code come back.
+- **The boundary is the microVM, not the user inside it.** The candidate is `agent` with passwordless `sudo` and a writable root overlay; that is contained by the VM, which is thrown away.
+- **"No network" is "nothing gets through", not "connect() fails".** The runner's check is the policy engine's verdict; the live test measures 403 or an empty reply, never content.
+- A timeout kills the client, but the in-VM process lives until `rm --force`; the runner's `finally` guarantees that. Exit 255 with sbx-shaped stderr is treated as sbx's failure, a bare 255 as the candidate's.
+- Remaining caveats: `ssh.agentForwardingEnabled=true` and `browser.enabled=true` are the defaults on this host (`sbx settings ls`) and are not checked by the runner; set both to `false` before running hostile code on a machine that has an SSH agent or a browser. The first `create` pulls the shell image over the network (done by the daemon, not the candidate); `--pull missing` avoids repeated pulls. `SandboxSpec` has no artefact field, so nothing is copied out. The stage-1 sweep itself still uses rootless Docker: nothing in this runner changes it unless `COGNITIVE_HARNESS2_SANDBOX=sbx` is exported.
 
 ## Upstream
 
@@ -605,7 +611,7 @@ The API key is read from `JEV_OPENROUTER_API_KEY` or `OPENROUTER_API_KEY` and is
 
 ## What is not done
 
-- **`sbx` microVM isolation is unverified.** `sbx` (v0.50.1) is installed here and `SbxRunner` is written against its real command line (preflight, create flags and refusals checked live), but the daemon could not start a VM (no `kvm` group), so `exec`, `cp`, the network and the filesystem inside a VM were never observed and `sbx` is never selected (see "sbx (Docker Sandboxes)", "Live findings"); the fail-closed path is tested and does not depend on it. Rootless Docker is verified against a real daemon.
+- **`sbx` is verified on v0.50.1 only, and is opt-in.** The live test (`COGNITIVE_HARNESS2_SBX_LIVE=1`, `-m requires_sbx_live`) passed on that version; other versions are refused. Inside the VM the candidate is `agent` with passwordless sudo and a writable root overlay (the VM is the boundary), `connect()` to the outside succeeds but no data flows, and `ssh.agentForwardingEnabled` / `browser.enabled` are not checked (see "Live findings"). Nothing is copied out of the VM. Rootless Docker is verified against a real daemon and stays the default.
 - **The engine does not yet call upstream.** Upstream is pinned and import-tested (see Upstream), but `engine.py`'s propose, probe and compose are still the slice 1 local baseline, and the composer is a heuristic (exit status, timeouts, output, stderr). The safety seams to upstream's `Substrate` exist (see Upstream seams); binding the stages themselves to upstream's execution is slice 3b.
 - The OpenRouter quota field names follow RFC 004 and are unverified against the live API.
 - The push hook counts tool failures only. It does not see `jev_judge` verdicts (the shape of that tool result in a PostToolUse payload has not been captured), and there is no `/probe` slash command or `engine probe`; the pull tool covers on-demand requests. The `PostToolUseFailure` payload is also uncaptured: the hook relies on the documented `hook_event_name`, `session_id` and `is_interrupt` fields.

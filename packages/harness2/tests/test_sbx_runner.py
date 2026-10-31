@@ -118,6 +118,18 @@ def test_exit_127_is_the_commands_own_result_not_a_refusal(world):
     assert world.listed() == []
 
 
+def test_exit_255_is_the_commands_own_unless_the_stderr_is_sbxs(world):
+    """A wedged VM made the real sbx print `failed to start stdin stream` and exit 255: that is a refusal.
+    A candidate that merely exits 255 is a result."""
+    r = world.runner(env={"FAKE_SBX_EXEC_RC": "255", "FAKE_SBX_EXEC_ERR": "plain failure\n"}).run(spec())
+    assert r.exit_code == 255
+    for err in ("failed to start stdin stream: failed to read ack length: i/o timeout\n",
+                "error: inspect exec: context deadline exceeded\n"):
+        with pytest.raises(SandboxUnavailable, match="exit 255"):
+            world.runner(env={"FAKE_SBX_EXEC_RC": "255", "FAKE_SBX_EXEC_ERR": err}).run(spec())
+        assert world.listed() == []
+
+
 def test_output_is_capped(world):
     big = "x" * 5000
     r = world.runner(max_output_bytes=100, env={"FAKE_SBX_EXEC_OUT": big}).run(spec())
@@ -364,14 +376,35 @@ def test_live_create_exec_rm_round_trip_leaves_nothing_behind():
     before = set(subprocess.run([path, "ls", "-q"], capture_output=True, text=True).stdout.split())
     runner = SbxRunner(path, verified=frozenset({version}), create_timeout_s=900)
     try:
-        r = runner.run(SandboxSpec(command=["sh", "-c", "echo out; echo err >&2; exit 3"],
-                                   files={"a.txt": "hello\n"}, timeout_s=120))
-        assert (r.exit_code, r.stdout.strip(), r.stderr.strip(), r.timed_out) == (3, "out", "err", False)
-        missing = runner.run(SandboxSpec(command=["definitely-not-a-command-xyz"], timeout_s=120))
-        assert missing.exit_code == 127
-        net = runner.run(SandboxSpec(command=["sh", "-c", "wget -T 5 -q -O- http://example.com/ || curl -m 5 -sS http://example.com/"],
-                                     timeout_s=120))
-        assert net.exit_code not in (0, None)
+        r = runner.run(SandboxSpec(command=["sh", "-c", "echo out; echo err >&2; cat a.txt d/b.txt; pwd; exit 3"],
+                                   files={"a.txt": "hello\n", "d/b.txt": "nested\n"}, timeout_s=120))
+        assert (r.exit_code, r.stdout.split(), r.stderr.strip(), r.timed_out) == (
+            3, ["out", "hello", "nested", "/tmp/candidate"], "err", False), r
+        assert runner.run(SandboxSpec(command=["definitely-not-a-command-xyz"], timeout_s=120)).exit_code == 127
+        # Flag-looking candidate arguments reach the command, not sbx.
+        assert runner.run(SandboxSpec(command=["sh", "-c", "echo $0 $1", "-x", "-y"], timeout_s=120)).stdout.strip() == "-x -y"
+        # The network, measured from inside: the proxy answers 403 (or the connection is dropped), never real content,
+        # and a direct socket to a host loopback service (ollama) gets no data back.
+        probe = (
+            "import socket\n"
+            "for h in ('host.docker.internal', 'gateway.docker.internal'):\n"
+            "    s = socket.socket(); s.settimeout(4)\n"
+            "    try:\n"
+            "        s.connect((h, 11434)); s.sendall(b'GET /api/version HTTP/1.0\\r\\n\\r\\n')\n"
+            "        print('DATA' if s.recv(100) else 'NODATA')\n"
+            "    except Exception:\n"
+            "        print('NODATA')\n")
+        net = runner.run(SandboxSpec(command=["python3", "-c", probe], timeout_s=120))
+        assert net.stdout.split() == ["NODATA", "NODATA"], net
+        codes = runner.run(SandboxSpec(command=["sh", "-c", (
+            "curl -m 5 -s -o /dev/null -w '%{http_code}\\n' http://example.com/; "
+            "curl --noproxy '*' -m 5 -s -o /dev/null -w '%{http_code}\\n' http://example.com/; "
+            "curl -m 5 -s -o /dev/null -w '%{http_code}\\n' http://host.docker.internal:11434/api/version; true")], timeout_s=120))
+        assert all(x in ("403", "000") for x in codes.stdout.split()) and len(codes.stdout.split()) == 3, codes
+        # The wall clock: a sleeper is cut off on time, and its sandbox is gone afterwards (checked below).
+        t0 = time.monotonic()
+        slow = runner.run(SandboxSpec(command=["sleep", "300"], timeout_s=3))
+        assert slow.timed_out and slow.exit_code is None and time.monotonic() - t0 < 60
     finally:
         # belt and braces: the runner already removed its own sandboxes; remove anything new that is ours
         after = set(subprocess.run([path, "ls", "-q"], capture_output=True, text=True).stdout.split())

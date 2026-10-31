@@ -4,7 +4,7 @@ Candidate code runs ONLY in one of two local runtimes, chosen in this order:
 
   1. a Docker Sandbox microVM driven by the standalone `sbx` CLI, ONLY when ALL of: the user
      opted in (`COGNITIVE_HARNESS2_SANDBOX=sbx`), the installed version is in
-     `VERIFIED_SBX_VERSIONS` (empty today), and a read-only probe passes (daemon reachable,
+     `VERIFIED_SBX_VERSIONS` ({0.50.1} today), and a read-only probe passes (daemon reachable,
      /dev/kvm accessible, global network policy initialised). `sbx` being on PATH is NOT enough;
   2. otherwise an EPHEMERAL ROOTLESS DOCKER container (`DockerRunner`), and only when the
      daemon itself reports `name=rootless` in `docker info` SecurityOptions. This is the default,
@@ -18,14 +18,13 @@ docker call the runner makes afterwards, so it cannot change between the check a
 an explicit opt-in that writes candidates to a temp directory and returns a diff for static
 inspection; it never executes code.
 
-⚠️ `SbxRunner` (create -> cp in -> exec -> rm --force) is written against `sbx --help` and a
-fake `sbx`, and is NOT verified end to end against a live microVM: on the host it was written on,
-the sbx daemon could not start a VM (`KVM error: Permission denied`: the daemon process lacked
-the `kvm` group). That is why `VERIFIED_SBX_VERSIONS` is empty and `SbxRunner` cannot be
-selected: adding a version there is the act of verifying the flow against that version (run the
-`requires_sbx_live` test with COGNITIVE_HARNESS2_SBX_LIVE=1 first), and nothing else should do it.
-`SbxRunner` itself also refuses to run for a version outside the set it was given. The
-fail-closed behaviour does not depend on the live verification and is fully tested.
+`SbxRunner` (create -> cp in -> exec -> rm --force) IS verified end to end against a live sbx v0.50.1
+microVM (tests/test_sbx_runner.py::test_live_*, COGNITIVE_HARNESS2_SBX_LIVE=1): exit codes, stdout/stderr,
+staged files, the wall clock, a network that returns 403 or nothing, and an empty `sbx ls` afterwards. That is
+why `VERIFIED_SBX_VERSIONS` holds exactly that version: adding another is the act of verifying the flow against
+it (run the live test on it first), and nothing else should do it. `SbxRunner` itself also refuses to run for a
+version outside the set it was given. The microVM is the isolation boundary, NOT the user inside it: the
+candidate runs as `agent` with passwordless sudo (see the README, "Live findings").
 `DockerRunner` IS verified end to end against a real rootless daemon
 (tests/test_docker_runner.py).
 """
@@ -84,10 +83,10 @@ def require_sbx(which: Callable[[str], str | None] = shutil.which) -> str:
     return path
 
 
-# The `sbx` versions whose command line `SbxRunner._argv` has been checked against a real install.
-# EMPTY on purpose: until someone runs a real probe through `_argv` on a given version and adds
-# it here, `default_runner` cannot return an `SbxRunner`, whatever is on PATH.
-VERIFIED_SBX_VERSIONS: frozenset[str] = frozenset()
+# The `sbx` versions the `SbxRunner` flow has been verified against, end to end, on a real install
+# (the `requires_sbx_live` test). A version is added here only after that test passes on it; until
+# then `default_runner` cannot return an `SbxRunner` for it, whatever is on PATH.
+VERIFIED_SBX_VERSIONS: frozenset[str] = frozenset({"0.50.1"})
 
 # `sbx` is selected only when this is `sbx`. Unset, empty, `auto` and `docker` mean rootless Docker.
 ENV_SANDBOX = "COGNITIVE_HARNESS2_SANDBOX"
@@ -384,6 +383,7 @@ SBX_DENIED_TARGETS = ("example.com:443", "example.com:80", "127.0.0.1:80", "loca
 _SBX_ENV_PREFIXES = ("DOCKER_SANDBOXES_", "SBX_")
 _SBX_POLICY_ACTIONS = frozenset({"net:connect:tcp", "net:connect:udp"})
 _SBX_CREATE_TIMEOUT_S = 600  # the daemon may pull the agent image on first use
+_SBX_EXEC_FAILURE = re.compile(r"\s*(failed to start|error: |inspect exec: )")
 
 
 def sbx_network_policy_problem(policy_json: str) -> str | None:
@@ -455,9 +455,7 @@ class SbxRunner:
     that it is gone. Any surprise (unknown version, unexpected output, exit 125 from `sbx`, a policy that is
     not deny-all, a sandbox that will not go away) raises `SandboxUnavailable`: nothing runs on the host.
 
-    ⚠️ NOT verified against a live microVM: see the module docstring. The preflight, the `create` flags
-    and the refusal paths have been checked against the real CLI and the fake in the tests; `cp` and
-    `exec` against a running VM have not, because the sandbox daemon on the development host could not start VMs.
+    Verified live on sbx v0.50.1 (see the module docstring and the README, "Live findings").
     """
 
     def __init__(self, sbx_path: str, *, environ: Mapping[str, str] | None = None,
@@ -583,10 +581,14 @@ class SbxRunner:
         if timed_out:
             # The in-VM process may outlive the killed client: the caller's `rm --force` destroys the VM.
             return SandboxResult(None, stdout, "timed out", True)
-        if code == 125:
-            raise SandboxUnavailable(f"`sbx exec` could not run the command (exit 125): "
-                                     f"{_first_line(err.decode('utf-8', 'replace'))} (fail closed)")
-        return SandboxResult(code, stdout, err.decode("utf-8", "replace"))
+        stderr = err.decode("utf-8", "replace")
+        # 125 is sbx's "could not run it". On v0.50.1 a wedged VM (a fork flood) made `sbx exec` print
+        # `failed to start stdin stream: ...` and exit 255, which a candidate could also exit with: only that
+        # sbx-shaped stderr, never the bare number, is treated as sbx's own failure.
+        if code == 125 or (code == 255 and _SBX_EXEC_FAILURE.match(stderr)):
+            raise SandboxUnavailable(f"`sbx exec` could not run the command (exit {code}): "
+                                     f"{_first_line(stderr)} (fail closed)")
+        return SandboxResult(code, stdout, stderr)
 
     @staticmethod
     def _kill_client(proc: subprocess.Popen) -> None:
@@ -761,7 +763,7 @@ def inspect_sbx(which: Callable[[str], str | None] = shutil.which, *, environ: M
         reasons.append(f"not opted in (set {ENV_SANDBOX}=sbx)")
     if not verified:
         reasons.append("sbx version is not in the verified set (the verified set is empty: "
-                       "SbxRunner is not verified end to end against any real version)")
+                       "SbxRunner has not been verified against any real version)")
 
     def ask(label: str, fn: Callable, *args):
         try:

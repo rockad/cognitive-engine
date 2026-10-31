@@ -110,8 +110,10 @@ def test_sbx_on_path_alone_does_not_probe_sbx_or_touch_docker_differently(monkey
     assert calls == []  # not opted in and nothing verified: no sbx process is started to find out more
 
 
-def test_the_default_verified_set_is_empty():
-    assert VERIFIED_SBX_VERSIONS == frozenset()
+def test_the_default_verified_set_is_exactly_the_live_verified_version():
+    """v0.50.1 was verified end to end (tests/test_sbx_runner.py::test_live_*). Adding a version is the act of
+    verifying it: run that test against it first."""
+    assert VERIFIED_SBX_VERSIONS == frozenset({"0.50.1"})
 
 
 @pytest.mark.parametrize("setting", ["sbx", "SBX", " sbx "])
@@ -119,10 +121,10 @@ def test_sbx_cannot_be_returned_while_the_verified_set_is_empty(monkeypatch, set
     """Opted in, daemon up, kvm fine, policy fine, every version string: still Docker while nothing is verified."""
     fake_docker(monkeypatch, True)
     calls: list[str] = []
-    r = sandbox.default_runner(which_with(True), environ={ENV_SANDBOX: setting}, probes=probes(calls=calls))
+    r = sandbox.default_runner(which_with(True), environ={ENV_SANDBOX: setting}, probes=probes(calls=calls), verified=frozenset())
     assert isinstance(r, DockerRunner)
     assert calls == []
-    rep = sandbox.sandbox_report(which_with(True), environ={ENV_SANDBOX: setting}, probes=probes())["sbx"]
+    rep = sandbox.sandbox_report(which_with(True), environ={ENV_SANDBOX: setting}, probes=probes(), verified=frozenset())["sbx"]
     assert rep["state"] == "present-but-unusable" and any("verified set is empty" in x for x in rep["reasons"])
 
 
@@ -136,9 +138,18 @@ def test_default_runner_hands_its_environment_and_verified_set_to_the_runner(mon
 def test_the_module_constant_is_what_default_runner_consults_when_not_overridden(monkeypatch):
     fake_docker(monkeypatch, True)
     env = {ENV_SANDBOX: "sbx"}
+    monkeypatch.setattr(sandbox, "VERIFIED_SBX_VERSIONS", frozenset())
     assert isinstance(sandbox.default_runner(which_with(True), environ=env, probes=probes()), DockerRunner)
     monkeypatch.setattr(sandbox, "VERIFIED_SBX_VERSIONS", frozenset({VERSION}))
     assert isinstance(sandbox.default_runner(which_with(True), environ=env, probes=probes()), SbxRunner)
+
+
+def test_the_shipped_default_selects_sbx_only_when_opted_in_and_on_the_verified_version(monkeypatch):
+    fake_docker(monkeypatch, True)
+    on = {ENV_SANDBOX: "sbx"}
+    assert isinstance(sandbox.default_runner(which_with(True), environ=on, probes=probes()), SbxRunner)
+    assert isinstance(sandbox.default_runner(which_with(True), environ=on, probes=probes(version="0.51.0")), DockerRunner)
+    assert isinstance(sandbox.default_runner(which_with(True), environ={}, probes=probes()), DockerRunner)
 
 
 # ── opt-in values ────────────────────────────────────────────────────────────────
@@ -228,13 +239,13 @@ def test_the_status_report_keeps_the_existing_string_and_adds_one_closed_dict(mo
     out = sandbox.sandbox_report(which_with(True), environ={}, probes=probes())
     assert set(out) == {"sandbox", "sbx"} and out["sandbox"] == "rootless-docker"
     assert set(out["sbx"]) == {"state", "path", "version", "opted_in", "verified_versions", "reasons"}
-    assert out["sbx"]["verified_versions"] == [] and out["sbx"]["opted_in"] is False
+    assert out["sbx"]["verified_versions"] == ["0.50.1"] and out["sbx"]["opted_in"] is False
 
 
 # ── the real host, read-only ─────────────────────────────────────────────────────
 
 def test_this_hosts_real_state_selects_docker_not_sbx(monkeypatch):
-    """Whatever is installed here, with no opt-in and nothing verified, the default is rootless Docker."""
+    """Whatever is installed here, with no opt-in, the default is rootless Docker."""
     fake_docker(monkeypatch, True)
     r = sandbox.default_runner(environ={})
     assert isinstance(r, DockerRunner) and not isinstance(r, SbxRunner)
