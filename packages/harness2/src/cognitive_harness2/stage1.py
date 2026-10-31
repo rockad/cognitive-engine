@@ -48,7 +48,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
-from . import channels, egress, image, ollama_guard, sandbox, sum_signed as ss, upstream_egress, upstream_import
+from . import channels, egress, image, ollama_guard, run_scope, sandbox, sum_signed as ss, upstream_egress, upstream_import
 from . import session_runner as sr
 from .contained_proposer import (OPENCODE_PROMPT, SessionConfig, build_command, make_proposer, make_selector_prop,
                                  session_env, TMP_EXEC)
@@ -599,9 +599,12 @@ def remove_leftovers(verified: sandbox.VerifiedDocker | None, items: Sequence[st
 
 
 def runtime_entries() -> set[str]:
+    """The session and bridge directories in the runtime base. Under a run id (`run_scope`, set by the tests) only that
+    run's own; a real sweep has none and reports every such directory, as before."""
     base = sr._runtime_base_dir()
+    prefixes = (run_scope.dir_prefix("h2s-"), run_scope.dir_prefix("h2bridge-"))
     with contextlib.suppress(OSError):
-        return {n for n in os.listdir(base) if n.startswith(("h2s-", "h2bridge-"))}
+        return {n for n in os.listdir(base) if n.startswith(prefixes)}
     return set()
 
 

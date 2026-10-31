@@ -30,9 +30,12 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import run_scope
+
 DEFAULT_TARGET = ("127.0.0.1", 11434)
 SOCKET_NAME = "ollama.sock"
-_SUN_PATH_MAX = 100       # sockaddr_un.sun_path is 108 bytes on Linux; leave room
+_SUN_PATH_MAX = 104       # sockaddr_un.sun_path is 108 bytes on Linux (107 plus the NUL); leave room. Was 100; a run id
+                          # (run_scope) adds 9 bytes to the directory name, which tipped deep pytest tmp paths over it
 
 
 class BridgeError(RuntimeError):
@@ -91,7 +94,7 @@ class HostBridge:
     def __enter__(self) -> "HostBridge":
         if self._thread is not None:
             raise BridgeError("the bridge is already running")
-        self.directory = Path(tempfile.mkdtemp(prefix="h2bridge-", dir=self._base)).resolve()
+        self.directory = Path(tempfile.mkdtemp(prefix=run_scope.dir_prefix("h2bridge-"), dir=self._base)).resolve()
         try:
             os.chmod(self.directory, 0o700)
             self.socket_path = self.directory / SOCKET_NAME

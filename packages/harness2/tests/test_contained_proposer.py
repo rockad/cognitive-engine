@@ -15,6 +15,7 @@ import threading
 import time
 from pathlib import Path
 
+import h2_isolation as iso
 import pytest
 from h2_upstream import isolated_upstream
 
@@ -52,11 +53,9 @@ def docker(verified, *args) -> subprocess.CompletedProcess:
 
 
 def leftovers(verified) -> set[str]:
-    out = docker(verified, "ps", "-a", "-q", "--filter", f"label={sr.LABEL}").stdout.split()
-    out += docker(verified, "network", "ls", "-q", "--filter", f"label={sr.LABEL}").stdout.split()
-    base = sr._runtime_base_dir()
-    out += [n for n in os.listdir(base) if n.startswith(("h2s-", "h2bridge-"))]
-    return set(out)
+    """Containers, networks and runtime directories of THIS test process (its run id) only."""
+    resources, dirs = iso.snapshot(verified)
+    return set(resources) | set(dirs)
 
 
 class World:
@@ -98,9 +97,9 @@ def world(tmp_path, verified, proposer_image, up):
     before = leftovers(verified)
     w = World(tmp_path, verified, proposer_image, up)
     yield w
-    # Other agents may run sessions on the same daemon at the same time: anything NEW must go away within a while
-    # (a leftover of ours never does); things that disappeared are theirs finishing.
-    deadline = time.monotonic() + 30
+    # The check is scoped to this run (its id), so another test process on the daemon cannot trip it. A short grace for a
+    # session still tearing down is kept: a leftover of ours never goes away, so it does not weaken the check.
+    deadline = time.monotonic() + 5
     new = leftovers(verified) - before
     while new and time.monotonic() < deadline:
         time.sleep(1)
@@ -338,7 +337,7 @@ def test_a_timeout_kills_the_session_and_leaves_nothing_behind(world, verified):
     with pytest.raises(world.up.proposer.ProposerError, match="timeout after 5s"):
         world.call(world.prop("local"), "FAKE:sleep", timeout=5)
     assert time.monotonic() - t0 < 60
-    assert docker(verified, "ps", "-a", "-q", "--filter", f"label={sr.LABEL}").stdout.split() == []
+    assert iso.run_containers(verified) == set()
 
 
 @pytest.mark.requires_rootless_docker

@@ -809,3 +809,22 @@ def test_egress_summary_is_bounded_and_ignores_anything_that_is_not_a_decision_l
     s = sr.egress_summary(many)
     assert s["egress_denied"] == 50 and len(s["denied_hosts"]) == 10
     assert sr.egress_summary(["ACCESS decision=allow host=x port=1 reason=unix-route extra=1", "", "ACCESS"])["model_requests"] == 0
+
+
+def test_every_container_and_network_a_scoped_process_creates_carries_its_run_id_and_an_unscoped_one_adds_nothing(world, monkeypatch):
+    from cognitive_harness2 import run_scope
+    rid = "0123abcd"
+    mark = ["--label", f"{run_scope.LABEL}={rid}"]
+
+    def builders() -> list[list[str]]:
+        plan, session = session_argv(world)
+        return [session, sr.build_proxy_create(plan, names(), docker=V.path, host=V.host, proxy_dir="/p", bridge_dir=None),
+                sr.build_reclaim_run(plan, names(), docker=V.path, host=V.host)]
+
+    def has_mark(argv: list[str]) -> bool:
+        return any(argv[i:i + 2] == mark for i in range(len(argv) - 1))
+
+    monkeypatch.setenv(run_scope.ENV, rid)
+    assert all(has_mark(a) for a in builders())
+    monkeypatch.delenv(run_scope.ENV)
+    assert not any(run_scope.LABEL in " ".join(a) for a in builders())      # production argv: unchanged

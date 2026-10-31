@@ -55,7 +55,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
-from . import channels, egress, sandbox, upstream_egress, workspace_harvest
+from . import channels, egress, run_scope, sandbox, upstream_egress, workspace_harvest
 from .egress_proxy import OLLAMA_ROUTE_ALLOW, PROXY_PORT_DEFAULT, READY_LINE
 from .host_bridge import HostBridge, validate_target
 from .image import PROXY_PATH_IN_IMAGE, ImageRef
@@ -347,7 +347,7 @@ def session_env(plan: Plan) -> dict[str, str]:
 def build_proxy_create(plan: Plan, names: Names, *, docker: str, host: str, proxy_dir: str,
                        bridge_dir: str | None) -> list[str]:
     lim = plan.spec.limits
-    argv = [docker, "-H", host, "create", "--name", names.proxy, "--label", f"{LABEL}={names.run_id}",
+    argv = [docker, "-H", host, "create", "--name", names.proxy, "--label", f"{LABEL}={names.run_id}", *run_scope.labels(),
             "--label", f"{LABEL}.component=proxy", "--pull", "never",
             "--network", names.internal, "--network-alias", PROXY_ALIAS,
             "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
@@ -368,7 +368,7 @@ def build_proxy_create(plan: Plan, names: Names, *, docker: str, host: str, prox
 
 def build_session_run(plan: Plan, names: Names, *, docker: str, host: str, cred_file: str | None) -> list[str]:
     spec, lim = plan.spec, plan.spec.limits
-    argv = [docker, "-H", host, "run", "--rm", "--name", names.session, "--label", f"{LABEL}={names.run_id}",
+    argv = [docker, "-H", host, "run", "--rm", "--name", names.session, "--label", f"{LABEL}={names.run_id}", *run_scope.labels(),
             "--label", f"{LABEL}.component=session", "--pull", "never"]
     if spec.stdin is not None:
         argv.append("-i")
@@ -398,7 +398,7 @@ RECLAIM_SCRIPT = ('set -eu; find "$1" -xdev ! -type l -exec chown 0:0 {} +; '
 
 def build_reclaim_run(plan: Plan, names: Names, *, docker: str, host: str) -> list[str]:
     """A one-shot container that gives the host user the files the container user created in the workspace."""
-    return [docker, "-H", host, "run", "--rm", "--name", names.reclaim, "--label", f"{LABEL}={names.run_id}",
+    return [docker, "-H", host, "run", "--rm", "--name", names.reclaim, "--label", f"{LABEL}={names.run_id}", *run_scope.labels(),
             "--label", f"{LABEL}.component=reclaim", "--pull", "never", "--network", "none", "--read-only",
             "--cap-drop", "ALL", "--cap-add", "CHOWN", "--cap-add", "DAC_OVERRIDE", "--cap-add", "FOWNER",
             "--security-opt", "no-new-privileges", "--pids-limit", "64", "--memory", "128m", "--memory-swap", "128m",
@@ -711,7 +711,7 @@ class ProposerSessionRunner:
         run_id = secrets.token_hex(6)
         names = Names(run_id)
         secrets_ = [spec.credential.value] if spec.credential else []
-        base = Path(tempfile.mkdtemp(prefix="h2s-", dir=_runtime_base_dir())).resolve()
+        base = Path(tempfile.mkdtemp(prefix=run_scope.dir_prefix("h2s-"), dir=_runtime_base_dir())).resolve()
         result: SessionResult | None = None
         error: BaseException | None = None
         created_networks: list[str] = []
@@ -743,11 +743,11 @@ class ProposerSessionRunner:
                 bridge = stack.enter_context(HostBridge(*plan.bridge_target))
                 bridge_dir = str(bridge.directory)
 
-            self._must(["network", "create", "--internal", "--label", f"{LABEL}={run_id}", names.internal])
+            self._must(["network", "create", "--internal", "--label", f"{LABEL}={run_id}", *run_scope.labels(), names.internal])
             created_networks.append(names.internal)
             egress_net = plan.egress_network
             if not plan.local and egress_net is None:
-                self._must(["network", "create", "--label", f"{LABEL}={run_id}", names.egress])
+                self._must(["network", "create", "--label", f"{LABEL}={run_id}", *run_scope.labels(), names.egress])
                 created_networks.append(names.egress)
                 egress_net = names.egress
             self._must(self._argv_for(build_proxy_create(plan, names, docker=self.verified.path, host=self.verified.host,
@@ -860,13 +860,18 @@ class ProposerSessionRunner:
     # ── housekeeping for crashes ──────────────────────────────────────────────────
 
     def reap_all(self) -> list[str]:
-        """Remove every container and network carrying the session label (after a crash of an earlier process)."""
+        """Remove every container and network carrying the session label (after a crash of an earlier process).
+
+        When this process has a run id (`run_scope`), only resources that also carry THAT id are removed, so a test
+        process cannot reap the sessions of a concurrent one. Unscoped (production) it reaps every labelled resource."""
         removed: list[str] = []
-        ids = self._docker(["ps", "-a", "-q", "--filter", f"label={LABEL}"]).stdout.split()
+        scope = run_scope.label_filter()
+        extra = ["--filter", scope] if scope else []
+        ids = self._docker(["ps", "-a", "-q", "--filter", f"label={LABEL}", *extra]).stdout.split()
         for i in ids:
             self._quiet(["rm", "-f", i])
             removed.append(f"container {i}")
-        for n in self._docker(["network", "ls", "-q", "--filter", f"label={LABEL}"]).stdout.split():
+        for n in self._docker(["network", "ls", "-q", "--filter", f"label={LABEL}", *extra]).stdout.split():
             self._quiet(["network", "rm", n])
             removed.append(f"network {n}")
         return removed

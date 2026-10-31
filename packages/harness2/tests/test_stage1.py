@@ -14,9 +14,11 @@ import shlex
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
+import h2_isolation as iso
 import pytest
 from h2_upstream import isolated_upstream
 
@@ -453,7 +455,7 @@ def runtime_entries() -> set[str]:
 
 
 def settle(before: set[str]) -> set[str]:
-    """Entries that appeared during a test and are still there after a while (other agents' sessions come and go)."""
+    """Entries of THIS run (stage1.runtime_entries is scoped by the run id) that appeared during a test and are still there after a while."""
     deadline = time.monotonic() + 30
     new = runtime_entries() - before
     while new and time.monotonic() < deadline:
@@ -574,10 +576,7 @@ def test_a_model_endpoint_that_does_not_answer_fails_the_sessions_not_the_teardo
 def test_plan_with_the_real_daemon_starts_nothing(tmp_path, verified, proposer_image, up):
     with FakeOllama() as fake:
         rig = Rig(tmp_path, fake)
-        before_c = subprocess.run([verified.path, "-H", verified.host, "ps", "-a", "-q", "--filter", f"label={sr.LABEL}"],
-                                  capture_output=True, text=True, env=sandbox._pinned_env()).stdout.split()
-        before_n = subprocess.run([verified.path, "-H", verified.host, "network", "ls", "-q", "--filter", f"label={sr.LABEL}"],
-                                  capture_output=True, text=True, env=sandbox._pinned_env()).stdout.split()
+        before_res = iso.run_resources(verified)                                # THIS run's containers and networks
         entries = runtime_entries()
         before_tree = tree(rig.tmp)
         out = io.StringIO()
@@ -585,11 +584,7 @@ def test_plan_with_the_real_daemon_starts_nothing(tmp_path, verified, proposer_i
         text = out.getvalue()
         assert code == 0 and "[ok] docker" in text and "rootless Docker verified" in text and "READY." in text
         assert tree(rig.tmp) == before_tree and not rig.runs.exists() and not any(rig.ws.iterdir())
-        after_c = subprocess.run([verified.path, "-H", verified.host, "ps", "-a", "-q", "--filter", f"label={sr.LABEL}"],
-                                 capture_output=True, text=True, env=sandbox._pinned_env()).stdout.split()
-        after_n = subprocess.run([verified.path, "-H", verified.host, "network", "ls", "-q", "--filter", f"label={sr.LABEL}"],
-                                 capture_output=True, text=True, env=sandbox._pinned_env()).stdout.split()
-        assert not (set(after_c) - set(before_c)) and not (set(after_n) - set(before_n)) and settle(entries) == set()
+        assert not (iso.run_resources(verified) - before_res) and settle(entries) == set()
         assert fake.hits == 1                                                   # exactly one GET /api/tags
 
 
@@ -610,14 +605,14 @@ def test_every_solver_command_line_is_vetted_by_check_proposer_before_it_can_sta
 
 
 @pytest.mark.requires_rootless_docker
-def test_the_selftest_subcommand_passes_on_the_real_daemon_and_removes_its_scratch(verified, proposer_image, up, capsys):
-    import tempfile
-    tmp = Path(tempfile.gettempdir())
-    before = {p.name for p in tmp.glob("h2-stage1-selftest-*")}
+def test_the_selftest_subcommand_passes_on_the_real_daemon_and_removes_its_scratch(verified, proposer_image, up, capsys, tmp_path, monkeypatch):
+    # The selftest makes its scratch under the temp directory. Point that at a private one, so the "nothing is left" check
+    # cannot be tripped by another process (a second test run, a real sweep) making its own scratch in the shared /tmp.
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     code = stage1.main(["selftest"])
     out = capsys.readouterr()
     assert code == 0 and "selftest passed: P=3 R=4, rollouts 4/4 correct, teardown clean: True" in out.out, out
-    assert {p.name for p in tmp.glob("h2-stage1-selftest-*")} <= before
+    assert list(tmp_path.glob("h2-stage1-selftest-*")) == []
 
 
 def test_the_plan_does_not_alarm_with_host_session_warnings_that_do_not_apply_to_a_container(rig, up):

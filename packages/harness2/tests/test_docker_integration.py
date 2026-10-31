@@ -12,7 +12,8 @@ import time
 
 import pytest
 
-from cognitive_harness2 import sandbox
+import h2_isolation as iso
+from cognitive_harness2 import run_scope, sandbox
 from cognitive_harness2.engine import Engine, Refused, Target
 from cognitive_harness2.experience import ExperienceStore
 from cognitive_harness2.quota import QuotaVerdict
@@ -31,7 +32,9 @@ def sh(runner, script, *, files=None, timeout_s=60):
 
 
 def sandbox_containers() -> list[str]:
-    p = subprocess.run(["docker", "ps", "-a", "-q", "--filter", "label=cognitive-harness2.sandbox=1"],
+    """Sandbox containers of THIS test process only (they carry its run id), never of a concurrent one."""
+    p = subprocess.run(["docker", "ps", "-a", "-q", "--filter", "label=cognitive-harness2.sandbox=1",
+                        "--filter", f"label={run_scope.LABEL}={iso.run_id()}"],
                        capture_output=True, text=True, timeout=30)
     return p.stdout.split()
 
@@ -247,8 +250,9 @@ def test_a_pinned_runner_ignores_an_ambient_switch_made_after_the_gate(monkeypat
     monkeypatch.undo()
     assert r.docker_host == verified
     assert subprocess.run(["docker", "-H", verified, "ps", "-a", "-q", "--filter",
-                           "label=cognitive-harness2.sandbox=1"], capture_output=True, text=True,
-                          timeout=30).stdout.split() == []   # --rm: nothing leaked on the verified daemon
+                           "label=cognitive-harness2.sandbox=1", "--filter", f"label={run_scope.LABEL}={iso.run_id()}"],
+                          capture_output=True, text=True,
+                          timeout=30).stdout.split() == []   # --rm: nothing of THIS run leaked on the verified daemon
 
 
 def test_an_unpinned_runner_is_still_refused_by_the_per_run_check_when_the_env_points_nowhere(monkeypatch):
