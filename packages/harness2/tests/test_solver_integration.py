@@ -20,7 +20,7 @@ import h2_isolation as iso
 import pytest
 from harness2.substrate.opencode import OPENCODE_SURFACE
 
-from cognitive_harness2 import channels, sandbox, session_runner as sr, sum_signed as ss, upstream_egress
+from cognitive_harness2 import channels, run_scope, sandbox, session_runner as sr, sum_signed as ss, upstream_egress
 from cognitive_harness2.substrate import CognitiveSubstrate, ExecutionGrant, ExecutionRefused, SolverExecution
 from cognitive_harness2.sweep_budget import BudgetExhausted
 
@@ -76,13 +76,13 @@ def egress_world(verified, proposer_image, tmp_path_factory):
     """A throwaway egress network with one 'remote' endpoint on it: upstream.harness2.test:9000."""
     suffix = secrets.token_hex(4)
     net, up = f"h2t-{suffix}-egr", f"h2t-{suffix}-up"
-    assert docker(verified, "network", "create", "--label", "cognitive-harness2.test=1", net).returncode == 0
+    assert docker(verified, "network", "create", "--label", "cognitive-harness2.test=1", *run_scope.labels(), net).returncode == 0
     script = tmp_path_factory.mktemp("up") / "upstream.py"
     script.write_bytes((FIX / "upstream.py").read_bytes())
     script.chmod(0o644)
     script.parent.chmod(0o755)
     try:
-        p = docker(verified, "run", "-d", "--name", up, "--label", "cognitive-harness2.test=1", "--network", net,
+        p = docker(verified, "run", "-d", "--name", up, "--label", "cognitive-harness2.test=1", *run_scope.labels(), "--network", net,
                    "--network-alias", UPSTREAM_HOST, "--user", "65534:65534", "--read-only", "--cap-drop", "ALL",
                    "--pull", "never", "--mount", f"type=bind,src={script},dst=/srv/upstream.py,readonly",
                    proposer_image.id, "python3", "-I", "/srv/upstream.py")

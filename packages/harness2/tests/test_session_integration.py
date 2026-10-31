@@ -98,13 +98,13 @@ def egress_world(verified, proposer_image, tmp_path_factory):
     """A throwaway egress network with one 'remote' endpoint on it: upstream.harness2.test:9000 (and :9001)."""
     suffix = secrets.token_hex(4)
     net, up = f"h2t-{suffix}-egr", f"h2t-{suffix}-up"
-    assert docker(verified, "network", "create", "--label", "cognitive-harness2.test=1", net).returncode == 0
+    assert docker(verified, "network", "create", "--label", "cognitive-harness2.test=1", *run_scope.labels(), net).returncode == 0
     script = tmp_path_factory.mktemp("up") / "upstream.py"
     script.write_bytes((FIX / "upstream.py").read_bytes())
     script.chmod(0o644)
     script.parent.chmod(0o755)
     try:
-        p = docker(verified, "run", "-d", "--name", up, "--label", "cognitive-harness2.test=1", "--network", net,
+        p = docker(verified, "run", "-d", "--name", up, "--label", "cognitive-harness2.test=1", *run_scope.labels(), "--network", net,
                    "--network-alias", UPSTREAM_HOST, "--user", "65534:65534", "--read-only", "--cap-drop", "ALL",
                    "--pull", "never", "--mount", f"type=bind,src={script},dst=/srv/upstream.py,readonly",
                    proposer_image.id, "python3", "-I", "/srv/upstream.py")
@@ -597,7 +597,9 @@ def test_reap_all_removes_only_labelled_leftovers(verified, proposer_image, egre
     docker(verified, "create", "--name", f"{name}-c", "--label", f"{sr.LABEL}=orphan", *own, "--pull", "never", proposer_image.id, "true")
     removed = r.reap_all()
     assert any(x.startswith("container") for x in removed) and any(x.startswith("network") for x in removed)
-    assert session_leftovers(verified) == []
+    names = docker(verified, "ps", "-a", "--format", "{{.Names}}").stdout.split() \
+        + docker(verified, "network", "ls", "--format", "{{.Name}}").stdout.split()
+    assert name not in names and f"{name}-c" not in names               # (the egress fixture carries this run's id too, so no "== []")
     assert egress_world.network in docker(verified, "network", "ls", "--format", "{{.Name}}").stdout      # not labelled: untouched
 
 

@@ -112,3 +112,23 @@ def test_the_runtime_directories_of_a_run_are_found_by_the_run_id_in_their_names
     finally:
         os.rmdir(d)
     assert os.path.basename(d) not in iso.run_runtime_dirs()
+
+
+def test_a_new_container_is_explained_only_when_it_is_another_harness2_runs(verified, proposer_image):
+    """What the one daemon-wide check (test_substrate) uses to tell a concurrent run's container from a leak."""
+    made: dict[str, str] = {}
+    try:
+        for kind, labels in (("theirs", ["--label", f"{sr.LABEL}=x", *_foreign()]), ("unscoped", ["--label", f"{sr.LABEL}=x"]),
+                             ("plain", []), ("mine", ["--label", f"{sr.LABEL}=x", *_mine()]),
+                             ("fixture", ["--label", "cognitive-harness2.test=1", *_foreign()]),
+                             ("unlabelled-fixture", ["--label", "cognitive-harness2.test=1"])):
+            name = _name(kind)
+            p = iso.docker(verified, "create", "--name", name, *labels, "--pull", "never", proposer_image.id, "true")
+            assert p.returncode == 0, p.stderr
+            made[kind] = p.stdout.strip()
+        unexplained = iso.unexplained_new_containers(verified, set(made.values()))
+        assert sorted(x.split(" ")[0] for x in unexplained) == sorted([made["plain"], made["mine"]])      # fixtures of another run are explained
+        assert iso.unexplained_new_containers(verified, {"0" * 64}) == []        # gone again: someone else's finished work
+    finally:
+        for ident in made.values():
+            iso.docker(verified, "rm", "-f", ident)

@@ -64,7 +64,7 @@ def foreign_harness2_resources(verified) -> list[str]:
     daemon-wide check cannot be trusted right now."""
     mine = run_id()
     found: list[str] = []
-    for key in (sr.LABEL, "cognitive-harness2.sandbox"):
+    for key in (sr.LABEL, "cognitive-harness2.sandbox", "cognitive-harness2.test"):
         for cmd, what in ((["ps", "-a"], "container"), (["network", "ls"], "network")):
             fmt = '{{.ID}} {{.Label "' + run_scope.LABEL + '"}}'
             p = docker(verified, *cmd, "--filter", f"label={key}", "--format", fmt)
@@ -73,3 +73,22 @@ def foreign_harness2_resources(verified) -> list[str]:
                 if ident and rid.strip() != mine:
                     found.append(f"{what} {ident} (run {rid.strip() or 'none'})")
     return found
+
+
+def unexplained_new_containers(verified, new_ids: set[str]) -> list[str]:
+    """Of containers that appeared on the daemon, those that are NOT another harness2 run's (a harness2 session or sandbox
+    label with a run id that is not ours, or no run id at all). A container that is gone again by the time it is inspected
+    is somebody else's finished work (this process created nothing), so it explains itself."""
+    mine = run_id()
+    out: list[str] = []
+    keys = (sr.LABEL, "cognitive-harness2.sandbox", "cognitive-harness2.test", run_scope.LABEL)   # ... and the test fixtures' own
+    fmt = "|".join('{{index .Config.Labels "' + k + '"}}' for k in keys)
+    for ident in sorted(new_ids):
+        p = docker(verified, "inspect", "--type", "container", "--format", fmt, ident)
+        if p.returncode != 0:
+            continue                                                  # vanished: a short-lived container of someone else's
+        session, sandbox_, fixture, rid = (p.stdout.strip().split("|") + ["", "", "", ""])[:4]
+        if (session or sandbox_ or fixture) and rid != mine:
+            continue                                                  # another harness2 run (or an unscoped sweep)
+        out.append(f"{ident} (session={session!r} sandbox={sandbox_!r} fixture={fixture!r} run={rid!r})")
+    return out

@@ -496,12 +496,14 @@ def test_preflight_leaves_the_whole_daemon_unchanged_unless_another_run_is_activ
     def containers() -> set[str]:
         return set(iso.docker(verified, "ps", "-a", "-q").stdout.split())
 
-    foreign_before = iso.foreign_harness2_resources(verified)
     before = containers()
     _preflight_on_the_real_daemon(opencode, monkeypatch)
     after = containers()
+    new = after - before
+    # A container that appeared and is another harness2 run's (or gone again: this process created none) does not make
+    # the check fail; one that is neither this run's nor another harness2 run's, or is this run's, does.
+    unexplained = iso.unexplained_new_containers(verified, new)
+    assert not unexplained, f"the preflight left a container behind: {unexplained}"
     if after != before:
-        foreign = foreign_before or iso.foreign_harness2_resources(verified)
-        if foreign:
-            pytest.skip(f"another harness2 run shares the daemon, so a daemon-wide comparison proves nothing: {foreign}")
-    assert after == before
+        pytest.skip(f"another harness2 run shares the daemon, so a daemon-wide comparison proves nothing "
+                    f"(appeared: {sorted(new)}, disappeared: {sorted(before - after)})")
