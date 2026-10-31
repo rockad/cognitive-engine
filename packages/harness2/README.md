@@ -466,7 +466,7 @@ The runner reads the profile from `--profile` or that variable, never from the d
 # 1. The plan. Read-only: it changes nothing and prints the command that approves the sweep.
 uv run python -m cognitive_harness2.stage1 plan --opencode ~/.opencode/bin/opencode
 
-# 2. The run. Needs --approve <channel> AND a phrase you type on this terminal; a pipe or a script cannot approve it.
+# 2. The run. Needs --approve <channel> AND a phrase plus a fresh 4-word nonce that you type on this terminal (run it from a plain shell yourself).
 uv run python -m cognitive_harness2.stage1 run --approve local-ollama --opencode ~/.opencode/bin/opencode
 
 # Rehearsal with a FAKE opencode and a FAKE Ollama on the real daemon (no model, safe to run any time):
@@ -477,7 +477,9 @@ Options: `--wall-s N` (total wall clock; it can only LOWER the profile's `wall_s
 
 `plan` prints the channel, endpoint, model, caps, expected P and R, timeouts, classification, that nothing leaves the machine, each preflight result and the exact `run` command. What `plan` does: read the profile, ask the channel policy, run the pinned read-only `docker info` and `docker image inspect`, send one `GET /api/tags` to the loopback Ollama. It creates no file, directory, container, network or socket, and `plan` is the default command.
 
-`run` refuses (exit 2, nothing started, nothing created) unless: `--approve` names the channel, stdin and stdout are a terminal, every preflight check passes (rootless Docker, the pinned image, `opencode` found, Ollama answering with the model, the workspace root), `plan_sweep` accepts, and you type `approve local-ollama <sweep id>` exactly. Only then does it create the run directory and the `ExecutionGrant` (channel, sweep id, who approved, expiry, caps: 3 proposer + 4 solver sessions, the wall clock, the per-session timeout), and start the first session; the host bridge opens per session, so nothing listens before the grant exists.
+`run` refuses (exit 2, nothing started, nothing created) unless: `--approve` names the channel, stdin and stdout are a terminal, every preflight check passes (rootless Docker, the pinned image, `opencode` found, Ollama answering with the model, the workspace root), `plan_sweep` accepts, and you type `approve local-ollama <sweep id>` followed by the four-word nonce shown on the terminal, exactly. Only then does it create the run directory and the `ExecutionGrant` (channel, sweep id, who approved, expiry, caps: 3 proposer + 4 solver sessions, the wall clock, the per-session timeout), and start the first session; the host bridge opens per session, so nothing listens before the grant exists.
+
+**What the approval gate does and does not stop.** It stops pipes, redirected stdin or stdout, scripts that have no terminal (the confirmation is read from the controlling terminal, `/dev/tty`, never from stdin, and the typed text must include a fresh four-word nonce shown there), and anything running inside a known agent-harness environment (the run is refused when `CLAUDECODE`, `CLAUDE_CODE_*`, `ANTIGRAVITY*`, `GEMINI_CLI*`, `AGY_*`, `OPENCODE*` or `CODEX*` is set; no flag overrides that). It does **not** stop a determined process of the same user that drives a pseudo-terminal (python `pty.fork`, `script`, `expect`, `tmux send-keys`): such a process can read the phrase and the nonce and type them back, and it can clear the environment markers first. `tests/test_stage1_approval_pty.py` asserts both sides of this on purpose. The human at the terminal remains the control: do not start `run` from a session an agent can drive, and do not leave a terminal with a pending prompt open to one.
 
 ### Expected duration against the caps
 
@@ -585,7 +587,7 @@ uv run python -m cognitive_harness2.stage1 selftest --task-set hard             
 # The plan: read-only, shows "task set hard" and prints the approve command with --task-set hard in it.
 uv run python -m cognitive_harness2.stage1 plan --task-set hard --opencode ~/.opencode/bin/opencode
 
-# The run: the same approval gate as stage 1 (--approve and a phrase typed on this terminal).
+# The run: the same approval gate as stage 1 (--approve and the phrase and nonce typed on this terminal).
 uv run python -m cognitive_harness2.stage1 run --approve local-ollama --task-set hard --opencode ~/.opencode/bin/opencode
 ```
 

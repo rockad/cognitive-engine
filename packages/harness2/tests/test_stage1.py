@@ -10,6 +10,7 @@ import dataclasses
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -40,6 +41,24 @@ SENTINELS = ("careful bookkeeper", "credits positive", "Read MISSION.md first") 
 class TTY(io.StringIO):
     def isatty(self) -> bool:
         return True
+
+
+class HumanTTY(io.StringIO):
+    """A controlling terminal with a person at it: it types back exactly what the prompt shows (the phrase and its fresh
+    nonce), or `typed` when given."""
+
+    def __init__(self, typed: str | None = None):
+        super().__init__()
+        self.typed = typed
+
+    def isatty(self) -> bool:
+        return True
+
+    def readline(self, *a) -> str:
+        if self.typed is not None:
+            return self.typed + "\n"
+        shown = [ln.strip() for ln in self.getvalue().splitlines() if ln.startswith("  approve ")]
+        return shown[-1] + "\n"
 
 
 @pytest.fixture(scope="module")
@@ -278,22 +297,90 @@ def test_run_needs_a_terminal_and_a_pipe_never_approves(rig, up, monkeypatch, ca
 
 def test_a_wrong_phrase_on_a_terminal_refuses_and_creates_nothing(rig, up, monkeypatch, capsys):
     Traps(monkeypatch, rig.fake.port)
-    out = TTY()
+    term = HumanTTY("yes")
     code = run_run(rig.parse("run", "--approve", "local-ollama"), environ={}, probes=rig.probes(),
-                   stdin=TTY("yes\n"), stdout=out)
+                   stdin=TTY(), stdout=TTY(), tty=term)
     assert code == 2 and "phrase was not typed exactly" in capsys.readouterr().err
-    assert "approve local-ollama stage1-" in out.getvalue() and not rig.runs.exists() and not any(rig.ws.iterdir())
+    assert "approve local-ollama stage1-" in term.getvalue() and not rig.runs.exists() and not any(rig.ws.iterdir())
 
 
 def test_the_phrase_binds_the_channel_and_the_sweep_and_must_be_exact():
     phrase = confirmation_phrase("local-ollama", "stage1-20261030T000000Z-ab12")
     assert phrase == "approve local-ollama stage1-20261030T000000Z-ab12"
-    assert confirm_on_terminal(phrase, stdin=TTY(phrase + "\n"), stdout=TTY())
-    assert confirm_on_terminal(phrase, stdin=TTY("  " + phrase + "  \n"), stdout=TTY())
-    for typed in ("", "approve", phrase + " now", phrase.upper(), "approve local-ollama stage1-OTHER", phrase[:-1]):
-        assert not confirm_on_terminal(phrase, stdin=TTY(typed + "\n"), stdout=TTY())
-    assert not confirm_on_terminal(phrase, stdin=io.StringIO(phrase + "\n"), stdout=TTY())
-    assert not confirm_on_terminal(phrase, stdin=TTY(phrase + "\n"), stdout=io.StringIO())
+    n = "amber birch cobalt delta"
+    ask = lambda typed, **kw: confirm_on_terminal(phrase, stdin=TTY(), stdout=TTY(), environ={}, nonce=n,   # noqa: E731
+                                                  tty=HumanTTY(typed), **kw)
+    assert ask(f"{phrase} {n}") and ask(f"  {phrase} {n}  ")
+    for typed in ("", "approve", phrase, phrase + " now", f"{phrase} {n} now", f"{phrase} amber birch cobalt", f"{phrase} {n.upper()}",
+                  f"{phrase} amber birch cobalt echo", f"{phrase.upper()} {n}", f"approve local-ollama stage1-OTHER {n}",
+                  f"{phrase} {n}"[:-1]):
+        assert not ask(typed), typed
+    assert not confirm_on_terminal(phrase, stdin=io.StringIO("x\n"), stdout=TTY(), environ={}, tty=HumanTTY(f"{phrase} {n}"), nonce=n)
+    assert not confirm_on_terminal(phrase, stdin=TTY(), stdout=io.StringIO(), environ={}, tty=HumanTTY(f"{phrase} {n}"), nonce=n)
+
+
+def test_the_nonce_is_four_words_shown_on_the_terminal_and_fresh_each_time():
+    phrase = confirmation_phrase("local-ollama", "stage1-x")
+    shown = []
+    for _ in range(6):
+        t = HumanTTY("nothing")
+        assert not confirm_on_terminal(phrase, stdin=TTY(), stdout=TTY(), environ={}, tty=t)
+        line = next(ln.strip() for ln in t.getvalue().splitlines() if ln.startswith("  approve "))
+        assert line.startswith(phrase + " ")
+        words = line[len(phrase):].split()
+        assert len(words) == 4 and all(w in stage1.NONCE_WORDS for w in words)
+        shown.append(tuple(words))
+    assert len(set(shown)) > 1                                                       # not a constant
+
+
+def test_the_phrase_without_the_nonce_never_approves_even_when_the_stored_phrase_is_known():
+    phrase = confirmation_phrase("local-ollama", "stage1-x")
+    assert not confirm_on_terminal(phrase, stdin=TTY(), stdout=TTY(), environ={}, tty=HumanTTY(phrase))
+
+
+@pytest.mark.parametrize("name", ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "ANTIGRAVITY_AGENT", "GEMINI_CLI",
+                                  "GEMINI_CLI_HOME", "AGY_SESSION", "OPENCODE", "OPENCODE_CONFIG", "CODEX_HOME", "CODEX_SANDBOX"])
+def test_an_agent_harness_marker_refuses_the_approval_and_nothing_overrides_it(rig, up, monkeypatch, capsys, name):
+    phrase = confirmation_phrase("local-ollama", "stage1-x")
+    with pytest.raises(stage1.ApprovalRefused) as ei:
+        confirm_on_terminal(phrase, stdin=TTY(), stdout=TTY(), environ={name: "1"}, tty=HumanTTY())
+    assert name in str(ei.value) and "no flag" in str(ei.value)
+    Traps(monkeypatch, rig.fake.port)
+    term = HumanTTY()
+    code = run_run(rig.parse("run", "--approve", "local-ollama"), environ={name: "1"}, probes=rig.probes(),
+                   stdin=TTY(), stdout=TTY(), tty=term)
+    err = capsys.readouterr().err
+    assert code == 2 and name in err and "agent-harness environment" in err and "nothing was started" in err
+    assert term.getvalue() == "" and rig.calls == {"gate": 0, "resolve": 0, "ollama": 0} and not rig.runs.exists()
+
+
+def test_no_flag_can_override_the_agent_marker_refusal():
+    help_text = build_parser().format_help() + "".join(a.format_help() for a in
+                                                       [sp for sp in build_parser()._subparsers._group_actions[0].choices.values()])
+    assert not re.search(r"--(force|allow-agent|override|i-am-human|ignore-env)", help_text)
+
+
+def test_a_process_with_no_controlling_terminal_refuses_and_stdin_is_never_read(tmp_path):
+    class Stdin(TTY):
+        def readline(self, *a):
+            raise AssertionError("the confirmation must not be read from stdin")
+    with pytest.raises(stage1.ApprovalRefused, match="controlling terminal"):
+        confirm_on_terminal("approve a b", stdin=Stdin("approve a b\n"), stdout=TTY(), environ={}, tty_path=str(tmp_path / "no-tty"))
+
+
+def test_a_controlling_terminal_that_is_not_a_terminal_refuses(tmp_path):
+    notty = tmp_path / "file"
+    notty.write_text("")
+    with pytest.raises(stage1.ApprovalRefused, match="not a terminal"):
+        confirm_on_terminal("approve a b", stdin=TTY(), stdout=TTY(), environ={}, tty_path=str(notty))
+
+
+def test_the_confirmation_is_read_from_the_terminal_stream_not_from_stdin():
+    class Stdin(TTY):
+        def readline(self, *a):
+            raise AssertionError("read stdin")
+    phrase = "approve local-ollama stage1-x"
+    assert confirm_on_terminal(phrase, stdin=Stdin(), stdout=TTY(), environ={}, tty=HumanTTY())
 
 
 # ══ the sweep, with a fake run_task: grant, bridge ordering, teardown ═══════════════
@@ -302,7 +389,7 @@ def approved_run(rig, up, monkeypatch, run_task, *, sweep="stage1-20261030T00000
     monkeypatch.setattr(stage1, "new_sweep_id", lambda: sweep)
     out = TTY()
     code = run_run(rig.parse("run", "--approve", "local-ollama"), environ={}, probes=rig.probes(),
-                   stdin=TTY(confirmation_phrase("local-ollama", sweep) + "\n"), stdout=out, run_task=run_task)
+                   stdin=TTY(), stdout=out, tty=HumanTTY(), run_task=run_task)
     return code, rig.runs / sweep, out.getvalue()
 
 
@@ -811,7 +898,7 @@ def test_a_hard_run_hands_upstream_the_hard_adapter_and_records_the_set(rig, up,
     sweep = "stage1-20261030T000000Z-bbbb"
     monkeypatch.setattr(stage1, "new_sweep_id", lambda: sweep)
     code = run_run(rig.parse("run", "--approve", "local-ollama", "--task-set", "hard"), environ={}, probes=rig.probes(),
-                   stdin=TTY(confirmation_phrase("local-ollama", sweep) + "\n"), stdout=TTY(), run_task=fake_run_task)
+                   stdin=TTY(), stdout=TTY(), tty=HumanTTY(), run_task=fake_run_task)
     assert code == 1                                                           # no ledger: the fake started nothing
     assert seen["task"] == "household/hard-1"
     ad = seen["adapter"]
@@ -835,7 +922,7 @@ def test_an_easy_run_records_the_set_too_and_its_adapter_is_the_easy_one(rig, up
     sweep = "stage1-20261030T000000Z-cccc"
     monkeypatch.setattr(stage1, "new_sweep_id", lambda: sweep)
     run_run(rig.parse("run", "--approve", "local-ollama"), environ={}, probes=rig.probes(),
-            stdin=TTY(confirmation_phrase("local-ollama", sweep) + "\n"), stdout=TTY(), run_task=fake_run_task)
+            stdin=TTY(), stdout=TTY(), tty=HumanTTY(), run_task=fake_run_task)
     assert seen["task"] == "household/sum-1" and seen["adapter"].ts is stage1.ss.EASY and seen["adapter"].spec.name == "sum-signed"
     assert json.loads((rig.runs / sweep / "report.json").read_text())["task_set"] == "easy"
 

@@ -478,19 +478,115 @@ def confirmation_phrase(channel: str, sweep_id: str) -> str:
     return f"approve {channel} {sweep_id}"
 
 
-def confirm_on_terminal(phrase: str, *, stdin: TextIO | None = None, stdout: TextIO | None = None) -> bool:
-    """True only if the exact phrase is typed, on a real terminal. A pipe, a file or a closed stdin never approves."""
+# Environment variables that mark a process as running inside an agent harness. The runner refuses to take an approval
+# there and NO flag overrides it. The names are those the harnesses set in the processes they spawn (Claude Code:
+# CLAUDECODE, CLAUDE_CODE_*; Antigravity / Gemini CLI / agy; opencode; codex). Not a security boundary: a process that
+# scrubs its own environment (`env -i`) defeats it. It makes the careless route (an agent running `stage1 run` and
+# approving it itself) fail loudly instead of quietly working.
+AGENT_ENV_EXACT = ("CLAUDECODE",)
+AGENT_ENV_PREFIXES = ("CLAUDE_CODE_", "ANTIGRAVITY", "GEMINI_CLI", "AGY_", "OPENCODE", "CODEX")
+TTY_PATH = "/dev/tty"
+
+NONCE_WORDS = ("amber", "anchor", "birch", "cobalt", "comet", "coral", "crane", "delta", "ember", "fennel", "flint",
+               "garnet", "harbor", "indigo", "jasper", "juniper", "kelp", "lantern", "linden", "maple", "meadow",
+               "nickel", "onyx", "orchid", "pebble", "quartz", "raven", "saffron", "sparrow", "thistle", "umber",
+               "velvet", "willow", "yarrow", "zephyr", "cedar", "falcon", "granite", "heron", "ivory", "lagoon",
+               "marble", "nectar", "opal", "pewter", "quill", "russet", "sable", "tundra", "valley")
+
+
+class ApprovalRefused(Exception):
+    """The approval gate declined to even ask: no controlling terminal, or an agent-harness environment."""
+
+
+def agent_markers(environ: Mapping[str, str]) -> list[str]:
+    """The names in `environ` that mark an agent-harness process (sorted; values are never read or shown)."""
+    return sorted(k for k in environ if k in AGENT_ENV_EXACT or k.startswith(AGENT_ENV_PREFIXES))
+
+
+def refuse_in_agent_environment(environ: Mapping[str, str]) -> None:
+    found = agent_markers(environ)
+    if found:
+        raise ApprovalRefused(
+            "refusing to take an approval inside an agent-harness environment (" + ", ".join(found[:6]) +
+            "): the approval must come from a person at their own terminal. There is no flag to override this; "
+            "run it from a plain shell yourself")
+
+
+def new_nonce(words: int = 4) -> str:
+    return " ".join(secrets.SystemRandom().sample(NONCE_WORDS, words))
+
+
+class _Terminal:
+    """The controlling terminal as one object: a read stream and a write stream on two descriptors of the same device
+    (a text `r+` stream needs a seekable file, which a terminal is not)."""
+
+    def __init__(self, rfd: int, wfd: int):
+        self._r = os.fdopen(rfd, "r", encoding="utf-8", errors="replace")
+        self._w = os.fdopen(wfd, "w", encoding="utf-8", errors="replace", buffering=1)
+
+    def isatty(self) -> bool:
+        return self._r.isatty() and self._w.isatty()
+
+    def write(self, s: str) -> int:
+        return self._w.write(s)
+
+    def flush(self) -> None:
+        self._w.flush()
+
+    def readline(self) -> str:
+        return self._r.readline()
+
+    def close(self) -> None:
+        for f in (self._w, self._r):
+            with contextlib.suppress(OSError):
+                f.close()
+
+
+def open_controlling_terminal(path: str = TTY_PATH) -> _Terminal:
+    """The process's controlling terminal, opened for reading and writing; OSError when there is none."""
+    rfd = os.open(path, os.O_RDONLY | os.O_NOCTTY)
+    try:
+        wfd = os.open(path, os.O_WRONLY | os.O_NOCTTY)
+    except OSError:
+        os.close(rfd)
+        raise
+    return _Terminal(rfd, wfd)
+
+
+def confirm_on_terminal(phrase: str, *, stdin: TextIO | None = None, stdout: TextIO | None = None,
+                        environ: Mapping[str, str] | None = None, tty: TextIO | None = None,
+                        tty_path: str = TTY_PATH, nonce: str | None = None) -> bool:
+    """True only if the phrase plus a fresh 4-word nonce is typed on the process's CONTROLLING terminal.
+
+    What it stops: a pipe, redirected stdin or stdout, a script with no terminal (the confirmation is read from the
+    controlling terminal, never from stdin), and anything inside a known agent-harness environment (raises
+    `ApprovalRefused`; no flag overrides it). What it does NOT stop: a determined process of the same user that runs this
+    under a pty it drives (python `pty.fork`, `script`, `expect`, `tmux send-keys`): it can read the phrase and type it
+    back, nonce included, and it can scrub the environment markers. The human remains the control."""
+    refuse_in_agent_environment(os.environ if environ is None else environ)
     sin, sout = stdin or sys.stdin, stdout or sys.stdout
     if not (sin.isatty() and sout.isatty()):
         return False
-    print(f"To approve this sweep, type exactly:\n\n  {phrase}\n", file=sout, flush=True)
-    sout.write("> ")
-    sout.flush()
+    owned = tty is None
     try:
-        typed = sin.readline()
-    except (OSError, KeyboardInterrupt):
-        return False
-    return typed.strip() == phrase
+        term = tty if tty is not None else open_controlling_terminal(tty_path)
+    except OSError as e:
+        raise ApprovalRefused(f"refusing to take an approval without a controlling terminal ({tty_path}: {e.strerror or e})") from e
+    try:
+        if not term.isatty():
+            raise ApprovalRefused("refusing to take an approval: the controlling terminal is not a terminal")
+        expected = f"{phrase} {nonce or new_nonce()}"
+        term.write(f"To approve this sweep, type exactly (the last four words change on every run):\n\n  {expected}\n\n> ")
+        term.flush()
+        try:
+            typed = term.readline()
+        except (OSError, KeyboardInterrupt):
+            return False
+        return typed.strip() == expected
+    finally:
+        if owned:
+            with contextlib.suppress(OSError):
+                term.close()
 
 
 def approver_name() -> str:
@@ -1013,10 +1109,16 @@ def run_plan(args: argparse.Namespace, *, environ: Mapping[str, str], probes: Pr
 
 def run_run(args: argparse.Namespace, *, environ: Mapping[str, str], probes: Probes | None = None,
             stdin: TextIO | None = None, stdout: TextIO | None = None,
-            run_task: Callable[..., Any] | None = None) -> int:
-    """`run`: the approval gate, then the sweep. Every refusal here happens before anything is created."""
+            run_task: Callable[..., Any] | None = None, tty: TextIO | None = None) -> int:
+    """`run`: the approval gate, then the sweep. Every refusal here happens before anything is created.
+    `tty` is for tests: the stream the confirmation is read from (default: the controlling terminal, /dev/tty)."""
     out = stdout or sys.stdout
     err = lambda m: print(f"stage1: {m}", file=sys.stderr)       # noqa: E731
+    try:
+        refuse_in_agent_environment(environ)
+    except ApprovalRefused as e:
+        err(f"{e}; nothing was started")
+        return 2
     if args.yes_i_am_the_user:
         err("--yes-i-am-the-user is not accepted by `run`: the non-interactive approval exists only for `selftest`")
         return 2
@@ -1049,7 +1151,12 @@ def run_run(args: argparse.Namespace, *, environ: Mapping[str, str], probes: Pro
         return 2
     out.write(format_plan(s, pre, plan, [], profile_path=None, with_command=False))
     phrase = confirmation_phrase(s.channel, sweep_id)
-    if not confirm_on_terminal(phrase, stdin=sin, stdout=out):
+    try:
+        confirmed = confirm_on_terminal(phrase, stdin=sin, stdout=out, environ=environ, tty=tty)
+    except ApprovalRefused as e:
+        err(f"{e}; nothing was started")
+        return 2
+    if not confirmed:
         err("the confirmation phrase was not typed exactly; nothing was started")
         return 2
     approval = Approval(approver_name(), "tty", phrase)
