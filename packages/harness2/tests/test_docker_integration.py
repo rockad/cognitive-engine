@@ -197,6 +197,7 @@ async def test_the_engine_probes_a_candidate_in_a_real_container(tmp_path, monke
     assert out["mode"] == "sandbox"
     (res,) = out["results"]
     assert res["exit_code"] == 0 and res["stdout"] == "mutated prompt text"
+    assert res["runner"] == out["runner"] == "rootless-docker"  # sbx was hidden: the result says which runtime ran it
 
 
 async def test_the_engine_fails_closed_on_an_unreachable_daemon_even_with_the_diff_opt_out_unset(tmp_path, monkeypatch):

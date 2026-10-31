@@ -480,3 +480,10 @@ def test_live_the_sum_signed_verifier_gives_the_same_verdict_in_sbx_as_in_python
         for leftover in sorted(n for n in after - before if n.startswith("harness2-")):
             subprocess.run([path, "rm", "--force", leftover], capture_output=True)
     assert set(subprocess.run([path, "ls", "-q"], capture_output=True, text=True).stdout.split()) == before
+
+
+def test_the_result_names_the_runner(world):
+    r = world.runner().run(spec())
+    assert (r.runner, r.fallback_reason) == ("sbx", None)
+    hung = world.runner(env={"FAKE_SBX_EXEC_HANG": "1"}).run(spec(timeout_s=1))
+    assert hung.timed_out and hung.runner == "sbx"

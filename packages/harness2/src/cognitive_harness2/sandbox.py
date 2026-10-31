@@ -80,6 +80,11 @@ class SandboxResult:
     stdout: str
     stderr: str
     timed_out: bool = False
+    # Which runtime executed the command (RUNNER_SBX or RUNNER_DOCKER; None when a runner does not say) and, when it is
+    # not sbx although sbx is present or was asked for, {code, detail, loud}. The two runtimes differ materially (image,
+    # user, root filesystem, pids limit), so the same command can give different results on each: evidence must say which.
+    runner: str | None = field(default=None, compare=False)
+    fallback_reason: dict | None = field(default=None, compare=False)
 
 
 class SandboxRunner(Protocol):
@@ -106,6 +111,8 @@ ENV_SANDBOX = "COGNITIVE_HARNESS2_SANDBOX"
 # `1` accepts a daemon with `ssh.agentForwardingEnabled` or `browser.enabled` on (both are on by default on a fresh
 # install). Off by default: with either on, the sandbox can reach the host's SSH agent or browser.
 ENV_ALLOW_HOST_SETTINGS = "COGNITIVE_HARNESS2_SBX_ALLOW_HOST_SETTINGS"
+# The runner names as data (`SandboxResult.runner`, `harness2_status`).
+RUNNER_SBX, RUNNER_DOCKER, RUNNER_NONE = "sbx", "rootless-docker", "unavailable"
 
 
 # ── ephemeral rootless Docker (the fallback when sbx is absent) ───────────────────
@@ -288,11 +295,13 @@ class DockerRunner:
 
     def __init__(self, docker_path: str, *, docker_host: str | None = None, image: str = DEFAULT_IMAGE,
                  pids_limit: int = 128, memory: str = "256m", cpus: str = "1", tmpfs_size: str = "64m",
-                 user: str = "65534:65534", max_output_bytes: int = MAX_OUTPUT_BYTES):
+                 user: str = "65534:65534", max_output_bytes: int = MAX_OUTPUT_BYTES,
+                 fallback_reason: dict | None = None):
         """`docker_host` is the endpoint the gate verified (`VerifiedDocker.host`). With it, every
         docker call this runner makes goes to exactly that daemon and the ambient DOCKER_HOST and
         DOCKER_CONTEXT are never consulted. Without it, each `run()` resolves the endpoint once,
-        verifies it, and pins the rest of that run to the endpoint it verified."""
+        verifies it, and pins the rest of that run to the endpoint it verified. `fallback_reason` is why this
+        runner and not sbx was built ({code, detail, loud}); it is only reported, in every `SandboxResult`."""
         if docker_host is not None and not _is_local_unix(docker_host):
             raise SandboxUnavailable(
                 f"the Docker endpoint {docker_host or 'is unknown'!r} is not a local unix socket; candidate "
@@ -300,6 +309,7 @@ class DockerRunner:
         self.docker_path, self.docker_host, self.image, self.pids_limit = docker_path, docker_host, image, pids_limit
         self.memory, self.cpus, self.tmpfs_size, self.user = memory, cpus, tmpfs_size, user
         self.max_output_bytes = max_output_bytes
+        self.fallback_reason = fallback_reason
 
     def _argv(self, spec: SandboxSpec, stage_dir: Path, name: str, host: str) -> list[str]:
         return [
@@ -385,9 +395,10 @@ class DockerRunner:
             shutil.rmtree(stage, ignore_errors=True)
         note = f"\n[output truncated at {self.max_output_bytes} bytes]\n" if cut[0] else ""
         stdout = out.decode("utf-8", "replace") + note
+        tag = {"runner": RUNNER_DOCKER, "fallback_reason": self.fallback_reason}
         if timed_out:
-            return SandboxResult(None, stdout, "timed out", True)
-        return SandboxResult(code, stdout, err.decode("utf-8", "replace"))
+            return SandboxResult(None, stdout, "timed out", True, **tag)
+        return SandboxResult(code, stdout, err.decode("utf-8", "replace"), **tag)
 
 
 # ── Docker Sandboxes (sbx) microVMs ───────────────────────────────────────────────
@@ -646,7 +657,7 @@ class SbxRunner:
         stdout = out.decode("utf-8", "replace") + note
         if timed_out:
             # The in-VM process may outlive the killed client: the caller's `rm --force` destroys the VM.
-            return SandboxResult(None, stdout, "timed out", True)
+            return SandboxResult(None, stdout, "timed out", True, runner=RUNNER_SBX)
         stderr = err.decode("utf-8", "replace")
         # 125 is sbx's "could not run it". On v0.50.1 a wedged VM (a fork flood) made `sbx exec` print
         # `failed to start stdin stream: ...` and exit 255, which a candidate could also exit with: only that
@@ -654,7 +665,7 @@ class SbxRunner:
         if code == 125 or (code == 255 and _SBX_EXEC_FAILURE.match(stderr)):
             raise SandboxUnavailable(f"`sbx exec` could not run the command (exit {code}): "
                                      f"{_first_line(stderr)} (fail closed)")
-        return SandboxResult(code, stdout, stderr)
+        return SandboxResult(code, stdout, stderr, runner=RUNNER_SBX)
 
     @staticmethod
     def _kill_client(proc: subprocess.Popen) -> None:
@@ -712,7 +723,6 @@ SBX_SELECTED = "usable-and-selected"
 SBX_NOT_CONSULTED = "not-consulted"  # COGNITIVE_HARNESS2_SANDBOX=docker: sbx is never looked at
 
 MODE_AUTO, MODE_DOCKER, MODE_SBX = "auto", "docker", "sbx"
-RUNNER_SBX, RUNNER_DOCKER, RUNNER_NONE = "sbx", "rootless-docker", "unavailable"
 
 # Structured reasons (`SbxProblem.code`) why a present sbx is not the selected runner.
 WHY_NOT_INSTALLED = "not-installed"
@@ -1076,7 +1086,7 @@ def default_runner(which: Callable[[str], str | None] = shutil.which, *, environ
         return SbxRunner(choice.sbx.path or "sbx", environ=environ, verified=verified)
     assert choice.docker is not None
     _warn_fallback_once(choice)
-    return DockerRunner(choice.docker.path, docker_host=choice.docker.host)
+    return DockerRunner(choice.docker.path, docker_host=choice.docker.host, fallback_reason=choice.fallback_reason)
 
 
 def sandbox_report(which: Callable[[str], str | None] = shutil.which, *, environ: Mapping[str, str] | None = None,

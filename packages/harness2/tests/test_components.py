@@ -286,3 +286,64 @@ async def test_stored_runs_are_bounded(tmp_path):
     for _ in range(MAX_RUNS + 6):
         await propose(eng, n=1)
     assert len(eng.runs) == MAX_RUNS
+
+
+# ── which runner executed a candidate is part of the evidence ─────────────────────────
+
+class NamedRunner:
+    """Returns results tagged like the real runners do (`SandboxResult.runner`, `.fallback_reason`)."""
+    def __init__(self, runner="sbx", fallback_reason=None, exit_code=0):
+        self.runner, self.fallback_reason, self.exit_code = runner, fallback_reason, exit_code
+    def run(self, spec):
+        return SandboxResult(self.exit_code, "out", "", False, runner=self.runner, fallback_reason=self.fallback_reason)
+
+
+async def test_the_probe_result_the_compose_evidence_and_the_lesson_name_the_runner(tmp_path):
+    eng, _, _ = make(tmp_path, runner=NamedRunner("sbx"))
+    run_id = (await propose(eng))["run_id"]
+    out = eng.probe(run_id=run_id, command=["pytest"], timeout_s=5, allow_worktree_diff=False)
+    assert out["mode"] == "sandbox" and out["runner"] == "sbx" and out["fallback_reason"] is None
+    assert [r["runner"] for r in out["results"]] == ["sbx", "sbx"]
+    assert "runner: sbx" in eng.compose(run_id)["evidence"]
+    lesson = ExperienceStore(tmp_path)
+    eng.reflect(run_id=run_id, domain="python")
+    (p,) = lesson.pending()
+    assert "2 of 2 candidate(s) succeeded (sandbox, runner: sbx)" in p.lesson
+
+
+async def test_a_docker_fallback_is_visible_in_the_tool_result_with_its_code(tmp_path):
+    reason = {"code": "daemon-down", "detail": "sbx daemon is not reachable", "loud": True}
+    eng, _, _ = make(tmp_path, runner=NamedRunner("rootless-docker", reason))
+    run_id = (await propose(eng))["run_id"]
+    out = eng.probe(run_id=run_id, command=["pytest"], timeout_s=5, allow_worktree_diff=False)
+    assert out["runner"] == "rootless-docker" and out["fallback_reason"] == reason
+    assert all(r["fallback_reason"] == reason for r in out["results"])
+    assert "runner: rootless-docker" in eng.compose(run_id)["evidence"]
+    assert "daemon-down" in eng.compose(run_id)["evidence"]
+
+
+async def test_a_runner_that_does_not_say_is_reported_as_unknown_never_as_a_guess(tmp_path):
+    eng, _, _ = make(tmp_path, runner=FakeRunner())
+    run_id = (await propose(eng))["run_id"]
+    out = eng.probe(run_id=run_id, command=["pytest"], timeout_s=5, allow_worktree_diff=False)
+    assert out["runner"] == "unknown" and out["results"][0]["runner"] == "unknown"
+
+
+async def test_a_run_that_mixed_runners_says_mixed_and_lists_them(tmp_path):
+    runners = iter([NamedRunner("sbx"), NamedRunner("rootless-docker", {"code": "sbx-run-failed", "detail": "d", "loud": True})])
+
+    class Alternating:
+        def run(self, spec):
+            return next(runners).run(spec)
+    eng, _, _ = make(tmp_path, runner=Alternating())
+    run_id = (await propose(eng))["run_id"]
+    out = eng.probe(run_id=run_id, command=["pytest"], timeout_s=5, allow_worktree_diff=False)
+    assert out["runner"] == "mixed" and out["runners"] == ["rootless-docker", "sbx"]
+    assert "mixed" in eng.compose(run_id)["evidence"]
+
+
+async def test_diff_only_results_name_no_runner(tmp_path):
+    eng, _, _ = make(tmp_path)
+    run_id = (await propose(eng))["run_id"]
+    out = eng.probe(run_id=run_id, command=["pytest"], timeout_s=5, allow_worktree_diff=True)
+    assert out["runner"] == "none" and out["results"][0]["runner"] == "none"

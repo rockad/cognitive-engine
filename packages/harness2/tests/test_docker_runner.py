@@ -554,3 +554,21 @@ def test_protected_keys_are_still_refused_and_nothing_is_left_behind(key, tmp_pa
 def test_a_non_string_key_is_refused():
     with pytest.raises(ValueError):
         DockerRunner("/usr/bin/docker", docker_host=SOCK)._stage(SandboxSpec(command=["x"], files={1: "x"}))  # type: ignore[dict-item]
+
+
+# ── the result names the runner that executed the candidate ───────────────────────────
+
+def test_a_docker_result_names_the_runner_and_why_it_is_not_sbx(monkeypatch):
+    Recorder(monkeypatch)
+    spec = SandboxSpec(command=["echo"], files={"prompt": "x"})
+    res = DockerRunner("/usr/bin/docker", docker_host=SOCK).run(spec)
+    assert (res.runner, res.fallback_reason) == ("rootless-docker", None)
+    reason = {"code": "daemon-down", "detail": "sbx daemon is not reachable", "loud": True}
+    res = DockerRunner("/usr/bin/docker", docker_host=SOCK, fallback_reason=reason).run(spec)
+    assert (res.runner, res.fallback_reason) == ("rootless-docker", reason)
+
+
+def test_a_timed_out_docker_result_names_the_runner_too(monkeypatch):
+    Recorder(monkeypatch, hang_first=True)
+    res = DockerRunner("/usr/bin/docker", docker_host=SOCK).run(SandboxSpec(command=["sleep", "9"], timeout_s=1))
+    assert res.timed_out and res.runner == "rootless-docker"

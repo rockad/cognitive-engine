@@ -65,6 +65,24 @@ class ProbeResult:
     stderr: str
     timed_out: bool
     diff: str
+    # Which runtime executed the candidate: "sbx", "rootless-docker", "unknown" (a runner that does not say) or "none"
+    # (diff only). The runtimes differ (image, user, root filesystem, limits), so a result is only comparable with
+    # results from the same one. `fallback_reason` is {code, detail, loud} when it ran on Docker although sbx is
+    # present or was the first choice.
+    runner: str = "none"
+    fallback_reason: dict | None = None
+
+
+def _runner_label(results: list[ProbeResult]) -> tuple[str, list[str]]:
+    """(one runner name, "mixed" or "none"; the sorted distinct names) over the executed results."""
+    names = sorted({r.runner for r in results if r.mode == "sandbox"})
+    if not names:
+        return "none", []
+    return (names[0] if len(names) == 1 else "mixed"), names
+
+
+def _fallback_of(results: list[ProbeResult]) -> dict | None:
+    return next((r.fallback_reason for r in results if r.fallback_reason), None)
 
 
 @dataclass
@@ -165,9 +183,12 @@ class Engine:
                 out = runner.run(SandboxSpec(command=command, files={c.component: c.mutated}, timeout_s=timeout_s))
             except SandboxUnavailable as e:  # the runtime vanished mid-probe: still fail closed, never degrade
                 raise Refused(str(e)) from e
-            results.append(ProbeResult(c.id, "sandbox", out.exit_code, out.stdout, out.stderr, out.timed_out, ""))
+            results.append(ProbeResult(c.id, "sandbox", out.exit_code, out.stdout, out.stderr, out.timed_out, "",
+                                       out.runner or "unknown", out.fallback_reason))
         run.results = results
-        return {"run_id": run.id, "mode": results[0].mode if results else "none",
+        runner, runners = _runner_label(results)
+        return {"run_id": run.id, "mode": results[0].mode if results else "none", "runner": runner,
+                "runners": runners, "fallback_reason": _fallback_of(results),
                 "results": [r.__dict__ for r in results]}
 
     # ── compose ──────────────────────────────────────────────────────────────────
@@ -184,7 +205,14 @@ class Engine:
         best = ranked[0]
         cand = next(c for c in run.candidates if c.id == best.candidate_id)
         diverged = sorted({r.exit_code for r in run.results})
-        return {**base, "evidence": "executed in sandbox", "winner": best.candidate_id,
+        runner, runners = _runner_label(run.results)
+        why = _fallback_of(run.results)
+        detail = [f"runner: {runner}"]
+        if runner == "mixed":
+            detail.append(f"mixed results are not comparable: {', '.join(runners)}")
+        if why:
+            detail.append(f"not sbx because {why['code']}")
+        return {**base, "evidence": f"executed in sandbox ({'; '.join(detail)})", "runner": runner, "fallback_reason": why, "winner": best.candidate_id,
                 "patch": {"component": cand.component, "replacement": cand.mutated},
                 "ranking": [r.candidate_id for r in ranked],
                 "divergence": f"exit codes seen: {diverged}",
@@ -196,8 +224,9 @@ class Engine:
         if not run.results:
             raise Refused("nothing to reflect on: run harness2_probe first")
         passed = [r for r in run.results if r.exit_code == 0]
-        lesson = (f"Task: {run.task}\n{len(passed)} of {len(run.results)} candidate(s) succeeded "
-                  f"({'sandbox' if run.results[0].mode == 'sandbox' else 'static diff only'}).")
+        runner, _ = _runner_label(run.results)
+        how = f"sandbox, runner: {runner}" if run.results[0].mode == "sandbox" else "static diff only"
+        lesson = f"Task: {run.task}\n{len(passed)} of {len(run.results)} candidate(s) succeeded ({how})."
         p: Pending = self.store.stage(domain, lesson)
         return {"pending_id": p.id, "domain": domain, "committed": False,
                 "next": f"a human must run: cognitive-harness2 experience approve {p.id} --by <name>"}

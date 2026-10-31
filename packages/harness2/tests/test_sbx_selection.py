@@ -591,3 +591,18 @@ def test_this_hosts_real_selection_is_consistent_with_its_own_report(monkeypatch
 
 def host_ok(rep, env) -> bool:
     return sandbox.host_settings_allowed(env) or rep["sbx"]["settings"] == OFF
+
+
+# ── the runner built carries the reason it is not sbx, so a result can say it ─────────
+
+def test_a_docker_runner_built_because_sbx_is_unusable_carries_the_structured_reason(docker):
+    r = sandbox.default_runner(which_with(True), environ={}, probes=probes(daemon=False))
+    assert isinstance(r, DockerRunner)
+    assert r.fallback_reason["code"] == "daemon-down" and r.fallback_reason["detail"] and r.fallback_reason["loud"]
+
+
+def test_a_docker_runner_without_sbx_or_by_choice_says_why_but_quietly(docker):
+    absent = sandbox.default_runner(which_with(False), environ={}).fallback_reason  # sbx simply absent: not a warning
+    assert absent["code"] == "not-installed" and absent["loud"] is False
+    forced = sandbox.default_runner(which_with(True), environ={ENV_SANDBOX: "docker"})
+    assert forced.fallback_reason["code"] == "forced-docker" and forced.fallback_reason["loud"] is False
