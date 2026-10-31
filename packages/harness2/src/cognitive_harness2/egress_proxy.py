@@ -120,7 +120,7 @@ class Limits:
     burst: int = 40
     # unix routes only (the host bridge to the local model): one proxy serves one session, so the request cap is per session
     route_max_requests: int = 2000          # allowed requests over all connections of this proxy's lifetime
-    route_max_request_bytes: int = 4 * 1024 * 1024        # one request body (a chat history); the CLI sends < 100 KB
+    route_max_request_bytes: int = 1024 * 1024     # one request body (a chat history, buffered: the proxy has 128 MiB); the CLI sends ~15 KB
     route_max_response_bytes: int = 64 * 1024 * 1024      # one response body (a stream), on the wire
     route_max_pipelined: int = 2            # requests a client may have queued behind the one in flight
     body_timeout_s: float = 60.0            # the WHOLE request body, once its head is read
@@ -909,11 +909,18 @@ class Proxy:
         True when the upstream connection may carry another request. Refused before the head is with the client
         (a clean 502 is still possible), `_Abort` after."""
         lim = self.limits
+
+        async def push(data: bytes) -> None:
+            writer.write(data)
+            try:
+                await asyncio.wait_for(writer.drain(), lim.idle_timeout_s)      # a client that stops reading cannot hold the stream
+            except asyncio.TimeoutError:
+                raise _Abort("unix-route-response-aborted") from None
+
         head, data = await self._read_response_head(ur)
         status, headers = parse_response_head(head, lim)
         kind, remaining, closes = response_framing(status, headers)
-        writer.write(head + b"\r\n\r\n")
-        await writer.drain()
+        await push(head + b"\r\n\r\n")
         dec = ChunkedDecoder(limit=lim.route_max_response_bytes, keep=False) if kind == "chunked" else None
         reusable, sent = not closes, 0
         while True:
@@ -937,8 +944,7 @@ class Proxy:
                 if sent > lim.route_max_response_bytes or moved[0] > lim.max_bytes:
                     raise _Abort("unix-route-response-too-large")
                 if take:
-                    writer.write(take)
-                    await writer.drain()
+                    await push(take)
             if kind == "none" or (kind == "length" and not remaining) or (dec is not None and dec.done):
                 return reusable
             try:

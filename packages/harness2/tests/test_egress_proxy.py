@@ -1389,3 +1389,18 @@ def test_routed_target_table():
                 req("*", "a.test:11434"), req("a.test:11434", "a.test:11434"), req("https://a.test:11434/", None)):
         with pytest.raises(Refused):
             ep.routed_target(bad, None)
+
+
+async def test_a_client_that_stops_reading_cannot_hold_a_streaming_response_open(routed):
+    chunk = b"x" * 65536
+    stream = [b"HTTP/1.1 200 OK\r\nContent-Length: 40000000\r\n\r\n"] + [chunk] * 500          # far more than the socket buffers hold
+    async with routed(lambda rec: stream, idle_timeout_s=0.5) as rt:
+        r, w = await asyncio.open_connection("127.0.0.1", rt.port)
+        w.write(rq("GET", "/api/tags", close=False))
+        await w.drain()
+        for _ in range(100):                                                    # never read: the proxy must give up by itself
+            await asyncio.sleep(0.1)
+            if any("reason=unix-route-response-aborted" in x for x in rt.denied()):
+                break
+        assert any("reason=unix-route-response-aborted" in x for x in rt.denied()), rt.log
+        w.close()
