@@ -764,7 +764,7 @@ def test_a_local_channel_routes_the_proxy_alias_to_the_bridge_socket_and_a_hoste
     plan = runner("local").authorize(spec(world))
     cfg = sr.proxy_config(plan)
     sock = f"{sr.BRIDGE_MOUNT}/ollama.sock"
-    allow = [["GET", "/api/tags"], ["GET", "/v1/models"], ["POST", "/v1/chat/completions"], ["POST", "/v1/completions"]]
+    allow = [["GET", "/api/tags"], ["GET", "/v1/models"], ["POST", "/v1/chat/completions"], ["POST", "/v1/completions"], ["POST", "/api/show"]]
     assert cfg["unix_routes"] == [{"host": "127.0.0.1", "port": 11434, "unix": sock, "allow": allow},
                                   {"host": sr.PROXY_ALIAS, "port": 11434, "unix": sock, "allow": allow}]
     assert cfg["listeners"] == [{"port": 11434, "unix": sock}] and cfg["allow"] == []

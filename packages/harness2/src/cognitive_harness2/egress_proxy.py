@@ -87,15 +87,18 @@ _ROUTE_METHODS = frozenset({"GET", "POST"})
 _ROUTE_REFUSED_HEADERS = frozenset({"expect", "upgrade", "te", "trailer"})
 
 # What a contained session may say to the host's ollama through a unix route, and nothing else: the OpenAI-compatible
-# surface its CLI uses (chat), the completion twin, the model list, and the one native read-only route opencode
-# calls first (`GET /api/tags`, measured with the real opencode v2.0.25, see the README). Everything else of ollama's
-# API (/api/delete, /api/pull, /api/push, /api/create, /api/copy, /api/generate, /api/chat, /api/show, /api/ps,
-# /api/embed, /v1/embeddings, /v1/models/{id}, ...) is absent: an absent pair is a 403.
+# surface its CLI uses (chat), the completion twin, the model list, and the two native read-only routes opencode
+# calls (`GET /api/tags` once per session, and `POST /api/show` at the start of each model step: model info only,
+# added 2026-10-31 after real stage-1b runs, see the README). Everything else of ollama's API (/api/delete,
+# /api/pull, /api/push, /api/create, /api/copy, /api/generate, /api/chat, /api/ps, /api/embed, /v1/embeddings,
+# /v1/models/{id}, ...) is absent: an absent pair is a 403. There are no per-entry caps: `POST /api/show` shares the
+# request body cap of every other route (`Limits.route_max_request_bytes`) and the same strict framing.
 OLLAMA_ROUTE_ALLOW: tuple[tuple[str, str], ...] = (
     ("GET", "/api/tags"),
     ("GET", "/v1/models"),
     ("POST", "/v1/chat/completions"),
     ("POST", "/v1/completions"),
+    ("POST", "/api/show"),
 )
 
 
