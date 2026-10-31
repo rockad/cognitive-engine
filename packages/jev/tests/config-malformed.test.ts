@@ -45,7 +45,7 @@ function runHook(stdin: unknown, arg = 'claude', opts: { unsetConfigEnv?: boolea
   return { code: r.exitCode, out: r.stdout.toString(), err: r.stderr.toString() };
 }
 
-const plainAgent = { tool_name: 'Agent', session_id: 's1', tool_input: { subagent_type: 'x', prompt: 'p' } };
+const plainAgent = { tool_name: 'Agent', session_id: 's1', tool_input: { subagent_type: 'general-purpose', prompt: 'p' } };
 const opusAgent = { tool_name: 'Agent', session_id: 's1', tool_input: { model: 'opus', prompt: 'p' } };
 const workflow = { tool_name: 'Workflow', session_id: 's1', cwd: os.tmpdir(), tool_input: { script: 'agent({ prompt: "x" })' } };
 const reasonOf = (out: string) => JSON.parse(out).hookSpecificOutput.permissionDecisionReason as string;

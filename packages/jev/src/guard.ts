@@ -13,7 +13,7 @@
  * Everything else Jev does for a turn (advice, dispatch, telemetry) is advice from the MCP tools.
  */
 import { modelTierRank } from './core/governance.js';
-import { readAgentDefinition } from './agent-definitions.js';
+import { describeAgentLookup, readAgentDefinition } from './agent-definitions.js';
 import { assessModelRequest } from './models.js';
 import { evaluateWorkflowInput } from './workflow-guard.js';
 import { resolveSessionModel, sessionModelFromTranscript, type SessionModelSource } from './session-model.js';
@@ -67,9 +67,33 @@ export function decideClaudeAgentCall(
   };
 }
 
+/** Claude Code's built-in subagent types: they have no definition file and run on the session model. */
+const BUILTIN_AGENT_TYPES: ReadonlySet<string> = new Set(['general-purpose', 'Explore', 'Plan', 'statusline-setup', 'claude-code-guide']);
+
 /**
- * The `model:` from a subagent's definition (`<cwd>/.claude/agents/<name>.md`, then
- * `~/.claude/agents/<name>.md`), or null. The name is restricted to file-name characters.
+ * A call with no `model` runs on its subagent's definition. When the type is not a built-in and no
+ * definition can be found, its model cannot be read, so ask (the Workflow guard does the same). No
+ * `subagent_type` is the general-purpose default and passes.
+ */
+function unknownAgentVerdict(call: AgentCall, cwd: string | undefined): Verdict | null {
+  const type: unknown = call.subagent_type;
+  if (type === undefined || type === null) return null;
+  const definition = typeof type === 'string' ? readAgentDefinition(type, cwd) : { found: false, model: null };
+  if (definition.found) return null;
+  if (typeof type === 'string' && BUILTIN_AGENT_TYPES.has(type)) return null;
+  const label = typeof type === 'string' ? JSON.stringify(type) : `a non-string value (${typeof type})`;
+  return {
+    decision: 'ask',
+    reason:
+      `[jev] The subagent type ${label} is not a built-in agent and no definition for it could be found, so the model it will run on cannot be checked against the session ceiling. ` +
+      `Looked in ${describeAgentLookup(cwd)}. Approve only if that agent is trusted to run on the session model or a cheaper one, or deny and re-run with an explicit model.`,
+    audit: { kind: 'unknown-agent', subagent_type: typeof type === 'string' ? type : null }
+  };
+}
+
+/**
+ * The `model:` from a subagent's definition (project `.claude/agents` from the cwd up to the project
+ * root, then `~/.claude/agents`, then installed plugins), or null. See agent-definitions.ts.
  */
 export function agentDefinitionModel(subagentType: string | undefined, cwd: string | undefined): string | null {
   return readAgentDefinition(subagentType, cwd).model;
@@ -135,13 +159,15 @@ export function evaluateClaude(input: any): Verdict | null {
   }
   const call = raw as AgentCall;
   const session = resolveSessionModel(input);
-  const verdict = decideClaudeAgentCall(
-    call,
-    session.model,
-    call.model === undefined ? agentDefinitionModel(call.subagent_type, input.cwd) : null,
-    session.source
-  );
-  return verdict ? { ...verdict, audit: { ...verdict.audit, tool_name: input.tool_name, session_id: input.session_id } } : null;
+  const facts = { tool_name: input.tool_name, session_id: input.session_id };
+  let definitionModel: string | null = null;
+  if (call.model === undefined) {
+    const unknown = unknownAgentVerdict(call, input.cwd);
+    if (unknown) return { ...unknown, audit: { ...unknown.audit, ...facts } };
+    definitionModel = agentDefinitionModel(call.subagent_type, input.cwd);
+  }
+  const verdict = decideClaudeAgentCall(call, session.model, definitionModel, session.source);
+  return verdict ? { ...verdict, audit: { ...verdict.audit, ...facts } } : null;
 }
 
 /** Antigravity PreToolUse input -> verdict. A malformed subagent list fails closed (ask). */
