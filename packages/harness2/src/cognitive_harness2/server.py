@@ -146,8 +146,10 @@ def build_server(engine: Engine | None = None, s: cfg.Settings | None = None) ->
         allow_worktree_diff: bool = False,
     ) -> dict:
         async def go():
-            return eng.probe(run_id=run_id, command=command, timeout_s=timeout_s,
-                             allow_worktree_diff=allow_worktree_diff)
+            # Blocking (an sbx run is about 10 s a candidate, up to 8 candidates): off the event loop, so that
+            # harness2_status, harness2_trigger and the transport keepalive keep being served meanwhile.
+            return await asyncio.to_thread(eng.probe, run_id=run_id, command=command, timeout_s=timeout_s,
+                                           allow_worktree_diff=allow_worktree_diff)
         return await guard(go)()
 
     @server.tool(name="harness2_compose", description="Contrast probe outcomes without labels and propose a "

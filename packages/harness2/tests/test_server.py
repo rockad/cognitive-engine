@@ -107,3 +107,32 @@ async def test_status_rejects_unknown_arguments(client):
     async with client as c:
         with pytest.raises(ToolError):
             await c.call_tool("harness2_status", {"check_quotas": True})
+
+
+# ── harness2_probe must not block the MCP event loop ──────────────────────────────────
+
+async def test_probe_runs_off_the_event_loop_thread(tmp_path, monkeypatch):
+    """Engine.probe is blocking (an sbx run is about 10 s a candidate): it runs in a worker thread, so
+    harness2_status, harness2_trigger and the transport keepalive are not stalled while it does."""
+    import threading
+
+    from cognitive_harness2.engine import Candidate, Run
+    from cognitive_harness2.sandbox import SandboxResult
+
+    loop_thread = threading.get_ident()
+    seen: list[int] = []
+
+    class Runner:
+        def run(self, spec):
+            seen.append(threading.get_ident())
+            return SandboxResult(0, "", "")
+
+    async def q():
+        return QuotaVerdict(True, "ok")
+    s = settings.from_env({settings.ENV_EXPERIENCE_ROOT: str(tmp_path)})
+    eng = Engine(generator=None, sandbox_factory=Runner, store=ExperienceStore(tmp_path), quota_check=q,
+                 base_url=settings.DEFAULT_BASE_URL, model=None)
+    eng._remember(Run("r1", "t", [Candidate("c1", "prompt", "a", "b"), Candidate("c2", "prompt", "a", "c")]))
+    out = await call(Client(build_server(eng, s)), "harness2_probe", {"run_id": "r1", "command": ["true"]})
+    assert len(out["results"]) == 2
+    assert seen and loop_thread not in seen
