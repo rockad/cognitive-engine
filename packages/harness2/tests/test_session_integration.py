@@ -23,7 +23,8 @@ from pathlib import Path
 
 import pytest
 
-from cognitive_harness2 import channels, sandbox, session_runner as sr, upstream_egress
+import h2_isolation as iso
+from cognitive_harness2 import channels, run_scope, sandbox, session_runner as sr, upstream_egress
 from cognitive_harness2.image import ImageRef
 from cognitive_harness2.session_runner import (Credential, ProposerSessionRunner, SessionLimits, SessionRefused,
                                                SessionSpec)
@@ -46,14 +47,13 @@ def docker(verified, *args, timeout=60) -> subprocess.CompletedProcess:
 
 
 def session_leftovers(verified) -> list[str]:
-    out = docker(verified, "ps", "-a", "-q", "--filter", f"label={sr.LABEL}").stdout.split()
-    out += docker(verified, "network", "ls", "-q", "--filter", f"label={sr.LABEL}").stdout.split()
-    return out
+    """Containers and networks of THIS test process (its run id), never of a concurrent one."""
+    return sorted(iso.run_resources(verified))
 
 
 def runtime_dirs() -> list[str]:
-    base = sr._runtime_base_dir()
-    return sorted(n for n in os.listdir(base) if n.startswith(("h2s-", "h2bridge-")))
+    """Session and bridge directories of THIS test process."""
+    return iso.run_runtime_dirs()
 
 
 def kv(text: str) -> dict[str, str]:
@@ -165,9 +165,11 @@ class Echo:
 
 @pytest.fixture(autouse=True)
 def nothing_left_behind(verified):
-    before = (set(session_leftovers(verified)), runtime_dirs())
+    """Nothing of THIS run (its id: label and directory names) outlives the test. Resources of another test process or a
+    real sweep on the same daemon are not looked at, so concurrent runs cannot fail each other."""
+    before = iso.snapshot(verified)
     yield
-    assert (set(session_leftovers(verified)), runtime_dirs()) == before
+    iso.assert_nothing_left(verified, before)
 
 
 # ── the big probe: one hosted session, many assertions ───────────────────────────
@@ -590,8 +592,9 @@ def test_a_wall_clock_above_the_channel_cap_and_a_foreign_executable_are_refused
 def test_reap_all_removes_only_labelled_leftovers(verified, proposer_image, egress_world):
     r = hosted_runner(verified, proposer_image, egress_world)
     name = f"h2s-{secrets.token_hex(4)}-orphan"
-    docker(verified, "network", "create", "--internal", "--label", f"{sr.LABEL}=orphan", name)
-    docker(verified, "create", "--name", f"{name}-c", "--label", f"{sr.LABEL}=orphan", "--pull", "never", proposer_image.id, "true")
+    own = ["--label", f"{run_scope.LABEL}={iso.run_id()}"]        # reap_all of a scoped process only reaps its own run
+    docker(verified, "network", "create", "--internal", "--label", f"{sr.LABEL}=orphan", *own, name)
+    docker(verified, "create", "--name", f"{name}-c", "--label", f"{sr.LABEL}=orphan", *own, "--pull", "never", proposer_image.id, "true")
     removed = r.reap_all()
     assert any(x.startswith("container") for x in removed) and any(x.startswith("network") for x in removed)
     assert session_leftovers(verified) == []
@@ -688,3 +691,17 @@ def test_the_local_model_endpoint_is_reached_through_the_proxy_and_the_hosts_oth
         assert model.hits == 1 and other.hits == 0
         own = kv(r.run(spec(ws, "selfserve")).stdout)
         assert own["selfserve[127.0.0.1]"] == "200 SELF-SERVER-OK"                       # a local-channel CLI can still serve itself
+
+
+def test_reap_all_of_a_scoped_process_leaves_another_runs_labelled_leftovers_alone(verified, proposer_image, egress_world):
+    r = hosted_runner(verified, proposer_image, egress_world)
+    name = f"h2s-{secrets.token_hex(4)}-foreign"
+    other = ["--label", f"{run_scope.LABEL}=ffffffff"]
+    assert docker(verified, "create", "--name", name, "--label", f"{sr.LABEL}=other", *other, "--pull", "never", proposer_image.id,
+                  "true").returncode == 0
+    try:
+        removed = r.reap_all()
+        assert not any(name in x for x in removed)
+        assert name in docker(verified, "ps", "-a", "--format", "{{.Names}}").stdout.split()      # still there: not ours to reap
+    finally:
+        docker(verified, "rm", "-f", name)

@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import h2_isolation as iso
 import pytest
 from harness2.substrate.opencode import OPENCODE_SURFACE
 
@@ -56,17 +57,18 @@ class _SecretsRecorder:
 
 @pytest.fixture(autouse=True)
 def nothing_left_behind(verified, monkeypatch):
-    """Nothing of THIS test's sessions remains. (The daemon is shared with other agents' tests, so the check is
-    scoped to the run ids this test's sessions were given, not to every labelled container.)"""
+    """Nothing of THIS test's sessions remains: by session id, and by this process's run id (containers, networks and runtime
+    directories), never by looking at the whole daemon, which other test processes share."""
     ids: list[str] = []
     monkeypatch.setattr(sr, "secrets", _SecretsRecorder(ids))
+    before = iso.snapshot(verified)
     yield
     monkeypatch.undo()
     for rid in ids:
         mine = docker(verified, "ps", "-a", "-q", "--filter", f"label={sr.LABEL}={rid}").stdout.split()
         mine += docker(verified, "network", "ls", "-q", "--filter", f"label={sr.LABEL}={rid}").stdout.split()
         assert mine == [], f"session {rid} left {mine}"
-        assert not [n for n in os.listdir(sr._runtime_base_dir()) if rid in n]
+    iso.assert_nothing_left(verified, before)
 
 
 @pytest.fixture(scope="module")

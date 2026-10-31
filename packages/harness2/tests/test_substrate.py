@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+import h2_isolation as iso
 from cognitive_harness2 import substrate as sub
 from cognitive_harness2.invariants import InvariantViolation
 from cognitive_harness2.quota import QuotaVerdict
@@ -457,12 +458,8 @@ def test_the_openrouter_quota_helper_without_a_key_is_a_refusal():
 
 # ── the real daemon (never skipped) ───────────────────────────────────────────────
 
-@pytest.mark.requires_rootless_docker
-def test_preflight_against_the_real_rootless_daemon_asks_only_pinned_read_only_questions(opencode, monkeypatch):
-    def containers() -> list[str]:
-        return subprocess.run(["docker", "ps", "-a", "-q"], capture_output=True, text=True, timeout=30).stdout.split()
-
-    before = containers()
+def _preflight_on_the_real_daemon(opencode, monkeypatch) -> None:
+    """Run `preflight()` against the real daemon and prove from its argv that it asked only pinned, read-only questions."""
     seen: list[list[str]] = []
     real_run = subprocess.run
 
@@ -481,4 +478,30 @@ def test_preflight_against_the_real_rootless_daemon_asks_only_pinned_read_only_q
             continue  # resolving the endpoint when DOCKER_HOST is unset; read-only and not yet pinned
         assert argv[1] == "-H" and argv[2].startswith("unix://"), argv
         assert argv[3:5] in (["info", "--format"], ["image", "inspect"]), argv
-    assert containers() == before
+
+
+@pytest.mark.requires_rootless_docker
+def test_preflight_against_the_real_rootless_daemon_asks_only_pinned_read_only_questions(opencode, monkeypatch, verified):
+    """Per run: the argv check above is what proves preflight creates nothing; this run's containers are also unchanged."""
+    before = iso.run_containers(verified)
+    _preflight_on_the_real_daemon(opencode, monkeypatch)
+    assert iso.run_containers(verified) == before
+
+
+@pytest.mark.requires_rootless_docker
+def test_preflight_leaves_the_whole_daemon_unchanged_unless_another_run_is_active(opencode, monkeypatch, verified):
+    """The ONE daemon-wide check, kept as a sanity net: every container on the daemon, not only this run's. It cannot be
+    trusted while another harness2 run (a second test process, a real stage-1 sweep, a stale leftover) shares the daemon, so
+    then it skips and says why; otherwise a changed container list fails."""
+    def containers() -> set[str]:
+        return set(iso.docker(verified, "ps", "-a", "-q").stdout.split())
+
+    foreign_before = iso.foreign_harness2_resources(verified)
+    before = containers()
+    _preflight_on_the_real_daemon(opencode, monkeypatch)
+    after = containers()
+    if after != before:
+        foreign = foreign_before or iso.foreign_harness2_resources(verified)
+        if foreign:
+            pytest.skip(f"another harness2 run shares the daemon, so a daemon-wide comparison proves nothing: {foreign}")
+    assert after == before
