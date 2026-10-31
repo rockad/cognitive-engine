@@ -6,6 +6,7 @@ session can say to the outside is said to this process, which applies a strict, 
 
     HTTP CONNECT host:port                     tunnelled, byte for byte, to the allow-listed host:port
     GET http://host[:port]/path ...            rewritten to origin form, `Connection: close`, one request
+    a request to a UNIX ROUTE                  parsed per request, allow-listed (method, path) only, keep-alive
     anything else (origin-form, userinfo, ...) refused
 
 Policy, all of it enforced before a single byte reaches an upstream:
@@ -20,11 +21,20 @@ Policy, all of it enforced before a single byte reaches an upstream:
     CGNAT, unspecified or an IPv4 address embedded in an IPv6 form of those, the request is refused even though
     the name is allow-listed (DNS rebinding and a hostile resolver cannot redirect an allowed name inward);
   * a route may point an allow-listed host:port at a UNIX SOCKET instead of the network (the host bridge to
-    a local ollama); and a `listener` may relay a TCP port of this proxy to such a socket verbatim. Neither
-    resolves anything;
+    a local ollama); and a `listener` may serve a TCP port of this proxy to such a socket. Neither resolves
+    anything. A unix route is NOT a tunnel: the session is untrusted and the socket reaches the whole HTTP
+    API of the model server (ollama's DELETE /api/delete, POST /api/pull, /api/create, ...), so the proxy
+    speaks HTTP on it. CONNECT is refused; plain-HTTP requests (absolute-URI, or origin-form with a `Host`
+    that names the route) are parsed ONE BY ONE on the keep-alive stream, and only the (method, exact path)
+    pairs in the route's `allow` list are forwarded (see `OLLAMA_ROUTE_ALLOW`); everything else is a logged
+    403 `unix-route-path-denied` and the connection is closed. A forwarded request is rebuilt from parsed
+    parts (the allow-listed literal path, a pinned `Host`, `Content-Length` framing only), its body is read
+    and bounded first, and the response is relayed as it arrives (SSE streams unchanged) while its framing is
+    followed so the next request on the connection can be told apart;
   * caps: request line 8 KiB, header block 32 KiB, 100 headers, a total deadline for the request head
     (slowloris), concurrent connections, new connections per second, idle time, lifetime and bytes per
-    connection.
+    connection; on a unix route also request body size, response body size, requests per proxy (= per
+    session) and pipelined requests.
 
 The access log has the decision, the normalised host and the port, and a rule code. Never a header, a body,
 a path, a query or a token. This module is stdlib-only: it ships inside the image and also runs as a plain
@@ -64,6 +74,27 @@ _LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,61}[a-z0-9])?$")
 _NUMERIC_LABEL = re.compile(r"^(?:0x[0-9a-f]*|[0-9]+)$")
 _HOP_BY_HOP = frozenset({"connection", "proxy-connection", "keep-alive", "proxy-authorization",
                          "proxy-authenticate", "te", "trailer", "upgrade"})
+_CTL = re.compile(rb"[\x00-\x08\x0a-\x1f\x7f]")      # a control character other than HTAB has no place in a field value
+_DIGITS = re.compile(r"^[0-9]{1,12}$")
+_CHUNK_SIZE = re.compile(rb"^[0-9A-Fa-f]{1,8}$")
+_STATUS_LINE = re.compile(r"^HTTP/1\.[01] ([1-5][0-9]{2})(?: [^\r\n]*)?$")
+_ROUTE_PATH = re.compile(r"^/[A-Za-z0-9._~/-]{0,199}$")
+_ROUTE_METHODS = frozenset({"GET", "POST"})
+# Header names a request to a unix route may not carry at all: each changes how a message is framed or answered,
+# and the proxy follows exactly one framing (Content-Length or chunked, no trailers, no 100-continue, no upgrade).
+_ROUTE_REFUSED_HEADERS = frozenset({"expect", "upgrade", "te", "trailer"})
+
+# What a contained session may say to the host's ollama through a unix route, and nothing else: the OpenAI-compatible
+# surface its CLI uses (chat), the completion twin, the model list, and the one native read-only route opencode
+# calls first (`GET /api/tags`, measured with the real opencode v2.0.25, see the README). Everything else of ollama's
+# API (/api/delete, /api/pull, /api/push, /api/create, /api/copy, /api/generate, /api/chat, /api/show, /api/ps,
+# /api/embed, /v1/embeddings, /v1/models/{id}, ...) is absent: an absent pair is a 403.
+OLLAMA_ROUTE_ALLOW: tuple[tuple[str, str], ...] = (
+    ("GET", "/api/tags"),
+    ("GET", "/v1/models"),
+    ("POST", "/v1/chat/completions"),
+    ("POST", "/v1/completions"),
+)
 
 
 class Refused(ValueError):
@@ -87,6 +118,12 @@ class Limits:
     max_connections: int = 64
     rate_per_s: float = 20.0
     burst: int = 40
+    # unix routes only (the host bridge to the local model): one proxy serves one session, so the request cap is per session
+    route_max_requests: int = 2000          # allowed requests over all connections of this proxy's lifetime
+    route_max_request_bytes: int = 4 * 1024 * 1024        # one request body (a chat history); the CLI sends < 100 KB
+    route_max_response_bytes: int = 64 * 1024 * 1024      # one response body (a stream), on the wire
+    route_max_pipelined: int = 2            # requests a client may have queued behind the one in flight
+    body_timeout_s: float = 60.0            # the WHOLE request body, once its head is read
 
 
 # ── host and address normalisation (pure) ─────────────────────────────────────────
@@ -223,11 +260,30 @@ class Decision:
     unix: str | None = None
 
 
+def _route_allow(raw: object) -> frozenset[tuple[str, str]]:
+    """A unix route's allow list: a non-empty list of [method, exact path]. No wildcard, no query, no dot segment."""
+    if not (isinstance(raw, (list, tuple)) and raw):
+        raise ValueError("a unix route's allow must be a non-empty list of [method, path]")
+    out: set[tuple[str, str]] = set()
+    for item in raw:
+        if not (isinstance(item, (list, tuple)) and len(item) == 2 and all(isinstance(x, str) for x in item)):
+            raise ValueError(f"unix route allow entry {item!r} must be [method, path]")
+        method, path = item
+        if method not in _ROUTE_METHODS:
+            raise ValueError(f"unix route allow entry {item!r}: the method must be one of {sorted(_ROUTE_METHODS)}")
+        if not _ROUTE_PATH.fullmatch(path) or "//" in path or any(seg in (".", "..") for seg in path.split("/")):
+            raise ValueError(f"unix route allow entry {item!r}: the path must be an exact, normalised path (no wildcard, "
+                             "query, percent-encoding, double slash or dot segment)")
+        out.add((method, path))
+    return frozenset(out)
+
+
 @dataclass(frozen=True)
 class Policy:
     allow: frozenset[tuple[str, int]] = frozenset()
     unix_routes: Mapping[tuple[str, int], str] = field(default_factory=dict)
     allow_cidrs: tuple = ()
+    route_allow: Mapping[tuple[str, int], frozenset[tuple[str, str]]] = field(default_factory=dict)   # per unix route: (method, path)
 
     @staticmethod
     def build(allow: Sequence[Sequence], unix_routes: Sequence[Mapping] = (),
@@ -245,21 +301,28 @@ class Policy:
             except Refused as e:
                 raise ValueError(f"allow entry {item!r} is unusable ({e.code})") from None
         routes: dict[tuple[str, int], str] = {}
+        route_allow: dict[tuple[str, int], frozenset[tuple[str, str]]] = {}
         for item in unix_routes:
-            if not isinstance(item, Mapping) or set(item) != {"host", "port", "unix"}:
-                raise ValueError(f"unix route {item!r} must have exactly host, port and unix")
+            if not isinstance(item, Mapping) or set(item) != {"host", "port", "unix", "allow"}:
+                raise ValueError(f"unix route {item!r} must have exactly host, port, unix and allow")
             path = item["unix"]
             if not (isinstance(path, str) and path.startswith("/") and "\0" not in path):
                 raise ValueError(f"unix route path {path!r} must be an absolute path")
             try:
-                routes[(normalize_host(item["host"]), parse_port(item["port"]))] = path
+                key = (normalize_host(item["host"]), parse_port(item["port"]))
             except Refused as e:
                 raise ValueError(f"unix route {dict(item)!r} is unusable ({e.code})") from None
+            routes[key] = path
+            route_allow[key] = _route_allow(item["allow"])
+        for key, path in routes.items():
+            if any(other != key and p == path and route_allow[other] != route_allow[key] for other, p in routes.items()):
+                # one socket, one set of rights: a listener (a port, no name) serves every name of its socket alike
+                raise ValueError(f"unix routes to {path!r} must all carry the same allow list")
         try:
             cidrs = tuple(ipaddress.ip_network(c, strict=True) for c in test_allow_cidrs)
         except ValueError as e:
             raise ValueError(f"test_allow_cidrs: {e}") from None
-        return Policy(frozenset(entries), dict(routes), cidrs)
+        return Policy(frozenset(entries), dict(routes), cidrs, dict(route_allow))
 
     def decide(self, host_raw: str, port: int | str) -> Decision:
         """Name-level decision. Resolution and the address rule come after this, in `connect`."""
@@ -343,9 +406,18 @@ def parse_head(head: bytes, limits: Limits = Limits()) -> Request:
         raise Refused("bad-request", 400)
     if _bad_chars(target) or "\\" in target:
         raise Refused("bad-request", 400)
+    headers = _parse_fields(rest if sep else None, limits)
+    lowered = [n.lower() for n, _ in headers]
+    if lowered.count("content-length") > 1 or ("content-length" in lowered and "transfer-encoding" in lowered):
+        raise Refused("ambiguous-body-framing", 400)
+    return Request(method, target, version, headers)
+
+
+def _parse_fields(block: bytes | None, limits: Limits) -> tuple[tuple[str, str], ...]:
+    """The header fields of a head (request or response), strictly: no obs-fold, no bare CR or LF, no NUL, token names."""
     headers: list[tuple[str, str]] = []
-    if sep:
-        for raw in rest.split(b"\r\n"):
+    if block is not None:
+        for raw in block.split(b"\r\n"):
             if len(headers) >= limits.header_count:
                 raise Refused("too-many-headers", 431)
             if not raw or raw[:1] in (b" ", b"\t") or b"\n" in raw or b"\r" in raw or b"\0" in raw:
@@ -353,14 +425,14 @@ def parse_head(head: bytes, limits: Limits = Limits()) -> Request:
             name, colon, value = raw.partition(b":")
             if not colon or not _FIELD.fullmatch(name):
                 raise Refused("bad-request", 400)
+            value = value.strip(b" \t")                      # optional whitespace is SP and HTAB, not Python's wider set
+            if _CTL.search(value):
+                raise Refused("bad-request", 400)
             try:
-                headers.append((name.decode("ascii"), value.strip().decode("latin-1")))
+                headers.append((name.decode("ascii"), value.decode("latin-1")))
             except UnicodeDecodeError:
                 raise Refused("bad-request", 400) from None
-    lowered = [n.lower() for n, _ in headers]
-    if lowered.count("content-length") > 1 or ("content-length" in lowered and "transfer-encoding" in lowered):
-        raise Refused("ambiguous-body-framing", 400)
-    return Request(method, target, version, tuple(headers))
+    return tuple(headers)
 
 
 def split_absolute_uri(target: str) -> tuple[str, int, str]:
@@ -391,6 +463,183 @@ def rewrite_request(req: Request, host: str, port: int, path: str) -> bytes:
         lines.append(f"{name}: {value}")
     lines.append("Connection: close")
     return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
+
+
+# ── requests and responses on a unix route (pure) ─────────────────────────────────
+
+def routed_target(req: Request, default: tuple[str, int] | None) -> tuple[str, int, str]:
+    """(host, port, path-and-query as written) of a plain-HTTP request to a unix route, or `Refused`.
+
+    An absolute-URI names its own target, and a `Host` header, when there is one, must say the same (a request that
+    names one thing in the URI and another in `Host` is how a proxy and its upstream are made to disagree). An
+    origin-form request is placed by its `Host` header, which is required in HTTP/1.1; HTTP/1.0 may omit it and then
+    means `default` (a listener's own name), or nothing (the proxy port itself: there is nothing to default to)."""
+    hosts = [v for n, v in req.headers if n.lower() == "host"]
+    if len(hosts) > 1:
+        raise Refused("duplicate-host", 400)
+    named = split_authority(hosts[0], default_port=80) if hosts else None
+    if req.target.startswith("/"):
+        if named is None:
+            if req.version == "HTTP/1.1":
+                raise Refused("missing-host", 400)
+            if default is None:
+                raise Refused("not-a-proxy-request", 400)
+            named = default
+        return named[0], named[1], req.target
+    host, port, path = split_absolute_uri(req.target)
+    if named is not None and named != (host, port):
+        raise Refused("unix-route-host-mismatch", 403)
+    return host, port, path
+
+
+def _tokens(req: Request, name: str) -> list[str]:
+    return [t.strip().lower() for n, v in req.headers if n.lower() == name for t in v.split(",")]
+
+
+def request_framing(req: Request) -> tuple[str, int, bool]:
+    """(`none` | `length` | `chunked`, the Content-Length, whether the client wants the connection closed) of a request
+    to a unix route. Anything that makes the framing ambiguous, or asks for more than one plain request/response
+    (Expect, Upgrade, TE, Trailer, a Connection token other than keep-alive/close), is refused; the proxy follows exactly
+    one framing and re-emits it itself."""
+    lowered = [n.lower() for n, _ in req.headers]
+    if _ROUTE_REFUSED_HEADERS & set(lowered):
+        raise Refused("unix-route-unsupported-header", 400)
+    tokens = _tokens(req, "connection")
+    if any(t not in ("keep-alive", "close") for t in tokens):
+        raise Refused("unix-route-bad-connection", 400)
+    close = "close" in tokens or req.version == "HTTP/1.0"
+    te = [v for n, v in req.headers if n.lower() == "transfer-encoding"]
+    cl = [v for n, v in req.headers if n.lower() == "content-length"]
+    if te:
+        if len(te) != 1 or te[0].lower() != "chunked" or req.version != "HTTP/1.1" or cl:
+            raise Refused("unix-route-bad-framing", 400)
+        kind, length = "chunked", 0
+    elif cl:
+        if len(cl) != 1 or not _DIGITS.fullmatch(cl[0]):
+            raise Refused("unix-route-bad-framing", 400)
+        kind, length = ("length", int(cl[0])) if int(cl[0]) else ("none", 0)
+    else:
+        kind, length = "none", 0
+    if req.method == "GET" and kind != "none":
+        raise Refused("unix-route-bad-framing", 400)
+    return kind, length, close
+
+
+def rewrite_routed(req: Request, host: str, port: int, path: str, body_len: int | None, close: bool) -> bytes:
+    """The request sent over a unix route, built from parsed parts: the (allow-listed, literal) path, a `Host` pinned
+    to the route's own name, every other header but the hop-by-hop and framing ones, and `Content-Length` framing of
+    the body the proxy already read (a chunked client body is re-sent as a length: upstream sees one framing only)."""
+    shown = f"[{host}]" if ":" in host else host
+    lines = [f"{req.method} {path} {req.version}", f"Host: {shown}:{port}"]
+    for name, value in req.headers:
+        low = name.lower()
+        if low == "host" or low in _HOP_BY_HOP or low in ("content-length", "transfer-encoding"):
+            continue
+        lines.append(f"{name}: {value}")
+    if body_len is not None:
+        lines.append(f"Content-Length: {body_len}")
+    if close:
+        lines.append("Connection: close")
+    return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
+
+
+class ChunkedDecoder:
+    """Incremental, strict decoder of a chunked message body, fed as bytes arrive.
+
+    A size line is 1-8 hex digits and CRLF (no extension, no sign, no whitespace), a chunk is its data and CRLF, the
+    last chunk is `0` CRLF and a bare CRLF: a trailer is refused. `feed` returns how many of the given bytes belong to the
+    body (fewer than given only once `done`, the rest is whatever follows). `keep` collects the decoded data."""
+
+    def __init__(self, *, limit: int, keep: bool):
+        self.limit, self.keep = limit, keep
+        self.data = bytearray()
+        self.size = 0
+        self.done = False
+        self._state, self._line, self._left = "size", bytearray(), 0
+
+    def feed(self, data: bytes) -> int:
+        i, n = 0, len(data)
+        while i < n and not self.done:
+            if self._state == "data":
+                take = min(self._left, n - i)
+                if self.keep:
+                    self.data += data[i:i + take]
+                self._left -= take
+                i += take
+                if not self._left:
+                    self._state = "crlf"
+                continue
+            j = data.find(b"\n", i)
+            end = n if j < 0 else j + 1
+            self._line += data[i:end]
+            i = end
+            if len(self._line) > 12:
+                raise Refused("bad-chunking", 400)
+            if j < 0:
+                continue
+            line = bytes(self._line)
+            self._line.clear()
+            if not line.endswith(b"\r\n") or b"\r" in line[:-2]:
+                raise Refused("bad-chunking", 400)
+            line = line[:-2]
+            if self._state == "size":
+                if not _CHUNK_SIZE.fullmatch(line):
+                    raise Refused("bad-chunking", 400)
+                size = int(line, 16)
+                if self.size + size > self.limit:
+                    raise Refused("unix-route-body-too-large", 413)
+                self.size += size
+                self._state, self._left = ("data", size) if size else ("last", 0)
+            elif line:                                  # after a chunk's data, or after the last chunk: a bare CRLF only
+                raise Refused("bad-chunking", 400)
+            elif self._state == "crlf":
+                self._state = "size"
+            else:
+                self.done = True
+        return i
+
+
+def parse_response_head(head: bytes, limits: Limits = Limits()) -> tuple[int, tuple[tuple[str, str], ...]]:
+    """(status, headers) of the head a unix route's upstream answered with, strictly, or `Refused(..., 502)`."""
+    first, sep, rest = head.partition(b"\r\n")
+    try:
+        m = _STATUS_LINE.fullmatch(first.decode("ascii"))
+        if not m or len(first) > limits.request_line or b"\0" in first:
+            raise Refused("unix-route-bad-response", 502)
+        return int(m.group(1)), _parse_fields(rest if sep else None, limits)
+    except (UnicodeDecodeError, Refused):
+        raise Refused("unix-route-bad-response", 502) from None
+
+
+def response_framing(status: int, headers: Sequence[tuple[str, str]]) -> tuple[str, int, bool]:
+    """(`none` | `length` | `chunked` | `close`, the Content-Length, whether the upstream will close afterwards)."""
+    if status < 200:
+        raise Refused("unix-route-bad-response", 502)        # 100-continue and 101 were never asked for
+    te = [v for n, v in headers if n.lower() == "transfer-encoding"]
+    cl = [v for n, v in headers if n.lower() == "content-length"]
+    tokens = [t.strip().lower() for n, v in headers if n.lower() == "connection" for t in v.split(",")]
+    closes = "close" in tokens
+    if (te and cl) or len(te) > 1 or len(cl) > 1:
+        raise Refused("unix-route-bad-response", 502)
+    if status in (204, 304):
+        return "none", 0, closes
+    if te:
+        if te[0].lower() != "chunked":
+            raise Refused("unix-route-bad-response", 502)
+        return "chunked", 0, closes
+    if cl:
+        if not _DIGITS.fullmatch(cl[0]):
+            raise Refused("unix-route-bad-response", 502)
+        return ("length", int(cl[0]), closes) if int(cl[0]) else ("none", 0, closes)
+    return "close", 0, True
+
+
+class _Abort(Exception):
+    """A response that cannot be completed once its head is already with the client: the connection just ends."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
 
 
 class TokenBucket:
@@ -424,6 +673,7 @@ class Proxy:
         self.log = log or (lambda line: print(line, file=sys.stderr, flush=True))
         self.bucket = TokenBucket(limits.rate_per_s, limits.burst, clock)
         self.active = 0
+        self.route_requests = 0          # requests forwarded over unix routes: this proxy serves one session
 
     def _log(self, decision: str, host: str, port: int, reason: str) -> None:
         self.log(f"ACCESS decision={decision} host={host} port={port} reason={reason}")
@@ -465,10 +715,10 @@ class Proxy:
         except (OSError, TimeoutError):
             pass
 
-    async def _read_head(self, reader: asyncio.StreamReader) -> tuple[bytes, bytes]:
-        """(head without the blank line, bytes already read past it). Bounded in size AND in total time."""
+    async def _read_head(self, reader: asyncio.StreamReader, buf: bytes = b"") -> tuple[bytes, bytes]:
+        """(head without the blank line, bytes already read past it). Bounded in size AND in total time.
+        `buf` is what was already read for this head (the bytes a previous request on the connection left over)."""
         lim = self.limits
-        buf = b""
         try:
             async with asyncio.timeout(lim.head_timeout_s):
                 while True:
@@ -550,18 +800,31 @@ class Proxy:
                 await self._linger(reader, writer)
                 return
             host, port = "<invalid>", 0
+            routed = None
             try:
                 head, rest = await self._read_head(reader)
                 req = parse_head(head, self.limits)
                 if req.method == "CONNECT":
                     host, port = split_authority(req.target)
                     path = None
+                elif req.target.startswith("/"):
+                    # origin-form: only meaningful when its Host names a unix route (a client that talks to the proxy
+                    # port as if it were the model server); for any other name the request is not a proxy request
+                    h, p, pth = routed_target(req, None)
+                    if self.policy.decide(h, p).unix is None:
+                        raise Refused("not-a-proxy-request", 400)
+                    host, port, path = h, p, pth
                 else:
                     host, port, path = split_absolute_uri(req.target)
                 decision = self.policy.decide(host, port)
                 if not decision.allowed:
                     raise Refused(decision.reason, 403)
-                ur, upstream_writer = await self.connect_target(decision.host, decision.port, decision.unix)
+                if decision.unix is not None:
+                    if path is None:
+                        raise Refused("unix-route-connect-denied", 403)     # a tunnel would carry any request
+                    routed = decision.unix
+                else:
+                    ur, upstream_writer = await self.connect_target(decision.host, decision.port, decision.unix)
             except Refused as e:
                 self._log("deny", host, port, e.code)
                 await self._respond(writer, e.status, e.code)
@@ -571,6 +834,9 @@ class Proxy:
                 self._log("deny", host, port, "upstream-unreachable")
                 await self._respond(writer, 502, "upstream-unreachable")
                 await self._linger(reader, writer)
+                return
+            if routed is not None:
+                await self.serve_routed(reader, writer, unix=routed, first=(req, rest), label=(host, port))
                 return
             self._log("allow", host, port, decision.reason)
             if path is None:
@@ -590,27 +856,206 @@ class Proxy:
                 if w is not None:
                     w.close()
 
+    # ── a unix route: HTTP, request by request ────────────────────────────────────
+
+    async def _read_body(self, reader: asyncio.StreamReader, buf: bytes, kind: str, length: int) -> tuple[bytes, bytes]:
+        """(the whole request body, the bytes already read past it). Bounded in size AND in total time; nothing of a
+        request reaches the upstream until its body is complete and well formed."""
+        lim = self.limits
+        try:
+            async with asyncio.timeout(lim.body_timeout_s):
+                if kind == "none":
+                    return b"", buf
+                if kind == "length":
+                    while len(buf) < length:
+                        chunk = await reader.read(65536)
+                        if not chunk:
+                            raise Refused("incomplete-request", 400)
+                        buf += chunk
+                    return buf[:length], buf[length:]
+                dec = ChunkedDecoder(limit=lim.route_max_request_bytes, keep=True)
+                data = buf
+                while True:
+                    used = dec.feed(data)
+                    if dec.done:
+                        return bytes(dec.data), data[used:]
+                    data = await reader.read(65536)
+                    if not data:
+                        raise Refused("incomplete-request", 400)
+        except TimeoutError:
+            raise Refused("body-timeout", 408) from None
+
+    async def _read_response_head(self, ur: asyncio.StreamReader) -> tuple[bytes, bytes]:
+        lim = self.limits
+        buf = b""
+        while True:
+            end = buf.find(b"\r\n\r\n")
+            if end >= 0:
+                return buf[:end], buf[end + 4:]
+            if len(buf) > lim.header_bytes:
+                raise Refused("unix-route-bad-response", 502)
+            try:
+                chunk = await asyncio.wait_for(ur.read(65536), lim.idle_timeout_s)   # a local model may be slow to a first byte
+            except asyncio.TimeoutError:
+                raise Refused("upstream-timeout", 504) from None
+            except OSError:
+                raise Refused("upstream-closed", 502) from None
+            if not chunk:
+                raise Refused("upstream-closed", 502)
+            buf += chunk
+
+    async def _relay_response(self, ur: asyncio.StreamReader, writer: asyncio.StreamWriter, moved: list[int]) -> bool:
+        """Relay ONE response to the client as it arrives, unchanged, following its framing so the end of it is known.
+        True when the upstream connection may carry another request. Refused before the head is with the client
+        (a clean 502 is still possible), `_Abort` after."""
+        lim = self.limits
+        head, data = await self._read_response_head(ur)
+        status, headers = parse_response_head(head, lim)
+        kind, remaining, closes = response_framing(status, headers)
+        writer.write(head + b"\r\n\r\n")
+        await writer.drain()
+        dec = ChunkedDecoder(limit=lim.route_max_response_bytes, keep=False) if kind == "chunked" else None
+        reusable, sent = not closes, 0
+        while True:
+            if data:
+                if kind == "length":
+                    take = data[:remaining]
+                    remaining -= len(take)
+                elif kind == "chunked":
+                    try:
+                        take = data[:dec.feed(data)]
+                    except Refused:
+                        raise _Abort("unix-route-response-aborted") from None
+                elif kind == "close":
+                    take = data
+                else:
+                    take = b""
+                if len(take) < len(data):
+                    reusable = False                            # bytes nobody asked for after the end of the response
+                sent += len(take)
+                moved[0] += len(take)
+                if sent > lim.route_max_response_bytes or moved[0] > lim.max_bytes:
+                    raise _Abort("unix-route-response-too-large")
+                if take:
+                    writer.write(take)
+                    await writer.drain()
+            if kind == "none" or (kind == "length" and not remaining) or (dec is not None and dec.done):
+                return reusable
+            try:
+                data = await asyncio.wait_for(ur.read(65536), lim.idle_timeout_s)
+            except (OSError, asyncio.TimeoutError):
+                raise _Abort("unix-route-response-aborted") from None
+            if not data:
+                if kind == "close":
+                    return False
+                raise _Abort("unix-route-response-aborted")
+
+    async def serve_routed(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, *, unix: str,
+                           first: tuple[Request, bytes] | None, label: tuple[str, int],
+                           allow_line: tuple[str, int, str] | None = None, default: tuple[str, int] | None = None) -> None:
+        """Serve HTTP on a connection whose requests go to the unix socket `unix`: every request is parsed, checked
+        against the route's allow list and rebuilt; every response is relayed. `first` is a head already parsed (and
+        the bytes read past it); `label` is what a refusal is logged as until a request names a route; `allow_line`
+        replaces (host, port, reason) in the log line of an allowed request (the listener's)."""
+        lim, policy = self.limits, self.policy
+        buf = b""
+        ur: asyncio.StreamReader | None = None
+        uw: asyncio.StreamWriter | None = None
+        host, port = label
+        served = pipelined = 0
+        moved = [0]
+        polite = False
+        try:
+            try:
+                async with asyncio.timeout(lim.lifetime_s):
+                    while True:
+                        if first is None:
+                            host, port = label
+                        if first is not None:
+                            (req, buf), first = first, None
+                        else:
+                            if not buf:
+                                try:
+                                    buf = await asyncio.wait_for(reader.read(4096), lim.idle_timeout_s)
+                                except (OSError, asyncio.TimeoutError):
+                                    return
+                                if not buf:
+                                    return                       # the client is done: nothing to answer, nothing to say
+                            head, buf = await self._read_head(reader, buf)
+                            req = parse_head(head, lim)
+                        if pipelined > lim.route_max_pipelined:
+                            raise Refused("unix-route-pipeline-limit", 429)
+                        host, port, path = routed_target(req, default)
+                        decision = policy.decide(host, port)
+                        if decision.unix != unix:
+                            raise Refused("unix-route-host-mismatch", 403)
+                        if (req.method, path) not in policy.route_allow[(host, port)]:
+                            raise Refused("unix-route-path-denied", 403)
+                        if self.route_requests >= lim.route_max_requests:
+                            raise Refused("unix-route-request-limit", 429)
+                        kind, length, close = request_framing(req)
+                        if kind == "length" and length > lim.route_max_request_bytes:
+                            raise Refused("unix-route-body-too-large", 413)
+                        body, buf = await self._read_body(reader, buf, kind, length)
+                        pipelined = pipelined + 1 if buf else 0
+                        if ur is not None and ur.at_eof():
+                            uw.close()                           # the upstream hung up between requests
+                            ur = uw = None
+                        if ur is None:
+                            try:
+                                ur, uw = await self.connect_target(host, port, unix)
+                            except (OSError, asyncio.TimeoutError):
+                                raise Refused("upstream-unreachable", 502) from None
+                        self.route_requests += 1
+                        last = close or self.route_requests >= lim.route_max_requests
+                        self._log("allow", *(allow_line or (host, port, "unix-route")))
+                        data = rewrite_routed(req, host, port, path, len(body) if req.method == "POST" else None, last) + body
+                        moved[0] += len(data)
+                        uw.write(data)
+                        await uw.drain()
+                        reusable = await self._relay_response(ur, writer, moved)
+                        if not reusable:
+                            uw.close()
+                            ur = uw = None
+                        if last or not reusable:
+                            polite = True
+                            return
+            except Refused as e:
+                self._log("deny", host, port, e.code)
+                await self._respond(writer, e.status, e.code)
+                polite = True
+            except _Abort as e:
+                self._log("deny", host, port, e.code)
+            except TimeoutError:
+                self._log("deny", host, port, "unix-route-lifetime")
+        except (OSError, ConnectionError):
+            pass
+        finally:
+            if uw is not None:
+                uw.close()
+            if polite:
+                try:
+                    await self._linger(reader, writer)
+                except (OSError, ConnectionError):
+                    pass
+
     async def relay_unix(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, unix: str, label: str) -> None:
-        """A `listener`: relay this TCP connection verbatim to a unix socket. Same caps, nothing is parsed."""
+        """A `listener`: serve this TCP connection to the unix socket the same way a unix route is served (origin-form
+        or absolute-URI requests, each checked against the allow list of the route to this socket). It is the same
+        door as the route, reached without the proxy protocol, so it gets the same filter and the same caps; its
+        `Host` must be one of the names routed to this socket."""
         if self.active >= self.limits.max_connections or not self.bucket.take():
             self._log("deny", label, 0, "connection-limit")
             writer.close()
             return
         self.active += 1
-        upstream_writer = None
         try:
-            try:
-                ur, upstream_writer = await self.connect_target("", 0, unix)
-            except (OSError, asyncio.TimeoutError):
-                self._log("deny", label, 0, "upstream-unreachable")
-                return
-            self._log("allow", label, 0, "unix-listener")
-            await self._pipe(reader, writer, ur, upstream_writer)
+            names = sorted(k for k, v in self.policy.unix_routes.items() if v == unix)
+            await self.serve_routed(reader, writer, unix=unix, first=None, label=(label, 0),
+                                    allow_line=(label, 0, "unix-listener"), default=names[0] if names else None)
         finally:
             self.active -= 1
-            for w in (upstream_writer, writer):
-                if w is not None:
-                    w.close()
+            writer.close()
 
 
 # ── configuration and entry point ─────────────────────────────────────────────────
@@ -640,6 +1085,8 @@ def parse_config(raw: object) -> tuple[Policy, str, int, list[tuple[int, str]], 
             raise ValueError(f"listener {item!r} must have exactly port and unix")
         if not (isinstance(item["unix"], str) and item["unix"].startswith("/")):
             raise ValueError("listener unix path must be absolute")
+        if item["unix"] not in policy.unix_routes.values():
+            raise ValueError(f"listener {item!r}: no unix route leads to that socket, so it would have no allow list")
         try:
             listeners.append((parse_port(item["port"]), item["unix"]))
         except Refused:
