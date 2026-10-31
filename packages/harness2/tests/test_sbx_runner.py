@@ -452,3 +452,31 @@ def test_live_create_exec_rm_round_trip_leaves_nothing_behind():
             subprocess.run([path, "rm", "--force", leftover], capture_output=True)
     final = set(subprocess.run([path, "ls", "-q"], capture_output=True, text=True).stdout.split())
     assert final == before
+
+
+@pytest.mark.requires_sbx_live
+@pytest.mark.skipif(_live_ready() is not None, reason=_live_ready() or "")
+def test_live_the_sum_signed_verifier_gives_the_same_verdict_in_sbx_as_in_python():
+    """`VERIFY_SH` is written for busybox `sh` and `awk` (the Docker image); the sbx shell image is Ubuntu (dash,
+    mawk or gawk). The verifier is a consumer that `auto` now moves to sbx, so its verdict is checked there, on both
+    task sets, against the pure-Python grader."""
+    from cognitive_harness2 import sum_signed as ss
+    from cognitive_harness2 import sum_signed_hard as hd
+
+    path = shutil.which("sbx")
+    assert path
+    version = sandbox.real_sbx_probes(os.environ).version(path)
+    runner = SbxRunner(path, verified=frozenset({version}), create_timeout_s=900,
+                       environ={**os.environ, sandbox.ENV_ALLOW_HOST_SETTINGS: "1"})
+    before = set(subprocess.run([path, "ls", "-q"], capture_output=True, text=True).stdout.split())
+    try:
+        for ts, task in ((ss.EASY, "household/sum-1"), (hd.TASKSET, "household/hard-1")):
+            inst = ts.instance(task)
+            for raw in ((inst.expected_line + "\n").encode(), b"Total: 1.00\n", b"junk", None):
+                got = ss.verify_in_container(runner, task, raw, taskset=ts)
+                assert got == ss.grade_answer(raw, inst.expected_total), (ts.name, raw, got)
+    finally:
+        after = set(subprocess.run([path, "ls", "-q"], capture_output=True, text=True).stdout.split())
+        for leftover in sorted(n for n in after - before if n.startswith("harness2-")):
+            subprocess.run([path, "rm", "--force", leftover], capture_output=True)
+    assert set(subprocess.run([path, "ls", "-q"], capture_output=True, text=True).stdout.split()) == before
