@@ -8,7 +8,10 @@ from cognitive_harness2 import channels
 
 LOCAL = "http://127.0.0.1:11434/v1"
 CAPS = {"sessions": 30, "wall_s": 3600, "cost_usd": 5.0}
-WORKSPACE_ROOT = os.path.join(tempfile.gettempdir(), "h2ws-tests")   # a real, empty directory
+# A real, empty directory that is private to this process (it was a fixed /tmp/h2ws-tests that concurrent test processes
+# shared). The TemporaryDirectory object removes it when the process exits.
+_ROOT = tempfile.TemporaryDirectory(prefix="h2ws-tests-")
+WORKSPACE_ROOT = os.path.realpath(_ROOT.name)
 WORK = os.path.join(WORKSPACE_ROOT, "work")
 os.makedirs(WORK, exist_ok=True)
 
