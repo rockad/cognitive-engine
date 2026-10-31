@@ -365,7 +365,7 @@ def test_post_api_show_reaches_the_model_server_exactly_once_and_with_its_body(v
     """The one native POST that is allowed (read-only model info, allowed 2026-10-31): through the proxy in absolute-URI form
     and through the listener in origin form it arrives once, as a POST with the body the session wrote, and is logged as an
     allow. The model server's `GET` counter stays 0: nothing else came with it."""
-    body = '{"model":"gemma4:e4b"}'
+    body = '{"model":"gemma4:12b"}'          # the channel's model (profile(): ollama/gemma4:12b); the proxy refuses any other
     with HttpStub() as model:
         r = local_runner(verified, proposer_image, model)
         if via == "proxy":

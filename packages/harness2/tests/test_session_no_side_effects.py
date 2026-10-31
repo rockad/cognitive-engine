@@ -103,7 +103,7 @@ def test_every_trap_trips_and_is_recorded(traps):
 def test_the_proxy_decision_logic_is_pure(traps):
     allow = [list(p) for p in ep.OLLAMA_ROUTE_ALLOW]
     policy = ep.Policy.build([["api.anthropic.com", 443], ["203.0.113.9", 443]],
-                             [{"host": "ollama.test", "port": 11434, "unix": "/bridge/o.sock", "allow": allow}], ["172.30.0.0/16"])
+                             [{"host": "ollama.test", "port": 11434, "unix": "/bridge/o.sock", "allow": allow, "allowed_models": ["m"]}], ["172.30.0.0/16"])
     for host in ("api.anthropic.com", "API.anthropic.com.", "api。anthropic。com", "127.1", "0x7f000001", "[::1]", "169.254.169.254",
                  "evil.com", "ollama.test", "203.0.113.9", "", "a b", "a@b", "x" * 300):
         policy.decide(host, 443)
@@ -163,7 +163,7 @@ class _MemoryWriter:
 def _serve_routed_once(request: bytes, **kw):
     async def go():
         policy = ep.Policy.build([], [{"host": "ollama.test", "port": 11434, "unix": "/bridge/o.sock",
-                                       "allow": [list(p) for p in ep.OLLAMA_ROUTE_ALLOW]}])
+                                       "allow": [list(p) for p in ep.OLLAMA_ROUTE_ALLOW], "allowed_models": ["m", "gemma4:e4b"]}])
         log = []
         proxy = ep.Proxy(policy, ep.Limits(head_timeout_s=2, idle_timeout_s=2), log=log.append)
         reader = asyncio.StreamReader()
@@ -278,3 +278,13 @@ def test_the_places_that_do_reach_the_outside_are_the_ones_that_trip_the_traps(t
     with pytest.raises(SideEffectAttempted):
         asyncio.run(ep.resolve_once("a.example", 443))           # name resolution
     assert "run" in " ".join(traps.attempts) and "getaddrinfo" in " ".join(traps.attempts)
+
+
+def test_a_model_denied_request_is_answered_from_memory_and_touches_nothing(traps):
+    """The model check happens after the body is read and before any connection to the bridge: with every door trapped, a
+    cloud model, an unknown model and a body naming none are refused and nothing is attempted."""
+    for body in (b'{"model":"m:cloud"}', b'{"model":"other"}', b"{}", b"not json", b'{"model":"m","model":"m"}'):
+        w, log = _serve_routed_once(b"POST /v1/chat/completions HTTP/1.1\r\nHost: ollama.test:11434\r\nContent-Length: %d\r\n\r\n"
+                                    % len(body) + body)
+        assert w.out.startswith(b"HTTP/1.1 403 ") and b"unix-route-model-denied" in w.out and len(log) == 1, body
+    assert traps.attempts == []

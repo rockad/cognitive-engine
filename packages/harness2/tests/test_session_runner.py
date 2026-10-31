@@ -765,8 +765,9 @@ def test_a_local_channel_routes_the_proxy_alias_to_the_bridge_socket_and_a_hoste
     cfg = sr.proxy_config(plan)
     sock = f"{sr.BRIDGE_MOUNT}/ollama.sock"
     allow = [["GET", "/api/tags"], ["GET", "/v1/models"], ["POST", "/v1/chat/completions"], ["POST", "/v1/completions"], ["POST", "/api/show"]]
-    assert cfg["unix_routes"] == [{"host": "127.0.0.1", "port": 11434, "unix": sock, "allow": allow},
-                                  {"host": sr.PROXY_ALIAS, "port": 11434, "unix": sock, "allow": allow}]
+    models = ["gemma4:12b"]                      # the channel's model id without its provider prefix; it has a tag, so no `:latest` twin
+    assert cfg["unix_routes"] == [{"host": "127.0.0.1", "port": 11434, "unix": sock, "allow": allow, "allowed_models": models},
+                                  {"host": sr.PROXY_ALIAS, "port": 11434, "unix": sock, "allow": allow, "allowed_models": models}]
     assert cfg["listeners"] == [{"port": 11434, "unix": sock}] and cfg["allow"] == []
     assert "unix_routes" not in sr.proxy_config(runner("claude").authorize(spec(world)))
 
@@ -888,3 +889,42 @@ def test_a_forged_line_inside_a_path_cannot_inflate_allowed_counts():
     # and a raw newline that got past everything is not two lines to the parser: the whole element fails to match
     s = sr.egress_summary([f"{_pd('GET', '/x')}\n{fake}", f"{PD} method=GET path=/x\r\n{fake}"])
     assert s["egress_allowed"] == 0 and s["model_requests"] == 0 and s["egress_denied"] == 0 and "denied_requests" not in s
+
+
+# ── the model the proxy lets through is the approved channel's model (F3) ────────────────────────────────────────────
+
+@pytest.mark.parametrize("model,names", [
+    ("ollama/gemma4-e4b-16k", ["gemma4-e4b-16k", "gemma4-e4b-16k:latest"]),     # untagged: ollama also accepts ':latest'
+    ("ollama/gemma4:12b", ["gemma4:12b"]),                                      # tagged: exactly that
+    ("ollama/qwen3:30b", ["qwen3:30b"]),
+    ("gemma4-e4b-16k", ["gemma4-e4b-16k", "gemma4-e4b-16k:latest"]),            # no provider prefix at all
+])
+def test_the_local_model_names_are_the_channels_model_without_its_provider_prefix(model, names):
+    assert sr.local_model_names(model) == names
+
+
+@pytest.mark.parametrize("model", ["ollama/x:cloud", "ollama/x-cloud", "ollama/a b", "ollama/", "ollama/é"])
+def test_a_channel_model_that_cannot_be_an_allowed_model_is_refused_before_anything_starts(world, model):
+    with pytest.raises(SessionRefused):
+        sr.local_model_names(model)
+
+
+def test_the_local_plan_carries_the_allowed_models_into_every_unix_route_and_a_hosted_plan_has_none(world):
+    plan = runner("local").authorize(spec(world))
+    assert plan.allowed_models == ("gemma4:12b",)
+    cfg = sr.proxy_config(plan)
+    assert [r["allowed_models"] for r in cfg["unix_routes"]] == [["gemma4:12b"], ["gemma4:12b"]]
+    assert runner("claude").authorize(spec(world)).allowed_models == ()
+    # the whole config the proxy would load must parse (the proxy fails to start on a route without the list)
+    from cognitive_harness2 import egress_proxy
+    pol = egress_proxy.parse_config(cfg)[0]
+    assert pol.route_models[("127.0.0.1", 11434)] == frozenset({"gemma4:12b"})
+
+
+def test_the_egress_summary_counts_a_model_denied_line_as_a_denied_request_and_keeps_its_reason():
+    lines = ["ACCESS decision=deny host=harness2-proxy.internal port=11434 reason=unix-route-model-denied model=x:cloud",
+             "ACCESS decision=deny host=harness2-proxy.internal port=11434 reason=unix-route-model-denied model=(missing)",
+             "ACCESS decision=allow host=harness2-proxy.internal port=11434 reason=unix-route"]
+    s = sr.egress_summary(lines)
+    assert s["egress_denied"] == 2 and s["egress_allowed"] == 1 and s["model_requests"] == 1
+    assert s["denied_reasons"] == ["unix-route-model-denied"]

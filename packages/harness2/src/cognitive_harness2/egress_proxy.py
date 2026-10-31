@@ -39,7 +39,10 @@ Policy, all of it enforced before a single byte reaches an upstream:
 The access log has the decision, the normalised host and the port, and a rule code. Never a header, a body,
 a query or a token. The one exception is a unix-route `unix-route-path-denied` line, which adds
 ` method=<M> path=<P>` (M: 1 to 16 capital letters else `?`; P: the target cut to 80 characters, everything but
-printable ASCII percent-escaped, the query replaced by `?<its length>`), so a denied request can be identified. This module is stdlib-only: it ships inside the image and also runs as a plain
+printable ASCII percent-escaped, the query replaced by `?<its length>`), so a denied request can be identified; and a
+`unix-route-model-denied` line (the model named in a chat, completion or /api/show body is not one of the route's
+`allowed_models`; see `check_model_body`), which adds ` model=<M>` (the model string escaped and cut to 64 characters like
+a path, or a fixed word such as `(missing)`). This module is stdlib-only: it ships inside the image and also runs as a plain
 function in the unit tests. Importing it starts nothing.
 
 `test_allow_cidrs` in the config is an explicit opt-in that exempts those networks from the address rule.
@@ -101,6 +104,62 @@ OLLAMA_ROUTE_ALLOW: tuple[tuple[str, str], ...] = (
     ("POST", "/api/show"),
 )
 
+# The POSTs whose body names a model. The model is the one thing in a body the proxy reads (nothing else of a body is
+# interpreted or logged): the host's ollama obeys it, a signed-in ollama relays `name:cloud` off the machine, and any
+# large local model could be picked. Its value must be one of the route's `allowed_models` (the channel's approved model).
+MODEL_CHECKED: frozenset[tuple[str, str]] = frozenset({("POST", "/v1/chat/completions"), ("POST", "/v1/completions"),
+                                                       ("POST", "/api/show")})
+_MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")      # an ollama model name: no space, slash, wildcard, non-ASCII
+MAX_ALLOWED_MODELS = 32
+LOG_MODEL_MAX = 64
+
+
+def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    out: dict = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError("duplicate key")
+        out[key] = value
+    return out
+
+
+def _no_constant(name: str):
+    raise ValueError("non-standard JSON constant")
+
+
+def check_model_body(path: str, body: bytes, allowed: frozenset[str]) -> None:
+    """Refuse (`unix-route-model-denied`, 403) unless the JSON body of a model-naming POST names exactly one of `allowed`.
+
+    Strict, because the upstream parses the same bytes differently from us if we are lax: the body must be UTF-8 JSON
+    holding one object and nothing else, with no duplicate key anywhere (Go keeps the last, other parsers the first), no
+    `NaN`/`Infinity`, and no top-level key that is a case or Unicode fold of `model` (Go matches field names
+    case-insensitively, so `{"model":"ok","Model":"x:cloud"}` would be read by ollama as `x:cloud`; for `/api/show` the
+    same goes for `name`). `model` must be a string, equal to an allowed name character for character (no case folding, no
+    trimming, no normalisation). On `/api/show` `name` is accepted in place of `model`; when both are present both must
+    match. A name containing `cloud` is refused whatever the list says. The forwarded body is the original bytes."""
+    show = path == "/api/show"
+
+    def deny(what: str) -> Refused:
+        return Refused("unix-route-model-denied", 403, f"model={what}")
+    try:
+        obj = json.loads(body.decode("utf-8"), object_pairs_hook=_no_duplicate_keys, parse_constant=_no_constant)
+    except (ValueError, RecursionError):                    # UnicodeDecodeError is a ValueError
+        raise deny("(unparsed)") from None
+    if not isinstance(obj, dict):
+        raise deny("(not-an-object)")
+    watched = ("model", "name") if show else ("model",)
+    for key in obj:
+        if key not in watched and unicodedata.normalize("NFKC", key).casefold() in watched:
+            raise deny("(key-lookalike)")
+    wanted = [obj[k] for k in watched if k in obj]
+    if not wanted:
+        raise deny("(missing)")
+    for model in wanted:
+        if not isinstance(model, str):
+            raise deny("(non-string)")
+        if "cloud" in model.lower() or model not in allowed:
+            raise deny(route_log_model(model))
+
 
 class Refused(ValueError):
     """A request or target that policy refuses. `.code` is the rule id used in the log and the 4xx reason. `.detail` is
@@ -130,15 +189,26 @@ def route_log_target(target: str) -> str:
     target shows as written)."""
     path, mark, query = target.partition("?")
     tail = f"?<{len(query)}>" if mark else ""
-    room = max(LOG_TARGET_MAX - len(tail), 0)
+    return _log_escape(path, max(LOG_TARGET_MAX - len(tail), 0)) + tail
+
+
+def _log_escape(text: str, room: int) -> str:
+    """`text` as printable ASCII 0x21-0x7e only (every other character `%XX`-escaped by its UTF-8 bytes), cut to `room`
+    characters without splitting an escape."""
     out, used = [], 0
-    for c in path:
+    for c in text:
         piece = c if "!" <= c <= "~" else "".join(f"%{b:02X}" for b in c.encode("utf-8", "surrogatepass"))
         if used + len(piece) > room:
             break
         out.append(piece)
         used += len(piece)
-    return "".join(out) + tail
+    return "".join(out)
+
+
+def route_log_model(model: object) -> str:
+    """The `model` of a refused request as it may appear in a log line: escaped and cut exactly like a path (printable
+    ASCII only, so one token), at most `LOG_MODEL_MAX` characters. Not a string: a fixed word, never its content."""
+    return _log_escape(model, LOG_MODEL_MAX) if isinstance(model, str) else "(non-string)"
 
 
 @dataclass(frozen=True)
@@ -314,12 +384,28 @@ def _route_allow(raw: object) -> frozenset[tuple[str, str]]:
     return frozenset(out)
 
 
+def _route_models(raw: object) -> frozenset[str]:
+    """A unix route's `allowed_models`: a non-empty list of exact model names (no wildcard; `cloud` never allowed).
+    Required: a route without it fails to load, as a route without `allow` does."""
+    if not (isinstance(raw, (list, tuple)) and 0 < len(raw) <= MAX_ALLOWED_MODELS):
+        raise ValueError(f"a unix route's allowed_models must be a list of 1 to {MAX_ALLOWED_MODELS} model names")
+    out: set[str] = set()
+    for name in raw:
+        if not (isinstance(name, str) and _MODEL_NAME.fullmatch(name)):
+            raise ValueError("a unix route's allowed_models entry must be a model name (letters, digits and . _ : -, at most 128)")
+        if "cloud" in name.lower():
+            raise ValueError("a unix route's allowed_models entry may not name a cloud model")
+        out.add(name)
+    return frozenset(out)
+
+
 @dataclass(frozen=True)
 class Policy:
     allow: frozenset[tuple[str, int]] = frozenset()
     unix_routes: Mapping[tuple[str, int], str] = field(default_factory=dict)
     allow_cidrs: tuple = ()
     route_allow: Mapping[tuple[str, int], frozenset[tuple[str, str]]] = field(default_factory=dict)   # per unix route: (method, path)
+    route_models: Mapping[tuple[str, int], frozenset[str]] = field(default_factory=dict)              # per unix route: model names
 
     @staticmethod
     def build(allow: Sequence[Sequence], unix_routes: Sequence[Mapping] = (),
@@ -338,9 +424,10 @@ class Policy:
                 raise ValueError(f"allow entry {item!r} is unusable ({e.code})") from None
         routes: dict[tuple[str, int], str] = {}
         route_allow: dict[tuple[str, int], frozenset[tuple[str, str]]] = {}
+        route_models: dict[tuple[str, int], frozenset[str]] = {}
         for item in unix_routes:
-            if not isinstance(item, Mapping) or set(item) != {"host", "port", "unix", "allow"}:
-                raise ValueError(f"unix route {item!r} must have exactly host, port, unix and allow")
+            if not isinstance(item, Mapping) or set(item) != {"host", "port", "unix", "allow", "allowed_models"}:
+                raise ValueError(f"unix route {item!r} must have exactly host, port, unix, allow and allowed_models")
             path = item["unix"]
             if not (isinstance(path, str) and path.startswith("/") and "\0" not in path):
                 raise ValueError(f"unix route path {path!r} must be an absolute path")
@@ -350,15 +437,18 @@ class Policy:
                 raise ValueError(f"unix route {dict(item)!r} is unusable ({e.code})") from None
             routes[key] = path
             route_allow[key] = _route_allow(item["allow"])
+            route_models[key] = _route_models(item["allowed_models"])
         for key, path in routes.items():
             if any(other != key and p == path and route_allow[other] != route_allow[key] for other, p in routes.items()):
                 # one socket, one set of rights: a listener (a port, no name) serves every name of its socket alike
                 raise ValueError(f"unix routes to {path!r} must all carry the same allow list")
+            if any(other != key and p == path and route_models[other] != route_models[key] for other, p in routes.items()):
+                raise ValueError(f"unix routes to {path!r} must all carry the same allowed_models")
         try:
             cidrs = tuple(ipaddress.ip_network(c, strict=True) for c in test_allow_cidrs)
         except ValueError as e:
             raise ValueError(f"test_allow_cidrs: {e}") from None
-        return Policy(frozenset(entries), dict(routes), cidrs, dict(route_allow))
+        return Policy(frozenset(entries), dict(routes), cidrs, dict(route_allow), dict(route_models))
 
     def decide(self, host_raw: str, port: int | str) -> Decision:
         """Name-level decision. Resolution and the address rule come after this, in `connect`."""
@@ -1040,6 +1130,8 @@ class Proxy:
                         if kind == "length" and length > lim.route_max_request_bytes:
                             raise Refused("unix-route-body-too-large", 413)
                         body, buf = await self._read_body(reader, buf, kind, length)
+                        if (req.method, path) in MODEL_CHECKED:
+                            check_model_body(path, body, policy.route_models[(host, port)])
                         pipelined = pipelined + 1 if buf else 0
                         if ur is not None and ur.at_eof():
                             uw.close()                           # the upstream hung up between requests

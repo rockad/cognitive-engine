@@ -80,6 +80,7 @@ _CPUS = re.compile(r"^(?:[1-9][0-9]?|0?\.[1-9][0-9]?|[1-9][0-9]?\.[0-9]{1,2})$")
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _NET_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _CLI_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_LOCAL_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")      # same shape as the proxy's `allowed_models` entries
 _MOUNT_UNSAFE = re.compile(r'[,"\n\r\0=]')
 _ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]|\x1b.", re.DOTALL)
 _BAD_WS_PREFIXES = ("/proc", "/sys", "/dev", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/boot",
@@ -213,9 +214,9 @@ def redact(text: str, secrets_: Sequence[str]) -> str:
     return text
 
 
-# the optional tail is the proxy's `method=<M> path=<P>` on a route path denial (older logs have none); it is a single token
-# each, so no text of a request can end the line or open another field
-_ACCESS_LINE = re.compile(r"ACCESS decision=(allow|deny) host=(\S+) port=(\d+) reason=([a-z-]+)(?: method=([A-Z?]{1,16}) path=(\S+))?")
+# the optional tail is the proxy's `method=<M> path=<P>` on a route path denial (older logs have none), or `model=<token>` on a
+# model denial; every value is a single token, so no text of a request can end the line or open another field
+_ACCESS_LINE = re.compile(r"ACCESS decision=(allow|deny) host=(\S+) port=(\d+) reason=([a-z-]+)(?: method=([A-Z?]{1,16}) path=(\S+)| model=\S+)?")
 _MODEL_ROUTES = frozenset({"unix-route", "unix-listener"})      # the proxy's two ways to the host bridge (the local model)
 DENIED_REQUESTS_MAX = 20                                        # distinct `METHOD path` keys kept; the rest are summed in `other`
 
@@ -239,7 +240,7 @@ def egress_summary(lines: Sequence[str]) -> dict[str, object]:
         m = _ACCESS_LINE.fullmatch(line.strip())
         if not m:
             continue
-        decision, host, port, reason, method, path = m.groups()
+        decision, host, port, reason, method, path = m.groups()      # a `model=<token>` tail (unix-route-model-denied) is matched, not kept
         if decision == "allow":
             allowed += 1
             model += reason in _MODEL_ROUTES
@@ -308,10 +309,21 @@ class Plan:
     local_port: int | None
     egress_network: str | None                # an existing network to use for egress (else one is created)
     test_allow_cidrs: tuple[str, ...] = ()
+    allowed_models: tuple[str, ...] = ()      # local: the model names the proxy lets a request name (the channel's approved model)
 
     @property
     def local(self) -> bool:
         return self.bridge_target is not None
+
+
+def local_model_names(model: str) -> list[str]:
+    """The names a request to the host's ollama may carry for the channel model `model` (e.g. `ollama/gemma4-e4b-16k`): the id
+    without its provider prefix (what the opencode config sends), and, when it has no tag, the same with `:latest` appended
+    (ollama accepts that spelling). Refuses (`SessionRefused`) an id that is not a plain model name or names a cloud model."""
+    name = model.partition("/")[2] if "/" in model else model
+    if not _LOCAL_MODEL.fullmatch(name) or "cloud" in name.lower():
+        raise SessionRefused("the channel's model id cannot be an allowed local model name (plain name, no cloud model)")
+    return [name] if ":" in name else [name, name + ":latest"]
 
 
 def proxy_config(plan: Plan) -> dict:
@@ -325,9 +337,12 @@ def proxy_config(plan: Plan) -> dict:
         # below, served the same way. Nothing else is routed. The socket reaches the WHOLE HTTP API of the host's ollama
         # (delete, pull, create, push, copy), and the session is untrusted: the proxy parses every request on a route and
         # forwards only the (method, path) pairs of `allow` (`egress_proxy.OLLAMA_ROUTE_ALLOW`); CONNECT is refused.
+        # The body of a model-naming POST must also name one of `allowed_models` (the channel's approved model): the host's
+        # ollama obeys the body, and a signed-in one relays `x:cloud` off the machine.
         allow = [list(pair) for pair in OLLAMA_ROUTE_ALLOW]
-        cfg["unix_routes"] = [{"host": host, "port": port, "unix": sock, "allow": allow},
-                              {"host": PROXY_ALIAS, "port": port, "unix": sock, "allow": allow}]
+        models = list(plan.allowed_models)
+        cfg["unix_routes"] = [{"host": host, "port": port, "unix": sock, "allow": allow, "allowed_models": models},
+                              {"host": PROXY_ALIAS, "port": port, "unix": sock, "allow": allow, "allowed_models": models}]
         cfg["listeners"] = [{"port": port, "unix": sock}]
     if plan.test_allow_cidrs:
         cfg["test_allow_cidrs"] = list(plan.test_allow_cidrs)
@@ -605,7 +620,8 @@ class ProposerSessionRunner:
             allow = tuple(keys)
         return Plan(spec=spec, image=self.image, workspace=ws, cli_host=cli_host, cli_container=cli_container,
                     allow=allow, bridge_target=bridge, local_port=loop[0][1] if loop else None,
-                    egress_network=self.egress_network, test_allow_cidrs=self._test_allow_cidrs)
+                    egress_network=self.egress_network, test_allow_cidrs=self._test_allow_cidrs,
+                    allowed_models=tuple(local_model_names(ch.model)) if loop else ())
 
     # ── docker plumbing ───────────────────────────────────────────────────────────
 

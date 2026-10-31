@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import re
 
 import pytest
 
@@ -16,6 +17,7 @@ from cognitive_harness2.egress_proxy import Limits, Policy, Refused
 
 API = ("api.anthropic.com", 443)
 ALLOW = [list(p) for p in ep.OLLAMA_ROUTE_ALLOW]
+MODELS = ["m", "gemma4:e4b"]          # the fixtures' bodies name these two
 
 
 def policy(*allow, **kw) -> Policy:
@@ -234,7 +236,7 @@ def test_the_token_bucket_limits_and_refills():
 
 def test_config_round_trip_and_loud_failures(tmp_path):
     cfg = {"allow": [["api.anthropic.com", 443]], "listeners": [{"port": 11434, "unix": "/bridge/o.sock"}],
-           "unix_routes": [{"host": "ollama.test", "port": 11434, "unix": "/bridge/o.sock", "allow": ALLOW}],
+           "unix_routes": [{"host": "ollama.test", "port": 11434, "unix": "/bridge/o.sock", "allow": ALLOW, "allowed_models": MODELS}],
            "limits": {"max_connections": 3}}
     p = tmp_path / "c.json"
     p.write_text(json.dumps(cfg))
@@ -242,7 +244,7 @@ def test_config_round_trip_and_loud_failures(tmp_path):
     assert host == "0.0.0.0" and port == 3128 and listeners == [(11434, "/bridge/o.sock")] and limits.max_connections == 3
     assert policy_.decide("ollama.test", 11434).unix == "/bridge/o.sock"
     for bad in ({"alow": []}, {"allow": [["a.example", 443]], "limits": {"nope": 1}}, [], {"listeners": [{"port": 1}]},
-                {"unix_routes": [{"host": "a.example", "port": 1, "unix": "relative", "allow": ALLOW}]},
+                {"unix_routes": [{"host": "a.example", "port": 1, "unix": "relative", "allow": ALLOW, "allowed_models": MODELS}]},
                 {"unix_routes": [{"host": "a.example", "port": 1, "unix": "/s"}]},       # no allow list: refused, not defaulted
                 {"listeners": [{"port": 1, "unix": "/s"}]},                               # a listener with no route has no allow list
                 {"test_allow_cidrs": ["10.0.0.1/8"]}):
@@ -596,7 +598,7 @@ async def test_idle_and_byte_caps_end_a_tunnel():
 
 
 async def test_a_dead_unix_socket_is_a_502_not_a_hang(tmp_path):
-    route = {"host": "ollama.test", "port": 11434, "unix": str(tmp_path / "gone.sock"), "allow": ALLOW}
+    route = {"host": "ollama.test", "port": 11434, "unix": str(tmp_path / "gone.sock"), "allow": ALLOW, "allowed_models": MODELS}
     async with Running([], unix_routes=[route]) as px:
         out = await talk(px.port, rq("GET", "/v1/models", absolute=True))
         assert out.startswith(b"HTTP/1.1 502 ") and b"upstream-unreachable" in out
@@ -609,6 +611,7 @@ ROUTE_PORT = 11434
 CHAT = ("POST", "/v1/chat/completions")
 BODY = b'{"model":"m","messages":[{"role":"user","content":"SECRET-BODY-TEXT"}]}'
 JSON_OK = b'{"ok":true}'
+PAD100 = b'{"model":"m"}' + b" " * 87          # a valid body of exactly 100 bytes
 CLOSE = object()          # in a UnixOllama responder's parts: hang up after answering
 
 
@@ -704,13 +707,13 @@ class UnixOllama:
 class Routed:
     """A proxy with one unix route (`ollama.test:11434`, and `127.0.0.1:11434`) and a listener, in front of a `UnixOllama`."""
 
-    def __init__(self, tmp_path, responder=None, **limits):
+    def __init__(self, tmp_path, responder=None, models=None, **limits):
         self.up = UnixOllama(str(tmp_path / "o.sock"), responder)
-        self.limits = limits
+        self.limits, self.models = limits, models or MODELS
 
     async def __aenter__(self):
         await self.up.__aenter__()
-        routes = [{"host": h, "port": ROUTE_PORT, "unix": self.up.path, "allow": ALLOW} for h in (ROUTE_HOST, "127.0.0.1")]
+        routes = [{"host": h, "port": ROUTE_PORT, "unix": self.up.path, "allow": ALLOW, "allowed_models": self.models} for h in (ROUTE_HOST, "127.0.0.1")]
         self.px = await Running([], unix_routes=routes, listeners=[{"port": ROUTE_PORT, "unix": self.up.path}],
                                 limits={"head_timeout_s": 5, "idle_timeout_s": 5, **self.limits}).__aenter__()
         self.log, self.port, self.listener = self.px.log, self.px.ports[0], self.px.ports[1]
@@ -1166,15 +1169,15 @@ async def test_framing_smuggling_attempts_are_refused_and_never_forwarded(routed
 async def test_a_second_request_hidden_after_the_declared_body_is_judged_on_its_own_and_denied(routed):
     async with routed() as rt:
         smuggled = b"DELETE /api/delete HTTP/1.1\r\nHost: ollama.test:11434\r\n\r\n"
-        body = b"{}"
+        body = b'{"model":"m"} '
         payload = (f"POST /v1/chat/completions HTTP/1.1\r\nHost: {ROUTE_HOST}:{ROUTE_PORT}\r\nContent-Length: {len(body)}\r\n\r\n").encode() + body + smuggled
         out = await talk(rt.port, payload)
         assert [s for s, _, _ in responses(out)] == [200, 403]
         assert [(x["method"], x["target"]) for x in rt.up.requests] == [CHAT]
         # a body longer than declared leaves junk in front of the next head, which is not a request at all
         rt.up.requests.clear()
-        out = await talk(rt.port, payload.replace(b"Content-Length: 2", b"Content-Length: 1"))
-        assert [s for s, _, _ in responses(out)] == [200, 400] and len(rt.up.requests) == 1 and rt.up.requests[0]["body"] == b"{"
+        out = await talk(rt.port, payload.replace(f"Content-Length: {len(body)}".encode(), f"Content-Length: {len(body) - 1}".encode()))
+        assert [s for s, _, _ in responses(out)] == [200, 400] and len(rt.up.requests) == 1 and rt.up.requests[0]["body"] == body[:-1]
 
 
 async def test_post_api_show_has_the_same_strict_framing_and_caps_as_the_other_posts(routed):
@@ -1186,8 +1189,8 @@ async def test_post_api_show_has_the_same_strict_framing_and_caps_as_the_other_p
         assert responses(out)[0][0] == 200
         (got,) = rt.up.requests
         assert got["body"] == SHOW_BODY and got["low"]["content-length"] == str(len(SHOW_BODY)) and "transfer-encoding" not in got["low"]
-        out = await talk(rt.port, rq(*SHOW))                                              # a missing body is length 0
-        assert responses(out)[0][0] == 200 and rt.up.requests[-1]["low"]["content-length"] == "0"
+        out = await talk(rt.port, rq(*SHOW))                                              # a missing body names no model: refused
+        assert responses(out)[0][0] == 403 and b"unix-route-model-denied" in out and len(rt.up.requests) == 1
         rt.up.requests.clear()
         for extra in (["Expect: 100-continue"], ["Transfer-Encoding: chunked"], ["Upgrade: websocket", "Connection: Upgrade"], ["TE: trailers"]):
             head = (f"POST /api/show HTTP/1.1\r\nHost: {ROUTE_HOST}:{ROUTE_PORT}\r\nContent-Length: 4\r\n" + "\r\n".join(extra)
@@ -1203,7 +1206,7 @@ async def test_post_api_show_has_the_same_strict_framing_and_caps_as_the_other_p
     async with routed(route_max_request_bytes=100) as rt:
         assert responses(await talk(rt.port, rq(*SHOW, body=b"x" * 101)))[0][0] == 413
         assert responses(await talk(rt.port, rq(*SHOW, chunks=[b"x" * 60, b"x" * 41])))[0][0] == 413
-        assert responses(await talk(rt.port, rq(*SHOW, body=b"x" * 100)))[0][0] == 200 and len(rt.up.requests) == 1
+        assert responses(await talk(rt.port, rq(*SHOW, body=PAD100)))[0][0] == 200 and len(rt.up.requests) == 1
 
 
 async def test_a_get_with_a_body_and_a_missing_post_length_are_handled_strictly(routed):
@@ -1214,8 +1217,9 @@ async def test_a_get_with_a_body_and_a_missing_post_length_are_handled_strictly(
         assert responses(out)[0][0] == 400 and rt.up.requests == []
         out = await talk(rt.port, rq("GET", "/api/tags", extra=["Content-Length: 0"]))        # an empty one is fine
         assert responses(out)[0][0] == 200
+        rt.up.requests.clear()
         out = await talk(rt.port, b"POST /v1/chat/completions HTTP/1.1\r\nHost: ollama.test:11434\r\nConnection: close\r\n\r\n")
-        assert responses(out)[0][0] == 200 and rt.up.requests[-1]["low"]["content-length"] == "0"
+        assert responses(out)[0][0] == 403 and b"unix-route-model-denied" in out and rt.up.requests == []      # no body, no model
 
 
 async def test_the_request_body_cap_applies_to_declared_and_to_chunked_bodies(routed):
@@ -1224,9 +1228,9 @@ async def test_the_request_body_cap_applies_to_declared_and_to_chunked_bodies(ro
         assert responses(out)[0][0] == 413 and b"unix-route-body-too-large" in out
         out = await talk(rt.port, rq(*CHAT, chunks=[b"x" * 60, b"x" * 41]))
         assert responses(out)[0][0] == 413
-        out = await talk(rt.port, rq(*CHAT, chunks=[b"x" * 100]))
+        out = await talk(rt.port, rq(*CHAT, chunks=[PAD100]))
         assert responses(out)[0][0] == 200 and len(rt.up.requests) == 1
-        out = await talk(rt.port, rq(*CHAT, body=b"x" * 100))
+        out = await talk(rt.port, rq(*CHAT, body=PAD100))
         assert responses(out)[0][0] == 200 and len(rt.up.requests) == 2
     async with routed(route_max_request_bytes=1000) as rt:
         head = f"POST /v1/chat/completions HTTP/1.1\r\nHost: {ROUTE_HOST}:{ROUTE_PORT}\r\nContent-Length: 5000\r\nConnection: close\r\n\r\n"
@@ -1415,11 +1419,11 @@ async def test_a_path_that_tries_to_forge_log_lines_stays_inside_one_deny_line_a
 ])
 def test_a_bad_route_allow_list_is_refused_loudly(allow):
     with pytest.raises(ValueError):
-        Policy.build([], [{"host": "ollama.test", "port": 11434, "unix": "/s", "allow": allow}])
+        Policy.build([], [{"host": "ollama.test", "port": 11434, "unix": "/s", "allow": allow, "allowed_models": ["m"]}])
 
 
 def test_routes_to_one_socket_must_agree_on_the_allow_list_and_route_keys_are_exact():
-    base = {"host": "ollama.test", "port": 11434, "unix": "/s"}
+    base = {"host": "ollama.test", "port": 11434, "unix": "/s", "allowed_models": ["m"]}
     ok = Policy.build([], [{**base, "allow": [["GET", "/api/tags"]]}, {**base, "host": "b.test", "allow": [["GET", "/api/tags"]]}])
     assert ok.route_allow[("ollama.test", 11434)] == frozenset({("GET", "/api/tags")})
     with pytest.raises(ValueError, match="same allow list"):
@@ -1436,7 +1440,7 @@ def test_the_shipped_allow_list_is_exactly_the_five_pairs_and_the_session_runner
     assert sorted(p for _, p in ep.OLLAMA_ROUTE_ALLOW if p.startswith("/api/")) == ["/api/show", "/api/tags"]
     for method, path in ep.OLLAMA_ROUTE_ALLOW:
         assert method in ("GET", "POST") and "?" not in path and not path.endswith("/")
-    assert ep.Policy.build([], [{"host": "a.test", "port": 1, "unix": "/s", "allow": ALLOW}]).route_allow[("a.test", 1)] == set(ep.OLLAMA_ROUTE_ALLOW)
+    assert ep.Policy.build([], [{"host": "a.test", "port": 1, "unix": "/s", "allow": ALLOW, "allowed_models": MODELS}]).route_allow[("a.test", 1)] == set(ep.OLLAMA_ROUTE_ALLOW)
 
 
 def test_the_limits_for_routes_are_configurable_and_default_sane():
@@ -1546,3 +1550,188 @@ async def test_a_client_that_stops_reading_cannot_hold_a_streaming_response_open
                 break
         assert any("reason=unix-route-response-aborted" in x for x in rt.denied()), rt.log
         w.close()
+
+
+# ══ the model name in a POST body is checked against the route's allowed_models (F3) ════════════════════════════════════
+# The host bridge reaches the host's WHOLE ollama. A signed-in ollama relays a model named `x:cloud` off the box, and any
+# large local model could be picked: so the body of the three model-naming POSTs is parsed and its model must be exactly
+# one of the names the session's channel was approved for.
+
+LOCAL = "gemma4-e4b-16k"
+LOCAL_MODELS = [LOCAL, LOCAL + ":latest"]            # ollama accepts the bare name with ':latest' appended
+CHAT_PATH, COMP_PATH, SHOW_PATH = "/v1/chat/completions", "/v1/completions", "/api/show"
+DENIED_BODY = b"403 unix-route-model-denied\n"
+
+
+def jb(obj) -> bytes:
+    return json.dumps(obj).encode()
+
+
+# (id, path, body, allowed): `allowed` is what the proxy must do
+MODEL_CASES = [
+    ("exact", CHAT_PATH, jb({"model": LOCAL, "messages": []}), True),
+    ("latest-spelling", CHAT_PATH, jb({"model": LOCAL + ":latest", "messages": []}), True),
+    ("completions-exact", COMP_PATH, jb({"model": LOCAL, "prompt": "x"}), True),
+    ("completions-latest", COMP_PATH, jb({"model": LOCAL + ":latest", "prompt": "x"}), True),
+    ("show-model", SHOW_PATH, jb({"model": LOCAL}), True),
+    ("show-name-instead-of-model", SHOW_PATH, jb({"name": LOCAL}), True),
+    ("show-name-latest", SHOW_PATH, jb({"name": LOCAL + ":latest"}), True),
+    ("show-both-same", SHOW_PATH, jb({"model": LOCAL, "name": LOCAL}), True),
+    ("json-escaped-spelling-of-the-same-name", CHAT_PATH, b'{"model":"gemma4\\u002de4b-16k","messages":[]}', True),
+    ("whitespace-around-json-is-fine", CHAT_PATH, b' \n{"model": "' + LOCAL.encode() + b'"}\n ', True),
+    ("other-local-model", CHAT_PATH, jb({"model": "llama3:70b"}), False),
+    ("other-local-model-completions", COMP_PATH, jb({"model": "qwen3:30b"}), False),
+    ("other-local-model-show", SHOW_PATH, jb({"model": "qwen3:30b"}), False),
+    ("colon-cloud", CHAT_PATH, jb({"model": LOCAL + ":cloud"}), False),
+    ("dash-cloud", CHAT_PATH, jb({"model": LOCAL + "-cloud"}), False),
+    ("upper-cloud", CHAT_PATH, jb({"model": "gpt-oss:120B-CLOUD"}), False),
+    ("cloud-show", SHOW_PATH, jb({"model": "kimi-k2:cloud"}), False),
+    ("cloud-in-name-only", SHOW_PATH, jb({"name": "x:cloud"}), False),
+    ("show-model-ok-name-cloud", SHOW_PATH, jb({"model": LOCAL, "name": "x:cloud"}), False),
+    ("show-name-ok-model-other", SHOW_PATH, jb({"model": "llama3:70b", "name": LOCAL}), False),
+    ("missing-model", CHAT_PATH, jb({"messages": []}), False),
+    ("empty-object", CHAT_PATH, b"{}", False),
+    ("missing-model-show", SHOW_PATH, jb({"verbose": True}), False),
+    ("name-is-not-a-model-for-chat", CHAT_PATH, jb({"name": LOCAL}), False),
+    ("model-null", CHAT_PATH, b'{"model":null}', False),
+    ("model-number", CHAT_PATH, b'{"model":1}', False),
+    ("model-true", CHAT_PATH, b'{"model":true}', False),
+    ("model-list", CHAT_PATH, jb({"model": [LOCAL]}), False),
+    ("model-object", CHAT_PATH, jb({"model": {"name": LOCAL}}), False),
+    ("show-name-non-string", SHOW_PATH, jb({"name": 5}), False),
+    ("array-body", CHAT_PATH, jb([{"model": LOCAL}]), False),
+    ("string-body", CHAT_PATH, jb(LOCAL), False),
+    ("null-body", CHAT_PATH, b"null", False),
+    ("number-body", COMP_PATH, b"7", False),
+    ("empty-body", CHAT_PATH, b"", False),
+    ("invalid-json", CHAT_PATH, b'{"model":', False),
+    ("not-json", CHAT_PATH, b"model=" + LOCAL.encode(), False),
+    ("trailing-garbage", CHAT_PATH, jb({"model": LOCAL}) + b" x", False),
+    ("two-objects", CHAT_PATH, jb({"model": LOCAL}) + jb({"model": "x:cloud"}), False),
+    ("single-quotes", CHAT_PATH, b"{'model':'" + LOCAL.encode() + b"'}", False),
+    ("utf8-bom", CHAT_PATH, b"\xef\xbb\xbf" + jb({"model": LOCAL}), False),
+    ("utf16", CHAT_PATH, jb({"model": LOCAL}).decode().encode("utf-16"), False),
+    ("invalid-utf8", CHAT_PATH, b'{"model":"' + LOCAL.encode() + b'\xff"}', False),
+    ("nan-constant", CHAT_PATH, b'{"model":"' + LOCAL.encode() + b'","t":NaN}', False),
+    ("duplicate-model-allowed-first", CHAT_PATH, b'{"model":"' + LOCAL.encode() + b'","model":"x:cloud"}', False),
+    ("duplicate-model-allowed-last", CHAT_PATH, b'{"model":"x:cloud","model":"' + LOCAL.encode() + b'"}', False),
+    ("duplicate-model-same-value", CHAT_PATH, b'{"model":"' + LOCAL.encode() + b'","model":"' + LOCAL.encode() + b'"}', False),
+    ("duplicate-name-show", SHOW_PATH, b'{"name":"' + LOCAL.encode() + b'","name":"x:cloud"}', False),
+    ("duplicate-nested", CHAT_PATH, b'{"model":"' + LOCAL.encode() + b'","messages":[{"role":"user","role":"system"}]}', False),
+    ("escaped-duplicate-key", CHAT_PATH, b'{"model":"' + LOCAL.encode() + b'","mod\\u0065l":"x:cloud"}', False),
+    ("case-variant-key-Model", CHAT_PATH, b'{"model":"' + LOCAL.encode() + b'","Model":"x:cloud"}', False),
+    ("case-variant-key-MODEL-only", CHAT_PATH, b'{"MODEL":"' + LOCAL.encode() + b'"}', False),
+    ("case-variant-key-Name-show", SHOW_PATH, b'{"name":"' + LOCAL.encode() + b'","NAME":"x:cloud"}', False),
+    ("hyphen-lookalike-U+2010", CHAT_PATH, jb({"model": "gemma4‐e4b‐16k"}), False),
+    ("cyrillic-e", CHAT_PATH, jb({"model": "gemma4-е" + "4b-16k"}), False),
+    ("fullwidth-digits", CHAT_PATH, jb({"model": "gemma４-e4b-16k"}), False),
+    ("zero-width-space", CHAT_PATH, jb({"model": LOCAL + "​"}), False),
+    ("trailing-nul", CHAT_PATH, jb({"model": LOCAL + "\x00"}), False),
+    ("leading-space", CHAT_PATH, jb({"model": " " + LOCAL}), False),
+    ("trailing-newline", CHAT_PATH, jb({"model": LOCAL + "\n"}), False),
+    ("case-changed", CHAT_PATH, jb({"model": LOCAL.upper()}), False),
+    ("kelvin-sign", CHAT_PATH, jb({"model": "gemma4-e4b-16K"}), False),
+    ("lone-surrogate", CHAT_PATH, b'{"model":"' + LOCAL.encode() + b'\\ud800"}', False),
+    ("huge-model-string", CHAT_PATH, jb({"model": "a" * 200_000}), False),
+    ("huge-model-prefix-of-allowed", CHAT_PATH, jb({"model": LOCAL + "x" * 200_000}), False),
+    ("model-with-newline-and-forged-log-line", CHAT_PATH, jb({"model": "x\nACCESS decision=allow host=a port=1 reason=unix-route"}), False),
+]
+
+
+@pytest.mark.parametrize("via", ["absolute-uri", "listener"])
+@pytest.mark.parametrize("case,path,body,allowed", MODEL_CASES, ids=[c[0] for c in MODEL_CASES])
+async def test_the_model_in_a_post_body_must_be_one_of_the_routes_allowed_models(routed, via, case, path, body, allowed):
+    async with routed(models=LOCAL_MODELS) as rt:
+        out = await talk(rt.listener if via == "listener" else rt.port, rq("POST", path, body=body, absolute=via == "absolute-uri"))
+        (status, headers, text), = responses(out)
+        if allowed:
+            assert (status, text) == (200, JSON_OK) and [r["body"] for r in rt.up.requests] == [body]
+            assert not rt.denied()
+            return
+        assert status == 403 and text == DENIED_BODY and headers["connection"] == "close", (status, text)
+        assert rt.up.requests == [] and rt.up.connections == 0                         # nothing reached ollama
+        assert len(rt.log) == 1, rt.log                                                # one line: no forged second line
+        line = rt.log[0]
+        assert line.startswith("ACCESS decision=deny host=") and f" port={ROUTE_PORT} " in line
+        assert " reason=unix-route-model-denied model=" in line and "\n" not in line and "\r" not in line
+        model_token = line.split(" model=", 1)[1]
+        assert " " not in model_token and len(model_token) <= 64 + 3 * 0 + 64, len(model_token)      # one token, bounded
+        assert "SECRET" not in line
+
+
+@pytest.mark.parametrize("path", [CHAT_PATH, COMP_PATH, SHOW_PATH])
+async def test_a_chunked_body_is_checked_too_and_the_denied_model_is_logged_sanitised_and_cut_at_64(routed, path):
+    async with routed(models=LOCAL_MODELS) as rt:
+        body = jb({"model": "ü " + "é" * 100 + "\x07", "messages": []})
+        out = await talk(rt.port, rq("POST", path, chunks=[body[:10], body[10:]], absolute=True))
+        (status, _, text), = responses(out)
+        assert status == 403 and text == DENIED_BODY and rt.up.requests == []
+        token = rt.log[0].split(" model=", 1)[1]
+        assert token.startswith("%C3%BC%20%C3%A9") and len(token) <= 64 and re.fullmatch(r"[!-~]+", token) and token.endswith("%A9")
+
+
+async def test_a_chunked_allowed_model_passes_with_its_body_intact(routed):
+    async with routed(models=LOCAL_MODELS) as rt:
+        body = jb({"model": LOCAL, "messages": [{"role": "user", "content": "hi"}]})
+        out = await talk(rt.port, rq("POST", CHAT_PATH, chunks=[body[:7], body[7:]], absolute=True))
+        assert responses(out)[0][0] == 200 and rt.up.requests[0]["body"] == body
+
+
+@pytest.mark.parametrize("method,path", [("GET", "/api/tags"), ("GET", "/v1/models")])
+async def test_the_get_paths_have_no_body_and_need_no_model(routed, method, path):
+    async with routed(models=LOCAL_MODELS) as rt:
+        assert responses(await talk(rt.port, rq(method, path, absolute=True)))[0][0] == 200
+
+
+async def test_the_model_check_runs_per_request_on_a_keep_alive_connection(routed):
+    async with routed(models=LOCAL_MODELS) as rt:
+        good, bad = jb({"model": LOCAL}), jb({"model": LOCAL + ":cloud"})
+        out = await talk(rt.port, rq("POST", CHAT_PATH, body=good, close=False, absolute=True) + rq("POST", CHAT_PATH, body=bad, absolute=True))
+        rs = responses(out)
+        assert [r[0] for r in rs] == [200, 403] and rs[1][2] == DENIED_BODY
+        assert [r["body"] for r in rt.up.requests] == [good]
+
+
+def test_the_log_helper_escapes_and_cuts_the_model_string():
+    assert ep.route_log_model(LOCAL) == LOCAL
+    assert ep.route_log_model("a b\n") == "a%20b%0A"
+    assert ep.route_log_model("a?b=c") == "a%3Fb%3Dc" or ep.route_log_model("a?b=c") == "a?b=c"
+    assert len(ep.route_log_model("x" * 1000)) == 64 and len(ep.route_log_model("é" * 1000)) <= 64
+    assert ep.route_log_model("é" * 1000).endswith("%A9")                 # never a split escape
+    assert ep.route_log_model(5) == "(non-string)" and ep.route_log_model(None) == "(non-string)"
+
+
+@pytest.mark.parametrize("raw", [
+    None, [], "m", ["m", 5], ["m", ""], [" m"], ["m "], ["a:cloud"], ["a-CLOUD"], ["cloud"], ["x" * 129], ["m\n"], ["m", "m\x00"],
+    ["m/../x"], ["é"], ["a b"], ["*"], ["m", "*"], [["m"]], {"m": 1}, ["m"] * 33,
+])
+def test_a_bad_allowed_models_list_is_refused_loudly(raw):
+    route = {"host": "ollama.test", "port": 11434, "unix": "/s", "allow": ALLOW, "allowed_models": raw}
+    with pytest.raises(ValueError):
+        Policy.build([], [route])
+
+
+def test_a_route_without_allowed_models_fails_to_load_like_a_route_without_allow():
+    base = {"host": "ollama.test", "port": 11434, "unix": "/s", "allow": ALLOW}
+    with pytest.raises(ValueError):
+        Policy.build([], [base])
+    with pytest.raises(ValueError):
+        ep.parse_config({"unix_routes": [base], "listeners": [{"port": 11434, "unix": "/s"}]})
+    p = Policy.build([], [{**base, "allowed_models": ["m", "m:latest"]}])
+    assert p.route_models[("ollama.test", 11434)] == frozenset({"m", "m:latest"})
+
+
+def test_routes_to_one_socket_must_agree_on_the_allowed_models_too():
+    base = {"host": "ollama.test", "port": 11434, "unix": "/s", "allow": ALLOW}
+    Policy.build([], [{**base, "allowed_models": ["m"]}, {**base, "host": "b.test", "allowed_models": ["m"]}])
+    with pytest.raises(ValueError, match="same allowed_models"):
+        Policy.build([], [{**base, "allowed_models": ["m"]}, {**base, "host": "b.test", "allowed_models": ["other"]}])
+
+
+@pytest.mark.parametrize("path", [CHAT_PATH, COMP_PATH, SHOW_PATH])
+def test_check_model_body_is_pure_and_names_the_rule(path):
+    allowed = frozenset(LOCAL_MODELS)
+    ep.check_model_body(path, jb({"model": LOCAL}), allowed)
+    with pytest.raises(Refused) as ei:
+        ep.check_model_body(path, jb({"model": "x:cloud"}), allowed)
+    assert ei.value.code == "unix-route-model-denied" and ei.value.status == 403 and ei.value.detail == "model=x:cloud"
