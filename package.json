@@ -4,7 +4,17 @@
   "private": true,
   "type": "module",
   "workspaces": [
-    "packages/jev",
+    "packages/*",
     "adapters/*"
-  ]
+  ],
+  "scripts": {
+    "test": "bun test packages/jev adapters",
+    "build": "bun run --filter '*' build",
+    "lint": "bun run --filter '*' lint"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "@types/node": "^22.13.9",
+    "typescript": "^5.8.2"
+  }
 }
