@@ -15,6 +15,7 @@ from cognitive_harness2 import egress_proxy as ep
 from cognitive_harness2.egress_proxy import Limits, Policy, Refused
 
 API = ("api.anthropic.com", 443)
+ALLOW = [list(p) for p in ep.OLLAMA_ROUTE_ALLOW]
 
 
 def policy(*allow, **kw) -> Policy:
@@ -233,14 +234,18 @@ def test_the_token_bucket_limits_and_refills():
 
 def test_config_round_trip_and_loud_failures(tmp_path):
     cfg = {"allow": [["api.anthropic.com", 443]], "listeners": [{"port": 11434, "unix": "/bridge/o.sock"}],
-           "unix_routes": [{"host": "ollama.test", "port": 11434, "unix": "/bridge/o.sock"}], "limits": {"max_connections": 3}}
+           "unix_routes": [{"host": "ollama.test", "port": 11434, "unix": "/bridge/o.sock", "allow": ALLOW}],
+           "limits": {"max_connections": 3}}
     p = tmp_path / "c.json"
     p.write_text(json.dumps(cfg))
     policy_, host, port, listeners, limits = ep.load_config(str(p))
     assert host == "0.0.0.0" and port == 3128 and listeners == [(11434, "/bridge/o.sock")] and limits.max_connections == 3
     assert policy_.decide("ollama.test", 11434).unix == "/bridge/o.sock"
     for bad in ({"alow": []}, {"allow": [["a.example", 443]], "limits": {"nope": 1}}, [], {"listeners": [{"port": 1}]},
-                {"unix_routes": [{"host": "a.example", "port": 1, "unix": "relative"}]}, {"test_allow_cidrs": ["10.0.0.1/8"]}):
+                {"unix_routes": [{"host": "a.example", "port": 1, "unix": "relative", "allow": ALLOW}]},
+                {"unix_routes": [{"host": "a.example", "port": 1, "unix": "/s"}]},       # no allow list: refused, not defaulted
+                {"listeners": [{"port": 1, "unix": "/s"}]},                               # a listener with no route has no allow list
+                {"test_allow_cidrs": ["10.0.0.1/8"]}):
         with pytest.raises(ValueError):
             ep.parse_config(bad)
     p.write_bytes(b"x" * (ep.MAX_CONFIG_BYTES + 1))
@@ -588,32 +593,814 @@ async def test_idle_and_byte_caps_end_a_tunnel():
     quiet.close()
 
 
-async def test_a_unix_route_and_a_unix_listener_reach_the_socket_without_resolving(tmp_path):
-    sock = str(tmp_path / "o.sock")
-    seen = []
-
-    async def echo(r, w):
-        data = await r.read(1024)
-        seen.append(data)
-        w.write(b"OLLAMA:" + data)
-        await w.drain()
-        w.close()
-    server = await asyncio.start_unix_server(echo, sock)
-    try:
-        async with Running([], unix_routes=[{"host": "ollama.test", "port": 11434, "unix": sock}],
-                           listeners=[{"port": 11434, "unix": sock}]) as px:
-            out = await talk(px.port, b"CONNECT ollama.test:11434 HTTP/1.1\r\n\r\nhello")
-            assert out.endswith(b"OLLAMA:hello")
-            out = await talk(px.ports[1], b"raw bytes")
-            assert out == b"OLLAMA:raw bytes"
-            out = await talk(px.port, b"CONNECT ollama.test:11435 HTTP/1.1\r\n\r\n")
-            assert out.startswith(b"HTTP/1.1 403 ")
-            assert px.resolved == []
-    finally:
-        server.close()
 
 
 async def test_a_dead_unix_socket_is_a_502_not_a_hang(tmp_path):
-    async with Running([], unix_routes=[{"host": "ollama.test", "port": 11434, "unix": str(tmp_path / "gone.sock")}]) as px:
-        out = await talk(px.port, b"CONNECT ollama.test:11434 HTTP/1.1\r\n\r\n")
-        assert out.startswith(b"HTTP/1.1 502 ")
+    route = {"host": "ollama.test", "port": 11434, "unix": str(tmp_path / "gone.sock"), "allow": ALLOW}
+    async with Running([], unix_routes=[route]) as px:
+        out = await talk(px.port, rq("GET", "/v1/models", absolute=True))
+        assert out.startswith(b"HTTP/1.1 502 ") and b"upstream-unreachable" in out
+
+
+# ══ the unix route is HTTP, not a tunnel (the host bridge reaches ollama's WHOLE API) ═══════════════════════════════
+
+ROUTE_HOST = "ollama.test"
+ROUTE_PORT = 11434
+CHAT = ("POST", "/v1/chat/completions")
+BODY = b'{"model":"m","messages":[{"role":"user","content":"SECRET-BODY-TEXT"}]}'
+JSON_OK = b'{"ok":true}'
+CLOSE = object()          # in a UnixOllama responder's parts: hang up after answering
+
+
+def rq(method: str, target: str, *, host: str | None = f"{ROUTE_HOST}:{ROUTE_PORT}", body: bytes = b"", extra=(),
+       version: str = "HTTP/1.1", close: bool = True, absolute: bool = False, chunks: list[bytes] | None = None) -> bytes:
+    """One request, as bytes. `absolute` writes the proxy form `http://ollama.test:11434<target>`; `chunks` sends the body chunked."""
+    lines = [f"{method} {'http://' + ROUTE_HOST + ':' + str(ROUTE_PORT) if absolute else ''}{target} {version}"]
+    if host is not None:
+        lines.append(f"Host: {host}")
+    if chunks is not None:
+        lines.append("Transfer-Encoding: chunked")
+        body = b"".join(f"{len(c):x}\r\n".encode() + c + b"\r\n" for c in chunks) + b"0\r\n\r\n"
+    elif body or method == "POST":
+        lines.append(f"Content-Length: {len(body)}")
+    lines += list(extra)
+    if close:
+        lines.append("Connection: close")
+    return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body
+
+
+def responses(raw: bytes) -> list[tuple[int, dict[str, str], bytes]]:
+    """Split what a client read into (status, lower-cased headers, body); Content-Length, chunked and close-delimited bodies."""
+    out, rest = [], raw
+    while rest.startswith(b"HTTP/1."):
+        head, _, rest = rest.partition(b"\r\n\r\n")
+        lines = head.decode("latin-1").split("\r\n")
+        headers = {k.lower(): v.strip() for k, _, v in (ln.partition(":") for ln in lines[1:])}
+        status = int(lines[0].split()[1])
+        if "content-length" in headers:
+            n = int(headers["content-length"])
+            body, rest = rest[:n], rest[n:]
+        elif headers.get("transfer-encoding") == "chunked":
+            body = b""
+            while True:
+                size_line, _, rest = rest.partition(b"\r\n")
+                size = int(size_line, 16)
+                if not size:
+                    rest = rest[2:]
+                    break
+                body, rest = body + rest[:size], rest[size + 2:]
+        else:
+            body, rest = rest, b""
+        out.append((status, headers, body))
+    return out
+
+
+class UnixOllama:
+    """A throwaway HTTP/1.1 server on a unix socket (what the host bridge leads to): parses every request, records it as
+    the proxy delivered it, answers from `responder(record)` (bytes, or a list of bytes and float sleeps), keeps alive."""
+
+    def __init__(self, path: str, responder=None):
+        self.path, self.requests, self.connections = path, [], 0
+        self.responder = responder or (lambda rec: b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                       b"Content-Length: %d\r\n\r\n" % len(JSON_OK) + JSON_OK)
+
+    async def __aenter__(self):
+        self.server = await asyncio.start_unix_server(self._handle, self.path)
+        return self
+
+    async def __aexit__(self, *a):
+        self.server.close()
+        await self.server.wait_closed()
+
+    async def _handle(self, r, w):
+        self.connections += 1
+        try:
+            while True:
+                head = (await r.readuntil(b"\r\n\r\n"))[:-4].decode("latin-1").split("\r\n")
+                method, target, version = head[0].split(" ")
+                headers = [tuple(ln.split(": ", 1)) for ln in head[1:]]
+                low = {k.lower(): v for k, v in headers}
+                body = await r.readexactly(int(low.get("content-length", 0)))
+                rec = {"method": method, "target": target, "version": version, "headers": headers, "low": low, "body": body}
+                self.requests.append(rec)
+                resp = self.responder(rec)
+                hang_up = low.get("connection") == "close"
+                for part in [resp] if isinstance(resp, bytes) else resp:
+                    if isinstance(part, float):
+                        await asyncio.sleep(part)
+                    elif part is CLOSE:
+                        hang_up = True
+                    else:
+                        w.write(part)
+                        await w.drain()
+                if hang_up:
+                    break
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        finally:
+            w.close()
+
+
+class Routed:
+    """A proxy with one unix route (`ollama.test:11434`, and `127.0.0.1:11434`) and a listener, in front of a `UnixOllama`."""
+
+    def __init__(self, tmp_path, responder=None, **limits):
+        self.up = UnixOllama(str(tmp_path / "o.sock"), responder)
+        self.limits = limits
+
+    async def __aenter__(self):
+        await self.up.__aenter__()
+        routes = [{"host": h, "port": ROUTE_PORT, "unix": self.up.path, "allow": ALLOW} for h in (ROUTE_HOST, "127.0.0.1")]
+        self.px = await Running([], unix_routes=routes, listeners=[{"port": ROUTE_PORT, "unix": self.up.path}],
+                                limits={"head_timeout_s": 5, "idle_timeout_s": 5, **self.limits}).__aenter__()
+        self.log, self.port, self.listener = self.px.log, self.px.ports[0], self.px.ports[1]
+        return self
+
+    async def __aexit__(self, *a):
+        await self.px.__aexit__(*a)
+        await self.up.__aexit__(*a)
+
+    def denied(self) -> list[str]:
+        return [x for x in self.log if "decision=deny" in x]
+
+
+@pytest.fixture
+def routed(tmp_path):
+    return lambda responder=None, **limits: Routed(tmp_path, responder, **limits)
+
+
+MANAGEMENT = [
+    ("DELETE", "/api/delete"), ("POST", "/api/delete"), ("POST", "/api/pull"), ("POST", "/api/push"), ("POST", "/api/create"),
+    ("POST", "/api/copy"), ("POST", "/api/generate"), ("POST", "/api/chat"), ("POST", "/api/show"), ("POST", "/api/embed"),
+    ("POST", "/api/embeddings"), ("GET", "/api/ps"), ("GET", "/api/version"), ("GET", "/"), ("HEAD", "/api/tags"),
+    ("HEAD", "/api/blobs/sha256:0000"), ("POST", "/api/blobs/sha256:0000"), ("POST", "/v1/embeddings"),
+    ("GET", "/v1/models/gemma4:e4b"), ("DELETE", "/v1/models/gemma4:e4b"), ("GET", "/api/tags/x"), ("POST", "/api/tags"),
+    # the allowed paths with the wrong method
+    ("GET", "/v1/chat/completions"), ("DELETE", "/v1/chat/completions"), ("PUT", "/v1/chat/completions"),
+    ("PATCH", "/v1/completions"), ("POST", "/v1/models"), ("DELETE", "/v1/models"), ("OPTIONS", "/v1/models"),
+    ("POST", "/api/tags"), ("TRACE", "/v1/models"),
+]
+
+
+@pytest.mark.parametrize("via", ["absolute-uri", "origin-form", "listener"])
+@pytest.mark.parametrize("method,path", MANAGEMENT)
+async def test_every_ollama_management_endpoint_and_every_wrong_method_is_a_logged_403_that_never_reaches_ollama(routed, via, method, path):
+    async with routed() as rt:
+        body = BODY if method in ("POST", "PUT", "PATCH") else b""
+        payload = rq(method, path, body=body, absolute=via == "absolute-uri")
+        out = await talk(rt.listener if via == "listener" else rt.port, payload)
+        (status, headers, text), = responses(out)
+        assert status == 403 and text == b"403 unix-route-path-denied\n" and headers["connection"] == "close"
+        assert rt.up.requests == [] and rt.up.connections == 0
+        assert rt.log == [f"ACCESS decision=deny host={ROUTE_HOST} port={ROUTE_PORT} reason=unix-route-path-denied"], rt.log
+
+
+@pytest.mark.parametrize("method,path", [("GET", "/api/tags"), ("GET", "/v1/models"), CHAT, ("POST", "/v1/completions")])
+@pytest.mark.parametrize("via", ["absolute-uri", "origin-form", "listener"])
+async def test_the_four_allowed_pairs_pass_every_way_in_and_arrive_rebuilt(routed, via, method, path):
+    async with routed() as rt:
+        payload = rq(method, path, body=BODY if method == "POST" else b"", absolute=via == "absolute-uri",
+                     extra=["Accept: application/json", "X-Custom: kept"])
+        out = await talk(rt.listener if via == "listener" else rt.port, payload)
+        (status, _, text), = responses(out)
+        assert (status, text) == (200, JSON_OK)
+        (got,) = rt.up.requests
+        assert (got["method"], got["target"], got["version"]) == (method, path, "HTTP/1.1")
+        assert got["body"] == (BODY if method == "POST" else b"")
+        names = [k.lower() for k, _ in got["headers"]]
+        assert names.count("host") == 1 and got["low"]["host"] == f"{ROUTE_HOST}:{ROUTE_PORT}"        # pinned, one only
+        assert got["low"]["x-custom"] == "kept" and got["low"]["connection"] == "close"
+        host_allow = "unix-listener" if via == "listener" else "unix-route"
+        assert len(rt.log) == 1 and rt.log[0].endswith(f"reason={host_allow}") and "decision=allow" in rt.log[0]
+
+
+@pytest.mark.parametrize("target", [
+    "/v1/chat/completions?stream=true", "/v1/chat/completions?", "/api/tags?x=1", "/v1/models?limit=1",
+    "/v1/chat/completions/", "/v1/models/", "/api/tags/", "/V1/chat/completions", "/v1/Chat/Completions", "/API/TAGS",
+    "/v1/chat%2Fcompletions", "/v1/%63hat/completions", "/v1/chat/completions%00", "/v1/chat/completions%20", "/%76%31/chat/completions",
+    "//v1/chat/completions", "/v1//chat/completions", "/v1/chat//completions", "///api/tags",
+    "/v1/./chat/completions", "/./v1/chat/completions", "/v1/chat/../chat/completions", "/api/../v1/models",
+    "/v1/models/../../api/delete", "/v1/chat/completions/.", "/v1/chat/completions/..", "/v1/chat/completions/../../api/pull",
+    "/v1/chat/completions;x=1", "/v1/chat/completions;/../../api/delete", "/api/tags%2e%2e/delete", "/api/%2e%2e/api/delete",
+    "/v1/chat/completions#frag", "/v1/chat/completions\t", "/v1/chat/completions%0d%0aX: y", "/v1/chat/completions.", "/v1/chat/completionsx",
+    "/ v1/chat/completions".replace(" ", "%20"), "/v1/chat/completions?/../../api/delete", "/v1/models?/api/delete",
+])
+@pytest.mark.parametrize("absolute", [True, False])
+async def test_an_allowed_path_in_any_other_spelling_is_denied_exactly_not_normalised(routed, target, absolute):
+    async with routed() as rt:
+        method = "POST" if "chat" in target else "GET"
+        out = await talk(rt.port, rq(method, target, body=BODY if method == "POST" else b"", absolute=absolute))
+        statuses = [s for s, _, _ in responses(out)]
+        assert statuses and statuses[0] in (400, 403), out
+        assert rt.up.requests == [] and rt.up.connections == 0
+        assert not any(x for x in rt.log if "decision=allow" in x)
+
+
+async def test_a_lower_case_method_or_a_bad_request_line_is_a_400_and_nothing_is_forwarded(routed):
+    async with routed() as rt:
+        for payload in (b"post /v1/chat/completions HTTP/1.1\r\nHost: ollama.test:11434\r\nContent-Length: 0\r\n\r\n",
+                        b"GET /v1/models  HTTP/1.1\r\nHost: ollama.test:11434\r\n\r\n",
+                        b"GET /v1/models HTTP/2.0\r\nHost: ollama.test:11434\r\n\r\n",
+                        b"GET /v1/models HTTP/1.1 extra\r\nHost: ollama.test:11434\r\n\r\n",
+                        b"GET /v1/models\x00 HTTP/1.1\r\nHost: ollama.test:11434\r\n\r\n",
+                        b"GET /v1/models HTTP/1.1\r\nHost: ollama.test:11434\r\nX\r\n\r\n"):
+            assert responses(await talk(rt.port, payload))[0][0] == 400, payload
+        assert rt.up.requests == []
+
+
+# ── absolute-URI vs origin-form, Host header forms, CONNECT, HTTP/1.0 ───────────────────────────────
+
+@pytest.mark.parametrize("host", ["ollama.test:11434", "OLLAMA.TEST:11434", "ollama.test.:11434", "Ollama.Test.:11434"])
+async def test_the_host_header_of_an_origin_form_request_may_be_written_any_way_that_normalises_to_the_route(routed, host):
+    async with routed() as rt:
+        assert responses(await talk(rt.port, rq("GET", "/v1/models", host=host)))[0][0] == 200
+        assert responses(await talk(rt.listener, rq("GET", "/v1/models", host=host)))[0][0] == 200
+        assert [r["low"]["host"] for r in rt.up.requests] == [f"{ROUTE_HOST}:{ROUTE_PORT}"] * 2
+
+
+@pytest.mark.parametrize("host,status,code", [
+    ("evil.example:11434", 400, "not-a-proxy-request"), ("ollama.test:11435", 400, "not-a-proxy-request"),
+    ("ollama.test", 400, "not-a-proxy-request"), ("127.1:11434", 400, "ambiguous-numeric-host"),
+    ("user@ollama.test:11434", 400, "bad-"), ("ollama.test:11434:1", 400, "bad-authority"),
+    ("ollama.test:abc", 400, "bad-port"), ("", 400, "bad-authority"), ("[::1]:11434", 400, "not-a-proxy-request"),
+    ("ollama.test:11434, evil.example", 400, "bad-authority"), ("ollama.test/x", 400, "bad-host"),
+    (None, 400, "missing-host"),
+])
+async def test_an_origin_form_request_whose_host_is_not_the_route_is_refused_on_the_proxy_port(routed, host, status, code):
+    async with routed() as rt:
+        (s, _, text), = responses(await talk(rt.port, rq("GET", "/v1/models", host=host)))
+        assert s == status and code.encode() in text, text
+        assert rt.up.requests == []
+
+
+@pytest.mark.parametrize("host,code", [("evil.example:11434", "unix-route-host-mismatch"), ("ollama.test:11435", "unix-route-host-mismatch"),
+                                       ("ollama.test", "unix-route-host-mismatch"), ("172.30.0.2:11434", "unix-route-host-mismatch")])
+async def test_the_listener_only_serves_the_names_routed_to_its_socket(routed, host, code):
+    async with routed() as rt:
+        (s, _, text), = responses(await talk(rt.listener, rq("GET", "/v1/models", host=host)))
+        assert s == 403 and code.encode() in text and rt.up.requests == []
+
+
+async def test_a_duplicate_host_header_is_a_400(routed):
+    async with routed() as rt:
+        out = await talk(rt.port, rq("GET", "/v1/models", extra=["Host: ollama.test:11434"]))
+        assert responses(out)[0][0] == 400 and b"duplicate-host" in out and rt.up.requests == []
+
+
+@pytest.mark.parametrize("host,ok", [(None, True), ("ollama.test:11434", True), ("OLLAMA.test:11434", True), ("evil.example:11434", False),
+                                     ("ollama.test:11435", False), ("ollama.test", False)])
+async def test_an_absolute_uri_must_agree_with_its_host_header_when_there_is_one(routed, host, ok):
+    async with routed() as rt:
+        (s, _, text), = responses(await talk(rt.port, rq("GET", "/v1/models", host=host, absolute=True)))
+        assert (s == 200) is ok
+        if not ok:
+            assert s == 403 and b"unix-route-host-mismatch" in text and rt.up.requests == []
+            assert rt.log == [f"ACCESS decision=deny host=<invalid> port=0 reason=unix-route-host-mismatch"] or "unix-route-host-mismatch" in rt.log[0]
+
+
+@pytest.mark.parametrize("target", ["https://ollama.test:11434/v1/models", "http://evil.example:11434/v1/models",
+                                    "http://ollama.test:11435/v1/models", "http://user@ollama.test:11434/v1/models",
+                                    "http://ollama.test:11434/v1/models#x", "*", "ollama.test:11434", "ftp://ollama.test:11434/v1/models"])
+async def test_a_request_target_that_is_not_plain_http_to_the_route_is_refused(routed, target):
+    async with routed() as rt:
+        out = await talk(rt.port, f"GET {target} HTTP/1.1\r\nHost: ollama.test:11434\r\nConnection: close\r\n\r\n".encode())
+        assert responses(out)[0][0] in (400, 403) and rt.up.requests == []
+
+
+@pytest.mark.parametrize("name", [f"{ROUTE_HOST}:{ROUTE_PORT}", f"127.0.0.1:{ROUTE_PORT}"])
+async def test_connect_to_a_unix_route_is_refused_because_a_tunnel_would_carry_any_request(routed, name):
+    async with routed() as rt:
+        out = await talk(rt.port, f"CONNECT {name} HTTP/1.1\r\nHost: {name}\r\n\r\nDELETE /api/delete HTTP/1.1\r\n\r\n".encode())
+        (s, _, text), = responses(out)
+        assert s == 403 and text == b"403 unix-route-connect-denied\n"
+        assert rt.up.connections == 0 and rt.up.requests == []
+        assert rt.log == [f"ACCESS decision=deny host={name.rsplit(':', 1)[0]} port={ROUTE_PORT} reason=unix-route-connect-denied"]
+
+
+async def test_http_1_0_is_served_once_and_closed(routed):
+    async with routed() as rt:
+        for port, host in ((rt.port, f"{ROUTE_HOST}:{ROUTE_PORT}"), (rt.port, None), (rt.listener, None)):
+            out = await talk(port, rq("GET", "/v1/models", version="HTTP/1.0", host=host, absolute=host is None and port == rt.port))
+            assert responses(out)[0][:1] == (200,) and len(responses(out)) == 1
+        got = rt.up.requests[0]
+        assert got["version"] == "HTTP/1.0" and got["low"]["connection"] == "close"
+        # origin-form HTTP/1.0 without a Host on the proxy port has no name to be placed by; on the listener it means its socket
+        out = await talk(rt.port, rq("GET", "/v1/models", version="HTTP/1.0", host=None))
+        assert responses(out)[0][0] == 400 and b"not-a-proxy-request" in out
+        # HTTP/1.0 keep-alive is not honoured: the request is the last on its connection
+        out = await talk(rt.port, rq("GET", "/v1/models", version="HTTP/1.0", close=False, extra=["Connection: keep-alive"]) * 2)
+        assert len(responses(out)) == 1
+
+
+# ── keep-alive, pipelining, streaming ──────────────────────────────────────────────────────────────
+
+async def call(r, w, payload: bytes):
+    """Write one request, read ONE complete response off an open connection (Content-Length or chunked)."""
+    w.write(payload)
+    await w.drain()
+    head = await asyncio.wait_for(r.readuntil(b"\r\n\r\n"), 5)
+    raw = head
+    h = head.lower()
+    if b"content-length:" in h:
+        n = int(h.split(b"content-length:")[1].split(b"\r\n")[0])
+        raw += await asyncio.wait_for(r.readexactly(n), 5)
+    elif b"chunked" in h:
+        while not raw.endswith(b"0\r\n\r\n"):
+            raw += await asyncio.wait_for(r.read(65536), 5)
+    return responses(raw)[0]
+
+
+async def test_two_allowed_requests_share_one_keep_alive_connection_and_one_upstream_connection(routed):
+    async with routed() as rt:
+        r, w = await asyncio.open_connection("127.0.0.1", rt.port)
+        a = await call(r, w, rq("GET", "/api/tags", close=False, absolute=True))
+        b = await call(r, w, rq(*CHAT, body=BODY, close=False, absolute=True))
+        c = await call(r, w, rq("GET", "/v1/models", close=True))
+        assert [x[0] for x in (a, b, c)] == [200, 200, 200] and a[2] == b[2] == c[2] == JSON_OK
+        assert await asyncio.wait_for(r.read(), 5) == b""                      # Connection: close on the last: the proxy closes
+        assert rt.up.connections == 1 and [x["target"] for x in rt.up.requests] == ["/api/tags", CHAT[1], "/v1/models"]
+        assert [x["low"].get("connection") for x in rt.up.requests] == [None, None, "close"]
+        assert rt.log.count("ACCESS decision=allow host=ollama.test port=11434 reason=unix-route") == 3 and not rt.denied()
+        w.close()
+
+
+async def test_a_denied_request_in_the_middle_of_a_keep_alive_stream_ends_the_stream_and_is_never_forwarded(routed):
+    async with routed() as rt:
+        r, w = await asyncio.open_connection("127.0.0.1", rt.port)
+        assert (await call(r, w, rq("GET", "/api/tags", close=False)))[0] == 200
+        (s, h, text) = await call(r, w, rq("DELETE", "/api/delete", close=False, body=BODY))
+        assert s == 403 and h["connection"] == "close" and text == b"403 unix-route-path-denied\n"
+        assert await asyncio.wait_for(r.read(), 5) == b""
+        assert [x["target"] for x in rt.up.requests] == ["/api/tags"]
+        w.close()
+
+
+async def test_a_request_may_name_the_route_by_either_of_its_names_on_one_connection(routed):
+    async with routed() as rt:
+        r, w = await asyncio.open_connection("127.0.0.1", rt.port)
+        assert (await call(r, w, rq("GET", "/api/tags", close=False, host="ollama.test:11434")))[0] == 200
+        assert (await call(r, w, rq("GET", "/api/tags", close=False, host="127.0.0.1:11434")))[0] == 200
+        assert [x["low"]["host"] for x in rt.up.requests] == ["ollama.test:11434", "127.0.0.1:11434"]
+        w.close()
+
+
+async def test_pipelined_requests_are_answered_in_order_up_to_the_cap_and_a_denied_one_stops_the_rest(routed):
+    async with routed() as rt:
+        ok = lambda t, **k: rq("GET", t, close=k.get("close", False))            # noqa: E731
+        out = await talk(rt.port, ok("/api/tags") + ok("/v1/models") + ok("/api/tags", close=True))
+        assert [s for s, _, _ in responses(out)] == [200, 200, 200] and len(rt.up.requests) == 3
+        # a fourth request already queued behind three is over the cap (route_max_pipelined = 2): answered 429, not forwarded
+        rt.up.requests.clear()
+        out = await talk(rt.port, b"".join(ok("/api/tags") for _ in range(4)))
+        got = responses(out)
+        assert [s for s, _, _ in got] == [200, 200, 200, 429] and b"unix-route-pipeline-limit" in got[-1][2]
+        assert len(rt.up.requests) == 3
+        # allowed, then denied, then allowed: the allowed one behind the denied one is never forwarded
+        rt.up.requests.clear()
+        out = await talk(rt.port, ok("/api/tags") + rq("DELETE", "/api/delete", close=False) + ok("/v1/models"))
+        got = responses(out)
+        assert [s for s, _, _ in got] == [200, 403] and [x["target"] for x in rt.up.requests] == ["/api/tags"]
+        # denied first: nothing behind it is forwarded either
+        rt.up.requests.clear()
+        out = await talk(rt.port, rq("POST", "/api/pull", close=False, body=b"{}") + ok("/api/tags"))
+        assert [s for s, _, _ in responses(out)] == [403] and rt.up.requests == []
+
+
+async def test_a_response_streams_through_unchanged_as_it_is_produced(routed):
+    events = [b'data: {"n":%d}\n\n' % i for i in range(5)] + [b"data: [DONE]\n\n"]
+    head = (b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n\r\n")
+    wire = [head]
+    for ev in events:
+        wire += [b"%x\r\n" % len(ev) + ev + b"\r\n", 0.25]
+    wire += [b"0\r\n\r\n"]
+    async with routed(lambda rec: wire) as rt:
+        r, w = await asyncio.open_connection("127.0.0.1", rt.port)
+        w.write(rq(*CHAT, body=BODY, close=False, absolute=True, extra=['Accept: text/event-stream']))
+        t0 = asyncio.get_running_loop().time()
+        raw, first = b"", None
+        while not raw.endswith(b"0\r\n\r\n"):
+            raw += await asyncio.wait_for(r.read(65536), 5)
+            if first is None and b"data: " in raw:
+                first = asyncio.get_running_loop().time() - t0
+        total = asyncio.get_running_loop().time() - t0
+        assert raw == head + b"".join(b"%x\r\n" % len(e) + e + b"\r\n" for e in events) + b"0\r\n\r\n"      # byte for byte
+        assert first < 0.25 and total > 1.0                                  # the first event arrived while the stream was still going
+        # and the connection is still good for the next request
+        assert (await call(r, w, rq("GET", "/api/tags", close=True)))[0] == 200
+        w.close()
+
+
+async def test_a_close_delimited_and_a_connection_close_response_end_the_client_connection(routed):
+    plain = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" + JSON_OK         # no length, no chunking: ends at EOF
+    async def serve(raw, extra_close):
+        async with routed(lambda rec: [raw, CLOSE]) as rt:
+            r, w = await asyncio.open_connection("127.0.0.1", rt.port)
+            w.write(rq("GET", "/api/tags", close=False))
+            data = await asyncio.wait_for(r.read(), 5)
+            w.close()
+            return data, rt
+    data, rt = await serve(plain, False)
+    assert data == plain
+    shut = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n" + JSON_OK
+    data, rt = await serve(shut, True)
+    assert data == shut
+
+
+@pytest.mark.parametrize("name,raw", [
+    ("garbage", b"not http at all\r\n\r\n"),
+    ("both framings", b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\nok"),
+    ("two lengths", b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nok"),
+    ("100 continue", b"HTTP/1.1 100 Continue\r\n\r\n"),
+    ("101 switching", b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: x\r\n\r\n"),
+    ("unknown coding", b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nx"),
+    ("signed length", b"HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\nok"),
+    ("obs-fold", b"HTTP/1.1 200 OK\r\nX: a\r\n b\r\nContent-Length: 0\r\n\r\n"),
+])
+async def test_a_malformed_response_from_the_upstream_becomes_a_clean_502(routed, name, raw):
+    async with routed(lambda rec: raw) as rt:
+        out = await talk(rt.port, rq("GET", "/api/tags"))
+        (s, _, text), = responses(out)
+        assert s == 502 and b"unix-route-bad-response" in text, (name, out)
+
+
+async def test_an_upstream_that_closes_before_answering_is_a_502_and_one_that_dies_mid_body_just_ends_the_stream(routed):
+    async with routed(lambda rec: b"") as rt:
+        (s, _, text), = responses(await talk(rt.port, rq("GET", "/api/tags")))
+        assert s == 502 and b"upstream-closed" in text
+    async with routed(lambda rec: b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial") as rt:
+        out = await talk(rt.port, rq("GET", "/api/tags"))
+        assert out.endswith(b"\r\n\r\npartial") and b"502" not in out
+        assert any("reason=unix-route-response-aborted" in x for x in rt.denied())
+
+
+async def test_response_size_cap_cuts_an_endless_response_off(routed):
+    big = b"x" * 5000
+    async with routed(lambda rec: b"HTTP/1.1 200 OK\r\nContent-Length: 5000\r\n\r\n" + big, route_max_response_bytes=1000) as rt:
+        out = await talk(rt.port, rq("GET", "/api/tags"))
+        assert len(out.split(b"\r\n\r\n", 1)[1]) <= 1000 + 65536 and b"x" * 5000 not in out
+        assert any("reason=unix-route-response-too-large" in x for x in rt.denied())
+    chunk = b"%x\r\n" % 600 + b"y" * 600 + b"\r\n"
+    async with routed(lambda rec: [b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", chunk, chunk, chunk, 0.1, chunk, b"0\r\n\r\n"],
+                      route_max_response_bytes=1000) as rt:
+        out = await talk(rt.port, rq("GET", "/api/tags"))
+        assert out.count(b"y" * 600) < 4 and not out.endswith(b"0\r\n\r\n")
+
+
+# ── bodies: Content-Length, chunked, caps ──────────────────────────────────────────────────────────
+
+async def test_a_chunked_request_body_is_decoded_and_forwarded_as_one_content_length_body(routed):
+    async with routed() as rt:
+        pieces = [BODY[:10], BODY[10:11], BODY[11:]]
+        out = await talk(rt.port, rq(*CHAT, chunks=pieces))
+        assert responses(out)[0][0] == 200
+        (got,) = rt.up.requests
+        assert got["body"] == BODY and got["low"]["content-length"] == str(len(BODY)) and "transfer-encoding" not in got["low"]
+
+
+async def test_a_body_arriving_in_pieces_and_a_chunked_body_split_anywhere_are_reassembled(routed):
+    async with routed() as rt:
+        payload = rq(*CHAT, chunks=[BODY[:7], BODY[7:]])
+        r, w = await asyncio.open_connection("127.0.0.1", rt.port)
+        for i in range(0, len(payload), 3):                           # three bytes at a time
+            w.write(payload[i:i + 3])
+            await w.drain()
+            await asyncio.sleep(0)
+        assert responses(await asyncio.wait_for(r.read(), 5))[0][0] == 200
+        assert rt.up.requests[0]["body"] == BODY
+        w.close()
+        out = await talk(rt.port, rq(*CHAT, body=BODY).replace(b"Content-Length", b"Content-Length", 1))
+        assert responses(out)[0][0] == 200 and rt.up.requests[1]["body"] == BODY
+
+
+CHUNK = lambda n, data: f"{n}\r\n".encode() + data + b"\r\n"             # noqa: E731
+BAD_CHUNKED = {
+    "non-hex size": CHUNK("zz", b"ab") + b"0\r\n\r\n",
+    "extension": CHUNK("2;ext=1", b"ab") + b"0\r\n\r\n",
+    "0x prefix": CHUNK("0x2", b"ab") + b"0\r\n\r\n",
+    "signed size": CHUNK("+2", b"ab") + b"0\r\n\r\n",
+    "spaced size": CHUNK(" 2", b"ab") + b"0\r\n\r\n",
+    "empty size": CHUNK("", b"ab") + b"0\r\n\r\n",
+    "nine digit size": CHUNK("000000002", b"ab") + b"0\r\n\r\n",
+    "trailer": CHUNK("2", b"ab") + b"0\r\nX-Trailer: 1\r\n\r\n",
+    "data longer than size": CHUNK("2", b"abc") + b"0\r\n\r\n",
+    "data shorter than size": CHUNK("4", b"ab") + b"0\r\n\r\n",
+    "bare LF": b"2\nab\r\n0\r\n\r\n",
+    "bare CR in size": b"2\rX\r\nab\r\n0\r\n\r\n",
+    "missing final CRLF": CHUNK("2", b"ab") + b"0\r\n",
+}
+
+
+@pytest.mark.parametrize("name", BAD_CHUNKED)
+async def test_a_malformed_chunked_body_is_refused_before_anything_reaches_ollama(routed, name):
+    async with routed(body_timeout_s=1.0) as rt:
+        head = (f"POST /v1/chat/completions HTTP/1.1\r\nHost: {ROUTE_HOST}:{ROUTE_PORT}\r\nTransfer-Encoding: chunked\r\n"
+                "Connection: close\r\n\r\n").encode()
+        out = await talk(rt.port, head + BAD_CHUNKED[name])
+        statuses = [s for s, _, _ in responses(out)]
+        assert statuses == [400] or statuses == [408], (name, out)
+        assert rt.up.requests == [] and rt.up.connections == 0
+
+
+SMUGGLING = {
+    "TE and CL": ["Transfer-Encoding: chunked", "Content-Length: 4"],
+    "two CL, different": ["Content-Length: 4", "Content-Length: 5"],
+    "two CL, same": ["Content-Length: 4", "Content-Length: 4"],
+    "CL list": ["Content-Length: 4, 4"],
+    "CL signed": ["Content-Length: +4"],
+    "CL hex": ["Content-Length: 0x4"],
+    "CL negative": ["Content-Length: -1"],
+    "CL huge": ["Content-Length: 99999999999999999999"],
+    "CL empty": ["Content-Length:"],
+    "space before colon": ["Content-Length : 4"],
+    "tab before colon": ["Content-Length\t: 4"],
+    "obs-fold": ["Content-Length: 4", " X-Fold: 1"],
+    "TE chunked, identity": ["Transfer-Encoding: chunked, identity"],
+    "TE identity, chunked": ["Transfer-Encoding: identity, chunked"],
+    "TE identity": ["Transfer-Encoding: identity"],
+    "TE gzip": ["Transfer-Encoding: gzip"],
+    "TE padded": ["Transfer-Encoding: xchunked"],
+    "two TE": ["Transfer-Encoding: chunked", "Transfer-Encoding: chunked"],
+    "TE header trick": ["Transfer-Encoding:\tchunked\x0b"],
+    "Expect": ["Expect: 100-continue", "Content-Length: 4"],
+    "Upgrade": ["Upgrade: websocket", "Connection: Upgrade", "Content-Length: 4"],
+    "Upgrade alone": ["Upgrade: h2c"],
+    "TE trailers": ["TE: trailers"],
+    "Trailer": ["Trailer: X"],
+    "Connection hides a header": ["Connection: close, Content-Length", "Content-Length: 4"],
+    "Connection with a name": ["Connection: X-Foo", "Content-Length: 4"],
+    "Connection: upgrade": ["Connection: upgrade", "Content-Length: 4"],
+    "NUL in a value": ["X-A: a\x00b", "Content-Length: 4"],
+    "bare CR in a value": ["X-A: a\rb", "Content-Length: 4"],
+    "non-token name": ["X A: b", "Content-Length: 4"],
+    "non-ascii name": ["X-\xe9: b", "Content-Length: 4"],
+}
+
+
+@pytest.mark.parametrize("name", SMUGGLING)
+async def test_framing_smuggling_attempts_are_refused_and_never_forwarded(routed, name):
+    async with routed(head_timeout_s=1.0) as rt:
+        head = (f"POST /v1/chat/completions HTTP/1.1\r\nHost: {ROUTE_HOST}:{ROUTE_PORT}\r\n" + "\r\n".join(SMUGGLING[name])
+                + "\r\nConnection: close\r\n\r\nabcd").encode("latin-1")
+        tail = b"0\r\n\r\nDELETE /api/delete HTTP/1.1\r\nHost: ollama.test:11434\r\n\r\n"
+        out = await talk(rt.port, head + tail)
+        statuses = [s for s, _, _ in responses(out)]
+        assert statuses and statuses[0] == 400 and 200 not in statuses and len(statuses) == 1, (name, out)
+        assert rt.up.requests == [] and rt.up.connections == 0
+
+
+async def test_a_second_request_hidden_after_the_declared_body_is_judged_on_its_own_and_denied(routed):
+    async with routed() as rt:
+        smuggled = b"DELETE /api/delete HTTP/1.1\r\nHost: ollama.test:11434\r\n\r\n"
+        body = b"{}"
+        payload = (f"POST /v1/chat/completions HTTP/1.1\r\nHost: {ROUTE_HOST}:{ROUTE_PORT}\r\nContent-Length: {len(body)}\r\n\r\n").encode() + body + smuggled
+        out = await talk(rt.port, payload)
+        assert [s for s, _, _ in responses(out)] == [200, 403]
+        assert [(x["method"], x["target"]) for x in rt.up.requests] == [CHAT]
+        # a body longer than declared leaves junk in front of the next head, which is not a request at all
+        rt.up.requests.clear()
+        out = await talk(rt.port, payload.replace(b"Content-Length: 2", b"Content-Length: 1"))
+        assert [s for s, _, _ in responses(out)] == [200, 400] and len(rt.up.requests) == 1 and rt.up.requests[0]["body"] == b"{"
+
+
+async def test_a_get_with_a_body_and_a_missing_post_length_are_handled_strictly(routed):
+    async with routed() as rt:
+        out = await talk(rt.port, rq("GET", "/api/tags", extra=["Content-Length: 4"]) + b"abcd")
+        assert responses(out)[0][0] == 400 and rt.up.requests == []
+        out = await talk(rt.port, rq("GET", "/api/tags", chunks=[b"ab"]))
+        assert responses(out)[0][0] == 400 and rt.up.requests == []
+        out = await talk(rt.port, rq("GET", "/api/tags", extra=["Content-Length: 0"]))        # an empty one is fine
+        assert responses(out)[0][0] == 200
+        out = await talk(rt.port, b"POST /v1/chat/completions HTTP/1.1\r\nHost: ollama.test:11434\r\nConnection: close\r\n\r\n")
+        assert responses(out)[0][0] == 200 and rt.up.requests[-1]["low"]["content-length"] == "0"
+
+
+async def test_the_request_body_cap_applies_to_declared_and_to_chunked_bodies(routed):
+    async with routed(route_max_request_bytes=100) as rt:
+        out = await talk(rt.port, rq(*CHAT, body=b"x" * 101))
+        assert responses(out)[0][0] == 413 and b"unix-route-body-too-large" in out
+        out = await talk(rt.port, rq(*CHAT, chunks=[b"x" * 60, b"x" * 41]))
+        assert responses(out)[0][0] == 413
+        out = await talk(rt.port, rq(*CHAT, chunks=[b"x" * 100]))
+        assert responses(out)[0][0] == 200 and len(rt.up.requests) == 1
+        out = await talk(rt.port, rq(*CHAT, body=b"x" * 100))
+        assert responses(out)[0][0] == 200 and len(rt.up.requests) == 2
+    async with routed(route_max_request_bytes=1000) as rt:
+        head = f"POST /v1/chat/completions HTTP/1.1\r\nHost: {ROUTE_HOST}:{ROUTE_PORT}\r\nContent-Length: 5000\r\nConnection: close\r\n\r\n"
+        out = await talk(rt.port, head.encode() + b"x" * 5000)          # refused on the declared length, before the body is read
+        assert responses(out)[0][0] == 413 and rt.up.requests == []
+
+
+async def test_a_body_that_stalls_or_stops_short_is_never_forwarded(routed):
+    async with routed(body_timeout_s=0.5) as rt:
+        r, w = await asyncio.open_connection("127.0.0.1", rt.port)
+        w.write(rq(*CHAT, body=BODY)[:-5])                               # five bytes of the body never come
+        out = await asyncio.wait_for(r.read(), 5)
+        assert responses(out)[0][0] == 408 and rt.up.requests == []
+        w.close()
+        r, w = await asyncio.open_connection("127.0.0.1", rt.port)
+        w.write(rq(*CHAT, body=BODY)[:-5])
+        w.write_eof()
+        assert responses(await asyncio.wait_for(r.read(), 5))[0][0] == 400 and rt.up.requests == []
+        w.close()
+
+
+async def test_the_request_line_and_header_caps_hold_on_every_request_of_a_keep_alive_stream(routed):
+    async with routed() as rt:
+        r, w = await asyncio.open_connection("127.0.0.1", rt.port)
+        assert (await call(r, w, rq("GET", "/api/tags", close=False)))[0] == 200
+        w.write(b"GET /" + b"a" * 9000 + b" HTTP/1.1\r\nHost: ollama.test:11434\r\n\r\n")
+        out = await asyncio.wait_for(r.read(), 5)
+        assert responses(out)[0][0] == 414 and len(rt.up.requests) == 1
+        w.close()
+        r, w = await asyncio.open_connection("127.0.0.1", rt.port)
+        assert (await call(r, w, rq("GET", "/api/tags", close=False)))[0] == 200
+        w.write(b"GET /api/tags HTTP/1.1\r\nHost: ollama.test:11434\r\n" + b"X-A: " + b"a" * 40000 + b"\r\n\r\n")
+        assert responses(await asyncio.wait_for(r.read(), 5))[0][0] == 431
+        w.close()
+
+
+async def test_the_request_count_is_per_session_over_all_connections(routed):
+    async with routed(route_max_requests=3) as rt:
+        for _ in range(2):
+            assert responses(await talk(rt.port, rq("GET", "/api/tags")))[0][0] == 200
+        # the third is the last this proxy will forward: it is served, and its connection ends after it
+        r, w = await asyncio.open_connection("127.0.0.1", rt.port)
+        (s, _, _) = await call(r, w, rq("GET", "/api/tags", close=False))
+        assert s == 200 and await asyncio.wait_for(r.read(), 5) == b""
+        w.close()
+        out = await talk(rt.port, rq("GET", "/api/tags"))
+        assert responses(out)[0][0] == 429 and b"unix-route-request-limit" in out
+        out = await talk(rt.listener, rq("GET", "/api/tags"))
+        assert responses(out)[0][0] == 429
+        assert len(rt.up.requests) == 3
+
+
+async def test_an_idle_keep_alive_connection_is_dropped_quietly(routed):
+    async with routed(idle_timeout_s=0.3) as rt:
+        r, w = await asyncio.open_connection("127.0.0.1", rt.port)
+        assert (await call(r, w, rq("GET", "/api/tags", close=False)))[0] == 200
+        assert await asyncio.wait_for(r.read(), 5) == b""                    # closed by the proxy after the idle time, no reply
+        w.close()
+        assert not rt.denied()
+
+
+# ── what the log may say ───────────────────────────────────────────────────────────────────────────
+
+async def test_the_log_has_decisions_hosts_ports_and_codes_and_never_a_path_a_header_or_a_body(routed):
+    async with routed() as rt:
+        secret = ["Authorization: Bearer SECRET-TOKEN-123", "X-Api-Key: SECRET-KEY-456"]
+        await talk(rt.port, rq(*CHAT, body=BODY, extra=secret))
+        await talk(rt.port, rq("DELETE", "/api/delete/SECRET-PATH-789", body=BODY, extra=secret))
+        await talk(rt.listener, rq("POST", "/api/pull", body=BODY, extra=secret))
+        await talk(rt.port, rq(*CHAT, body=BODY, extra=secret, host="evil.example:11434"))
+        await talk(rt.port, rq(*CHAT, extra=secret + ["Transfer-Encoding: chunked"]))
+        text = "\n".join(rt.log)
+        assert all(re.fullmatch(r"ACCESS decision=(allow|deny) host=\S+ port=\d+ reason=[a-z-]+", x) for x in rt.log), rt.log
+        for leak in ("SECRET", "/api/", "/v1/", "Bearer", "messages", "Authorization"):
+            assert leak not in text, leak
+        assert "reason=unix-route-path-denied" in text and "host=ollama.test port=11434" in text
+        assert [x for x in rt.log if "decision=deny" in x and "path-denied" in x][0] == \
+            "ACCESS decision=deny host=ollama.test port=11434 reason=unix-route-path-denied"
+
+
+import re   # noqa: E402  (used by the log test above)
+
+
+# ── configuration and the pure parts ───────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("allow", [
+    [], [["DELETE", "/api/delete"]], [["GET", "/api/*"]], [["GET", "/v1/models?x=1"]], [["GET", "/v1/models/"]] if False else [["GET", "v1/models"]],
+    [["GET", "/v1/../api/tags"]], [["GET", "/v1/./models"]], [["GET", "//api/tags"]], [["GET", "/api/%74ags"]], [["get", "/api/tags"]],
+    [["GET"]], [["GET", "/api/tags", "x"]], ["GET /api/tags"], [["GET", 5]], "GET /api/tags", [["GET", "/api/ tags"]], [["GET", "/" + "a" * 300]],
+    [["CONNECT", "/api/tags"]], [["GET", "/api/tags#x"]],
+])
+def test_a_bad_route_allow_list_is_refused_loudly(allow):
+    with pytest.raises(ValueError):
+        Policy.build([], [{"host": "ollama.test", "port": 11434, "unix": "/s", "allow": allow}])
+
+
+def test_routes_to_one_socket_must_agree_on_the_allow_list_and_route_keys_are_exact():
+    base = {"host": "ollama.test", "port": 11434, "unix": "/s"}
+    ok = Policy.build([], [{**base, "allow": [["GET", "/api/tags"]]}, {**base, "host": "b.test", "allow": [["GET", "/api/tags"]]}])
+    assert ok.route_allow[("ollama.test", 11434)] == frozenset({("GET", "/api/tags")})
+    with pytest.raises(ValueError, match="same allow list"):
+        Policy.build([], [{**base, "allow": [["GET", "/api/tags"]]}, {**base, "host": "b.test", "allow": [["GET", "/v1/models"]]}])
+    with pytest.raises(ValueError):
+        Policy.build([], [{**base, "allow": [["GET", "/api/tags"]], "extra": 1}])
+
+
+def test_the_shipped_allow_list_is_exactly_the_four_pairs_and_the_session_runner_uses_it():
+    assert set(ep.OLLAMA_ROUTE_ALLOW) == {("GET", "/api/tags"), ("GET", "/v1/models"), ("POST", "/v1/chat/completions"), ("POST", "/v1/completions")}
+    assert len(ep.OLLAMA_ROUTE_ALLOW) == 4
+    for method, path in ep.OLLAMA_ROUTE_ALLOW:
+        assert method in ("GET", "POST") and "?" not in path and not path.endswith("/")
+    assert ep.Policy.build([], [{"host": "a.test", "port": 1, "unix": "/s", "allow": ALLOW}]).route_allow[("a.test", 1)] == set(ep.OLLAMA_ROUTE_ALLOW)
+
+
+def test_the_limits_for_routes_are_configurable_and_default_sane():
+    lim = ep.Limits()
+    assert lim.route_max_requests >= 500 and 1 << 20 <= lim.route_max_request_bytes <= 16 << 20
+    assert lim.route_max_response_bytes >= 1 << 20 and 0 <= lim.route_max_pipelined <= 4
+    assert ep.parse_config({"limits": {"route_max_requests": 5}})[4].route_max_requests == 5
+
+
+def _feed_all(dec, data, step):
+    used = 0
+    for i in range(0, len(data), step):
+        if dec.done:
+            break
+        used += dec.feed(data[i:i + step])
+    return used
+
+
+@pytest.mark.parametrize("step", [1, 2, 3, 7, 1000])
+def test_the_chunked_decoder_gives_the_same_body_however_the_bytes_are_cut(step):
+    wire = b"5\r\nhello\r\n1\r\n \r\n5\r\nworld\r\n0\r\n\r\n"
+    dec = ep.ChunkedDecoder(limit=100, keep=True)
+    assert _feed_all(dec, wire, step) == len(wire) and dec.done and bytes(dec.data) == b"hello world" and dec.size == 11
+
+
+def test_the_chunked_decoder_stops_at_the_end_of_the_body_and_reports_what_follows_it():
+    dec = ep.ChunkedDecoder(limit=100, keep=False)
+    wire = b"3\r\nabc\r\n0\r\n\r\nGET / HTTP/1.1\r\n"
+    assert dec.feed(wire) == wire.index(b"GET") and dec.done and dec.data == b"" and dec.size == 3
+
+
+@pytest.mark.parametrize("wire", [b"1" * 9 + b"\r\n", b"G\r\n", b"1;x\r\nA\r\n", b"-1\r\n", b"1\r\nAB\r\n", b"1\r\nA\n", b"0\r\nX: y\r\n\r\n", b"0\n\n",
+                                  b"2\r\nab\r\n\r\n", b"\r\n"])
+def test_the_chunked_decoder_refuses_every_irregular_form(wire):
+    with pytest.raises(Refused):
+        ep.ChunkedDecoder(limit=100, keep=True).feed(wire)
+
+
+def test_the_chunked_decoder_enforces_its_size_limit_on_the_declared_sizes():
+    with pytest.raises(Refused) as e:
+        ep.ChunkedDecoder(limit=10, keep=False).feed(b"b\r\n")
+    assert e.value.code == "unix-route-body-too-large" and e.value.status == 413
+    dec = ep.ChunkedDecoder(limit=10, keep=False)
+    dec.feed(b"5\r\nabcde\r\n5\r\nabcde\r\n")
+    with pytest.raises(Refused):
+        dec.feed(b"1\r\n")
+
+
+def test_request_framing_table():
+    def req(method="POST", version="HTTP/1.1", **h):
+        return ep.Request(method, "/x", version, tuple((k.replace("_", "-"), v) for k, v in h.items()))
+    assert ep.request_framing(req()) == ("none", 0, False)
+    assert ep.request_framing(req(Content_Length="0")) == ("none", 0, False)
+    assert ep.request_framing(req(Content_Length="12")) == ("length", 12, False)
+    assert ep.request_framing(req(Transfer_Encoding="Chunked")) == ("chunked", 0, False)
+    assert ep.request_framing(req(Connection="Keep-Alive")) == ("none", 0, False)
+    assert ep.request_framing(req(Connection="close")) == ("none", 0, True)
+    assert ep.request_framing(req(version="HTTP/1.0")) == ("none", 0, True)
+    for bad in (req(Transfer_Encoding="chunked", version="HTTP/1.0"), req(Transfer_Encoding="chunked", Content_Length="3"),
+                req("GET", Content_Length="3"), req("GET", Transfer_Encoding="chunked"), req(Content_Length="3 "), req(Content_Length="١٢"),
+                req(Content_Length="1" * 13), req(Expect="100-continue"), req(Upgrade="x"), req(TE="trailers"), req(Connection="te")):
+        with pytest.raises(Refused):
+            ep.request_framing(bad)
+
+
+def test_response_framing_table():
+    assert ep.response_framing(200, [("Content-Length", "5")]) == ("length", 5, False)
+    assert ep.response_framing(200, [("Content-Length", "0")]) == ("none", 0, False)
+    assert ep.response_framing(200, [("Transfer-Encoding", "chunked"), ("Connection", "close")]) == ("chunked", 0, True)
+    assert ep.response_framing(200, []) == ("close", 0, True)
+    assert ep.response_framing(204, [("Content-Length", "5")]) == ("none", 0, False)
+    assert ep.response_framing(304, []) == ("none", 0, False)
+    for status, headers in ((100, []), (101, []), (200, [("Transfer-Encoding", "gzip")]), (200, [("Content-Length", "1"), ("Transfer-Encoding", "chunked")]),
+                            (200, [("Content-Length", "1"), ("Content-Length", "1")]), (200, [("Content-Length", "-1")])):
+        with pytest.raises(Refused):
+            ep.response_framing(status, headers)
+    assert ep.parse_response_head(b"HTTP/1.1 200 OK\r\nA: b")[0] == 200
+    assert ep.parse_response_head(b"HTTP/1.0 404")[0] == 404
+    for bad in (b"HTTP/2 200 OK", b"HTTP/1.1 20 OK", b"HTTP/1.1 600 X", b"junk", b"HTTP/1.1 200 OK\r\n folded: x", b"HTTP/1.1 200 \xff"):
+        with pytest.raises(Refused):
+            ep.parse_response_head(bad)
+
+
+def test_routed_target_table():
+    def req(target, host=None, version="HTTP/1.1"):
+        return ep.Request("GET", target, version, (("Host", host),) if host is not None else ())
+    assert ep.routed_target(req("/v1/models", "A.test.:11434"), None) == ("a.test", 11434, "/v1/models")
+    assert ep.routed_target(req("http://a.test:11434/v1/models?x=1"), None) == ("a.test", 11434, "/v1/models?x=1")
+    assert ep.routed_target(req("http://a.test:11434"), None) == ("a.test", 11434, "/")
+    assert ep.routed_target(req("/x", None, "HTTP/1.0"), ("d.test", 7)) == ("d.test", 7, "/x")
+    for bad in (req("/x"), req("/x", None, "HTTP/1.0"), req("http://a.test:11434/x", "b.test:11434"), req("http://a.test:11434/x", "a.test"),
+                req("*", "a.test:11434"), req("a.test:11434", "a.test:11434"), req("https://a.test:11434/", None)):
+        with pytest.raises(Refused):
+            ep.routed_target(bad, None)
+
+
+async def test_a_client_that_stops_reading_cannot_hold_a_streaming_response_open(routed):
+    chunk = b"x" * 65536
+    stream = [b"HTTP/1.1 200 OK\r\nContent-Length: 40000000\r\n\r\n"] + [chunk] * 500          # far more than the socket buffers hold
+    async with routed(lambda rec: stream, idle_timeout_s=0.5) as rt:
+        r, w = await asyncio.open_connection("127.0.0.1", rt.port)
+        w.write(rq("GET", "/api/tags", close=False))
+        await w.drain()
+        for _ in range(100):                                                    # never read: the proxy must give up by itself
+            await asyncio.sleep(0.1)
+            if any("reason=unix-route-response-aborted" in x for x in rt.denied()):
+                break
+        assert any("reason=unix-route-response-aborted" in x for x in rt.denied()), rt.log
+        w.close()

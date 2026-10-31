@@ -15,6 +15,8 @@ proxy_raw() {
 }
 connect() { proxy_raw "CONNECT $1:$2 HTTP/1.1\r\nHost: $1:$2\r\n\r\nGET / HTTP/1.1\r\nHost: $1\r\n\r\n"; }
 get() { proxy_raw "GET http://$1:$2/ HTTP/1.1\r\nHost: $1:$2\r\n\r\n"; }
+# one absolute-URI request of METHOD PATH to HOST:PORT through the proxy (no body, Connection: close)
+route() { proxy_raw "$1 http://$3:$4$2 HTTP/1.1\r\nHost: $3:$4\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"; }
 raw_tcp() { exec 3<>"/dev/tcp/$1/$2" 2>/dev/null || { echo FAILED; return; }; printf "$3" >&3; timeout 2 cat <&3 2>/dev/null | head -c 200; echo; }
 tryw() { if ( : > "$1" ) 2>/dev/null; then echo WROTE; else echo DENIED; fi; }
 tryw_append() { if ( echo x >> "$1" ) 2>/dev/null; then echo WROTE; else echo DENIED; fi; }
@@ -133,6 +135,7 @@ PY
     ;;
   tcp) tcp "$2" "$3" ;;
   connect) connect "$2" "$3" ;;
+  route) route "$2" "$3" "$4" "$5" ;;
   raw) raw_tcp "$2" "$3" "$4" ;;
   echo) shift; printf '%s\n' "$@" ;;
   cat) cat "${@:2}" ;;

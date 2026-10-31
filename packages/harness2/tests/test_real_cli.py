@@ -175,3 +175,21 @@ def test_the_trajectory_renderer_understands_the_real_event_shapes(verified, pro
     assert trajectory.count_events(p.result.stdout) == len(p.events)
     print(text)
     assert "read" in text and "373.25" in text and "write" in text and "Created file successfully" in text, text
+
+
+# ── the host-bridge route filter: what the real opencode sends must be exactly what the proxy allows ──────────────
+
+def test_every_request_the_real_opencode_sends_is_on_the_proxys_allow_list_and_none_is_denied(verified, proposer_image, tmp_path):
+    """The proxy forwards only `egress_proxy.OLLAMA_ROUTE_ALLOW` to the model server (the bridge socket reaches ollama's WHOLE
+    API, delete and pull included). opencode v2.0.25 sends `GET /api/tags` once, then one `POST /v1/chat/completions` per model
+    step (measured; it never asks for /v1/models, never sends a query string, and goes through the proxy in absolute-URI form
+    with `Host` agreeing, keep-alive). A multi-step session (tool call, then the answer) must pass the filter untouched."""
+    from cognitive_harness2 import egress_proxy as ep
+    from real_cli_probe import SCENARIOS
+    p, _ = go(verified, proposer_image, tmp_path, SCENARIOS["write"])
+    sent = [(x["method"], x["path"]) for x in p.stub]
+    assert sent == [("GET", "/api/tags"), ("POST", "/v1/chat/completions"), ("POST", "/v1/chat/completions")]
+    assert set(sent) <= set(ep.OLLAMA_ROUTE_ALLOW)
+    summary = sr.egress_summary(p.result.egress_log)
+    assert summary["model_requests"] == 3 and summary["egress_denied"] == 0 and summary["denied_reasons"] == []
+    assert p.result.exit_code == 0 and "output/answer.txt" in p.result.harvest.files

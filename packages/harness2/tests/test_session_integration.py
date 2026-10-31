@@ -337,24 +337,44 @@ def local_runner(verified, image, echo, **kw):
 
 
 def test_the_local_channel_reaches_the_host_model_only_through_the_bridge_and_the_proxy(verified, proposer_image, ws, monkeypatch):
-    with Echo() as echo, Echo() as other:
-        r = local_runner(verified, proposer_image, echo)
+    with HttpStub() as model, HttpStub() as other:
+        r = local_runner(verified, proposer_image, model)
         issued = []
         real_must = r._must
         monkeypatch.setattr(r, "_must", lambda args: (issued.append(list(args)), real_must(args))[1])
-        res = r.run(spec(ws, "raw", "harness2-proxy.internal", str(echo.port), "hello"))
-        assert "ECHO:hello" in res.stdout, res
-        probes = [r.run(spec(ws, "connect", "127.0.0.1", str(echo.port))), r.run(spec(ws, "connect", "127.0.0.1", str(other.port))),
-                  r.run(spec(ws, "connect", "example.com", "443")), r.run(spec(ws, "tcp", "127.0.0.1", str(echo.port)))]
-        assert "200 Connection Established" in probes[0].stdout and "ECHO:" in probes[0].stdout
+        listener_get = f"GET /v1/models HTTP/1.1\\r\\nHost: harness2-proxy.internal:{model.port}\\r\\nConnection: close\\r\\n\\r\\n"
+        res = r.run(spec(ws, "raw", "harness2-proxy.internal", str(model.port), listener_get))       # the listener, origin-form
+        assert "MODEL-STUB-OK" in res.stdout, res
+        probes = [r.run(spec(ws, "connect", "127.0.0.1", str(model.port))), r.run(spec(ws, "connect", "127.0.0.1", str(other.port))),
+                  r.run(spec(ws, "connect", "example.com", "443")), r.run(spec(ws, "tcp", "127.0.0.1", str(model.port)))]
+        assert "403" in probes[0].stdout and "unix-route-connect-denied" in probes[0].stdout       # a CONNECT would tunnel ANY request
         assert "403" in probes[1].stdout and "403" in probes[2].stdout           # no other loopback service, no internet
         assert "FAILED" in probes[3].stdout                                       # the session's own loopback is empty
-        assert other.accepted == 0 and echo.accepted >= 2
-        assert r.local_endpoint == f"http://harness2-proxy.internal:{echo.port}"
+        assert other.hits == 0 and model.hits == 1 and model.other == []
+        assert r.local_endpoint == f"http://harness2-proxy.internal:{model.port}"
         creates = [a for a in issued if a[:2] == ["network", "create"]]
         assert len(creates) == 5 and all("--internal" in a for a in creates)       # one internal network per session, NO egress network
         proxy_created = [a for a in issued if a[0] == "create"]
         assert all("/bridge,readonly" in " ".join(a) for a in proxy_created) and not [a for a in issued if a[:2] == ["network", "connect"]]
+
+
+@pytest.mark.parametrize("method,path", [("DELETE", "/api/delete"), ("POST", "/api/pull"), ("POST", "/api/create"), ("POST", "/api/push"),
+                                         ("POST", "/api/copy"), ("POST", "/api/generate"), ("GET", "/api/ps"), ("DELETE", "/v1/models")])
+def test_the_model_servers_management_api_is_a_403_through_the_proxy_and_through_the_listener_and_never_reaches_it(
+        verified, proposer_image, ws, method, path):
+    with HttpStub() as model:
+        r = local_runner(verified, proposer_image, model)
+        via_proxy = r.run(spec(ws, "route", method, path, "harness2-proxy.internal", str(model.port)))
+        raw = f"{method} {path} HTTP/1.1\\r\\nHost: harness2-proxy.internal:{model.port}\\r\\nContent-Length: 0\\r\\nConnection: close\\r\\n\\r\\n"
+        via_listener = r.run(spec(ws, "raw", "harness2-proxy.internal", str(model.port), raw))
+        assert "403" in via_proxy.stdout and "unix-route-path-denied" in via_proxy.stdout, via_proxy
+        assert "403" in via_listener.stdout and "unix-route-path-denied" in via_listener.stdout, via_listener
+        assert model.hits == 0 and model.other == [], (model.hits, model.other)                        # the model server heard nothing
+        denied = [x for x in via_proxy.egress_log + via_listener.egress_log if "decision=deny" in x]
+        assert denied and all(x == f"ACCESS decision=deny host=harness2-proxy.internal port={model.port} reason=unix-route-path-denied"
+                              for x in denied), denied
+        assert not [x for x in via_proxy.egress_log if "decision=allow" in x]
+        assert path not in "".join(via_proxy.egress_log + via_listener.egress_log)                     # a path is never logged
 
 
 def test_the_bridge_directory_is_private_and_gone_after_the_session(verified, proposer_image, ws):
@@ -633,6 +653,7 @@ class HttpStub:
         import http.server
         outer = self
         self.hits = 0
+        self.other = []          # (method, path) of every request that was NOT a GET: the model server's management API
 
         class H(http.server.BaseHTTPRequestHandler):
             def do_GET(self):                                     # noqa: N802
@@ -642,6 +663,14 @@ class HttpStub:
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+
+            def _other(self):
+                outer.other.append((self.command, self.path))
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            do_POST = do_DELETE = do_PUT = do_PATCH = do_HEAD = _other           # noqa: N815
 
             def log_message(self, *a): pass
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)

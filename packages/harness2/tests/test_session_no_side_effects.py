@@ -101,8 +101,9 @@ def test_every_trap_trips_and_is_recorded(traps):
 
 
 def test_the_proxy_decision_logic_is_pure(traps):
+    allow = [list(p) for p in ep.OLLAMA_ROUTE_ALLOW]
     policy = ep.Policy.build([["api.anthropic.com", 443], ["203.0.113.9", 443]],
-                             [{"host": "ollama.test", "port": 11434, "unix": "/bridge/o.sock"}], ["172.30.0.0/16"])
+                             [{"host": "ollama.test", "port": 11434, "unix": "/bridge/o.sock", "allow": allow}], ["172.30.0.0/16"])
     for host in ("api.anthropic.com", "API.anthropic.com.", "api。anthropic。com", "127.1", "0x7f000001", "[::1]", "169.254.169.254",
                  "evil.com", "ollama.test", "203.0.113.9", "", "a b", "a@b", "x" * 300):
         policy.decide(host, 443)
@@ -125,6 +126,71 @@ def test_the_proxy_decision_logic_is_pure(traps):
     with pytest.raises(ValueError):
         ep.parse_config({"allow": [["*.a.example", 443]]})
     assert traps.attempts == []
+
+
+def test_the_route_filter_parsers_are_pure(traps):
+    """The new request/response parsing of a unix route (framing, the chunked decoder, the target and Host rules, the rewrite)
+    reads bytes and returns values: it opens nothing, resolves nothing and starts nothing."""
+    req = ep.parse_head(b"POST /v1/chat/completions HTTP/1.1\r\nHost: ollama.test:11434\r\nTransfer-Encoding: chunked\r\nX-A: b")
+    assert ep.routed_target(req, None) == ("ollama.test", 11434, "/v1/chat/completions")
+    assert ep.request_framing(req) == ("chunked", 0, False)
+    dec = ep.ChunkedDecoder(limit=100, keep=True)
+    assert dec.feed(b"2\r\nab\r\n0\r\n\r\n") == 12 and bytes(dec.data) == b"ab"
+    assert b"Content-Length: 2" in ep.rewrite_routed(req, "ollama.test", 11434, "/v1/chat/completions", 2, False)
+    status, headers = ep.parse_response_head(b"HTTP/1.1 200 OK\r\nContent-Length: 2")
+    assert ep.response_framing(status, headers) == ("length", 2, False)
+    for bad in (b"POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nTransfer-Encoding: chunked",):
+        with pytest.raises(ep.Refused):
+            ep.parse_head(bad)
+    with pytest.raises(ep.Refused):
+        ep.ChunkedDecoder(limit=1, keep=False).feed(b"zz\r\n")
+    assert traps.attempts == []
+
+
+class _MemoryWriter:
+    """Enough of a StreamWriter to see what the proxy answers, with no socket behind it."""
+
+    def __init__(self):
+        self.out, self.closed = b"", False
+
+    def write(self, data): self.out += data
+    async def drain(self): pass
+    def can_write_eof(self): return True
+    def write_eof(self): pass
+    def close(self): self.closed = True
+
+
+def _serve_routed_once(request: bytes, **kw):
+    async def go():
+        policy = ep.Policy.build([], [{"host": "ollama.test", "port": 11434, "unix": "/bridge/o.sock",
+                                       "allow": [list(p) for p in ep.OLLAMA_ROUTE_ALLOW]}])
+        log = []
+        proxy = ep.Proxy(policy, ep.Limits(head_timeout_s=2, idle_timeout_s=2), log=log.append)
+        reader = asyncio.StreamReader()
+        reader.feed_data(request)
+        reader.feed_eof()
+        w = _MemoryWriter()
+        await proxy.serve_routed(reader, w, unix="/bridge/o.sock", first=None, label=("l", 0), **kw)
+        return w, log
+    return asyncio.run(go())
+
+
+def test_a_refused_request_on_a_unix_route_touches_nothing_outside_the_process(traps):
+    """Every refusal of the route filter is decided before a connection to the bridge exists: with every door trapped, a
+    management request, a smuggling attempt and a bad target are answered from memory and nothing is attempted."""
+    for method, path, extra in (("DELETE", "/api/delete", b""), ("POST", "/api/pull", b""), ("GET", "/v1/models?x=1", b""),
+                                ("POST", "/v1/chat/completions", b"Expect: 100-continue\r\n"),
+                                ("POST", "/v1/chat/completions", b"Transfer-Encoding: chunked\r\nContent-Length: 4\r\n")):
+        w, log = _serve_routed_once(f"{method} {path} HTTP/1.1\r\nHost: ollama.test:11434\r\n".encode() + extra + b"\r\n")
+        assert w.out.startswith((b"HTTP/1.1 403 ", b"HTTP/1.1 400 ")) and len(log) == 1 and "decision=deny" in log[0]
+    assert traps.attempts == []
+
+
+def test_only_an_allowed_request_on_a_unix_route_reaches_for_the_bridge_socket(traps):
+    """The one door out of the filter is `connect_target`, and only after the (method, path) is on the allow list."""
+    with pytest.raises(SideEffectAttempted):
+        _serve_routed_once(b"GET /api/tags HTTP/1.1\r\nHost: ollama.test:11434\r\n\r\n")
+    assert any("open_unix_connection" in a for a in traps.attempts)
 
 
 def test_bridge_validators_and_construction_are_pure(traps):

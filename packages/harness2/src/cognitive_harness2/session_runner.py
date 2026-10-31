@@ -56,7 +56,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 from . import channels, egress, sandbox, upstream_egress, workspace_harvest
-from .egress_proxy import PROXY_PORT_DEFAULT, READY_LINE
+from .egress_proxy import OLLAMA_ROUTE_ALLOW, PROXY_PORT_DEFAULT, READY_LINE
 from .host_bridge import HostBridge, validate_target
 from .image import PROXY_PATH_IN_IMAGE, ImageRef
 from .sweep_budget import ROLES, BudgetExhausted, SweepBudget
@@ -220,9 +220,10 @@ _MODEL_ROUTES = frozenset({"unix-route", "unix-listener"})      # the proxy's tw
 def egress_summary(lines: Sequence[str]) -> dict[str, object]:
     """What the proxy decided during one session, as numbers and `host:port` strings. Nothing else of the log is kept.
 
-    `model_requests` counts the connections the proxy opened to the host bridge, i.e. to the local model endpoint
-    (`unix-route`, or the direct listener). It is connection-level evidence that the CLI got as far as the model's
-    door: it says nothing about whether the model answered. `denied_hosts` is deduplicated, in first-seen order, capped."""
+    `model_requests` counts the REQUESTS the proxy forwarded to the host bridge, i.e. to the local model endpoint
+    (`unix-route`, or the direct listener; one line per allowed request, several per keep-alive connection). It is
+    evidence that the CLI got as far as the model's door: it says nothing about whether the model answered. A request
+    the route filter refused is a `deny` line (`unix-route-path-denied`, ...), counted in `egress_denied`. `denied_hosts` is deduplicated, in first-seen order, capped."""
     model = allowed = denied = 0
     hosts: list[str] = []
     reasons: list[str] = []
@@ -302,12 +303,15 @@ def proxy_config(plan: Plan) -> dict:
     if plan.bridge_target is not None:
         sock = f"{BRIDGE_MOUNT}/ollama.sock"
         host, port = plan.bridge_target
-        # Two names, one socket: the loopback address a forward-proxy client names (a CONNECT or absolute-URI request),
-        # and the proxy alias the CLI's provider base URL uses (`runner.local_endpoint`), which a proxy-aware client sends
-        # THROUGH the proxy now that the alias is not in NO_PROXY. A client that connects to the alias directly lands on
-        # the listener below, which relays to the same socket. Nothing else is routed.
-        cfg["unix_routes"] = [{"host": host, "port": port, "unix": sock},
-                              {"host": PROXY_ALIAS, "port": port, "unix": sock}]
+        # Two names, one socket: the loopback address a forward-proxy client names (an absolute-URI request) and the proxy
+        # alias the CLI's provider base URL uses (`runner.local_endpoint`), which a proxy-aware client sends THROUGH the
+        # proxy now that the alias is not in NO_PROXY. A client that connects to the alias directly lands on the listener
+        # below, served the same way. Nothing else is routed. The socket reaches the WHOLE HTTP API of the host's ollama
+        # (delete, pull, create, push, copy), and the session is untrusted: the proxy parses every request on a route and
+        # forwards only the (method, path) pairs of `allow` (`egress_proxy.OLLAMA_ROUTE_ALLOW`); CONNECT is refused.
+        allow = [list(pair) for pair in OLLAMA_ROUTE_ALLOW]
+        cfg["unix_routes"] = [{"host": host, "port": port, "unix": sock, "allow": allow},
+                              {"host": PROXY_ALIAS, "port": port, "unix": sock, "allow": allow}]
         cfg["listeners"] = [{"port": port, "unix": sock}]
     if plan.test_allow_cidrs:
         cfg["test_allow_cidrs"] = list(plan.test_allow_cidrs)
