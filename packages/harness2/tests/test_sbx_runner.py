@@ -599,3 +599,25 @@ def test_a_bad_spec_is_still_a_value_error_not_a_fallback(world):
     with pytest.raises(ValueError):
         world.runner(fallback=docker.factory).run(SandboxSpec(command=[]))
     assert docker.runs == [] and world.calls() == []
+
+
+# ── a restart-flagged setting changed after the daemon started is refused on every run too ──
+
+def _cfg_env(world, *, newer: bool) -> dict:
+    f = world.root / "cfg" / "sandboxes" / "sandboxes" / "settings.json"
+    f.parent.mkdir(parents=True)
+    f.write_text("{}")
+    sock_mtime = sandbox._sbx_socket(world.env).stat().st_mtime
+    os.utime(f, (sock_mtime + (60 if newer else -60),) * 2)
+    return {"XDG_CONFIG_HOME": str(world.root / "cfg"), "FAKE_SBX_SETTINGS": "restart"}
+
+
+def test_the_runner_refuses_while_the_daemon_has_not_been_restarted_and_creates_nothing(world):
+    with pytest.raises(SandboxUnavailable, match="sbx daemon restart") as e:
+        world.runner(env=_cfg_env(world, newer=True)).run(spec())
+    assert isinstance(e.value, SandboxNotStarted) and "ssh.agentForwardingEnabled" in str(e.value)
+    assert world.verbs() == ["version", "policy ls", "settings"]  # nothing created, nothing run
+
+
+def test_the_runner_runs_when_the_daemon_started_after_the_override(world):
+    assert world.runner(env=_cfg_env(world, newer=False)).run(spec()).exit_code == 0

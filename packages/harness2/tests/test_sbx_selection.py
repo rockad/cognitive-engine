@@ -678,3 +678,88 @@ def test_auto_selected_sbx_with_an_unusable_docker_still_fails_closed(fakehost, 
                                environ={**fakehost.env, "FAKE_SBX_CREATE": "fail"}, verified=frozenset({"9.9.9"}))
     with pytest.raises(SandboxUnavailable, match="Docker fallback is unusable"):
         r.run(sandbox.SandboxSpec(command=["true"]))
+
+
+# ── a setting flagged requires_restart: "off" in `settings ls` is not "off in the running daemon" ──
+
+import json as _json  # noqa: E402
+
+SSH = "ssh.agentForwardingEnabled"
+
+
+def settings_doc(*, ssh=False, restart=True, source="user", browser=False) -> str:
+    row = {"key": SSH, "type": "bool", "value": ssh, "source": source}
+    if restart is not None:
+        row["requires_restart"] = restart
+    return _json.dumps([{"key": "browser.enabled", "type": "bool", "value": browser, "source": "user"}, row])
+
+
+def config_file(env_root: Path, *, newer_than_socket: bool | None, socket_path: Path | None = None) -> dict:
+    """An XDG_CONFIG_HOME holding (or not) the sbx settings override file, dated relative to the daemon socket."""
+    cfg = env_root / "cfg"
+    if newer_than_socket is not None:
+        f = cfg / "sandboxes" / "sandboxes" / "settings.json"
+        f.parent.mkdir(parents=True)
+        f.write_text("{}")
+        sock_mtime = socket_path.stat().st_mtime
+        os.utime(f, (sock_mtime + (60 if newer_than_socket else -60),) * 2)
+    return {"XDG_CONFIG_HOME": str(cfg)}
+
+
+def test_a_restart_flagged_override_set_after_the_daemon_started_is_pending(fakehost):
+    sock = sandbox._sbx_socket(fakehost.env)
+    env = {**fakehost.env, **config_file(fakehost.root, newer_than_socket=True, socket_path=sock)}
+    assert sandbox.sbx_restart_pending(settings_doc(), env) == [SSH]
+
+
+def test_a_restart_flagged_override_older_than_the_daemon_is_in_effect(fakehost):
+    sock = sandbox._sbx_socket(fakehost.env)
+    env = {**fakehost.env, **config_file(fakehost.root, newer_than_socket=False, socket_path=sock)}
+    assert sandbox.sbx_restart_pending(settings_doc(), env) == []
+
+
+def test_an_override_that_cannot_be_dated_is_pending_never_assumed_in_effect(fakehost):
+    env = {**fakehost.env, **config_file(fakehost.root, newer_than_socket=None)}  # no settings.json at all
+    assert sandbox.sbx_restart_pending(settings_doc(), env) == [SSH]
+    assert sandbox.sbx_restart_pending(settings_doc(source=None), env) == [SSH]  # a missing source is not "default"
+
+
+@pytest.mark.parametrize("doc", [
+    settings_doc(source="default"),          # no override exists: the daemon read the default when it started
+    settings_doc(restart=None),              # not flagged (the key's own contract says no restart needed)
+    settings_doc(restart=False),
+    settings_doc(ssh=True),                  # on: that is `unsafe-setting`, not this
+])
+def test_nothing_is_pending_without_a_restart_flagged_off_override(fakehost, doc):
+    assert sandbox.sbx_restart_pending(doc, fakehost.env) == []
+
+
+def test_the_documented_override_accepts_a_pending_restart_too(fakehost):
+    assert sandbox.sbx_restart_pending(settings_doc(), {**fakehost.env, ENV_ALLOW_HOST_SETTINGS: "1"}) == []
+
+
+@pytest.mark.parametrize("text", ["not json", "{}", "[1]"])
+def test_unreadable_documents_have_nothing_pending_here_the_parser_refuses_them(text):
+    assert sandbox.sbx_restart_pending(text, {}) == []
+
+
+def test_the_real_probe_refuses_sbx_while_a_restart_is_pending_and_names_the_fix(fakehost, monkeypatch):
+    sock = sandbox._sbx_socket(fakehost.env)
+    cfg = config_file(fakehost.root, newer_than_socket=True, socket_path=sock)
+    which, env, pr, ver = inspect_fake(fakehost, monkeypatch, FAKE_SBX_SETTINGS="restart", **cfg)
+    rep = sandbox.sandbox_report(which, environ=env, probes=pr, verified=ver)
+    assert rep["runner"] == "rootless-docker" and rep["sbx"]["codes"] == ["restart-pending"]
+    assert rep["fallback_reason"]["code"] == "restart-pending" and rep["fallback_reason"]["loud"] is True
+    assert "sbx daemon restart" in rep["sbx"]["reasons"][0] and SSH in rep["sbx"]["reasons"][0]
+
+
+def test_the_real_probe_selects_sbx_once_the_daemon_has_been_restarted_after_the_override(fakehost, monkeypatch):
+    sock = sandbox._sbx_socket(fakehost.env)
+    cfg = config_file(fakehost.root, newer_than_socket=False, socket_path=sock)
+    which, env, pr, ver = inspect_fake(fakehost, monkeypatch, FAKE_SBX_SETTINGS="restart", **cfg)
+    assert isinstance(sandbox.default_runner(which, environ=env, probes=pr, verified=ver), SbxRunner)
+
+
+def test_the_real_probe_selects_sbx_when_the_flagged_setting_is_just_the_default_off(fakehost, monkeypatch):
+    which, env, pr, ver = inspect_fake(fakehost, monkeypatch, FAKE_SBX_SETTINGS="restart_default")
+    assert isinstance(sandbox.default_runner(which, environ=env, probes=pr, verified=ver), SbxRunner)

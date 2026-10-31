@@ -4,7 +4,7 @@
 # for exec and 1 for the rest) and records every call. It never starts a VM and touches nothing but $FAKE_SBX_DIR.
 #
 # Behaviour knobs (environment): FAKE_SBX_POLICY_FILE (policy ls --json output), FAKE_SBX_CREATE=fail,
-# FAKE_SBX_CHECK=allowed|garbage, FAKE_SBX_CP=fail|drop, FAKE_SBX_EXEC_RC/OUT/ERR, FAKE_SBX_EXEC_HANG=1 (sleeps 60s),
+# FAKE_SBX_SETTINGS=off|ssh|browser|both|restart|restart_default|garbage|fail|hang, FAKE_SBX_CHECK=allowed|garbage, FAKE_SBX_CP=fail|drop, FAKE_SBX_EXEC_RC/OUT/ERR, FAKE_SBX_EXEC_HANG=1 (sleeps 60s),
 # FAKE_SBX_RM=leak (rm --force succeeds but the sandbox stays), FAKE_SBX_LS=fail, FAKE_SBX_VERSION.
 set -u
 D="${FAKE_SBX_DIR:?FAKE_SBX_DIR is required}"
@@ -37,6 +37,11 @@ case "${1:-}" in
       fail) echo "error: daemon unreachable" >&2; exit 1 ;;
       hang) sleep 60 ;;
       garbage) echo "not json" ;;
+      restart|restart_default)
+        # ssh agent forwarding is OFF but flagged requires_restart (as on a real v0.50.1): `restart` = a user override
+        # (source "user"; the daemon may predate it), `restart_default` = the default (no override to be pending)
+        src=user; [ "${FAKE_SBX_SETTINGS}" = restart_default ] && src=default
+        echo "[{\"key\":\"browser.enabled\",\"type\":\"bool\",\"value\":false,\"source\":\"user\"},{\"key\":\"ssh.agentForwardingEnabled\",\"type\":\"bool\",\"value\":false,\"requires_restart\":true,\"source\":\"$src\"}]" ;;
       *)
         ssh=false; br=false
         case "${FAKE_SBX_SETTINGS:-off}" in ssh|both) ssh=true ;; esac

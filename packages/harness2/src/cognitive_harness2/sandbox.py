@@ -502,6 +502,63 @@ def _unsafe_settings_message(on: Sequence[str]) -> str:
             f"restart`), or accept the risk with {ENV_ALLOW_HOST_SETTINGS}=1")
 
 
+class SbxRestartPending(RuntimeError):
+    """A host-reach setting reads as off but is flagged `requires_restart` and was set after the daemon started."""
+
+    def __init__(self, keys: Sequence[str]):
+        self.keys = list(keys)
+        super().__init__(
+            f"sbx setting(s) {', '.join(self.keys)} read as off but are flagged `requires_restart` and were set after "
+            f"the daemon started, so the running daemon may still apply the old value (existing agent connections "
+            f"stay active); run `sbx daemon restart` (from a shell with the kvm group), or accept the risk with "
+            f"{ENV_ALLOW_HOST_SETTINGS}=1")
+
+
+def _settings_override_file(environ: Mapping[str, str]) -> Path:
+    # Beside `settings.json.lock`, which sbx v0.50.1 creates there; the file itself exists once an override was set.
+    home = environ.get("HOME") or str(Path.home())
+    base = environ.get("XDG_CONFIG_HOME") or str(Path(home) / ".config")
+    return Path(base) / "sandboxes" / "sandboxes" / "settings.json"
+
+
+def _override_predates_daemon(environ: Mapping[str, str]) -> bool:
+    """True only when the settings override file is provably no newer than the daemon socket (created when the daemon
+    started, mtime never touched by connections). Anything that cannot be dated is False: not proven is pending."""
+    try:
+        return _settings_override_file(environ).stat().st_mtime <= _sbx_socket(environ).stat().st_mtime
+    except OSError:
+        return False
+
+
+def sbx_restart_pending(settings_json: str, environ: Mapping[str, str]) -> list[str]:
+    """The host-reach settings that read as OFF but may not be off in the RUNNING daemon.
+
+    `sbx settings ls --format json` marks `ssh.agentForwardingEnabled` `requires_restart: true` (v0.50.1): the CLI
+    prints the configured value, the daemon applies it only after `sbx daemon restart`. A key is pending when it is
+    flagged, reads off, has an override (`source` other than `default`), and the override cannot be shown to be older
+    than the daemon (file mtime <= daemon socket mtime). With no override the daemon read the default when it started,
+    and the documented override accepts the risk. Unreadable documents have nothing pending: the parser refuses them.
+
+    `source` values other than `default` were not observed (this host has no override): any other value counts as an
+    override. The evaluated value comes from the daemon, so an env var the daemon itself was started with is already
+    part of what `settings ls` prints; the CLI-side scrub of `DOCKER_SANDBOXES_*` does not hide it.
+    """
+    if host_settings_allowed(environ):
+        return []
+    try:
+        doc = json.loads(settings_json)
+    except ValueError:
+        return []
+    if not isinstance(doc, list):
+        return []
+    flagged = [row.get("key") for row in doc if isinstance(row, dict) and row.get("key") in SBX_RISKY_SETTINGS
+               and row.get("requires_restart") is True and row.get("value") is False
+               and row.get("source") != "default"]
+    if flagged and not _override_predates_daemon(environ):
+        return flagged
+    return []
+
+
 def _stage_for_sbx(spec: SandboxSpec) -> Path | None:
     """Write the files under `<tmp>/candidate/`; returns `<tmp>` (the caller removes it) or None when there are none."""
     _validate_stage_names(spec.files)  # before mkdtemp: a bad key leaves nothing behind
@@ -627,6 +684,9 @@ class SbxRunner:
             raise SandboxUnavailable(f"cannot read the sbx host-reach settings: {e} (fail closed)") from None
         if on:
             raise SandboxUnavailable(_unsafe_settings_message(on) + " (fail closed)")
+        pending = sbx_restart_pending(raw, self.environ)
+        if pending:
+            raise SandboxUnavailable(f"{SbxRestartPending(pending)} (fail closed)")
 
     def _check_sandbox_denies_network(self, name: str) -> None:
         for target in SBX_DENIED_TARGETS:
@@ -786,7 +846,8 @@ WHY_UNREADABLE_SETTING = "unreadable-setting"
 WHY_PROBE_TIMEOUT = "probe-timeout"
 WHY_PROBE_ERROR = "probe-error"
 WHY_BAD_SETTING = "bad-setting-value"
-WHY_RUN_FAILED = "sbx-run-failed"  # selected and usable at probe time, then failed before the candidate started
+WHY_RESTART_PENDING = "restart-pending"  # a host-reach setting reads off but needs `sbx daemon restart` to apply
+WHY_RUN_FAILED ="sbx-run-failed"  # selected and usable at probe time, then failed before the candidate started
 
 _SBX_PROBE_TIMEOUT_S = 5       # one read-only `sbx` command; the whole probe asks at most three
 _SBX_PROBE_CACHE_TTL_S = 60.0  # per process; a daemon started later is noticed within this long
@@ -877,7 +938,12 @@ def real_sbx_probes(environ: Mapping[str, str]) -> SbxProbes:
         p = _run_readonly([path, *_SBX_SETTINGS_ARGV], env)
         if p.returncode != 0:
             raise RuntimeError(f"`sbx settings ls` failed (exit {p.returncode}): {_first_line(p.stderr or p.stdout)}")
-        return sbx_settings_observed(p.stdout)
+        observed = sbx_settings_observed(p.stdout)
+        if not sbx_unsafe_settings(observed, environ):  # an "on" setting is reported as that, not as a pending restart
+            pending = sbx_restart_pending(p.stdout, environ)
+            if pending:
+                raise SbxRestartPending(pending)
+        return observed
 
     return SbxProbes(kvm, daemon, version, policy, risky_settings)
 
@@ -998,6 +1064,8 @@ def _probe_sbx(path: str, environ: Mapping[str, str], pr: SbxProbes, verified: f
             timed_out[0] = True
             problems.append(SbxProblem(WHY_PROBE_TIMEOUT, f"{label} probe timed out after {_SBX_PROBE_TIMEOUT_S}s "
                                        "(a hung sbx counts as unusable)"))
+        except SbxRestartPending as e:
+            problems.append(SbxProblem(WHY_RESTART_PENDING, str(e)))
         except Exception as e:  # noqa: BLE001 - a probe that cannot answer means unusable, never a crash
             problems.append(SbxProblem(WHY_PROBE_ERROR, f"{label} probe failed: {type(e).__name__}: {e}"))
         return _FAILED
