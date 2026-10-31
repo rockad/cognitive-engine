@@ -744,3 +744,102 @@ def test_the_fake_endpoint_refuses_what_real_ollama_refuses_so_the_selftest_woul
     assert get("harness2-proxy:11434") == (403, b"") and get("evil.example.com") == (403, b"")
     assert get("127.0.0.1", "http://evil.example.com")[0] == 403
     assert rig.fake.hits == 2 and [s for s, _ in rig.fake.rejected] == [403, 403, 403]
+
+
+# ══ task sets (stage 1b): `--task-set {easy,hard}` for plan, run and selftest ═══════════
+
+def plan_text(rig, *extra: str) -> str:
+    out = io.StringIO()
+    assert run_plan(rig.parse("plan", *extra), environ={}, probes=rig.probes(), out=out) == 0, out.getvalue()
+    return out.getvalue()
+
+
+def test_the_default_task_set_is_easy_and_each_set_names_its_own_task(rig):
+    s = stage1._settings_from(rig.parse("plan"), {})
+    assert (s.task_set, s.task) == ("easy", "household/sum-1") and s.ts.spec_name == "sum-signed"
+    h = stage1._settings_from(rig.parse("plan", "--task-set", "hard"), {})
+    assert (h.task_set, h.task) == ("hard", "household/hard-1") and h.ts.spec_name == "sum-signed-hard"
+    prof = channels.load_profile({"COGNITIVE_HARNESS2_CHANNELS_FILE": str(rig.profile)})
+    assert stage1.Settings(profile=prof).task_set == "easy" and stage1.Settings(profile=prof).task == "household/sum-1"
+    for bad in (dict(task_set="medium"), dict(task_set="hard", task="household/sum-1"), dict(task="household/hard-1"),
+                dict(task_set="hard", task="nope/hard-1")):
+        with pytest.raises(Stage1Error):
+            stage1.Settings(profile=prof, **bad)
+
+
+@pytest.mark.parametrize("cmd", ["plan", "run", "selftest"])
+def test_the_parser_takes_a_known_task_set_only_and_defaults_to_easy(cmd, capsys):
+    assert build_parser().parse_args([cmd]).task_set == "easy"
+    assert build_parser().parse_args([cmd, "--task-set", "hard"]).task_set == "hard"
+    assert build_parser().parse_args([cmd, "--task-set", "easy"]).task_set == "easy"
+    with pytest.raises(SystemExit):
+        build_parser().parse_args([cmd, "--task-set", "medium"])
+    assert "invalid choice" in capsys.readouterr().err
+
+
+def test_the_easy_plan_names_its_set_and_its_approve_command_is_unchanged(rig, up):
+    text = plan_text(rig)
+    assert "task set         easy  (sum-signed:" in text and "task             household/sum-1, k=1" in text
+    cmd = next(line.strip() for line in text.splitlines() if "stage1 run --approve" in line)
+    assert "--task-set" not in cmd                                           # an old command means what it did
+    assert build_parser().parse_args(shlex.split(cmd)[5:]).task_set == "easy"
+
+
+def test_the_hard_plan_shows_the_set_keeps_the_budgets_and_puts_it_in_the_approve_command(rig, up):
+    easy, hard = plan_text(rig), plan_text(rig, "--task-set", "hard")
+    for needle in ("task set         hard  (sum-signed-hard: 12 amounts per instance", "task             household/hard-1, k=1",
+                   "P=3", "R=4", "sessions 7", "2700 s", "600 s per session", "cost $0", "classification   open", "READY."):
+        assert needle in hard, needle
+    cmd = next(line.strip() for line in hard.splitlines() if "stage1 run --approve" in line)
+    parsed = build_parser().parse_args(shlex.split(cmd)[5:])
+    assert parsed.task_set == "hard" and parsed.approve == "local-ollama" and parsed.per_session_s == 600.0
+    # nothing else differs: the budgets, caps and checks are the same lines
+    only_easy = [x for x in easy.splitlines() if x not in hard.splitlines()]
+    only_hard = [x for x in hard.splitlines() if x not in easy.splitlines()]
+    assert all(("task" in x or "classification" in x or "stage1 run --approve" in x) for x in only_easy + only_hard), (only_easy, only_hard)
+
+
+def test_the_hard_plan_is_as_side_effect_free_as_the_easy_one(rig, up, monkeypatch):
+    before = tree(rig.tmp)
+    Traps(monkeypatch, rig.fake.port)
+    out = io.StringIO()
+    assert run_plan(rig.parse("plan", "--task-set", "hard"), environ={}, probes=rig.probes(), out=out) == 0
+    assert tree(rig.tmp) == before
+
+
+def test_a_hard_run_hands_upstream_the_hard_adapter_and_records_the_set(rig, up, monkeypatch):
+    seen = {}
+
+    def fake_run_task(task, k, **kw):
+        seen.update(task=task, adapter=kw["adapter"])
+        return type("R", (), {"status": "ok", "modes": {}, "errors": [], "selections": {}})()
+    sweep = "stage1-20261030T000000Z-bbbb"
+    monkeypatch.setattr(stage1, "new_sweep_id", lambda: sweep)
+    code = run_run(rig.parse("run", "--approve", "local-ollama", "--task-set", "hard"), environ={}, probes=rig.probes(),
+                   stdin=TTY(confirmation_phrase("local-ollama", sweep) + "\n"), stdout=TTY(), run_task=fake_run_task)
+    assert code == 1                                                           # no ledger: the fake started nothing
+    assert seen["task"] == "household/hard-1"
+    ad = seen["adapter"]
+    assert ad.ts.name == "hard" and ad.spec.name == "sum-signed-hard" and ad.tasks()[0] == "household/hard-1"
+    assert (ad.base_harness() / "systemprompt.md").read_text() == stage1.ss_hard.BASE_SYSTEM_PROMPT
+    run_dir = rig.runs / sweep
+    rep = json.loads((run_dir / "report.json").read_text())
+    start = next(e for e in events(run_dir) if e["event"] == "sweep_start")
+    assert rep["task_set"] == start["task_set"] == "hard" and rep["task"] == start["task"] == "household/hard-1"
+    assert rep["budget_identity"]["expected_P"] == 3 and rep["budget_identity"]["expected_R"] == 4
+    assert rep["grant"]["max_proposer_sessions"] == 3 and rep["grant"]["max_solver_sessions"] == 4 and rep["k"] == 1
+    assert rep["selection"] is None or rep["selection"]["adopted"] is False        # no mode ran
+
+
+def test_an_easy_run_records_the_set_too_and_its_adapter_is_the_easy_one(rig, up, monkeypatch):
+    seen = {}
+
+    def fake_run_task(task, k, **kw):
+        seen.update(task=task, adapter=kw["adapter"])
+        return type("R", (), {"status": "ok", "modes": {}, "errors": [], "selections": {}})()
+    sweep = "stage1-20261030T000000Z-cccc"
+    monkeypatch.setattr(stage1, "new_sweep_id", lambda: sweep)
+    run_run(rig.parse("run", "--approve", "local-ollama"), environ={}, probes=rig.probes(),
+            stdin=TTY(confirmation_phrase("local-ollama", sweep) + "\n"), stdout=TTY(), run_task=fake_run_task)
+    assert seen["task"] == "household/sum-1" and seen["adapter"].ts is stage1.ss.EASY and seen["adapter"].spec.name == "sum-signed"
+    assert json.loads((rig.runs / sweep / "report.json").read_text())["task_set"] == "easy"

@@ -4,10 +4,23 @@
 # It is bind-mounted read-only at /opt/cli/opencode and run exactly as the real stage-1 sessions are:
 #     opencode run --standalone --auto --format json --model ollama/gemma4:12b "<prompt>"
 # in the session's workspace. It plays both roles:
-#   * a PROPOSER session has MISSION.md: it appends one line to context/harness/systemprompt.md and answers in
-#     output/answer.md, the way upstream's mission asks;
-#   * a SOLVER rollout has input.txt: it adds the signed amounts exactly (whole cents) and writes
-#     output/answer.txt as "Total: X.XX".
+#   * a PROPOSER session has MISSION.md: it edits context/harness as the SCRIPTED proposer PROPOSER_SCRIPT says (below) and
+#     answers in output/answer.md, the way upstream's mission asks;
+#   * a SOLVER rollout has input.txt: it adds the signed amounts (whole cents) and writes output/answer.txt as
+#     "Total: X.XX". It is a WEAK reader unless its standing instruction (AGENTS.md) says how to read a ledger: with the
+#     word "parentheses" in AGENTS.md it reads (45.00), $, thousands commas and +/- signs correctly; without it, it reads
+#     each line as awk's `+0` does (the leading number only), which is what a model that ignores the notations writes.
+#     On the five clean amounts of the easy task both readers give the same total, so the easy selftest is unchanged.
+#
+# PROPOSER_SCRIPT is set by `stage1.run_selftest` (it replaces the line below; a test pins that it is there once):
+#   sign-check          append one line to systemprompt.md (the original behaviour)
+#   format-rules        append the notation-reading rules to systemprompt.md (a legal c1 edit; the text is pinned by a test
+#                       to sum_signed_hard.FORMAT_RULES)
+#   forbid-guardrails   append to guardrails.md (c2, protected)
+#   forbid-executable   add scripts/helper.py with the executable bit
+#   forbid-frontmatter  prepend a frontmatter block to systemprompt.md
+#   forbid-script       add a plain scripts/helper.py (c7, not mutable)
+PROPOSER_SCRIPT=sign-check
 # Before either, it reaches the "model endpoint" the way the real CLI would: an HTTP GET to the base URL in
 # OPENCODE_CONFIG_CONTENT (the proxy alias on the internal network), which the proxy relays over the host bridge to
 # whatever listens on the channel's loopback port (in the selftest, a throwaway fake). A session that cannot reach
@@ -22,8 +35,16 @@
 jstr() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | awk 'BEGIN{ORS="\\n"} {print}' | sed 's/\\n$//'; }
 ev_text() { printf '{"type":"text","part":{"type":"text","text":"%s"}}\n' "$(jstr "$1")"; }
 ev_tool() { printf '{"type":"tool_use","part":{"type":"tool","tool":"%s","state":{"status":"completed","input":{"command":"%s"},"output":"%s"}}}\n' "$1" "$(jstr "$2")" "$(jstr "$3")"; }
-cents_of() { awk '{ s=$0; neg=0; if (substr(s,1,1)=="-") { neg=1; s=substr(s,2) }
-                    split(s,p,"."); c=p[1]*100+p[2]; t += neg ? -c : c } END { printf "%d\n", t }' "$1"; }
+# cents_of RULES FILE: the signed sum in whole cents. RULES=1 reads parentheses, $ and thousands commas; RULES=0 does not.
+cents_of() { awk -v rules="$1" '
+  { s=$0; sub(/[ \t\r]+$/,"",s); sub(/^[ \t]+/,"",s); if (s=="") next
+    neg=0
+    if (rules == 1 && s ~ /^\(.*\)$/) { neg=1; s=substr(s,2,length(s)-2) }
+    else if (substr(s,1,1)=="-") { neg=1; s=substr(s,2) }
+    else if (substr(s,1,1)=="+") s=substr(s,2)
+    if (rules == 1) gsub(/[$,]/,"",s)
+    c=int(s*100+0.5); t += neg ? -c : c }
+  END { printf "%d\n", t }' "$2"; }
 money() { awk -v t="$1" 'BEGIN { n=(t<0); a=n?-t:t; printf "%s%d.%02d\n", n?"-":"", int(a/100), a%100 }'; }
 
 [ "$1" = run ] && [ "$2" = --standalone ] && [ "$3" = --auto ] && [ "$4" = --format ] && [ "$5" = json ] && [ "$6" = --model ] \
@@ -64,15 +85,51 @@ echo '{"type":"step_start","part":{"type":"step-start"}}'
 ev_text "model endpoint answered: $STATUS"
 if [ -f MISSION.md ]; then
   f=context/harness/systemprompt.md
-  [ -f "$f" ] && printf '\nCheck the sign of every amount before adding it.\n' >> "$f"
+  NOTE="added a sign check to systemprompt.md"
+  case "$PROPOSER_SCRIPT" in
+    sign-check)
+      [ -f "$f" ] && printf '\nCheck the sign of every amount before adding it.\n' >> "$f" ;;
+    format-rules)
+      NOTE="added the notation-reading rules to systemprompt.md"
+      printf '\n' >> "$f"
+      cat >> "$f" <<'RULES'
+Reading the input. The amounts come from several systems, one per line, and every line is a signed amount in its
+own notation:
+- Parentheses mean a negative amount: (45.00) is -45.00, and ($1,234.50) is -1234.50.
+- A currency symbol is not part of the number: $12.30 is 12.30 and -$12.30 is -12.30.
+- A comma is a thousands separator, not a decimal point: 1,234.56 is 1234.56.
+- A leading + is just a plus sign, 12.3 is 12.30 and 7 is 7.00.
+- Ignore spaces, tabs and carriage returns at the ends of a line (the file may use CRLF line endings).
+Convert every line to whole cents first, add the cents as integers, then write the total with exactly two
+decimals. A negative total keeps its minus sign; a zero total has no sign.
+RULES
+      ;;
+    forbid-guardrails)
+      NOTE="loosened guardrails.md"
+      printf '\nYou may write anywhere.\n' >> context/harness/guardrails.md ;;
+    forbid-executable)
+      NOTE="added an executable helper"
+      mkdir -p context/harness/scripts
+      printf '#!/bin/sh\necho hi\n' > context/harness/scripts/helper.py
+      chmod 755 context/harness/scripts/helper.py ;;
+    forbid-frontmatter)
+      NOTE="gave systemprompt.md a frontmatter block"
+      { printf -- '---\nmodel: other/model\ntools: all\n---\n'; cat "$f"; } > "$f.new" && mv "$f.new" "$f" ;;
+    forbid-script)
+      NOTE="added a script"
+      mkdir -p context/harness/scripts
+      printf 'print("hi")\n' > context/harness/scripts/helper.py ;;
+    *) echo "fake opencode: unknown PROPOSER_SCRIPT '$PROPOSER_SCRIPT'" >&2; exit 66 ;;
+  esac
   mkdir -p output
-  printf '<notes>fake proposer: added a sign check to systemprompt.md</notes>\n' > output/answer.md
-  ev_text "<notes>fake proposer: added a sign check to systemprompt.md</notes>"
+  printf '<notes>fake proposer: %s</notes>\n' "$NOTE" > output/answer.md
+  ev_text "<notes>fake proposer: $NOTE</notes>"
 elif [ -f input.txt ]; then
   ev_text "AGENTS: $(head -n 2 AGENTS.md 2>/dev/null | tr '\n' ' ')"
-  ev_tool bash "cat input.txt" "$(cat input.txt)"
+  ev_tool bash "cat input.txt" "$(tr -d '\r' < input.txt)"
   mkdir -p output
-  printf 'Total: %s\n' "$(money "$(cents_of input.txt)")" > output/answer.txt
+  if grep -qi parentheses AGENTS.md 2>/dev/null; then RULES=1; else RULES=0; fi
+  printf 'Total: %s\n' "$(money "$(cents_of "$RULES" input.txt)")" > output/answer.txt
   ev_tool write "output/answer.txt" "done"
 else
   echo "fake opencode: neither MISSION.md nor input.txt in $(pwd)" >&2; exit 65
