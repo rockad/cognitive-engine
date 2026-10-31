@@ -200,6 +200,41 @@ def task_prompt_text(task_id: str) -> str:
     )
 
 
+# ── a task set: the data that makes one family of instances (easy, hard) ───────────────────
+
+@dataclass(frozen=True)
+class TaskSet:
+    """Everything the adapter and the stage-1 runner need to know about one family of `sum-signed` instances.
+
+    The output contract (`Total: X.XX` in `output/answer.txt`, three criteria) is the same for every set, so
+    `grade_answer` is shared; what differs is the input, the prompt, the weak base harness and the verifier that
+    parses the input. `instances` maps a task id to an object with `task_id`, `domain`, `input_text`,
+    `expected_total` and `expected_line`. `enforce_slot_table` makes `SumSignedAdapter.validate_tree` also run
+    `upstream_surface.check_mutation` on every changed file (the hard set does; the easy set keeps its behaviour)."""
+    name: str                                   # the --task-set word
+    spec_name: str                              # BenchSpec.name
+    instances: Mapping[str, Any]
+    prompt_text: Callable[[str], str]
+    base_files: Mapping[str, str]               # always-on file name -> text; any other always-on file is empty
+    verify_sh: str
+    prompt_fields: Mapping[str, str]
+    default_task: str
+    description: str
+    enforce_slot_table: bool = False
+
+    def instance(self, task_id: str) -> Any:
+        try:
+            return self.instances[task_id]
+        except (KeyError, TypeError):
+            raise ValueError(f"unknown {self.spec_name} task {str(task_id)[:60]!r}") from None
+
+    def solver_task(self, task_ref: str) -> Any:
+        """The prompt and the input files a solver session gets, as `substrate.SolverTask` (the `task_loader`)."""
+        from .substrate import SolverTask   # local: substrate does not import this module
+        inst = self.instance(task_ref)
+        return SolverTask(prompt=self.prompt_text(task_ref), files={"input.txt": inst.input_text})
+
+
 # ── the verdict, in Python ───────────────────────────────────────────────────────────────────
 
 def staged_text(raw: bytes) -> str:
@@ -221,12 +256,14 @@ def grade_answer(raw: bytes | None, expected: str) -> dict[str, Any]:
     return {"n_passed": n, "n_criteria": N_CRITERIA, "all_pass": n == N_CRITERIA}
 
 
-def verifier_files(task_id: str, raw: bytes | None, *, input_text: str | None = None) -> dict[str, str]:
+def verifier_files(task_id: str, raw: bytes | None, *, input_text: str | None = None,
+                   taskset: TaskSet | None = None) -> dict[str, str]:
     """What the verifier container is given: the script, the input and (if there is one) the answer.
 
     `input_text` replaces the task's input (used by the tests of the verifier itself, to reach totals such as
-    zero or a negative one that no fixed instance has)."""
-    files = {"verify.sh": VERIFY_SH, "input.txt": instance(task_id).input_text if input_text is None else input_text}
+    zero or a negative one that no fixed instance has). `taskset` names another family (default: the easy one)."""
+    ts = taskset or EASY
+    files = {"verify.sh": ts.verify_sh, "input.txt": ts.instance(task_id).input_text if input_text is None else input_text}
     if raw is not None:
         files[ANSWER_PATH] = staged_text(raw)
     return files
@@ -247,12 +284,13 @@ def parse_verdict(stdout: str) -> dict[str, Any]:
 
 
 def verify_in_container(runner: Any, task_id: str, raw: bytes | None, *, timeout_s: int = 60,
-                        input_text: str | None = None) -> dict[str, Any]:
-    """Score an answer with `VERIFY_SH` in a `DockerRunner`-like `runner` (`.run(SandboxSpec) -> SandboxResult`)."""
+                        input_text: str | None = None, taskset: TaskSet | None = None) -> dict[str, Any]:
+    """Score an answer with the set's verifier script in a `DockerRunner`-like `runner`
+    (`.run(SandboxSpec) -> SandboxResult`)."""
     from .sandbox import SandboxSpec   # local: this module's pure parts import nothing that touches docker
 
     res = runner.run(SandboxSpec(command=("sh", "verify.sh"), timeout_s=timeout_s,
-                                 files=verifier_files(task_id, raw, input_text=input_text)))
+                                 files=verifier_files(task_id, raw, input_text=input_text, taskset=taskset)))
     if res.timed_out or res.exit_code != 0:
         raise RuntimeError(f"the verifier container failed (exit {res.exit_code}, timed_out={res.timed_out})")
     return parse_verdict(res.stdout)
@@ -351,32 +389,34 @@ class SumSignedAdapter:
     def __init__(self, root: Path, spec: Any, substrate: Any, *, results_root: Path | None = None,
                  timeout: int = 600, verifier: Any = None,
                  mark: Callable[..., Path] = mark_complete, is_done: Callable[..., bool] = is_complete,
-                 read_marker: Callable[[Path], dict | None] = read_mark, fp: Callable[..., str] = fingerprint):
+                 read_marker: Callable[[Path], dict | None] = read_mark, fp: Callable[..., str] = fingerprint,
+                 taskset: TaskSet | None = None):
+        self.ts = taskset or EASY            # the family of instances (default: the easy one, unchanged)
         self.root = Path(root)
         self.spec, self.substrate = spec, substrate
         self.results_root = Path(results_root) if results_root is not None else self.root / "results"
         self.timeout = int(timeout)
         self._verifier = verifier           # optional DockerRunner: `container_score` uses it; `score` never does
         self._mark, self._is_done, self._read_mark, self._fp = mark, is_done, read_marker, fp
-        for task_id, inst in INSTANCES.items():
+        for task_id, inst in self.ts.instances.items():
             src = self.task_files(task_id)
             assert src is not None
             src.mkdir(parents=True, exist_ok=True)
-            (src / "input.txt").write_text(inst.input_text, encoding="utf-8")
+            (src / "input.txt").write_bytes(inst.input_text.encode("utf-8"))      # bytes: a CRLF input stays CRLF
         self._write_base()
 
     # ── what the method asks ─────────────────────────────────────────────────────────
     def tasks(self, split: str = "all") -> list[str]:
-        return list(INSTANCES)
+        return list(self.ts.instances)
 
     def domain_of(self, task_id: str) -> str:
-        return instance(task_id).domain
+        return self.ts.instance(task_id).domain
 
     def task_prompt(self, task_id: str) -> str:
-        return task_prompt_text(task_id)
+        return self.ts.prompt_text(task_id)
 
     def task_files(self, task_id: str) -> Path | None:
-        instance(task_id)
+        self.ts.instance(task_id)
         return self.root / "sources" / task_id
 
     def base_harness(self) -> Path:
@@ -388,7 +428,7 @@ class SumSignedAdapter:
         for name in surface.always_on:
             p = base / name
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(BASE_SYSTEM_PROMPT if name == "systemprompt.md" else "", encoding="utf-8")
+            p.write_text(self.ts.base_files.get(name, ""), encoding="utf-8")
 
     def validate_tree(self, tree: dict[str, str]) -> None:
         """Harness invariants for this task, as actionable prose. Every problem is listed."""
@@ -402,8 +442,53 @@ class SumSignedAdapter:
                 if "answer.txt" in line and "output/answer.txt" not in line:
                     problems.append(f"{name}:{ln} names answer.txt without its output/ directory: the answer file "
                                     "is always output/answer.txt")
+        if self.ts.enforce_slot_table:
+            problems += self._slot_table_problems(tree)
         if problems:
-            raise ValueError("The sum-signed harness is invalid:\n- " + "\n- ".join(problems))
+            raise ValueError(f"The {self.ts.spec_name} harness is invalid:\n- " + "\n- ".join(problems))
+
+    # ── the slot table, applied to a proposed tree ───────────────────────────────────
+    def _base_text(self, path: str) -> str:
+        try:
+            return (self.base_harness() / path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def tree_changes(self, tree: Mapping[str, str]) -> dict[str, str]:
+        """The files `tree` changes against the base harness (added, removed or edited), each with its slot (`c1`..)
+        or `?` when the path is not on the surface at all. A file that is only the autotrigger's own appended trigger
+        lines (upstream gives every new skill a trigger line in `guardrails.md`) is not the proposer's edit and is
+        left out."""
+        from . import upstream_surface as us
+        from .invariants import InvariantViolation
+
+        surface = self.substrate.surface()
+        out: dict[str, str] = {}
+        for path in sorted(set(tree) | set(surface.always_on)):
+            old, new = self._base_text(path), tree.get(path, "")
+            if old == new or (path == getattr(surface, "autotrigger_file", None) and _only_trigger_lines(surface, old, new)):
+                continue
+            try:
+                out[path] = us.classify_path(surface, path)[0]
+            except InvariantViolation:
+                out[path] = "?"
+        return out
+
+    def _slot_table_problems(self, tree: Mapping[str, str]) -> list[str]:
+        """`upstream_surface.check_mutation` on every changed file, against the base harness. One line per refusal."""
+        from . import upstream_surface as us
+        from .invariants import InvariantViolation
+
+        problems: list[str] = []
+        for path, slot in self.tree_changes(tree).items():
+            if slot == "?":
+                problems.append(f"slot table: {path} is not on the harness surface; only the harness files may change")
+                continue
+            try:
+                us.check_mutation(slot, path, self._base_text(path), tree.get(path, ""))
+            except InvariantViolation as e:
+                problems.append(f"slot table: {path} (slot {slot}) cannot be changed this way: {e}")
+        return problems
 
     # ── running ──────────────────────────────────────────────────────────────────────
     def _run_dir(self, run_id: str) -> Path:
@@ -425,7 +510,7 @@ class SumSignedAdapter:
                 and marker["output_fingerprint"] == self._output_fingerprint(run_dir))
 
     def execute(self, task_id: str, harness_dir: Path | None, run_id: str, *, timeout: int | None = None) -> Path:
-        instance(task_id)
+        self.ts.instance(task_id)
         out = self._run_dir(run_id)
         if self._is_done(out, harness_dir=harness_dir) and self.artifacts_intact(out):
             return out
@@ -498,7 +583,7 @@ class SumSignedAdapter:
     def score(self, run_dir: Path, task_id: str) -> dict | None:
         """Pure code: no container, no model. `None` only for an unknown task (the judge failing, never a zero)."""
         try:
-            inst = instance(task_id)
+            inst = self.ts.instance(task_id)
         except ValueError:
             return None
         return grade_answer(self._answer_bytes(run_dir), inst.expected_total)
@@ -507,11 +592,30 @@ class SumSignedAdapter:
         """The same verdict from the verifier script in a container (needs `verifier=` a DockerRunner)."""
         if self._verifier is None:
             raise RuntimeError("no verifier runner was given to this adapter")
-        return verify_in_container(self._verifier, task_id, self._answer_bytes(run_dir))
+        return verify_in_container(self._verifier, task_id, self._answer_bytes(run_dir), taskset=self.ts)
+
+
+def _only_trigger_lines(surface: Any, old: str, new: str) -> bool:
+    """True if `new` is `old` plus nothing but lines in the surface's `trigger_line` shape (upstream's autotrigger)."""
+    template = getattr(surface, "trigger_line", None)
+    if not isinstance(template, str) or not template.strip():
+        return False
+    head = old.rstrip()
+    if not new.startswith(head):
+        return False
+    parts = re.split(r"\{(name|desc)\}", template.strip())
+    shape = re.compile("".join(re.escape(p) if i % 2 == 0 else (r"[a-z0-9_\-]+" if p == "name" else r".+")
+                               for i, p in enumerate(parts)))
+    lines = [ln for ln in new[len(head):].splitlines() if ln.strip()]
+    return bool(lines) and all(shape.fullmatch(ln.strip()) for ln in lines)
 
 
 def solver_task(task_ref: str) -> Any:
     """The prompt and the input files a solver session gets, as `substrate.SolverTask` (the `task_loader`)."""
-    from .substrate import SolverTask   # local: substrate does not import this module
-    inst = instance(task_ref)
-    return SolverTask(prompt=task_prompt_text(task_ref), files={"input.txt": inst.input_text})
+    return EASY.solver_task(task_ref)
+
+
+EASY = TaskSet(name="easy", spec_name=SPEC_NAME, instances=INSTANCES, prompt_text=task_prompt_text,
+               base_files={"systemprompt.md": BASE_SYSTEM_PROMPT}, verify_sh=VERIFY_SH, prompt_fields=PROMPT_FIELDS,
+               default_task="household/sum-1",
+               description="sum-signed: 5 clean signed amounts per instance (the base harness already passes it)")
