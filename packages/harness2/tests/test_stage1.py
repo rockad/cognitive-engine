@@ -838,3 +838,51 @@ def test_an_easy_run_records_the_set_too_and_its_adapter_is_the_easy_one(rig, up
             stdin=TTY(confirmation_phrase("local-ollama", sweep) + "\n"), stdout=TTY(), run_task=fake_run_task)
     assert seen["task"] == "household/sum-1" and seen["adapter"].ts is stage1.ss.EASY and seen["adapter"].spec.name == "sum-signed"
     assert json.loads((rig.runs / sweep / "report.json").read_text())["task_set"] == "easy"
+
+
+# ── what the proxy refused by method and path (stage-1b: 5-10 unix-route-path-denied per session, unidentified) ──
+
+def _end_dr(denied_requests, **kw):
+    e = _end(1, 0, ["harness2-proxy.internal:11434"], ["unix-route-path-denied"], **kw)
+    e["denied_requests"] = dict(denied_requests)
+    return e
+
+
+def test_sessions_view_adds_denied_requests_summed_over_sessions_and_omits_it_when_no_session_has_any():
+    ends = [_end_dr({"GET /api/version": 5, "HEAD /api/tags": 1}), _end_dr({"GET /api/version": 7}), _end(1, 0)]
+    v = stage1.sessions_view([{"event": "session_start"}] * 3, ends, rollout_errors=[], stage_errors=[])
+    assert v["denied_requests"] == {"GET /api/version": 12, "HEAD /api/tags": 1}
+    assert list(v["denied_requests"]) == ["GET /api/version", "HEAD /api/tags"]                 # most frequent first
+    old = stage1.sessions_view([{"event": "session_start"}] * 2, FIRST_RUN_ENDS[:2], rollout_errors=[], stage_errors=[])
+    assert "denied_requests" not in old
+    junk = stage1.sessions_view([{"event": "session_start"}], [{**_end(1, 0), "denied_requests": "x"}, {**_end(1, 0), "denied_requests": {"a b": "z"}}],
+                                rollout_errors=[], stage_errors=[])
+    assert "denied_requests" not in junk
+
+
+def test_sessions_view_keeps_at_most_20_denied_request_keys_and_sums_the_rest_into_other():
+    ends = [_end_dr({f"GET /p{i}": 1 for i in range(15)}), _end_dr({f"GET /q{i}": 2 for i in range(15)} | {"other": 4})]
+    d = stage1.sessions_view([{"event": "session_start"}] * 2, ends, rollout_errors=[], stage_errors=[])["denied_requests"]
+    assert len(d) == 21 and sum(d.values()) == 15 + 30 + 4
+    assert set(list(d)[:15]) == {f"GET /q{i}" for i in range(15)} and list(d)[-1] == "other"
+    assert d["other"] == 4 + 10                                                           # 10 singles beyond the 20th key
+    assert all(" " in k for k in d if k != "other")
+
+
+def test_the_summary_prints_the_most_frequent_denied_requests_and_how_many_more():
+    ends = [_end_dr({"GET /api/version": 9, "HEAD /api/tags": 2, **{f"GET /z{i}": 1 for i in range(6)}})]
+    v = stage1.sessions_view([{"event": "session_start"}], ends, rollout_errors=[], stage_errors=[])
+    text = "\n".join(stage1.sessions_lines({"sessions_summary": v}))
+    assert "denied requests: GET /api/version x9, HEAD /api/tags x2, GET /z0 x1, GET /z1 x1, GET /z2 x1, +3 more" in text
+    assert "denied requests" not in "\n".join(stage1.sessions_lines({"sessions_summary": stage1.sessions_view(
+        [{"event": "session_start"}], FIRST_RUN_ENDS[:1], rollout_errors=[], stage_errors=[])}))
+
+
+def test_the_audit_event_keeps_denied_requests_keys_whole(tmp_path):
+    a = stage1.Audit(tmp_path / "a.jsonl")
+    key = "POST /v1/chat/completions" + "/x" * 25 + "?<12>"                    # method + target at the proxy's 80 character cap
+    assert len(key) > 60
+    a.emit("session_end", denied_requests={key: 3, "GET /api/version": 1})
+    a.close()
+    row = json.loads((tmp_path / "a.jsonl").read_text())
+    assert row["denied_requests"] == {key: 3, "GET /api/version": 1}

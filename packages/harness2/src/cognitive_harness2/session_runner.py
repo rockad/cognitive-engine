@@ -213,8 +213,11 @@ def redact(text: str, secrets_: Sequence[str]) -> str:
     return text
 
 
-_ACCESS_LINE = re.compile(r"ACCESS decision=(allow|deny) host=(\S+) port=(\d+) reason=([a-z-]+)")
+# the optional tail is the proxy's `method=<M> path=<P>` on a route path denial (older logs have none); it is a single token
+# each, so no text of a request can end the line or open another field
+_ACCESS_LINE = re.compile(r"ACCESS decision=(allow|deny) host=(\S+) port=(\d+) reason=([a-z-]+)(?: method=([A-Z?]{1,16}) path=(\S+))?")
 _MODEL_ROUTES = frozenset({"unix-route", "unix-listener"})      # the proxy's two ways to the host bridge (the local model)
+DENIED_REQUESTS_MAX = 20                                        # distinct `METHOD path` keys kept; the rest are summed in `other`
 
 
 def egress_summary(lines: Sequence[str]) -> dict[str, object]:
@@ -223,15 +226,20 @@ def egress_summary(lines: Sequence[str]) -> dict[str, object]:
     `model_requests` counts the REQUESTS the proxy forwarded to the host bridge, i.e. to the local model endpoint
     (`unix-route`, or the direct listener; one line per allowed request, several per keep-alive connection). It is
     evidence that the CLI got as far as the model's door: it says nothing about whether the model answered. A request
-    the route filter refused is a `deny` line (`unix-route-path-denied`, ...), counted in `egress_denied`. `denied_hosts` is deduplicated, in first-seen order, capped."""
+    the route filter refused is a `deny` line (`unix-route-path-denied`, ...), counted in `egress_denied`. `denied_hosts` is deduplicated, in first-seen order, capped.
+
+    `denied_requests` (present only when a `unix-route-path-denied` line carried `method=` and `path=`; older logs have
+    neither) maps `"METHOD path"` (the path as the proxy sanitised it: escaped, query reduced to `?<length>`) to a count,
+    first-seen order, at most `DENIED_REQUESTS_MAX` keys, the rest summed under `other`."""
     model = allowed = denied = 0
     hosts: list[str] = []
     reasons: list[str] = []
+    requests: dict[str, int] = {}
     for line in lines:
         m = _ACCESS_LINE.fullmatch(line.strip())
         if not m:
             continue
-        decision, host, port, reason = m.groups()
+        decision, host, port, reason, method, path = m.groups()
         if decision == "allow":
             allowed += 1
             model += reason in _MODEL_ROUTES
@@ -241,8 +249,16 @@ def egress_summary(lines: Sequence[str]) -> dict[str, object]:
             hosts.append(f"{host}:{port}")
         if reason not in reasons and len(reasons) < 10:
             reasons.append(reason)
-    return {"model_requests": model, "egress_allowed": allowed, "egress_denied": denied,
-            "denied_hosts": hosts, "denied_reasons": sorted(reasons)}
+        if reason == "unix-route-path-denied" and method and path:
+            key = f"{method} {path}"
+            if key not in requests and len(requests) >= DENIED_REQUESTS_MAX:
+                key = "other"
+            requests[key] = requests.get(key, 0) + 1
+    out: dict[str, object] = {"model_requests": model, "egress_allowed": allowed, "egress_denied": denied,
+                              "denied_hosts": hosts, "denied_reasons": sorted(reasons)}
+    if requests:
+        out["denied_requests"] = requests
+    return out
 
 
 def _overlap(a: str, b: str) -> bool:

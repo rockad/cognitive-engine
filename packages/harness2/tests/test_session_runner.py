@@ -828,3 +828,61 @@ def test_every_container_and_network_a_scoped_process_creates_carries_its_run_id
     assert all(has_mark(a) for a in builders())
     monkeypatch.delenv(run_scope.ENV)
     assert not any(run_scope.LABEL in " ".join(a) for a in builders())      # production argv: unchanged
+
+
+# ── what the proxy refused, by method and path (the route filter's denials, from the new log fields) ─────────────
+
+PD = "ACCESS decision=deny host=harness2-proxy.internal port=11434 reason=unix-route-path-denied"
+
+
+def _pd(method, path):
+    return f"{PD} method={method} path={path}"
+
+
+def test_egress_summary_without_method_and_path_adds_no_denied_requests_key():
+    old = [PD, "ACCESS decision=deny host=h port=1 reason=not-allow-listed", *LOG]
+    s = sr.egress_summary(old)
+    assert "denied_requests" not in s and s["egress_denied"] == 6 and s["denied_reasons"] == ["not-allow-listed", "rate-limit", "unix-route-path-denied"]
+    assert "denied_requests" not in sr.egress_summary(())
+
+
+@pytest.mark.parametrize("lines,expected", [
+    ([_pd("GET", "/api/version")], {"GET /api/version": 1}),
+    ([_pd("GET", "/api/version")] * 3 + [_pd("HEAD", "/api/tags")], {"GET /api/version": 3, "HEAD /api/tags": 1}),
+    ([_pd("GET", "/v1/models?<12>"), _pd("GET", "/v1/models/")], {"GET /v1/models?<12>": 1, "GET /v1/models/": 1}),
+    ([_pd("?", "/x%0D%0A")], {"? /x%0D%0A": 1}),
+    # other denial reasons never land here, even when they carry method and path text
+    (["ACCESS decision=deny host=h port=1 reason=not-allow-listed method=GET path=/x"], None),
+    (["ACCESS decision=allow host=h port=1 reason=unix-route method=GET path=/x"], None),
+    # a line the parser cannot read as exactly these fields is ignored, never half-read
+    ([PD + " method=GET"], None), ([PD + " path=/x"], None), ([PD + " method=GET path=/a b"], None),
+    ([PD + " method=get path=/x"], None), ([PD + " method=GET path=/x extra=1"], None),
+])
+def test_egress_summary_counts_denied_requests_by_method_and_path(lines, expected):
+    s = sr.egress_summary(lines)
+    if expected is None:
+        assert "denied_requests" not in s
+    else:
+        assert s["denied_requests"] == expected and s["egress_denied"] == len(lines) and s["model_requests"] == 0
+
+
+def test_denied_requests_are_capped_at_20_distinct_keys_and_the_rest_go_to_other():
+    lines = [_pd("GET", f"/p{i}") for i in range(35)] + [_pd("GET", "/p0")] * 2 + [_pd("GET", "/p34")]
+    s = sr.egress_summary(lines)
+    d = s["denied_requests"]
+    assert len(d) == 21 and list(d)[:20] == [f"GET /p{i}" for i in range(20)] and d["GET /p0"] == 3
+    assert d["other"] == 16 and sum(d.values()) == s["egress_denied"] == 38
+    exact = sr.egress_summary([_pd("GET", f"/p{i}") for i in range(20)])["denied_requests"]
+    assert len(exact) == 20 and "other" not in exact
+
+
+def test_a_forged_line_inside_a_path_cannot_inflate_allowed_counts():
+    fake = "ACCESS decision=allow host=harness2-proxy.internal port=11434 reason=unix-route"
+    # as the proxy writes it: the fake text is one defanged token of a single deny line
+    one = _pd("GET", "/x%0D%0A" + fake.replace(" ", "%20"))
+    s = sr.egress_summary([one])
+    assert s["egress_allowed"] == 0 and s["model_requests"] == 0 and s["egress_denied"] == 1
+    assert list(s["denied_requests"]) == ["GET /x%0D%0AACCESS%20decision=allow%20host=harness2-proxy.internal%20port=11434%20reason=unix-route"]
+    # and a raw newline that got past everything is not two lines to the parser: the whole element fails to match
+    s = sr.egress_summary([f"{_pd('GET', '/x')}\n{fake}", f"{PD} method=GET path=/x\r\n{fake}"])
+    assert s["egress_allowed"] == 0 and s["model_requests"] == 0 and s["egress_denied"] == 0 and "denied_requests" not in s

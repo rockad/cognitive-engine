@@ -428,7 +428,7 @@ def clean(value: Any, depth: int = 0) -> Any:
     if depth >= 4:
         return "[deep]"
     if isinstance(value, Mapping):
-        return {str(k)[:60]: ("[withheld]" if str(k).lower() in _WITHHELD or _SECRETISH.search(str(k)) else clean(v, depth + 1))
+        return {str(k)[:100]: ("[withheld]" if str(k).lower() in _WITHHELD or _SECRETISH.search(str(k)) else clean(v, depth + 1))
                 for k, v in list(value.items())[:60]}
     if isinstance(value, (list, tuple, set, frozenset)):
         return [clean(v, depth + 1) for v in list(value)[:60]]
@@ -752,6 +752,7 @@ def sessions_view(starts: Sequence[Mapping[str, Any]], ends: Sequence[Mapping[st
     exit_codes: dict[str, int] = {}
     denied: dict[str, int] = {}
     reasons: set[str] = set()
+    requests: dict[str, int] = {}
     reached = timed_out = 0
     for e in ends:
         key = "none" if e.get("exit_code") is None else str(e["exit_code"])
@@ -761,14 +762,27 @@ def sessions_view(starts: Sequence[Mapping[str, Any]], ends: Sequence[Mapping[st
         for h in e.get("denied_hosts") or []:
             denied[h] = denied.get(h, 0) + 1
         reasons.update(e.get("denied_reasons") or [])
+        dr = e.get("denied_requests")
+        if isinstance(dr, Mapping):
+            for k, n in dr.items():
+                if isinstance(k, str) and isinstance(n, int) and not isinstance(n, bool) and n > 0 and (k == "other" or " " in k):
+                    requests[k] = requests.get(k, 0) + n
     first = next((sr.sanitize_terminal(x)[:160] for x in (*rollout_errors, *stage_errors) if x), None)
     # the status of a provider HTTP error in the CLI's own words ("... failed with HTTP 403"), to tell a refusal by the model
     # endpoint from a denial by the proxy (which has its own `denied_hosts`)
     http_status = re.search(r"\bHTTP (\d{3})\b", first or "")
-    return {"started": len(starts), "ended": len(ends), "reached_model": reached, "exit_codes": dict(sorted(exit_codes.items())),
+    view = {"started": len(starts), "ended": len(ends), "reached_model": reached, "exit_codes": dict(sorted(exit_codes.items())),
             "timed_out": timed_out, "denied_hosts": dict(sorted(denied.items(), key=lambda kv: (-kv[1], kv[0]))),
             "denied_reasons": sorted(reasons), "first_error": first,
             "first_error_http": int(http_status.group(1)) if http_status else None}
+    if requests:
+        # what the route filter refused, as `METHOD path` (the proxy's sanitised form): most frequent first, at most
+        # DENIED_REQUESTS_MAX keys, the remainder (and any per-session `other`) summed in a last `other`
+        named = sorted(((k, n) for k, n in requests.items() if k != "other"), key=lambda kv: (-kv[1], kv[0]))
+        kept, rest = named[:sr.DENIED_REQUESTS_MAX], named[sr.DENIED_REQUESTS_MAX:]
+        other = requests.get("other", 0) + sum(n for _, n in rest)
+        view["denied_requests"] = dict(kept) | ({"other": other} if other else {})
+    return view
 
 
 def _n(n: int, word: str) -> str:
@@ -793,6 +807,10 @@ def sessions_lines(report: Mapping[str, Any], *, max_hosts: int = 5) -> list[str
         shown = [f"{h} ({_n(n, 'session')}{why})" for h, n in list(denied.items())[:max_hosts]]
         more = len(denied) - max_hosts
         parts.append("proxy denied: " + ", ".join(shown) + (f", +{more} more" if more > 0 else ""))
+        if v.get("denied_requests"):
+            reqs = list(v["denied_requests"].items())
+            left = len(reqs) - max_hosts
+            parts.append("denied requests: " + ", ".join(f"{k} x{n}" for k, n in reqs[:max_hosts]) + (f", +{left} more" if left > 0 else ""))
     elif v.get("first_error_http") in (401, 403) and reached:
         # the second real run: every session reached ollama, the proxy denied nothing, ollama itself answered 403
         parts.append(f"the proxy denied nothing, the model endpoint itself refused (HTTP {v['first_error_http']}); "
