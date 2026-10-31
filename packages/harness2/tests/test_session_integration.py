@@ -374,7 +374,7 @@ def test_post_api_show_reaches_the_model_server_exactly_once_and_with_its_body(v
             raw = (f"POST /api/show HTTP/1.1\\r\\nHost: harness2-proxy.internal:{model.port}\\r\\nContent-Type: application/json\\r\\n"
                    f"Content-Length: {len(body)}\\r\\nConnection: close\\r\\n\\r\\n{body}")
             res = r.run(spec(ws, "raw", "harness2-proxy.internal", str(model.port), raw))
-        assert "HTTP/1.1 200" in res.stdout, res
+        assert " 200 OK" in res.stdout, res                                           # the stub's own status line, relayed unchanged
         assert model.other == [("POST", "/api/show")] and model.bodies == [body.encode()], (model.other, model.bodies)
         assert model.hits == 0                                                        # no GET came along
         reason = "unix-route" if via == "proxy" else "unix-listener"
