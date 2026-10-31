@@ -79,8 +79,11 @@ def test_the_whole_flow_and_every_argv(world):
     r = world.runner(memory="768m", cpus=2).run(spec("python3", "-c", "-x", "print(1)", files={"a.py": "x = 1\n", "d/b.py": "y = 2\n"}))
     assert r.exit_code == 0 and not r.timed_out
     calls = world.calls()
-    assert world.verbs() == ["version", "policy ls", "create", "ls", *["policy check"] * 4,
+    assert world.verbs() == ["version", "policy ls", "settings", "create", "ls", *["policy check"] * 4,
                              "cp", "exec", "exec", "rm", "ls"]
+    # The host-reach settings are re-read on every run (read-only), then the flow below is unchanged.
+    assert calls[2] == ["settings", "ls", "--format", "json"]
+    calls = calls[:2] + calls[3:]
     name = calls[2][3]
     assert name.startswith("harness2-") and len(name) == len("harness2-") + 12
     sbx = str(FAKE_DIR / "sbx")
@@ -104,7 +107,8 @@ def test_the_whole_flow_and_every_argv(world):
 def test_no_files_means_no_cp_and_the_scratch_workdir(world):
     world.runner().run(spec("true"))
     assert "cp" not in world.verbs()
-    assert [c for c in world.calls() if c[0] == "exec"] == [["exec", "-w", "/tmp", "--", world.calls()[2][3], "true"]]
+    name = next(c for c in world.calls() if c[0] == "create")[3]
+    assert [c for c in world.calls() if c[0] == "exec"] == [["exec", "-w", "/tmp", "--", name, "true"]]
 
 
 def test_output_and_exit_code_come_back(world):
@@ -144,6 +148,12 @@ def test_the_env_that_reaches_sbx_has_nothing_that_can_repoint_it(world):
     assert "XDG_STATE_HOME=" in seen and "FAKE_SBX_DIR=" in seen
 
 
+def test_the_hosts_ssh_agent_socket_never_reaches_an_sbx_process(world):
+    world.runner(env={"SSH_AUTH_SOCK": "/tmp/ssh-agent.sock", "ssh_auth_sock": "/tmp/lower"}).run(spec())
+    seen = (world.fake / "env.last").read_text().lower()
+    assert "ssh_auth_sock" not in seen and "/tmp/ssh-agent.sock" not in seen
+
+
 def test_no_environment_is_ever_passed_into_the_vm(world):
     world.runner(env={"SECRET_TOKEN": "s3cret"}).run(spec("env"))
     assert not any(a in ("-e", "--env", "--env-file") or "s3cret" in a for c in world.calls() for a in c)
@@ -159,6 +169,33 @@ def test_an_unverified_version_is_refused(world):
     with pytest.raises(SandboxUnavailable, match="not in the verified set"):
         world.runner(verified=frozenset({"1.0.0"})).run(spec())
     never_created(world)
+
+
+@pytest.mark.parametrize("setting,named", [("ssh", ["ssh.agentForwardingEnabled"]), ("browser", ["browser.enabled"]),
+                                           ("both", ["ssh.agentForwardingEnabled", "browser.enabled"])])
+def test_a_host_reach_setting_that_is_on_is_refused_on_every_run(world, setting, named):
+    """Re-read per run, not trusted from the selection probe's cache: a flip after selection still stops the run."""
+    with pytest.raises(SandboxUnavailable, match="host-reach setting") as e:
+        world.runner(env={"FAKE_SBX_SETTINGS": setting}).run(spec())
+    assert all(f"{n}=true" in str(e.value) for n in named) and sandbox.ENV_ALLOW_HOST_SETTINGS in str(e.value)
+    never_created(world)
+
+
+@pytest.mark.parametrize("setting", ["fail", "garbage"])
+def test_unreadable_host_reach_settings_are_refused_not_assumed_off(world, setting):
+    with pytest.raises(SandboxUnavailable, match="settings"):
+        world.runner(env={"FAKE_SBX_SETTINGS": setting}).run(spec())
+    never_created(world)
+
+
+def test_the_documented_override_accepts_the_settings_and_nothing_else(world):
+    r = world.runner(env={"FAKE_SBX_SETTINGS": "both", sandbox.ENV_ALLOW_HOST_SETTINGS: "1"}).run(spec())
+    assert r.exit_code == 0
+    with pytest.raises(SandboxUnavailable, match="not in the verified set"):  # every other check still applies
+        world.runner(env={"FAKE_SBX_SETTINGS": "both", sandbox.ENV_ALLOW_HOST_SETTINGS: "1"},
+                     verified=frozenset({"1.0.0"})).run(spec())
+    with pytest.raises(SandboxUnavailable, match="host-reach setting"):  # only the exact value `1` counts
+        world.runner(env={"FAKE_SBX_SETTINGS": "both", sandbox.ENV_ALLOW_HOST_SETTINGS: "true"}).run(spec())
 
 
 def test_the_empty_verified_set_refuses_everything(world):
@@ -374,7 +411,10 @@ def test_live_create_exec_rm_round_trip_leaves_nothing_behind():
     version = sandbox.real_sbx_probes(os.environ).version(path)
     assert version
     before = set(subprocess.run([path, "ls", "-q"], capture_output=True, text=True).stdout.split())
-    runner = SbxRunner(path, verified=frozenset({version}), create_timeout_s=900)
+    # The candidate here is this test's own code, so the host-reach settings (on by default) are accepted explicitly;
+    # without the override the runner refuses (test_a_host_reach_setting_that_is_on_is_refused_on_every_run).
+    runner = SbxRunner(path, verified=frozenset({version}), create_timeout_s=900,
+                       environ={**os.environ, sandbox.ENV_ALLOW_HOST_SETTINGS: "1"})
     try:
         r = runner.run(SandboxSpec(command=["sh", "-c", "echo out; echo err >&2; cat a.txt d/b.txt; pwd; exit 3"],
                                    files={"a.txt": "hello\n", "d/b.txt": "nested\n"}, timeout_s=120))

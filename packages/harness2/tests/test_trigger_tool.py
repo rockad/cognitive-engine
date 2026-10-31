@@ -285,3 +285,29 @@ async def test_the_signatures_are_not_echoed_back(tmp_path):
 def test_tri_state_ready(oks, expected):
     from cognitive_harness2.advice import tri_state_ready
     assert tri_state_ready({f"c{i}": {"ok": ok} for i, ok in enumerate(oks)}) is expected
+
+
+# ── the advice names the runner and, when it is not sbx, why ─────────────────────────
+
+async def test_the_sandbox_readiness_names_the_runner_and_why_it_is_not_sbx(tmp_path, monkeypatch):
+    from cognitive_harness2 import advice
+    from cognitive_harness2.sandbox import DockerRunner
+
+    def factory():
+        return DockerRunner("/usr/bin/docker", docker_host="unix:///run/user/1000/docker.sock")
+
+    why = {"code": "daemon-down", "detail": "sbx daemon is not reachable", "loud": True}
+    monkeypatch.setattr(advice, "default_runner", factory)  # "this engine uses the real selection"
+    monkeypatch.setattr(advice, "sandbox_report", lambda: {"mode": "auto", "fallback_reason": why})
+    eng = Engine(generator=ExplodingGenerator(), sandbox_factory=factory, store=ExperienceStore(tmp_path / "exp"),
+                 quota_check=Probes().quota_check, base_url=LOCAL, model="llama3")
+    client = Client(build_server(eng, settings.from_env({settings.ENV_EXPERIENCE_ROOT: str(tmp_path / "exp")})))
+    sb = (await ask(client, consecutive_failures=3))["readiness"]["sandbox"]
+    assert sb["ok"] is True and sb["runtime"] == "rootless-docker" and sb["mode"] == "auto"
+    assert sb["fallback_reason"] == why and "rootless-docker" in sb["detail"] and "daemon-down" in sb["detail"]
+
+
+async def test_a_fake_factory_gets_no_selection_report(tmp_path):
+    client, _, _ = make(tmp_path)  # sandbox_factory is not default_runner: no real probe is made for the advice
+    sb = (await ask(client, consecutive_failures=3))["readiness"]["sandbox"]
+    assert sb["runtime"] == "FakeRunner" and "fallback_reason" not in sb and "FakeRunner" in sb["detail"]

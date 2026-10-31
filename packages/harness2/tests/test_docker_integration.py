@@ -187,9 +187,9 @@ async def q():
 
 
 async def test_the_engine_probes_a_candidate_in_a_real_container(tmp_path, monkeypatch):
-    # No sbx on this host; make that explicit so the test exercises the Docker fallback.
-    monkeypatch.setattr(sandbox.shutil, "which", lambda n: None if n == "sbx" else "/usr/bin/docker")
-    eng = Engine(generator=Gen(), sandbox_factory=sandbox.default_runner, store=ExperienceStore(tmp_path),
+    # Docker is what this test exercises, and `default_runner` prefers a usable sbx: hide sbx explicitly (a passed
+    # `which`; patching shutil.which would not reach the default argument bound at import time).
+    eng = Engine(generator=Gen(), sandbox_factory=lambda: sandbox.default_runner(_no_sbx), store=ExperienceStore(tmp_path),
                  quota_check=q, base_url="http://127.0.0.1:11434/v1", model="m")
     run_id = (await eng.propose(task="t", targets=[Target("prompt", "orig")], n=1, zdr="strict",
                                 classification="unstated", dry_run=False))["run_id"]

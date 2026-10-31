@@ -14,7 +14,7 @@ uv run cognitive-harness2 experience approve ID --by NAME
 | tool | what it does |
 | --- | --- |
 | `harness2_propose` | Generate mutation candidates. Refuses protected or unknown components and any endpoint the ZDR/classification policy forbids **before** anything is sent. `dry_run` reports the verdict without calling a model. |
-| `harness2_probe` | Run each candidate in an ephemeral rootless Docker container (by default), or in a local `sbx` microVM only when opted in, verified and usable (below). With neither it **fails closed** and runs nothing; `allow_worktree_diff` opts in to static diffs, which execute no code. |
+| `harness2_probe` | Run each candidate in a local `sbx` microVM when sbx is a verified version and passes a read-only usability probe (the default, `auto`), else in an ephemeral rootless Docker container (below). With neither it **fails closed** and runs nothing; `allow_worktree_diff` opts in to static diffs, which execute no code. |
 | `harness2_compose` | Contrast outcomes without labels and propose a patch. Output always has `requires_human_approval: true`. |
 | `harness2_reflect` | Stage a lesson as **pending**. Nothing is committed. |
 | `harness2_trigger` | Read-only pull check: evaluates a failure summary and recommends whether to probe, with readiness, cost class and `requires_human_approval` (see Triggers). Starts nothing. Not in the RFC 004 §2.7 list; it is the pull tool of §2.3. |
@@ -77,12 +77,48 @@ It is **documented, not installed**. To enable it, merge this into `~/.claude/se
 
 Leave out `onFailure: "block"`: without it a crashing hook is fail-open (verified in the captured payload notes), which is what an advisory wants. `PostToolUse` fires on every tool call, so the script exits early when there is no count to reset.
 
-## Sandbox: rootless Docker, else nothing (sbx is opt-in)
+## Sandbox: sbx when verified and usable, else rootless Docker, else nothing
 
-`harness2_probe` runs candidate code only in a local sandbox, chosen in this order:
+`harness2_probe` runs candidate code only in a local sandbox, and so does anything else that builds its runner with `sandbox.default_runner` (the server's `Engine`, `harness2_status`, `harness2_trigger`'s readiness). The sum-signed verifier (`container_score`) and `Substrate` take their `SandboxRunner` as a parameter: pass them `default_runner()` to get this selection (the tests pass a `DockerRunner` directly). `COGNITIVE_HARNESS2_SANDBOX` is a tri-state:
 
-1. `sbx` microVM, **only** when opted in, verified and usable (see "sbx (Docker Sandboxes)" below). `sbx` being on `PATH` changes nothing.
-2. An **ephemeral rootless Docker container**, otherwise. This is the default. It is used only if every one of these holds, checked on every run:
+| Value | Runner | When it cannot be had |
+| --- | --- | --- |
+| unset, empty or `auto` (**default**) | `sbx` microVM if the installed version is in `VERIFIED_SBX_VERSIONS` **and** the read-only usability probe passes; otherwise rootless Docker | Docker is used, with the reason recorded and (when sbx is present) warned about once; with no usable Docker either: **fail closed** |
+| `docker` | rootless Docker; sbx is never consulted (no `which`, no process, no probe) | fail closed |
+| `sbx` | `sbx` microVM only | **fail closed** (`SandboxUnavailable`): never falls back to Docker |
+| anything else | none | fail closed |
+
+Case, and surrounding blanks, do not matter (`SBX`, ` auto `). `rootless-docker` is accepted as an alias of `docker`. Never rootful Docker, never the host.
+
+**What stays on Docker whatever this says.** The stage-1 proposer and solver sessions (`ProposerSessionRunner`, the egress proxy, the host bridge) call the model, and `sbx` has no route to one: a live test showed that direct sockets from inside a sandbox get no data (the proxy only returns 403), so those sessions use Docker's network design and do not go through `default_runner`. `sbx` is for the model-free, no-network execution of untrusted code (`harness2_probe`, the sum-signed verifier's `container_score`, `Substrate.execute`'s `runner.run`). Nothing in this section changes the session runners.
+
+**Cost.** An sbx-backed run creates a microVM: about **4 s** more than a Docker container for every `run()` (`sbx create` about 4 s with the image present, `exec` about 0.6 s, `rm` about 0.7 s; the first run on a host also pulls the shell image). A caller that executes many candidates pays that per candidate. Set `COGNITIVE_HARNESS2_SANDBOX=docker` to choose the faster, container-grade runner on purpose.
+
+**Fallback table (`auto`).** `harness2_status` and `sandbox_report()` give `runner`, `mode`, and `fallback_reason` (`{code, detail, loud}`); `sbx.codes` and `sbx.reasons` list every problem found.
+
+| Situation | Runner | `fallback_reason.code` | Warned |
+| --- | --- | --- | --- |
+| sbx not installed (the normal case) | Docker | `not-installed` | no |
+| `COGNITIVE_HARNESS2_SANDBOX=docker` | Docker | `forced-docker` | no |
+| verified set empty | Docker | `no-verified-version` | yes |
+| version not in `VERIFIED_SBX_VERSIONS` (or unreadable) | Docker | `unverified-version` / `unreadable-version` | yes |
+| `/dev/kvm` missing or not accessible to this process | Docker | `kvm-unusable` | yes |
+| daemon socket does not answer | Docker | `daemon-down` | yes |
+| global network policy not initialised or not deny-all | Docker | `policy-not-deny-all` | yes |
+| `ssh.agentForwardingEnabled` or `browser.enabled` is on | Docker | `unsafe-setting` | yes |
+| a setting is missing from `sbx settings ls` | Docker | `unreadable-setting` | yes |
+| a probe command timed out (5 s each) | Docker | `probe-timeout` | yes |
+| a probe command failed or printed something unexpected | Docker | `probe-error` | yes |
+| all of the above pass | **sbx** | none | no |
+
+The warning is one `WARNING` log line from `cognitive_harness2.sandbox` (stderr, with no logging configured), once per process per distinct reason set, saying which runner is used and why. `harness2_trigger` names the runner and the reason in `readiness.sandbox`.
+
+**The probe is safe to run by default.** It is cheap and read-only, bounded by a 5 s timeout per command (a hung `sbx` is killed with its process group and counts as unusable, never as a crash or a hang), and cached for 60 s per process. It never starts the daemon, creates a VM or pulls an image: the `sbx` commands it runs (`version`, `policy ls --json`, `settings ls --format json`) are only asked once a connect to the daemon socket already succeeds, because `sbx settings` says it starts the daemon if necessary. A timeout stops the remaining commands, and an unverified version stops them too. `SbxRunner` re-reads version, policy and the two settings on every run, so a change inside the cache window is still caught.
+
+The candidate is run, in order of preference, in:
+
+1. `sbx` microVM, selected as above (see "sbx (Docker Sandboxes)" below). `sbx` being on `PATH` changes nothing by itself.
+2. An **ephemeral rootless Docker container**, otherwise. It is used only if every one of these holds, checked on every run:
    - `docker` exists and the endpoint (`DOCKER_HOST` or the active context) is a **local unix socket**.
    - `docker info` lists `name=rootless` in its SecurityOptions. A rootful daemon is refused.
    - The pinned image (`alpine:3` plus digest, in `sandbox.DEFAULT_IMAGE`) is already local. It is never pulled at run time.
@@ -97,23 +133,32 @@ Host setup is rootless Docker (`dockerd-rootless-setuptool.sh install`), then `d
 
 `sbx` is Docker Sandboxes: a standalone CLI that runs AI agents in local microVMs (`sbx create`, `run`, `exec`, `policy`, `daemon`, `diagnose`). RFC 004 names it as the preferred isolation.
 
-**It is opt-in, not the default.** `SbxRunner` is verified end to end against a live sbx v0.50.1 microVM (see "Live findings" below), but that is a per-version fact, so only versions in `VERIFIED_SBX_VERSIONS` qualify. Having `sbx` on `PATH` is not enough to select it (it once was). `default_runner` returns `SbxRunner` only if **all** hold:
+**It is the default when usable.** `SbxRunner` is verified end to end against a live sbx v0.50.1 microVM (see "Live findings" below), but that is a per-version fact, so only versions in `VERIFIED_SBX_VERSIONS` qualify. Having `sbx` on `PATH` is not enough to select it (it once was). With `COGNITIVE_HARNESS2_SANDBOX` unset or `auto`, `default_runner` returns `SbxRunner` only if **all** hold; with `sbx` set it demands the same and refuses (never Docker) when any fails:
 
-- You opted in: `COGNITIVE_HARNESS2_SANDBOX=sbx`. Unset, empty, `auto` and `docker` mean rootless Docker. Any other value is refused (fail closed), not ignored.
 - The installed version is in `sandbox.VERIFIED_SBX_VERSIONS`. It holds exactly `0.50.1`, the version the live test passed on; any other version is refused.
-- A read-only usability probe passes: `/dev/kvm` is accessible to the user, the `sbx` daemon is reachable, and the global network policy is initialised **and deny-all** (an active `**` tcp+udp deny rule, and no network allow rule at all). The probe never starts the daemon: `sbx version` and `sbx policy ls --json` run only once the daemon socket already answers.
+- A read-only usability probe passes: `/dev/kvm` is accessible to this process, the `sbx` daemon is reachable, the global network policy is initialised **and deny-all** (an active `**` tcp+udp deny rule, and no network allow rule at all), and both `ssh.agentForwardingEnabled` and `browser.enabled` are **off** (see "The two host-reach settings" below). The probe never starts the daemon: `sbx version`, `sbx policy ls --json` and `sbx settings ls --format json` run only once the daemon socket already answers.
 
-Anything else gets rootless Docker exactly as above, and with no usable Docker either, the usual fail-closed refusal. There is no fallback to rootful Docker or to the host.
+In `auto`, anything else gets rootless Docker as above, with the reason recorded and warned about; with no usable Docker either, the usual fail-closed refusal. There is no fallback to rootful Docker or to the host.
 
-`harness2_status` keeps its `sandbox` string (the selected runner, or the refusal) and adds an `sbx` object: `state` (`absent`, `present-but-unusable` or `usable-and-selected`), `path`, `version`, `opted_in`, `verified_versions` and `reasons` (for example: not opted in, version not in the verified set, daemon not reachable, `/dev/kvm` permission denied, policy not initialised).
+`harness2_status` keeps its `sandbox` string (the selected runner, or the refusal) and adds `runner`, `mode`, `fallback_reason` and an `sbx` object: `state` (`absent`, `present-but-unusable`, `usable-and-selected` or `not-consulted`), `path`, `version`, `mode`, `verified_versions`, `reasons` and `codes` (see the fallback table above) and `settings` (the two host-reach settings as read).
 
-To enable it, the user does (these change the host, so they are yours to run):
+#### The two host-reach settings
 
-1. Give the user `/dev/kvm` access: `sudo usermod -aG kvm "$USER"`, then log out and in again.
+`ssh.agentForwardingEnabled` (lets sandboxes list the host's SSH agent keys and sign with them) and `browser.enabled` (lets sandboxed processes open URLs in the host browser) both **default to true** on a fresh sbx v0.50.1 install, including this host. Finding (read-only, `sbx settings --help`, `get`, `ls --format json`, 2026-10-31):
+
+- They **can be read**: `sbx settings get --json <key>` and `sbx settings ls --format json` print the evaluated value (default, environment variable or override, whichever wins). They are **global** (daemon-wide): `sbx create` has no per-sandbox flag for either.
+- They **can be disabled**: `sbx settings set ssh.agentForwardingEnabled false` and `sbx settings set browser.enabled false` (a user override; `sbx settings unset <key>` reverts it). `browser.enabled` takes effect within about five seconds; `ssh.agentForwardingEnabled` is marked as needing `sbx daemon restart` (and, per its description, disabling blocks new agent connections while existing ones stay active). Disabling `browser.enabled` also breaks in-sandbox OAuth logins that redirect to localhost, which a model-free `shell` sandbox never does.
+- So the usability probe **refuses to select sbx** while either is on (`unsafe-setting`, with the exact commands in the reason), and `SbxRunner` re-reads them on every run. The one override is `COGNITIVE_HARNESS2_SBX_ALLOW_HOST_SETTINGS=1` (exactly `1`), for a host with no SSH agent and no browser; it accepts only these two settings, every other check still applies.
+- `SSH_AUTH_SOCK` was not scrubbed from the environment of the `sbx` processes this module starts; it is now (with `DOCKER_SANDBOXES_*` and `SBX_*`), with a test. That is defence in depth only: the setting concerns the daemon's own environment, which this module neither reads nor controls, so the refusal above is the real control. The CLI does not show which agent socket the daemon would forward.
+
+To use sbx (these change the host, so they are the user's to run):
+
+1. Give the user `/dev/kvm` access: `sudo usermod -aG kvm "$USER"`, then log out and in again. The process that calls `default_runner` needs it too (the probe checks it), and so does the shell that starts the daemon.
 2. Start the daemon: `sbx daemon start`.
 3. Initialise the global network policy: `sbx policy init <allow-all|balanced|deny-all>` (pick the profile deliberately).
-4. To verify another version, run the live test with the daemon started from a shell that really has the `kvm` group: `COGNITIVE_HARNESS2_SBX_LIVE=1 uv run pytest -q packages/harness2/tests/test_sbx_runner.py -m requires_sbx_live`. It creates, uses and removes throwaway `harness2-*` sandboxes (no model, no workspace mount, `shell` agent only) and asserts exit codes, stdout/stderr, the staged files, a network that gives 403 or no data, a wall-clock kill, and an empty `sbx ls` afterwards. Only if it passes, add that version to `VERIFIED_SBX_VERSIONS`.
-5. Export `COGNITIVE_HARNESS2_SANDBOX=sbx` for the daemon.
+4. Turn the two settings off: `sbx settings set browser.enabled false`, `sbx settings set ssh.agentForwardingEnabled false`, then `sbx daemon restart` (from a shell with the `kvm` group). Or, knowingly, export `COGNITIVE_HARNESS2_SBX_ALLOW_HOST_SETTINGS=1`.
+5. Nothing to export: `auto` is the default. `COGNITIVE_HARNESS2_SANDBOX=sbx` makes a missing or unsafe sbx an error instead of a Docker run.
+6. To verify another version, run the live test with the daemon started from a shell that really has the `kvm` group: `COGNITIVE_HARNESS2_SBX_LIVE=1 uv run pytest -q packages/harness2/tests/test_sbx_runner.py -m requires_sbx_live`. It sets the override above for its own trivial candidates, creates, uses and removes throwaway `harness2-*` sandboxes (no model, no workspace mount, `shell` agent only) and asserts exit codes, stdout/stderr, the staged files, a network that gives 403 or no data, a wall-clock kill, and an empty `sbx ls` afterwards. Only if it passes, add that version to `VERIFIED_SBX_VERSIONS`. No other test starts a VM: the live test is skipped unless `COGNITIVE_HARNESS2_SBX_LIVE=1`.
 
 #### How `SbxRunner` runs a candidate
 
@@ -153,7 +198,7 @@ What this means:
 - **The boundary is the microVM, not the user inside it.** The candidate is `agent` with passwordless `sudo` and a writable root overlay; that is contained by the VM, which is thrown away.
 - **"No network" is "nothing gets through", not "connect() fails".** The runner's check is the policy engine's verdict; the live test measures 403 or an empty reply, never content.
 - A timeout kills the client, but the in-VM process lives until `rm --force`; the runner's `finally` guarantees that. Exit 255 with sbx-shaped stderr is treated as sbx's failure, a bare 255 as the candidate's.
-- Remaining caveats: `ssh.agentForwardingEnabled=true` and `browser.enabled=true` are the defaults on this host (`sbx settings ls`) and are not checked by the runner; set both to `false` before running hostile code on a machine that has an SSH agent or a browser. The first `create` pulls the shell image over the network (done by the daemon, not the candidate); `--pull missing` avoids repeated pulls. `SandboxSpec` has no artefact field, so nothing is copied out. The stage-1 sweep itself still uses rootless Docker: nothing in this runner changes it unless `COGNITIVE_HARNESS2_SANDBOX=sbx` is exported.
+- Remaining caveats: `ssh.agentForwardingEnabled=true` and `browser.enabled=true` were the defaults on this host (`sbx settings ls`) when these runs were made, and were not checked then; they are now checked (see "The two host-reach settings"). The first `create` pulls the shell image over the network (done by the daemon, not the candidate); `--pull missing` avoids repeated pulls. `SandboxSpec` has no artefact field, so nothing is copied out. The stage-1 proposer and solver sessions still use rootless Docker (they need the model route): nothing in this runner changes them.
 
 ## Upstream
 
@@ -701,7 +746,7 @@ The API key is read from `JEV_OPENROUTER_API_KEY` or `OPENROUTER_API_KEY` and is
 
 ## What is not done
 
-- **`sbx` is verified on v0.50.1 only, and is opt-in.** The live test (`COGNITIVE_HARNESS2_SBX_LIVE=1`, `-m requires_sbx_live`) passed on that version; other versions are refused. Inside the VM the candidate is `agent` with passwordless sudo and a writable root overlay (the VM is the boundary), `connect()` to the outside succeeds but no data flows, and `ssh.agentForwardingEnabled` / `browser.enabled` are not checked (see "Live findings"). Nothing is copied out of the VM. Rootless Docker is verified against a real daemon and stays the default.
+- **`sbx` is verified on v0.50.1 only, and is the default when usable.** The live test (`COGNITIVE_HARNESS2_SBX_LIVE=1`, `-m requires_sbx_live`) passed on that version; other versions are refused (in `auto`: Docker, warned). Inside the VM the candidate is `agent` with passwordless sudo and a writable root overlay (the VM is the boundary), `connect()` to the outside succeeds but no data flows, and `ssh.agentForwardingEnabled` / `browser.enabled` must be off (both default on; the selection refuses until they are, or `COGNITIVE_HARNESS2_SBX_ALLOW_HOST_SETTINGS=1` is set). Each sbx run costs about 4 s more than a Docker run. The sum-signed verifier script is written for busybox `sh` and `awk`; the sbx shell image is Ubuntu (see below for whether its verdict was checked there). Nothing is copied out of the VM. Rootless Docker is verified against a real daemon and is the fallback and the only runner for the model-calling sessions.
 - **The engine does not yet call upstream.** Upstream is pinned and import-tested (see Upstream), but `engine.py`'s propose, probe and compose are still the slice 1 local baseline, and the composer is a heuristic (exit status, timeouts, output, stderr). The safety seams to upstream's `Substrate` exist (see Upstream seams); binding the stages themselves to upstream's execution is slice 3b.
 - The OpenRouter quota field names follow RFC 004 and are unverified against the live API.
 - The push hook counts tool failures only. It does not see `jev_judge` verdicts (the shape of that tool result in a PostToolUse payload has not been captured), and there is no `/probe` slash command or `engine probe`; the pull tool covers on-demand requests. The `PostToolUseFailure` payload is also uncaptured: the hook relies on the documented `hook_event_name`, `session_id` and `is_interrupt` fields.

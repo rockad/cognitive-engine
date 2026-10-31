@@ -78,14 +78,16 @@ def build_server(engine: Engine | None = None, s: cfg.Settings | None = None) ->
         return wrapped
 
     @server.tool(name="harness2_status", description="Read-only readiness report: which local sandbox is usable "
-                 "(`sandbox`: rootless-docker by default, sbx only when opted in, verified and usable; otherwise "
-                 "unavailable and fail closed) and, in `sbx`, whether sbx is absent, present-but-unusable "
-                 "(with the reasons) or usable-and-selected, "
+                 "(`sandbox`, and as data `runner` and `mode`: sbx by default when it is a verified version and its "
+                 "read-only probe passes, else rootless-docker; `fallback_reason` says why when it is not sbx; "
+                 "fail closed when neither is usable) and, in `sbx`, whether sbx is absent, present-but-unusable "
+                 "(with the reasons and codes), usable-and-selected or not-consulted, "
                  "whether an OpenRouter key is configured (never its value), the experience root, "
                  "and the immutable protected set. Makes no network call unless check_quota is true.")
     async def status(check_quota: bool = False) -> dict:
         sb = await asyncio.to_thread(sandbox_report)
-        out = {"version": __version__, "sandbox": sb["sandbox"], "sbx": sb["sbx"],
+        out = {"version": __version__, "sandbox": sb["sandbox"], "runner": sb["runner"], "mode": sb["mode"],
+               "fallback_reason": sb["fallback_reason"], "sbx": sb["sbx"],
                "api_key_configured": _api_key() is not None, "experience_root": str(s.experience_root),
                "mutable_components": sorted(invariants.MUTABLE),
                "protected_components": sorted(invariants.PROTECTED_COMPONENTS),
@@ -134,9 +136,9 @@ def build_server(engine: Engine | None = None, s: cfg.Settings | None = None) ->
         return await guard(eng.propose)(task=task, targets=[Target(t.component, t.content) for t in targets],
                                         n=n, zdr=zdr, classification=classification, dry_run=dry_run)
 
-    @server.tool(name="harness2_probe", description="Run each candidate in an ephemeral rootless Docker container (or, only "
-                 "when opted in, verified and usable, a local sbx microVM), and collect outputs. With neither it fails closed "
-                 "and runs nothing; allow_worktree_diff opts in to static diffs only, which execute no code.")
+    @server.tool(name="harness2_probe", description="Run each candidate in a local sbx microVM when sbx is a verified, usable "
+                 "version (the default), else an ephemeral rootless Docker container, and collect outputs. With neither it "
+                 "fails closed and runs nothing; allow_worktree_diff opts in to static diffs only, which execute no code.")
     async def probe(
         run_id: str,
         command: Annotated[list[str], Field(min_length=1, description="command to run in the sandbox")],

@@ -31,6 +31,18 @@ case "${1:-}" in
           *) echo "{\"allowed\":false,\"target\":\"$t\",\"reason\":\"No matching allow rule (default deny)\"}"; exit 1 ;;
         esac ;;
     esac ;;
+  settings)
+    # settings ls --format json (the two host-reach settings; FAKE_SBX_SETTINGS=ssh|browser|both|garbage|fail|hang)
+    case "${FAKE_SBX_SETTINGS:-off}" in
+      fail) echo "error: daemon unreachable" >&2; exit 1 ;;
+      hang) sleep 60 ;;
+      garbage) echo "not json" ;;
+      *)
+        ssh=false; br=false
+        case "${FAKE_SBX_SETTINGS:-off}" in ssh|both) ssh=true ;; esac
+        case "${FAKE_SBX_SETTINGS:-off}" in browser|both) br=true ;; esac
+        echo "[{\"key\":\"browser.enabled\",\"type\":\"bool\",\"value\":$br},{\"key\":\"ssh.agentForwardingEnabled\",\"type\":\"bool\",\"value\":$ssh}]" ;;
+    esac ;;
   create)
     # create shell --name N ...
     if [ "${FAKE_SBX_CREATE:-}" = fail ]; then echo "error: request failed: 500 Internal Server Error: failed to run sandbox container" >&2; exit 1; fi

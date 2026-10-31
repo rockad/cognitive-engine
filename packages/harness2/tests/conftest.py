@@ -48,3 +48,14 @@ def run_id():
             os.environ.pop(run_scope.ENV, None)
         else:
             os.environ[run_scope.ENV] = previous
+
+
+@pytest.fixture(autouse=True)
+def _fresh_sandbox_selection_state():
+    """The sandbox selection caches its (real) sbx probe result and warns once per process: both are per-process
+    state a test must neither inherit nor leave behind."""
+    sandbox.clear_sbx_cache()
+    sandbox._reset_warnings()
+    yield
+    sandbox.clear_sbx_cache()
+    sandbox._reset_warnings()

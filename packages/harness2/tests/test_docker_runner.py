@@ -129,10 +129,14 @@ def test_the_pinned_image_is_a_tag_plus_digest():
 
 # ── runtime selection ────────────────────────────────────────────────────────────
 
-def test_sbx_on_path_no_longer_wins(monkeypatch):
-    """Was `test_sbx_wins_when_installed`. Selection is now opt-in + verified + usable: tests/test_sbx_selection.py."""
+def test_sbx_on_path_alone_never_wins(monkeypatch):
+    """Was `test_sbx_wins_when_installed`. Selection needs a verified version AND a passing probe (default `auto`), or
+    `sbx` forced: tests/test_sbx_selection.py has the table. Here: a bare `sbx` on PATH whose probe cannot pass (no
+    daemon is reachable at this fake state dir) is not selected, and `docker` forces Docker without consulting sbx."""
     monkeypatch.setattr(sandbox, "verify_rootless_docker", lambda which=None, **k: VerifiedDocker("/usr/bin/docker", SOCK))
-    r = sandbox.default_runner(lambda n: f"/x/{n}", environ={})
+    r = sandbox.default_runner(lambda n: f"/x/{n}", environ={"XDG_STATE_HOME": "/nonexistent/state"})
+    assert isinstance(r, DockerRunner) and not isinstance(r, SbxRunner)
+    r = sandbox.default_runner(lambda n: f"/x/{n}", environ={sandbox.ENV_SANDBOX: "docker"})
     assert isinstance(r, DockerRunner) and not isinstance(r, SbxRunner)
 
 

@@ -1,0 +1,36 @@
+[
+  {
+    "default": true,
+    "description": "Allow sandboxed processes to open URLs in the host browser. Disabling it also prevents in-sandbox OAuth logins that redirect to localhost.",
+    "key": "browser.enabled",
+    "source": "default",
+    "type": "bool",
+    "value": true
+  },
+  {
+    "default": false,
+    "description": "Allow sandboxed agents to read the host clipboard for image paste (Ctrl+V).",
+    "env_var": "DOCKER_SANDBOXES_CLIPBOARD_IMAGE_PASTE",
+    "key": "clipboard.imagePaste",
+    "source": "default",
+    "type": "bool",
+    "value": false
+  },
+  {
+    "default": false,
+    "description": "Dial the cloud SSH gateway directly instead of through the proxy selected for CLI host egress.",
+    "key": "proxy.sshDirect",
+    "source": "default",
+    "type": "bool",
+    "value": false
+  },
+  {
+    "default": true,
+    "description": "Allow sandboxes to list SSH agent keys and sign, but not add, remove or lock keys. Disabling blocks new agent connections; existing connections remain active. After enabling, restart the daemon, then restart sandboxes that started with forwarding disabled.",
+    "key": "ssh.agentForwardingEnabled",
+    "requires_restart": true,
+    "source": "default",
+    "type": "bool",
+    "value": true
+  }
+]

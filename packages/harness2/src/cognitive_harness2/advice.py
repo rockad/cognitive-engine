@@ -27,7 +27,7 @@ from urllib.parse import urlparse
 
 from . import egress, triggers
 from .engine import Engine
-from .sandbox import DockerRunner, SandboxUnavailable, SbxRunner
+from .sandbox import DockerRunner, SandboxUnavailable, SbxRunner, default_runner, sandbox_report
 
 
 async def _sandbox(eng: Engine) -> dict:
@@ -40,7 +40,18 @@ async def _sandbox(eng: Engine) -> dict:
             return {"ok": False, "runtime": "unavailable", "detail": f"could not check ({type(e).__name__})"}
         name = ("sbx" if isinstance(runner, SbxRunner)
                 else "rootless-docker" if isinstance(runner, DockerRunner) else type(runner).__name__)
-        return {"ok": True, "runtime": name, "detail": "usable; nothing was started"}
+        out = {"ok": True, "runtime": name, "detail": f"{name} is usable; nothing was started"}
+        if eng.sandbox_factory is default_runner:  # the real selection: say why sbx is not the runner, if it is not
+            try:
+                rep = sandbox_report()
+            except Exception:  # noqa: BLE001 - the reason is a courtesy; the runner above is what matters
+                return out
+            out["mode"] = rep["mode"]
+            if rep["fallback_reason"]:
+                fb = rep["fallback_reason"]
+                out["fallback_reason"] = fb
+                out["detail"] = f"{name} is usable (not sbx: {fb['code']}); nothing was started"
+        return out
     return await asyncio.to_thread(build)
 
 

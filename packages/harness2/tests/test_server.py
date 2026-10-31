@@ -18,9 +18,12 @@ from cognitive_harness2.server import build_server
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("JEV_OPENROUTER_API_KEY", "sk-secret-123")
     # The real report runs read-only `sbx` commands when a daemon is up; this suite starts no host process.
-    monkeypatch.setattr(server_mod, "sandbox_report", lambda: {"sandbox": "rootless-docker", "sbx": {
-        "state": "present-but-unusable", "path": "/usr/bin/sbx", "version": None, "opted_in": False,
-        "verified_versions": [], "reasons": ["not opted in (set COGNITIVE_HARNESS2_SANDBOX=sbx)"]}})
+    monkeypatch.setattr(server_mod, "sandbox_report", lambda: {
+        "sandbox": "rootless-docker", "runner": "rootless-docker", "mode": "auto",
+        "fallback_reason": {"code": "daemon-down", "detail": "sbx daemon is not reachable", "loud": True},
+        "sbx": {"state": "present-but-unusable", "path": "/usr/bin/sbx", "version": None, "mode": "auto",
+                "verified_versions": ["0.50.1"], "reasons": ["sbx daemon is not reachable"],
+                "codes": ["daemon-down"], "settings": {}}})
     s = settings.from_env({settings.ENV_EXPERIENCE_ROOT: str(tmp_path)})
     async def q():
         return QuotaVerdict(True, "ok")
@@ -95,6 +98,9 @@ async def test_status_keeps_the_sandbox_string_and_reports_sbx_separately(client
     out = await call(client, "harness2_status", {})
     assert out["sandbox"] == "rootless-docker"
     assert out["sbx"]["state"] == "present-but-unusable" and out["sbx"]["reasons"]
+    # the runner and why it is not sbx are data too, not only text
+    assert (out["runner"], out["mode"]) == ("rootless-docker", "auto")
+    assert out["fallback_reason"]["code"] == "daemon-down" and out["sbx"]["codes"] == ["daemon-down"]
 
 
 async def test_status_rejects_unknown_arguments(client):
