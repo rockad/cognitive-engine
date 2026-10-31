@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import os
+import secrets
 import sys
 from pathlib import Path
 
@@ -12,7 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from cognitive_harness2 import image, sandbox  # noqa: E402  (after the sys.path tweak above)
+from cognitive_harness2 import image, run_scope, sandbox  # noqa: E402  (after the sys.path tweak above)
 
 
 @pytest.fixture(scope="session")
@@ -28,3 +30,21 @@ def proposer_image(verified) -> image.ImageRef:
         return image.resolve_image(verified)
     except image.ImageError:
         return image.build(verified)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def run_id():
+    """A unique id for THIS pytest process, exported as COGNITIVE_HARNESS2_RUN_ID. The code under test then adds it as
+    the `cognitive-harness2.run` label and to the names of the runtime directories it creates, so a leak check can look
+    at this run's resources only (see h2_isolation) and two test processes on one daemon cannot fail each other.
+    Always fresh: an id inherited from the environment would defeat the point."""
+    rid = secrets.token_hex(4)
+    previous = os.environ.get(run_scope.ENV)
+    os.environ[run_scope.ENV] = rid
+    try:
+        yield rid
+    finally:
+        if previous is None:
+            os.environ.pop(run_scope.ENV, None)
+        else:
+            os.environ[run_scope.ENV] = previous

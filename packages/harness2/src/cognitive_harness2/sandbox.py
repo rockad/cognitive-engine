@@ -49,7 +49,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, NamedTuple, Protocol
 
-from . import invariants
+from . import invariants, run_scope
 
 
 class SandboxUnavailable(RuntimeError):
@@ -289,7 +289,7 @@ class DockerRunner:
     def _argv(self, spec: SandboxSpec, stage_dir: Path, name: str, host: str) -> list[str]:
         return [
             self.docker_path, "-H", host, "run", "--rm", "--name", name,
-            "--label", "cognitive-harness2.sandbox=1", "--pull", "never",
+            "--label", "cognitive-harness2.sandbox=1", *run_scope.labels(), "--pull", "never",
             "--network", "none", "--read-only",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "--pids-limit", str(self.pids_limit),
