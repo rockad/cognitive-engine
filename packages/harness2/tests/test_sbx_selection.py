@@ -606,3 +606,75 @@ def test_a_docker_runner_without_sbx_or_by_choice_says_why_but_quietly(docker):
     assert absent["code"] == "not-installed" and absent["loud"] is False
     forced = sandbox.default_runner(which_with(True), environ={ENV_SANDBOX: "docker"})
     assert forced.fallback_reason["code"] == "forced-docker" and forced.fallback_reason["loud"] is False
+
+
+# ── auto only: the runner it returns falls back to verified Docker when sbx fails before the command ──
+
+class RecordingDocker:
+    """Stands in for DockerRunner (and so never reaches a daemon): records what it is given."""
+    runs: list = []
+
+    def __init__(self, path, *, docker_host=None, fallback_reason=None, **kw):
+        self.path, self.docker_host, self.fallback_reason = path, docker_host, fallback_reason
+
+    def run(self, spec):
+        RecordingDocker.runs.append(spec)
+        return sandbox.SandboxResult(0, "on docker", "", runner="rootless-docker", fallback_reason=self.fallback_reason)
+
+
+@pytest.fixture
+def docker_runs(monkeypatch):
+    RecordingDocker.runs = []
+    monkeypatch.setattr(sandbox, "DockerRunner", RecordingDocker)
+    return RecordingDocker.runs
+
+
+def test_auto_gives_the_sbx_runner_a_lazy_docker_fallback_and_verifies_docker_only_when_it_is_needed(docker):
+    r = sandbox.default_runner(which_with(True), environ={}, probes=probes())
+    assert isinstance(r, SbxRunner) and r.fallback is not None
+    assert docker.asked == 0  # selection cost is unchanged
+
+
+def test_forced_sbx_has_no_fallback_whatever(docker):
+    r = sandbox.default_runner(which_with(True), environ={ENV_SANDBOX: "sbx"}, probes=probes())
+    assert isinstance(r, SbxRunner) and r.fallback is None
+
+
+def test_auto_selected_sbx_that_fails_to_create_runs_on_the_verified_docker_and_drops_the_cache(
+        fakehost, docker, docker_runs, monkeypatch, caplog):
+    """The report's scenario: the selection probe passed (and is cached), then `sbx create` fails (image not cached,
+    host offline). The harness2_probe must still run, on the Docker runner, and the stale 'selected' must go."""
+    fake = str(FAKE_DIR / "sbx")
+    env = {**fakehost.env, "FAKE_SBX_CREATE": "fail"}
+    monkeypatch.setattr(sandbox, "real_sbx_probes", lambda environ: probes(version="9.9.9"))
+    which = lambda n: fake if n == "sbx" else "/usr/bin/docker"  # noqa: E731
+    r = sandbox.default_runner(which, environ=env, verified=frozenset({"9.9.9"}))
+    assert isinstance(r, SbxRunner) and len(sandbox._CACHE) == 1  # selected, and cached for 60 s
+    res = r.run(sandbox.SandboxSpec(command=["true"], files={"prompt": "x"}))
+    assert res.runner == "rootless-docker" and res.fallback_reason["code"] == "sbx-run-failed"
+    assert docker.asked == 1 and len(docker_runs) == 1
+    assert sandbox._CACHE == {}  # every later harness2_probe asks again instead of trusting the stale verdict
+    assert [x for x in caplog.records if x.levelno == logging.WARNING and "sbx-run-failed" in x.getMessage()]
+
+
+def test_the_docker_fallback_is_the_verified_one_and_pinned_to_its_endpoint(
+        fakehost, docker, docker_runs, monkeypatch):
+    fake = str(FAKE_DIR / "sbx")
+    monkeypatch.setattr(sandbox, "real_sbx_probes", lambda environ: probes(version="9.9.9"))
+    r = sandbox.default_runner(lambda n: fake if n == "sbx" else "/usr/bin/docker",
+                               environ={**fakehost.env, "FAKE_SBX_CREATE": "fail"}, verified=frozenset({"9.9.9"}))
+    seen = []
+    monkeypatch.setattr(RecordingDocker, "__init__", lambda self, path, *, docker_host=None, fallback_reason=None, **kw:
+                        seen.append((path, docker_host)) or setattr(self, "fallback_reason", fallback_reason))
+    r.run(sandbox.SandboxSpec(command=["true"]))
+    assert seen == [("/usr/bin/docker", SOCK)]
+
+
+def test_auto_selected_sbx_with_an_unusable_docker_still_fails_closed(fakehost, monkeypatch):
+    Docker(monkeypatch, ok=False)
+    fake = str(FAKE_DIR / "sbx")
+    monkeypatch.setattr(sandbox, "real_sbx_probes", lambda environ: probes(version="9.9.9"))
+    r = sandbox.default_runner(lambda n: fake if n == "sbx" else "/usr/bin/docker",
+                               environ={**fakehost.env, "FAKE_SBX_CREATE": "fail"}, verified=frozenset({"9.9.9"}))
+    with pytest.raises(SandboxUnavailable, match="Docker fallback is unusable"):
+        r.run(sandbox.SandboxSpec(command=["true"]))

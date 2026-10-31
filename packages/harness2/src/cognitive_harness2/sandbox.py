@@ -11,6 +11,9 @@ Candidate code runs ONLY in one of two local runtimes. `COGNITIVE_HARNESS2_SANDB
     `name=rootless` in `docker info` SecurityOptions. When sbx is present but not selected the reason is
     recorded (`sandbox_report`) and logged once as a WARNING; when sbx is simply not installed Docker is
     chosen silently.
+    The selection is a cheap probe, not a guarantee that a VM can be created: in `auto` only, a failure of the
+    `SbxRunner` BEFORE the candidate command started (`SandboxNotStarted`) drops the cached selection, warns, and
+    runs that spec on verified rootless Docker (the result says `runner` and `fallback_reason`). Never after exec.
   * `docker`: rootless Docker only; sbx is never consulted (no process, no probe).
   * `sbx`: sbx only, FAIL CLOSED: when it is not verified or not usable the runner raises
     `SandboxUnavailable`; it never falls back to Docker.
@@ -65,6 +68,12 @@ from . import invariants, run_scope
 
 class SandboxUnavailable(RuntimeError):
     """No usable local sandbox runtime: refuse to run candidate code."""
+
+
+class SandboxNotStarted(SandboxUnavailable):
+    """`SbxRunner` refused or failed BEFORE the candidate command was started (preflight, create, the network and
+    staging checks): nothing of the candidate has run, so the same spec may safely run on another verified runtime.
+    Never raised once `sbx exec` of the candidate has been started, nor when the sandbox could not be removed."""
 
 
 @dataclass(frozen=True)
@@ -530,7 +539,13 @@ class SbxRunner:
     def __init__(self, sbx_path: str, *, environ: Mapping[str, str] | None = None,
                  verified: frozenset[str] | None = None, cpus: int = 1, memory: str = "512m",
                  create_timeout_s: int = _SBX_CREATE_TIMEOUT_S, control_timeout_s: int = 60,
-                 max_output_bytes: int = MAX_OUTPUT_BYTES):
+                 max_output_bytes: int = MAX_OUTPUT_BYTES,
+                 fallback: Callable[[dict], SandboxRunner] | None = None):
+        """`fallback` is for `auto` only: given the reason ({code, detail, loud}), it returns the verified Docker runner
+        (or raises `SandboxUnavailable`). It is used only for a failure BEFORE the candidate started (`SandboxNotStarted`);
+        None (the `sbx` setting, and the default) keeps the runner strictly fail-closed."""
+        self.fallback = fallback
+        self._fell_back: SandboxRunner | None = None
         self.sbx_path = sbx_path
         self.environ = dict(os.environ if environ is None else environ)
         self.verified = VERIFIED_SBX_VERSIONS if verified is None else verified
@@ -695,17 +710,50 @@ class SbxRunner:
         if not spec.command or not all(isinstance(a, str) and "\0" not in a for a in spec.command):
             raise ValueError("command must be a non-empty list of strings without NUL")
         _validate_stage_names(spec.files)  # cheapest refusal first: no sbx process for a bad key
-        self._preflight()
+        if self._fell_back is not None:  # sticky: a broken sbx would cost every remaining candidate a preflight
+            return self._fell_back.run(spec)
+        try:
+            return self._run_in_sbx(spec)
+        except SandboxNotStarted as e:
+            if self.fallback is None:
+                raise
+            return self._run_on_fallback(spec, e)
+
+    def _run_on_fallback(self, spec: SandboxSpec, why: SandboxNotStarted) -> SandboxResult:
+        """`auto` only. sbx failed before the candidate started; the selection that chose it (cached for up to 60 s) is
+        stale, so it is dropped, the event is logged loudly, and this spec runs on the Docker runner the factory
+        verifies NOW. A Docker that is not usable fails closed, naming both."""
+        clear_sbx_cache()
+        reason = {"code": WHY_RUN_FAILED, "detail": str(why), "loud": True}
+        try:
+            self._fell_back = self.fallback(reason)
+        except SandboxUnavailable as e:
+            raise SandboxUnavailable(f"{why}; and the Docker fallback is unusable: {e}") from e
+        _log.warning("sandbox runner is rootless Docker, not sbx: sbx failed before the candidate started: %s "
+                     "[%s]. Fix sbx, or set %s=docker to choose Docker on purpose.", why, WHY_RUN_FAILED, ENV_SANDBOX)
+        return self._fell_back.run(spec)
+
+    def _run_in_sbx(self, spec: SandboxSpec) -> SandboxResult:
+        try:
+            self._preflight()
+        except SandboxUnavailable as e:
+            raise SandboxNotStarted(str(e)) from e
         stage = _stage_for_sbx(spec)
         name = f"harness2-{secrets.token_hex(6)}"
         try:
-            self._must(self._create_argv(name), "create", self.create_timeout_s)
-            if name not in self._must(self._ls_argv(), "ls").stdout.split():
-                raise SandboxUnavailable(f"sandbox {name} is not listed by `sbx ls -q` after create (fail closed)")
-            self._check_sandbox_denies_network(name)
-            if stage is not None:
-                self._must(self._cp_in_argv(stage, name), "cp")
-                self._verify_staged(spec, name)
+            try:
+                self._must(self._create_argv(name), "create", self.create_timeout_s)
+                if name not in self._must(self._ls_argv(), "ls").stdout.split():
+                    raise SandboxUnavailable(f"sandbox {name} is not listed by `sbx ls -q` after create (fail closed)")
+                self._check_sandbox_denies_network(name)
+                if stage is not None:
+                    self._must(self._cp_in_argv(stage, name), "cp")
+                    self._verify_staged(spec, name)
+            except SandboxNotStarted:
+                raise
+            except SandboxUnavailable as e:
+                raise SandboxNotStarted(str(e)) from e
+            # From here on the candidate has been started: nothing below may fall back to another runtime.
             return self._exec(self._exec_argv(spec, name, stage is not None), spec.timeout_s)
         finally:
             try:
@@ -738,6 +786,7 @@ WHY_UNREADABLE_SETTING = "unreadable-setting"
 WHY_PROBE_TIMEOUT = "probe-timeout"
 WHY_PROBE_ERROR = "probe-error"
 WHY_BAD_SETTING = "bad-setting-value"
+WHY_RUN_FAILED = "sbx-run-failed"  # selected and usable at probe time, then failed before the candidate started
 
 _SBX_PROBE_TIMEOUT_S = 5       # one read-only `sbx` command; the whole probe asks at most three
 _SBX_PROBE_CACHE_TTL_S = 60.0  # per process; a daemon started later is noticed within this long
@@ -1074,7 +1123,8 @@ def default_runner(which: Callable[[str], str | None] = shutil.which, *, environ
 
     `COGNITIVE_HARNESS2_SANDBOX` unset or `auto`: `SbxRunner` when sbx is a verified version AND the read-only probe
     passes, else rootless Docker (a present-but-unselected sbx is warned about once). `docker`: rootless Docker,
-    sbx never consulted. `sbx`: `SbxRunner` or `SandboxUnavailable`, never Docker. Any other value: refuse.
+    sbx never consulted. `sbx`: `SbxRunner` or `SandboxUnavailable`, never Docker. Any other value: refuse. In `auto` the `SbxRunner` also
+    carries a lazy Docker fallback for a failure before the candidate started (see `SbxRunner.run`).
     `sbx` merely being on PATH changes nothing.
     """
     environ = os.environ if environ is None else environ
@@ -1083,7 +1133,12 @@ def default_runner(which: Callable[[str], str | None] = shutil.which, *, environ
     if choice.refusal:
         raise SandboxUnavailable(choice.refusal)
     if choice.runner == RUNNER_SBX:
-        return SbxRunner(choice.sbx.path or "sbx", environ=environ, verified=verified)
+        fallback = None
+        if choice.mode == MODE_AUTO:  # `sbx` mode never falls back; `auto` falls back to Docker verified at that moment
+            def fallback(reason: dict) -> SandboxRunner:
+                vd = verify_rootless_docker(which)
+                return DockerRunner(vd.path, docker_host=vd.host, fallback_reason=reason)
+        return SbxRunner(choice.sbx.path or "sbx", environ=environ, verified=verified, fallback=fallback)
     assert choice.docker is not None
     _warn_fallback_once(choice)
     return DockerRunner(choice.docker.path, docker_host=choice.docker.host, fallback_reason=choice.fallback_reason)

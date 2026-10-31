@@ -9,6 +9,7 @@ No Docker, no model, no network.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import socket
@@ -487,3 +488,114 @@ def test_the_result_names_the_runner(world):
     assert (r.runner, r.fallback_reason) == ("sbx", None)
     hung = world.runner(env={"FAKE_SBX_EXEC_HANG": "1"}).run(spec(timeout_s=1))
     assert hung.timed_out and hung.runner == "sbx"
+
+
+# ── auto only: a failure BEFORE the candidate started falls back to verified Docker ───
+
+from cognitive_harness2.sandbox import SandboxNotStarted, SandboxResult  # noqa: E402
+
+
+class FakeDocker:
+    """The verified Docker runner the fallback factory hands over. Records every spec it is given."""
+    def __init__(self, unusable: str | None = None):
+        self.runs, self.reasons, self.unusable = [], [], unusable
+
+    def factory(self, reason):
+        if self.unusable:
+            raise SandboxUnavailable(self.unusable)
+        self.reasons.append(reason)
+        return self
+
+    def run(self, spec):
+        self.runs.append(spec)
+        return SandboxResult(0, "on docker", "", runner="rootless-docker", fallback_reason=self.reasons[-1])
+
+
+PRE_EXEC = [
+    ("create fails (image pull, VM boot)", {"FAKE_SBX_CREATE": "fail"}),
+    ("the sandbox allows the network", {"FAKE_SBX_CHECK": "allowed"}),
+    ("cp fails", {"FAKE_SBX_CP": "fail"}),
+    ("cp silently drops the files", {"FAKE_SBX_CP": "drop"}),
+    ("a host-reach setting was flipped on", {"FAKE_SBX_SETTINGS": "ssh"}),
+    ("the daemon went away", {"XDG_STATE_HOME": "ELSEWHERE"}),
+    ("an unreadable version", {"FAKE_SBX_VERSION": "nightly"}),
+]
+
+
+@pytest.mark.parametrize("label,env", PRE_EXEC, ids=[p[0] for p in PRE_EXEC])
+def test_a_failure_before_the_command_started_runs_that_spec_on_docker(world, caplog, label, env):
+    env = {k: str(world.root / "elsewhere") if v == "ELSEWHERE" else v for k, v in env.items()}
+    docker = FakeDocker()
+    sbx_spec = spec("rm", "-rf", "/", files={"a.py": "x"})
+    with caplog.at_level("WARNING", logger=sandbox.__name__):
+        r = world.runner(env=env, fallback=docker.factory).run(sbx_spec)
+    assert (r.stdout, r.runner) == ("on docker", "rootless-docker")
+    assert docker.runs == [sbx_spec]  # exactly that spec, on Docker
+    reason = r.fallback_reason
+    assert reason["code"] == "sbx-run-failed" and reason["loud"] is True and reason["detail"]
+    assert not (world.fake / "exec_commands").exists()  # the candidate never ran in sbx
+    assert not (world.fake / "sandboxes").exists() or world.listed() == []  # a half-created sandbox is still removed
+    (w,) = [x for x in caplog.records if x.levelno == logging.WARNING]
+    assert "Docker" in w.getMessage() and "sbx-run-failed" in w.getMessage() and reason["detail"] in w.getMessage()
+
+
+def test_the_fallback_is_not_used_when_sbx_works(world):
+    docker = FakeDocker()
+    r = world.runner(fallback=docker.factory).run(spec(files={"a.py": "x"}))
+    assert r.runner == "sbx" and r.fallback_reason is None
+    assert docker.runs == [] and docker.reasons == []
+
+
+def test_after_a_fallback_the_rest_of_the_runners_life_stays_on_docker(world):
+    """A broken sbx would otherwise cost every remaining candidate its preflight (and up to 600 s of create)."""
+    docker = FakeDocker()
+    runner = world.runner(env={"FAKE_SBX_CREATE": "fail"}, fallback=docker.factory)
+    runner.run(spec())
+    seen = len(world.calls())
+    again = runner.run(spec("echo", "2"))
+    assert again.runner == "rootless-docker" and len(docker.runs) == 2
+    assert len(world.calls()) == seen  # no sbx process at all for the second candidate
+
+
+def test_a_fallback_drops_the_cached_selection(world, monkeypatch):
+    dropped = []
+    monkeypatch.setattr(sandbox, "clear_sbx_cache", lambda: dropped.append(1))
+    world.runner(env={"FAKE_SBX_CREATE": "fail"}, fallback=FakeDocker().factory).run(spec())
+    assert dropped == [1]
+
+
+def test_no_fallback_once_the_command_has_started(world):
+    docker = FakeDocker()
+    with pytest.raises(SandboxUnavailable, match="exit 125") as e:
+        world.runner(env={"FAKE_SBX_EXEC_RC": "125", "FAKE_SBX_EXEC_ERR": "boom\n"}, fallback=docker.factory).run(spec())
+    assert not isinstance(e.value, SandboxNotStarted) and docker.runs == []
+    ok = world.runner(env={"FAKE_SBX_EXEC_RC": "3"}, fallback=docker.factory).run(spec())
+    assert ok.exit_code == 3 and ok.runner == "sbx" and docker.runs == []  # a failing candidate is a result, not a fallback
+
+
+def test_no_fallback_when_the_sandbox_could_not_be_removed(world):
+    docker = FakeDocker()
+    with pytest.raises(SandboxUnavailable, match="NOT removed"):
+        world.runner(env={"FAKE_SBX_RM": "leak"}, fallback=docker.factory).run(spec())
+    with pytest.raises(SandboxUnavailable, match="NOT removed"):  # not even after a failure before the command
+        world.runner(env={"FAKE_SBX_RM": "leak", "FAKE_SBX_CHECK": "allowed"}, fallback=docker.factory).run(spec())
+    assert docker.runs == []
+
+
+def test_an_unusable_docker_fails_closed_and_names_both(world):
+    docker = FakeDocker(unusable="daemon is not rootless")
+    with pytest.raises(SandboxUnavailable) as e:
+        world.runner(env={"FAKE_SBX_CREATE": "fail"}, fallback=docker.factory).run(spec())
+    assert "create" in str(e.value) and "daemon is not rootless" in str(e.value) and "fallback" in str(e.value)
+
+
+def test_without_a_fallback_the_failure_stays_an_error(world):
+    with pytest.raises(SandboxUnavailable, match="create"):
+        world.runner(env={"FAKE_SBX_CREATE": "fail"}).run(spec())
+
+
+def test_a_bad_spec_is_still_a_value_error_not_a_fallback(world):
+    docker = FakeDocker()
+    with pytest.raises(ValueError):
+        world.runner(fallback=docker.factory).run(SandboxSpec(command=[]))
+    assert docker.runs == [] and world.calls() == []
