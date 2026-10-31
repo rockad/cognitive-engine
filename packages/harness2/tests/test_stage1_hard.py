@@ -336,13 +336,20 @@ def test_the_audited_hard_adapter_audits_an_accepted_and_a_refused_proposal(tmp_
     assert "SECRET-MODEL-LINE" not in audit.path.read_text()
 
 
-def test_the_audited_easy_adapter_adds_no_event_and_keeps_its_validate_tree(tmp_path, surface):
+def test_the_audited_easy_adapter_audits_the_slot_table_too_f6(tmp_path, surface):
+    """The slot table is enforced for every task set: the easy adapter audits each proposal as a `mutation_check` as well."""
     ad, audit = audited(tmp_path, surface, ss.EASY)
     tree = {n: (ad.base_harness() / n).read_text() for n in surface.always_on}
-    ad.validate_tree({**tree, "guardrails.md": "anything\n"})                      # no slot table on the easy set
+    ad.validate_tree({**tree, "systemprompt.md": tree["systemprompt.md"] + "\nCheck every sign.\n"})
+    with pytest.raises(ValueError, match="slot c2"):
+        ad.validate_tree({**tree, "guardrails.md": "anything\n"})
+    with pytest.raises(ValueError, match="slot c7"):
+        ad.validate_tree({**tree, "scripts/x.py": "print(1)\n"})
     with pytest.raises(ValueError, match="systemprompt.md is missing or empty"):
         ad.validate_tree({**tree, "systemprompt.md": ""})
-    assert [r for r in rows(audit) if r["event"] == "mutation_check"] == []
+    ev = [r for r in rows(audit) if r["event"] == "mutation_check"]
+    assert [e["ok"] for e in ev] == [True, False, False, False]
+    assert ev[2]["slots"] == {"scripts/x.py": "c7"}
 
 
 # ══ the end-to-end selftests, on the real rootless daemon ═════════════════════════════
@@ -437,7 +444,7 @@ def test_a_forbidden_proposer_edit_is_refused_and_the_base_is_kept(tmp_path, ver
 
 
 @pytest.mark.requires_rootless_docker
-def test_the_easy_selftest_is_unchanged_and_now_reports_what_selection_did(tmp_path, verified, proposer_image, up):
+def test_the_easy_selftest_is_unchanged_reports_what_selection_did_and_audits_the_slot_table(tmp_path, verified, proposer_image, up):
     base = tmp_path / "st"
     base.mkdir()
     base.chmod(0o755)
@@ -450,7 +457,9 @@ def test_the_easy_selftest_is_unchanged_and_now_reports_what_selection_did(tmp_p
     sel = r["selection"]
     assert (sel["adopted"], sel["verdict"], sel["chosen_label"]) == (True, "unchanged", "agg1")
     assert r["_harness"]["changed"] == {x: ["systemprompt.md"] for x in ("inv1", "dom1", "agg1")}
-    assert r["_harness"]["mutation_checks"] == []                              # the easy set does not enforce the slot table
+    # the slot table is enforced for every set (F6): each of the three proposals was audited, accepted
+    assert [m["ok"] for m in r["_harness"]["mutation_checks"]] == [True, True, True]
+    assert all(m["slots"] == {"systemprompt.md": "c1"} for m in r["_harness"]["mutation_checks"])
 
 
 @pytest.mark.requires_rootless_docker

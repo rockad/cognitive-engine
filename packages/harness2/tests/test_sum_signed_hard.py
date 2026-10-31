@@ -376,10 +376,10 @@ def test_the_verifier_script_is_posix_sh_with_no_external_dependency():
     assert ss.verifier_files(FIRST, b"x", taskset=hd.TASKSET)["input.txt"] == hd.INSTANCES[FIRST].input_text
 
 
-def test_the_easy_task_set_is_untouched():
+def test_the_easy_task_set_keeps_its_task_and_verifier_and_now_enforces_the_slot_table():
     assert ss.EASY.name == "easy" and ss.EASY.spec_name == "sum-signed" == ss.SPEC_NAME
     assert ss.EASY.instances is ss.INSTANCES and ss.EASY.default_task == "household/sum-1"
-    assert ss.EASY.enforce_slot_table is False and ss.EASY.verify_sh == ss.VERIFY_SH
+    assert ss.EASY.enforce_slot_table is True and ss.EASY.verify_sh == ss.VERIFY_SH      # the slot table is on for every set (F6)
     assert dict(ss.EASY.base_files) == {"systemprompt.md": ss.BASE_SYSTEM_PROMPT}
     assert hd.TASKSET.name == "hard" and hd.TASKSET.spec_name == "sum-signed-hard" and hd.TASKSET.enforce_slot_table
     # the hard module does not reuse an easy name anywhere a run directory or id could collide
@@ -473,12 +473,14 @@ def test_the_hard_adapter_satisfies_upstreams_protocol_and_names_its_own_cell(tm
     assert tuple(spec.leak_globs) == ("verify.sh", "expected*")
 
 
-def test_the_default_adapter_is_the_easy_one_and_its_validate_tree_is_unchanged(tmp_path, surface):
+def test_the_default_adapter_is_the_easy_one_and_it_validates_through_the_slot_table(tmp_path, surface):
     easy = make_adapter(tmp_path, surface, ss.EASY)
     assert easy.ts is ss.EASY and easy.tasks() == list(ss.INSTANCES)
     assert (easy.base_harness() / "systemprompt.md").read_text() == ss.BASE_SYSTEM_PROMPT
     tree = base_tree(easy)
-    easy.validate_tree({**tree, "guardrails.md": "Anything at all.\n"})        # no slot-table check on the easy set
+    easy.validate_tree({**tree, "systemprompt.md": tree["systemprompt.md"] + "\nCheck every sign.\n"})
+    with pytest.raises(ValueError, match="slot c2"):                           # the slot table is on for the easy set too (F6)
+        easy.validate_tree({**tree, "guardrails.md": "Anything at all.\n"})
     spec = SimpleNamespace(name=ss.SPEC_NAME, install_mode="workspace_agents_md", obs_trunc=50_000)
     default = ss.SumSignedAdapter(tmp_path / "d", spec, FakeSubstrate(tmp_path / "dr", surface))
     assert default.ts is ss.EASY
@@ -602,3 +604,66 @@ def test_container_score_agrees_with_score_on_a_hard_run_dir(tmp_path, runner, s
     nothing = tmp_path / "nothing"
     nothing.mkdir()
     assert ad.container_score(nothing, FIRST) == ad.score(nothing, FIRST) == {"n_passed": 0, "n_criteria": 3, "all_pass": False}
+
+
+# ══ the slot table is enforced for EVERY task set (F6) ═════════════════════════════════════════════════════════════════
+# It used to be off on the default easy set, so a proposer could add scripts/x.py (c7) or plugin/p.ts (c8), a non-executable
+# file that still shipped in the solver's harness tree. The flag stays a parameter (tests turn it off), but it defaults to True.
+
+@pytest.fixture
+def easy(tmp_path, surface):
+    return make_adapter(tmp_path, surface, ss.EASY)
+
+
+def test_the_slot_table_defaults_to_enforced_for_every_task_set():
+    import dataclasses
+    assert ss.TaskSet.__dataclass_fields__["enforce_slot_table"].default is True
+    assert ss.EASY.enforce_slot_table is True and hd.TASKSET.enforce_slot_table is True
+    # the parameter remains for tests: turning it off is explicit
+    assert dataclasses.replace(ss.EASY, enforce_slot_table=False).enforce_slot_table is False
+
+
+@pytest.mark.parametrize("path,slot", [("scripts/x.py", "c7"), ("plugin/p.ts", "c8"),
+                                       ("skills/s/scripts/run.py", "c7")])
+def test_a_c7_or_c8_addition_is_refused_on_the_easy_set(easy, path, slot):
+    tree = base_tree(easy)
+    tree[path] = "export default {}\n" if slot == "c8" else "print('hi')\n"
+    assert easy.tree_changes(tree) == {path: slot}
+    msg = refused(easy, tree)
+    assert path in msg and f"slot {slot}" in msg and msg.startswith("The sum-signed harness is invalid")
+
+
+def test_the_same_additions_are_refused_on_the_hard_set_with_the_same_reason(adapter):
+    for path, slot in (("scripts/x.py", "c7"), ("plugin/p.ts", "c8")):
+        tree = base_tree(adapter)
+        tree[path] = "x\n"
+        assert f"slot {slot}" in refused(adapter, tree)
+
+
+def test_the_easy_set_still_accepts_a_legal_edit_of_its_standing_instruction_and_memory(easy):
+    tree = base_tree(easy)
+    tree["systemprompt.md"] += "\nCheck the sign of every amount before adding it.\n"
+    easy.validate_tree(tree)
+    assert easy.tree_changes(tree) == {"systemprompt.md": "c1"}
+    tree["LongTermMEMORY.md"] = "Amounts are cents.\n"
+    easy.validate_tree(tree)
+
+
+def test_the_easy_set_refuses_what_it_used_to_let_through(easy):
+    tree = base_tree(easy)
+    tree["guardrails.md"] += "Anything at all.\n"
+    assert "slot c2" in refused(easy, tree)
+    tree = base_tree(easy)
+    tree["systemprompt.md"] = "---\nmodel: x\n---\n" + tree["systemprompt.md"]
+    assert "frontmatter" in refused(easy, tree)
+    tree = base_tree(easy)
+    tree["notes/extra.md"] = "x\n"
+    assert "not on the harness surface" in refused(easy, tree)
+
+
+def test_with_the_flag_off_a_set_behaves_as_the_easy_set_used_to(tmp_path, surface):
+    import dataclasses
+    off = make_adapter(tmp_path, surface, dataclasses.replace(ss.EASY, enforce_slot_table=False))
+    tree = base_tree(off)
+    tree["scripts/x.py"] = "print('hi')\n"
+    off.validate_tree(tree)                                   # only the generic checks run

@@ -210,7 +210,8 @@ class TaskSet:
     `grade_answer` is shared; what differs is the input, the prompt, the weak base harness and the verifier that
     parses the input. `instances` maps a task id to an object with `task_id`, `domain`, `input_text`,
     `expected_total` and `expected_line`. `enforce_slot_table` makes `SumSignedAdapter.validate_tree` also run
-    `upstream_surface.check_mutation` on every changed file (the hard set does; the easy set keeps its behaviour)."""
+    `upstream_surface.check_mutation` on every changed file. It is on for EVERY set (the default); the parameter stays so a
+    test can turn it off. (The easy set used to run without it, so a proposer could ship a c7 script or a c8 plugin.)"""
     name: str                                   # the --task-set word
     spec_name: str                              # BenchSpec.name
     instances: Mapping[str, Any]
@@ -220,7 +221,7 @@ class TaskSet:
     prompt_fields: Mapping[str, str]
     default_task: str
     description: str
-    enforce_slot_table: bool = False
+    enforce_slot_table: bool = True
 
     def instance(self, task_id: str) -> Any:
         try:

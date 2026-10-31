@@ -237,7 +237,10 @@ class FakeSubstrate:
         self.materialised: list = []
 
     def surface(self):
-        return SimpleNamespace(name="opencode", always_on=ALWAYS_ON)
+        # upstream's real opencode surface: the slot table (on for every task set) classifies paths against it
+        from harness2.substrate.opencode import OPENCODE_SURFACE
+        assert OPENCODE_SURFACE.always_on == ALWAYS_ON
+        return OPENCODE_SURFACE
 
     def materialise(self, tree_dir, spec, ctx):
         self.materialised.append(Path(tree_dir))
