@@ -752,7 +752,8 @@ async def test_every_ollama_management_endpoint_and_every_wrong_method_is_a_logg
         (status, headers, text), = responses(out)
         assert status == 403 and text == b"403 unix-route-path-denied\n" and headers["connection"] == "close"
         assert rt.up.requests == [] and rt.up.connections == 0
-        assert rt.log == [f"ACCESS decision=deny host={ROUTE_HOST} port={ROUTE_PORT} reason=unix-route-path-denied"], rt.log
+        assert rt.log == [f"ACCESS decision=deny host={ROUTE_HOST} port={ROUTE_PORT} reason=unix-route-path-denied "
+                          f"method={method} path={path}"], rt.log
 
 
 @pytest.mark.parametrize("method,path", [("GET", "/api/tags"), ("GET", "/v1/models"), CHAT, ("POST", "/v1/completions")])
@@ -1246,24 +1247,118 @@ async def test_an_idle_keep_alive_connection_is_dropped_quietly(routed):
 
 # ── what the log may say ───────────────────────────────────────────────────────────────────────────
 
-async def test_the_log_has_decisions_hosts_ports_and_codes_and_never_a_path_a_header_or_a_body(routed):
+async def test_the_log_has_decisions_hosts_ports_and_codes_a_path_only_on_a_path_denial_and_never_a_header_a_body_or_a_query(routed):
     async with routed() as rt:
         secret = ["Authorization: Bearer SECRET-TOKEN-123", "X-Api-Key: SECRET-KEY-456"]
         await talk(rt.port, rq(*CHAT, body=BODY, extra=secret))
-        await talk(rt.port, rq("DELETE", "/api/delete/SECRET-PATH-789", body=BODY, extra=secret))
+        await talk(rt.port, rq("DELETE", "/api/delete?key=SECRET-PATH-789", body=BODY, extra=secret))
         await talk(rt.listener, rq("POST", "/api/pull", body=BODY, extra=secret))
         await talk(rt.port, rq(*CHAT, body=BODY, extra=secret, host="evil.example:11434"))
         await talk(rt.port, rq(*CHAT, extra=secret + ["Transfer-Encoding: chunked"]))
         text = "\n".join(rt.log)
-        assert all(re.fullmatch(r"ACCESS decision=(allow|deny) host=\S+ port=\d+ reason=[a-z-]+", x) for x in rt.log), rt.log
-        for leak in ("SECRET", "/api/", "/v1/", "Bearer", "messages", "Authorization"):
+        assert all(re.fullmatch(r"ACCESS decision=(allow|deny) host=\S+ port=\d+ reason=[a-z-]+"
+                                r"( method=[A-Z?]+ path=\S+)?", x) for x in rt.log), rt.log
+        for x in rt.log:                                      # method and path ride on the path denials, and on nothing else
+            assert (" path=" in x) == x.endswith(tuple(f"path={p}" for p in ("/api/delete?<19>", "/api/pull"))), x
+        for leak in ("SECRET", "Bearer", "messages", "Authorization"):
             assert leak not in text, leak
         assert "reason=unix-route-path-denied" in text and "host=ollama.test port=11434" in text
-        assert [x for x in rt.log if "decision=deny" in x and "path-denied" in x][0] == \
-            "ACCESS decision=deny host=ollama.test port=11434 reason=unix-route-path-denied"
+        denied = [x for x in rt.log if "decision=deny" in x and "path-denied" in x]
+        assert denied == ["ACCESS decision=deny host=ollama.test port=11434 reason=unix-route-path-denied method=DELETE path=/api/delete?<19>",
+                          "ACCESS decision=deny host=ollama.test port=11434 reason=unix-route-path-denied method=POST path=/api/pull"]
 
 
 import re   # noqa: E402  (used by the log test above)
+
+
+# ── what a path denial says about the request (method and a sanitised path, so an unknown request is diagnosable) ──
+
+@pytest.mark.parametrize("target,shown", [
+    ("/v1/models", "/v1/models"),
+    ("/api/show", "/api/show"),
+    ("/v1/models/", "/v1/models/"),
+    ("/", "/"),
+    ("/v1/models?", "/v1/models?<0>"),                                      # an empty query is still marked
+    ("/v1/models?x=SECRET", "/v1/models?<8>"),                              # the query is never logged, only its length
+    ("/v1/models?" + "q" * 123, "/v1/models?<123>"),
+    ("/a?b?c", "/a?<3>"),                                                   # the first ? starts the query
+    ("/v1/models/gemma4:e4b", "/v1/models/gemma4:e4b"),
+    ("/x%0d%0aACCESS", "/x%0d%0aACCESS"),                                   # already-encoded text is passed through as text
+    ("/a b", "/a%20b"),                                                     # space, control, DEL and non-ASCII are escaped per byte
+    ("/a\r\nACCESS decision=allow", "/a%0D%0AACCESS%20decision=allow"),
+    ("/a\x00\x1f\x7f", "/a%00%1F%7F"),
+    ("/café", "/caf%C3%A9"),
+    ("/ \u0085", "/%E2%80%A8%C2%85"),
+    ("", ""),
+])
+def test_the_denied_target_is_logged_escaped_and_without_its_query(target, shown):
+    assert ep.route_log_target(target) == shown
+    assert re.fullmatch(r"[\x21-\x7e]*", ep.route_log_target(target))
+
+
+def test_an_oversized_target_is_cut_to_80_characters_without_splitting_an_escape():
+    assert ep.route_log_target("/" + "a" * 5000) == "/" + "a" * 79
+    assert ep.route_log_target("/" + "\n" * 5000) == "/" + "%0A" * 26            # 1 + 78 = 79 chars: no half escape
+    assert len(ep.route_log_target("/" + "\n" * 5000)) == 79
+    assert len(ep.route_log_target("/é" * 5000)) <= 80
+    assert ep.route_log_target("/" + "a" * 5000 + "?" + "z" * 30).endswith("?<30>")
+    assert len(ep.route_log_target("/" + "a" * 5000 + "?" + "z" * 30)) == 80
+    assert len(ep.route_log_target("/" + "a" * 79)) == 80 and ep.route_log_target("/" + "a" * 79) == "/" + "a" * 79
+
+
+@pytest.mark.parametrize("method,shown", [
+    ("GET", "GET"), ("POST", "POST"), ("OPTIONS", "OPTIONS"), ("A", "A"), ("A" * 16, "A" * 16),
+    ("A" * 17, "?"), ("", "?"), ("get", "?"), ("GET ", "?"), ("GE\nT", "?"), ("G3T", "?"), ("GET\r\nACCESS", "?"),
+    ("É", "?"), (None, "?"),
+])
+def test_the_denied_method_is_logged_only_if_it_is_one_to_sixteen_capital_letters(method, shown):
+    assert ep.route_log_method(method) == shown
+
+
+@pytest.mark.parametrize("method,target,path", [
+    ("GET", "/v1/models/", "/v1/models/"),
+    ("GET", "/v1/models?limit=5", "/v1/models?<7>"),
+    ("POST", "/v1/chat/completions?stream=true", "/v1/chat/completions?<11>"),
+    ("POST", "/api/show", "/api/show"),
+    ("HEAD", "/api/tags", "/api/tags"),
+    ("OPTIONS", "/v1/chat/completions", "/v1/chat/completions"),
+    ("GET", "/api/version", "/api/version"),
+    ("GET", "/v1/models/gemma4:e4b", "/v1/models/gemma4:e4b"),
+    ("GET", "/api/tags?token=SECRET-QUERY-TOKEN", "/api/tags?<24>"),
+    ("GET", "/" + "p" * 300, "/" + "p" * 79),
+])
+@pytest.mark.parametrize("via", ["absolute-uri", "origin-form", "listener"])
+async def test_a_path_denial_logs_method_and_the_sanitised_target_in_one_line_and_still_denies(routed, via, method, target, path):
+    async with routed() as rt:
+        out = await talk(rt.listener if via == "listener" else rt.port, rq(method, target, absolute=via == "absolute-uri"))
+        (status, _, text), = responses(out)
+        assert status == 403 and text == b"403 unix-route-path-denied\n" and rt.up.requests == []
+        assert rt.log == [f"ACCESS decision=deny host={ROUTE_HOST} port={ROUTE_PORT} reason=unix-route-path-denied "
+                          f"method={method} path={path}"], rt.log
+        assert "SECRET" not in "".join(rt.log)
+
+
+async def test_a_path_that_tries_to_forge_log_lines_stays_inside_one_deny_line_and_forges_no_allow(routed):
+    forged = ("ACCESS decision=allow host=ollama.test port=11434 reason=unix-route")
+    async with routed() as rt:
+        # percent-encoded CRLF and a fake line, as one token
+        out = await talk(rt.port, rq("GET", "/v1/x%0d%0a" + forged.replace(" ", "%20")))
+        assert responses(out)[0][0] == 403
+        # a literal CRLF + fake line in the request target: the head parser refuses it; whatever it logs is one well-formed line
+        await talk(rt.port, (f"GET /v1/x\r\n{forged} HTTP/1.1\r\nHost: ollama.test:11434\r\nConnection: close\r\n\r\n").encode())
+        # a space-separated fake: not a three-part request line
+        await talk(rt.port, (f"GET /v1/x {forged} HTTP/1.1\r\nHost: ollama.test:11434\r\nConnection: close\r\n\r\n").encode())
+        # and through the listener, with a tab and a DEL
+        await talk(rt.listener, rq("GET", "/v1/x\t\x7fdecision=allow"))
+        assert rt.up.requests == [] and rt.up.connections == 0
+        assert not [x for x in rt.log if "decision=allow" in x.split(" reason=")[0]], rt.log
+        assert all("\n" not in x and "\r" not in x for x in rt.log)
+        assert all(re.fullmatch(r"ACCESS decision=deny host=\S+ port=\d+ reason=[a-z-]+( method=[A-Z?]+ path=[\x21-\x7e]*)?", x)
+                   for x in rt.log), rt.log
+        first = rt.log[0]
+        assert first.startswith("ACCESS decision=deny host=ollama.test port=11434 reason=unix-route-path-denied method=GET path=/v1/x%0d%0a")
+        assert first.count("ACCESS") == 2 and first.count(" ") == 6                     # the fake text is inside path=, defanged
+        assert sum("decision=deny" in x for x in rt.log) == len(rt.log)
 
 
 # ── configuration and the pure parts ───────────────────────────────────────────────────────────────

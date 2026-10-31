@@ -37,7 +37,9 @@ Policy, all of it enforced before a single byte reaches an upstream:
     session) and pipelined requests.
 
 The access log has the decision, the normalised host and the port, and a rule code. Never a header, a body,
-a path, a query or a token. This module is stdlib-only: it ships inside the image and also runs as a plain
+a query or a token. The one exception is a unix-route `unix-route-path-denied` line, which adds
+` method=<M> path=<P>` (M: 1 to 16 capital letters else `?`; P: the target cut to 80 characters, everything but
+printable ASCII percent-escaped, the query replaced by `?<its length>`), so a denied request can be identified. This module is stdlib-only: it ships inside the image and also runs as a plain
 function in the unit tests. Importing it starts nothing.
 
 `test_allow_cidrs` in the config is an explicit opt-in that exempts those networks from the address rule.
@@ -98,11 +100,42 @@ OLLAMA_ROUTE_ALLOW: tuple[tuple[str, str], ...] = (
 
 
 class Refused(ValueError):
-    """A request or target that policy refuses. `.code` is the rule id used in the log and the 4xx reason."""
+    """A request or target that policy refuses. `.code` is the rule id used in the log and the 4xx reason. `.detail` is
+    extra, already-sanitised `key=value` text appended to the log line (empty for every refusal but a route path denial)."""
 
-    def __init__(self, code: str, status: int = 403):
+    def __init__(self, code: str, status: int = 403, detail: str = ""):
         super().__init__(code)
-        self.code, self.status = code, status
+        self.code, self.status, self.detail = code, status, detail
+
+
+_LOG_METHOD = re.compile(r"[A-Z]{1,16}")
+LOG_TARGET_MAX = 80
+
+
+def route_log_method(method: object) -> str:
+    """The request method as it may appear in a log line: 1 to 16 capital letters, else `?`."""
+    return method if isinstance(method, str) and _LOG_METHOD.fullmatch(method) else "?"
+
+
+def route_log_target(target: str) -> str:
+    """A request target as it may appear in a log line (a refused route request, so the operator can see what was asked).
+
+    Printable ASCII 0x21-0x7e only: every other byte (space, control, DEL, anything non-ASCII, by its UTF-8 bytes) is
+    `%XX`-escaped, so a target cannot carry a newline or a space into the line and forge a field or a second line. The
+    query string is never logged, only its length (`/v1/models?<12>`), because a credential may ride in it. At most
+    `LOG_TARGET_MAX` characters in all; the path is cut before an escape would be split. A `%` is left alone (an encoded
+    target shows as written)."""
+    path, mark, query = target.partition("?")
+    tail = f"?<{len(query)}>" if mark else ""
+    room = max(LOG_TARGET_MAX - len(tail), 0)
+    out, used = [], 0
+    for c in path:
+        piece = c if "!" <= c <= "~" else "".join(f"%{b:02X}" for b in c.encode("utf-8", "surrogatepass"))
+        if used + len(piece) > room:
+            break
+        out.append(piece)
+        used += len(piece)
+    return "".join(out) + tail
 
 
 @dataclass(frozen=True)
@@ -675,8 +708,8 @@ class Proxy:
         self.active = 0
         self.route_requests = 0          # requests forwarded over unix routes: this proxy serves one session
 
-    def _log(self, decision: str, host: str, port: int, reason: str) -> None:
-        self.log(f"ACCESS decision={decision} host={host} port={port} reason={reason}")
+    def _log(self, decision: str, host: str, port: int, reason: str, detail: str = "") -> None:
+        self.log(f"ACCESS decision={decision} host={host} port={port} reason={reason}" + (f" {detail}" if detail else ""))
 
     async def _respond(self, writer: asyncio.StreamWriter, status: int, code: str) -> None:
         body = f"{status} {code}\n".encode("ascii")
@@ -996,7 +1029,8 @@ class Proxy:
                         if decision.unix != unix:
                             raise Refused("unix-route-host-mismatch", 403)
                         if (req.method, path) not in policy.route_allow[(host, port)]:
-                            raise Refused("unix-route-path-denied", 403)
+                            raise Refused("unix-route-path-denied", 403,
+                                          f"method={route_log_method(req.method)} path={route_log_target(path)}")
                         if self.route_requests >= lim.route_max_requests:
                             raise Refused("unix-route-request-limit", 429)
                         kind, length, close = request_framing(req)
@@ -1027,7 +1061,7 @@ class Proxy:
                             polite = True
                             return
             except Refused as e:
-                self._log("deny", host, port, e.code)
+                self._log("deny", host, port, e.code, e.detail)
                 await self._respond(writer, e.status, e.code)
                 polite = True
             except _Abort as e:
