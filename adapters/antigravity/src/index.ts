@@ -93,7 +93,7 @@ export function jevHooksEntry(engineRoot: string, bunBin = 'bun'): Record<string
         hooks: [
           {
             type: 'command',
-            command: `${bunBin} ${path.join(engineRoot, 'packages', 'jev', 'src', 'hook.ts')} antigravity`,
+            command: `${bunBin} "${path.join(engineRoot, 'packages', 'jev', 'src', 'hook.ts')}" antigravity`,
             timeout: 5
           }
         ]
