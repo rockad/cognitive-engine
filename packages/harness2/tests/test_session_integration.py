@@ -360,6 +360,28 @@ def test_the_local_channel_reaches_the_host_model_only_through_the_bridge_and_th
         assert all("/bridge,readonly" in " ".join(a) for a in proxy_created) and not [a for a in issued if a[:2] == ["network", "connect"]]
 
 
+@pytest.mark.parametrize("via", ["proxy", "listener"])
+def test_post_api_show_reaches_the_model_server_exactly_once_and_with_its_body(verified, proposer_image, ws, via):
+    """The one native POST that is allowed (read-only model info, allowed 2026-10-31): through the proxy in absolute-URI form
+    and through the listener in origin form it arrives once, as a POST with the body the session wrote, and is logged as an
+    allow. The model server's `GET` counter stays 0: nothing else came with it."""
+    body = '{"model":"gemma4:e4b"}'
+    with HttpStub() as model:
+        r = local_runner(verified, proposer_image, model)
+        if via == "proxy":
+            res = r.run(spec(ws, "routebody", "POST", "/api/show", "harness2-proxy.internal", str(model.port), body))
+        else:
+            raw = (f"POST /api/show HTTP/1.1\\r\\nHost: harness2-proxy.internal:{model.port}\\r\\nContent-Type: application/json\\r\\n"
+                   f"Content-Length: {len(body)}\\r\\nConnection: close\\r\\n\\r\\n{body}")
+            res = r.run(spec(ws, "raw", "harness2-proxy.internal", str(model.port), raw))
+        assert "HTTP/1.1 200" in res.stdout, res
+        assert model.other == [("POST", "/api/show")] and model.bodies == [body.encode()], (model.other, model.bodies)
+        assert model.hits == 0                                                        # no GET came along
+        reason = "unix-route" if via == "proxy" else "unix-listener"
+        assert [x for x in res.egress_log if "decision=allow" in x and f"reason={reason}" in x], res.egress_log
+        assert not [x for x in res.egress_log if "decision=deny" in x], res.egress_log
+
+
 @pytest.mark.parametrize("method,path", [("DELETE", "/api/delete"), ("POST", "/api/pull"), ("POST", "/api/create"), ("POST", "/api/push"),
                                          ("POST", "/api/copy"), ("POST", "/api/generate"), ("GET", "/api/ps"), ("DELETE", "/v1/models")])
 def test_the_model_servers_management_api_is_a_403_through_the_proxy_and_through_the_listener_and_never_reaches_it(
@@ -659,6 +681,7 @@ class HttpStub:
         outer = self
         self.hits = 0
         self.other = []          # (method, path) of every request that was NOT a GET: the model server's management API
+        self.bodies = []         # the body of each of those, in the same order
 
         class H(http.server.BaseHTTPRequestHandler):
             def do_GET(self):                                     # noqa: N802
@@ -670,6 +693,8 @@ class HttpStub:
                 self.wfile.write(body)
 
             def _other(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                outer.bodies.append(self.rfile.read(n) if n else b"")
                 outer.other.append((self.command, self.path))
                 self.send_response(200)
                 self.send_header("Content-Length", "0")

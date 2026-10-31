@@ -773,12 +773,14 @@ def test_a_local_channel_routes_the_proxy_alias_to_the_bridge_socket_and_a_hoste
 
 def test_the_local_route_carries_the_chat_and_model_list_pairs_and_none_of_ollamas_management_api(world):
     """The bridge socket reaches the WHOLE HTTP API of the host's ollama and the session is untrusted: the config the proxy
-    loads must allow the OpenAI-compatible surface and nothing that deletes, pulls, creates, pushes or copies a model."""
+    loads must allow the OpenAI-compatible surface, the two read-only native routes (the model list and the model info),
+    and nothing that deletes, pulls, creates, pushes or copies a model."""
     policy, _, _, listeners, _ = egress_proxy.parse_config(sr.proxy_config(runner("local").authorize(spec(world))))
     for host in ("127.0.0.1", sr.PROXY_ALIAS):
         granted = policy.route_allow[(host, 11434)]
-        assert granted == {("GET", "/api/tags"), ("GET", "/v1/models"), ("POST", "/v1/chat/completions"), ("POST", "/v1/completions")}
-        assert not [p for _, p in granted if p.startswith("/api/") and p != "/api/tags"]
+        assert granted == {("GET", "/api/tags"), ("GET", "/v1/models"), ("POST", "/v1/chat/completions"), ("POST", "/v1/completions"),
+                           ("POST", "/api/show")}
+        assert not [p for _, p in granted if p.startswith("/api/") and p not in ("/api/tags", "/api/show")]
         assert not [m for m, _ in granted if m not in ("GET", "POST")]
     assert listeners == [(11434, f"{sr.BRIDGE_MOUNT}/ollama.sock")]
 

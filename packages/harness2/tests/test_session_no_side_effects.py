@@ -193,6 +193,20 @@ def test_only_an_allowed_request_on_a_unix_route_reaches_for_the_bridge_socket(t
     assert any("open_unix_connection" in a for a in traps.attempts)
 
 
+def test_post_api_show_is_an_allowed_request_and_the_near_misses_touch_nothing(traps):
+    """`POST /api/show` reaches for the bridge socket like any allowed request; its spelling variants and other methods are
+    refused from memory with every door trapped."""
+    with pytest.raises(SideEffectAttempted):
+        _serve_routed_once(b'POST /api/show HTTP/1.1\r\nHost: ollama.test:11434\r\nContent-Length: 22\r\n\r\n{"model":"gemma4:e4b"}')
+    assert any("open_unix_connection" in a for a in traps.attempts)
+    traps.attempts.clear()
+    for method, path in (("GET", "/api/show"), ("POST", "/api/show/"), ("POST", "/api/show?x=1"), ("POST", "/API/show"),
+                         ("POST", "/api/show%2f"), ("POST", "/api/shows"), ("DELETE", "/api/show"), ("POST", "/api/ps")):
+        w, log = _serve_routed_once(f"{method} {path} HTTP/1.1\r\nHost: ollama.test:11434\r\nContent-Length: 0\r\n\r\n".encode())
+        assert w.out.startswith((b"HTTP/1.1 403 ", b"HTTP/1.1 400 ")) and len(log) == 1 and "decision=deny" in log[0], (method, path)
+    assert traps.attempts == []
+
+
 def test_bridge_validators_and_construction_are_pure(traps):
     host_bridge.validate_target("127.0.0.1", 11434)
     for bad in (("localhost", 1), ("10.0.0.1", 1), ("127.0.0.1", 0)):

@@ -731,8 +731,13 @@ def routed(tmp_path):
 
 MANAGEMENT = [
     ("DELETE", "/api/delete"), ("POST", "/api/delete"), ("POST", "/api/pull"), ("POST", "/api/push"), ("POST", "/api/create"),
-    ("POST", "/api/copy"), ("POST", "/api/generate"), ("POST", "/api/chat"), ("POST", "/api/show"), ("POST", "/api/embed"),
+    ("POST", "/api/copy"), ("POST", "/api/generate"), ("POST", "/api/chat"), ("POST", "/api/embed"),
     ("POST", "/api/embeddings"), ("GET", "/api/ps"), ("GET", "/api/version"), ("GET", "/"), ("HEAD", "/api/tags"),
+    # POST /api/show is allowed (2026-10-31); everything near it is not: other methods, other spellings, other names
+    ("GET", "/api/show"), ("HEAD", "/api/show"), ("PUT", "/api/show"), ("PATCH", "/api/show"), ("DELETE", "/api/show"),
+    ("OPTIONS", "/api/show"), ("POST", "/api/show/"), ("POST", "/api/shows"), ("POST", "/api/show/x"), ("POST", "/api/Show"),
+    ("POST", "/API/show"), ("POST", "/api/sho"), ("POST", "/api/show.json"), ("POST", "/api/ps"), ("POST", "/api/version"),
+    ("POST", "/api/me"), ("POST", "/api/status"), ("POST", "/api/embed/show"), ("POST", "/show"), ("POST", "/v1/show"),
     ("HEAD", "/api/blobs/sha256:0000"), ("POST", "/api/blobs/sha256:0000"), ("POST", "/v1/embeddings"),
     ("GET", "/v1/models/gemma4:e4b"), ("DELETE", "/v1/models/gemma4:e4b"), ("GET", "/api/tags/x"), ("POST", "/api/tags"),
     # the allowed paths with the wrong method
@@ -756,18 +761,23 @@ async def test_every_ollama_management_endpoint_and_every_wrong_method_is_a_logg
                           f"method={method} path={path}"], rt.log
 
 
-@pytest.mark.parametrize("method,path", [("GET", "/api/tags"), ("GET", "/v1/models"), CHAT, ("POST", "/v1/completions")])
+SHOW = ("POST", "/api/show")
+SHOW_BODY = b'{"model":"gemma4:e4b"}'          # what opencode sends: the model name, nothing else
+
+
+@pytest.mark.parametrize("method,path", [("GET", "/api/tags"), ("GET", "/v1/models"), CHAT, ("POST", "/v1/completions"), SHOW])
 @pytest.mark.parametrize("via", ["absolute-uri", "origin-form", "listener"])
-async def test_the_four_allowed_pairs_pass_every_way_in_and_arrive_rebuilt(routed, via, method, path):
+async def test_the_five_allowed_pairs_pass_every_way_in_and_arrive_rebuilt(routed, via, method, path):
     async with routed() as rt:
-        payload = rq(method, path, body=BODY if method == "POST" else b"", absolute=via == "absolute-uri",
+        body = (SHOW_BODY if (method, path) == SHOW else BODY) if method == "POST" else b""
+        payload = rq(method, path, body=body, absolute=via == "absolute-uri",
                      extra=["Accept: application/json", "X-Custom: kept"])
         out = await talk(rt.listener if via == "listener" else rt.port, payload)
         (status, _, text), = responses(out)
         assert (status, text) == (200, JSON_OK)
         (got,) = rt.up.requests
         assert (got["method"], got["target"], got["version"]) == (method, path, "HTTP/1.1")
-        assert got["body"] == (BODY if method == "POST" else b"")
+        assert got["body"] == body
         names = [k.lower() for k, _ in got["headers"]]
         assert names.count("host") == 1 and got["low"]["host"] == f"{ROUTE_HOST}:{ROUTE_PORT}"        # pinned, one only
         assert got["low"]["x-custom"] == "kept" and got["low"]["connection"] == "close"
@@ -781,7 +791,11 @@ async def test_the_four_allowed_pairs_pass_every_way_in_and_arrive_rebuilt(route
     "/v1/chat%2Fcompletions", "/v1/%63hat/completions", "/v1/chat/completions%00", "/v1/chat/completions%20", "/%76%31/chat/completions",
     "//v1/chat/completions", "/v1//chat/completions", "/v1/chat//completions", "///api/tags",
     "/v1/./chat/completions", "/./v1/chat/completions", "/v1/chat/../chat/completions", "/api/../v1/models",
-    "/v1/models/../../api/delete", "/v1/chat/completions/.", "/v1/chat/completions/..", "/v1/chat/completions/../../api/pull",
+    "/api/show/", "/api/show?x", "/api/show?", "/api/show?model=x", "/API/show", "/api/SHOW", "/api/Show", "/api/show%2f", "/api/show%2F",
+    "/api/show%00", "/api/show%20", "/api/%73how", "/api/sh%6fw", "/api%2fshow", "/api/shows", "/api/show.", "/api/show;x=1",
+    "/api/show#frag", "/api/show\t", "//api/show", "/api//show", "/./api/show", "/api/./show", "/api/show/.", "/api/show/..",
+    "/api/show/../pull", "/api/show/../../api/delete", "/api/show;/../../api/delete", "/api/show?/../../api/delete",
+    "/v1/models/../../api/delete", "/v1/chat/completions/.","/v1/chat/completions/..", "/v1/chat/completions/../../api/pull",
     "/v1/chat/completions;x=1", "/v1/chat/completions;/../../api/delete", "/api/tags%2e%2e/delete", "/api/%2e%2e/api/delete",
     "/v1/chat/completions#frag", "/v1/chat/completions\t", "/v1/chat/completions%0d%0aX: y", "/v1/chat/completions.", "/v1/chat/completionsx",
     "/ v1/chat/completions".replace(" ", "%20"), "/v1/chat/completions?/../../api/delete", "/v1/models?/api/delete",
@@ -789,7 +803,7 @@ async def test_the_four_allowed_pairs_pass_every_way_in_and_arrive_rebuilt(route
 @pytest.mark.parametrize("absolute", [True, False])
 async def test_an_allowed_path_in_any_other_spelling_is_denied_exactly_not_normalised(routed, target, absolute):
     async with routed() as rt:
-        method = "POST" if "chat" in target else "GET"
+        method = "POST" if "chat" in target or "show" in target else "GET"
         out = await talk(rt.port, rq(method, target, body=BODY if method == "POST" else b"", absolute=absolute))
         statuses = [s for s, _, _ in responses(out)]
         assert statuses and statuses[0] in (400, 403), out
@@ -1163,6 +1177,35 @@ async def test_a_second_request_hidden_after_the_declared_body_is_judged_on_its_
         assert [s for s, _, _ in responses(out)] == [200, 400] and len(rt.up.requests) == 1 and rt.up.requests[0]["body"] == b"{"
 
 
+async def test_post_api_show_has_the_same_strict_framing_and_caps_as_the_other_posts(routed):
+    """`POST /api/show` is not a lighter door: chunked bodies are decoded and re-sent as a length, the body cap and the
+    smuggling refusals apply, and a request hidden behind its body is judged on its own. (The cap is the shared one: the
+    route table has no per-entry caps.)"""
+    async with routed() as rt:
+        out = await talk(rt.port, rq(*SHOW, chunks=[SHOW_BODY[:5], SHOW_BODY[5:]]))
+        assert responses(out)[0][0] == 200
+        (got,) = rt.up.requests
+        assert got["body"] == SHOW_BODY and got["low"]["content-length"] == str(len(SHOW_BODY)) and "transfer-encoding" not in got["low"]
+        out = await talk(rt.port, rq(*SHOW))                                              # a missing body is length 0
+        assert responses(out)[0][0] == 200 and rt.up.requests[-1]["low"]["content-length"] == "0"
+        rt.up.requests.clear()
+        for extra in (["Expect: 100-continue"], ["Transfer-Encoding: chunked"], ["Upgrade: websocket", "Connection: Upgrade"], ["TE: trailers"]):
+            head = (f"POST /api/show HTTP/1.1\r\nHost: {ROUTE_HOST}:{ROUTE_PORT}\r\nContent-Length: 4\r\n" + "\r\n".join(extra)
+                    + "\r\nConnection: close\r\n\r\nabcd").encode()
+            out = await talk(rt.port, head)
+            assert [s for s, _, _ in responses(out)][:1] == [400], (extra, out)
+        assert rt.up.requests == []                                                       # none of the refused ones was forwarded
+        smuggled = b"DELETE /api/delete HTTP/1.1\r\nHost: ollama.test:11434\r\n\r\n"
+        payload = (f"POST /api/show HTTP/1.1\r\nHost: {ROUTE_HOST}:{ROUTE_PORT}\r\nContent-Length: {len(SHOW_BODY)}\r\n\r\n").encode() + SHOW_BODY + smuggled
+        out = await talk(rt.port, payload)
+        assert [s for s, _, _ in responses(out)] == [200, 403]
+        assert [(x["method"], x["target"]) for x in rt.up.requests] == [SHOW]
+    async with routed(route_max_request_bytes=100) as rt:
+        assert responses(await talk(rt.port, rq(*SHOW, body=b"x" * 101)))[0][0] == 413
+        assert responses(await talk(rt.port, rq(*SHOW, chunks=[b"x" * 60, b"x" * 41])))[0][0] == 413
+        assert responses(await talk(rt.port, rq(*SHOW, body=b"x" * 100)))[0][0] == 200 and len(rt.up.requests) == 1
+
+
 async def test_a_get_with_a_body_and_a_missing_post_length_are_handled_strictly(routed):
     async with routed() as rt:
         out = await talk(rt.port, rq("GET", "/api/tags", extra=["Content-Length: 4"]) + b"abcd")
@@ -1319,7 +1362,8 @@ def test_the_denied_method_is_logged_only_if_it_is_one_to_sixteen_capital_letter
     ("GET", "/v1/models/", "/v1/models/"),
     ("GET", "/v1/models?limit=5", "/v1/models?<7>"),
     ("POST", "/v1/chat/completions?stream=true", "/v1/chat/completions?<11>"),
-    ("POST", "/api/show", "/api/show"),
+    ("GET", "/api/show", "/api/show"),
+    ("POST", "/api/shows", "/api/shows"),
     ("HEAD", "/api/tags", "/api/tags"),
     ("OPTIONS", "/v1/chat/completions", "/v1/chat/completions"),
     ("GET", "/api/version", "/api/version"),
@@ -1384,9 +1428,12 @@ def test_routes_to_one_socket_must_agree_on_the_allow_list_and_route_keys_are_ex
         Policy.build([], [{**base, "allow": [["GET", "/api/tags"]], "extra": 1}])
 
 
-def test_the_shipped_allow_list_is_exactly_the_four_pairs_and_the_session_runner_uses_it():
-    assert set(ep.OLLAMA_ROUTE_ALLOW) == {("GET", "/api/tags"), ("GET", "/v1/models"), ("POST", "/v1/chat/completions"), ("POST", "/v1/completions")}
-    assert len(ep.OLLAMA_ROUTE_ALLOW) == 4
+def test_the_shipped_allow_list_is_exactly_the_five_pairs_and_the_session_runner_uses_it():
+    assert set(ep.OLLAMA_ROUTE_ALLOW) == {("GET", "/api/tags"), ("GET", "/v1/models"), ("POST", "/v1/chat/completions"),
+                                          ("POST", "/v1/completions"), ("POST", "/api/show")}
+    assert len(ep.OLLAMA_ROUTE_ALLOW) == 5
+    # of ollama's native /api/* exactly two are reachable: the read-only model list and the read-only model info
+    assert sorted(p for _, p in ep.OLLAMA_ROUTE_ALLOW if p.startswith("/api/")) == ["/api/show", "/api/tags"]
     for method, path in ep.OLLAMA_ROUTE_ALLOW:
         assert method in ("GET", "POST") and "?" not in path and not path.endswith("/")
     assert ep.Policy.build([], [{"host": "a.test", "port": 1, "unix": "/s", "allow": ALLOW}]).route_allow[("a.test", 1)] == set(ep.OLLAMA_ROUTE_ALLOW)

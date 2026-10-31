@@ -183,12 +183,16 @@ def test_every_request_the_real_opencode_sends_is_on_the_proxys_allow_list_and_n
     """The proxy forwards only `egress_proxy.OLLAMA_ROUTE_ALLOW` to the model server (the bridge socket reaches ollama's WHOLE
     API, delete and pull included). opencode v2.0.25 sends `GET /api/tags` once, then one `POST /v1/chat/completions` per model
     step (measured; it never asks for /v1/models, never sends a query string, and goes through the proxy in absolute-URI form
-    with `Host` agreeing, keep-alive). A multi-step session (tool call, then the answer) must pass the filter untouched."""
+    with `Host` agreeing, keep-alive). Against a real ollama it also sends `POST /api/show` at the start of each model step
+    (real stage-1b runs, 2026-10-31; allowed since then: read-only model info). The stub model has not been seen to provoke
+    it, so the exact list is pinned with `/api/show` removed, and `/api/show` may appear wherever the CLI puts it.
+    A multi-step session (tool call, then the answer) must pass the filter untouched."""
     from cognitive_harness2 import egress_proxy as ep
     from real_cli_probe import SCENARIOS
     p, _ = go(verified, proposer_image, tmp_path, SCENARIOS["write"])
     sent = [(x["method"], x["path"]) for x in p.stub]
-    assert sent == [("GET", "/api/tags"), ("POST", "/v1/chat/completions"), ("POST", "/v1/chat/completions")]
+    assert ("POST", "/api/show") in ep.OLLAMA_ROUTE_ALLOW
+    assert [s for s in sent if s != ("POST", "/api/show")] == [("GET", "/api/tags"), ("POST", "/v1/chat/completions"), ("POST", "/v1/chat/completions")]
     assert set(sent) <= set(ep.OLLAMA_ROUTE_ALLOW)
     summary = sr.egress_summary(p.result.egress_log)
     assert summary["model_requests"] == 3 and summary["egress_denied"] == 0 and summary["denied_reasons"] == []
