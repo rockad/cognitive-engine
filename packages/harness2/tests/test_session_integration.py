@@ -373,10 +373,10 @@ def test_the_model_servers_management_api_is_a_403_through_the_proxy_and_through
         assert "403" in via_listener.stdout and "unix-route-path-denied" in via_listener.stdout, via_listener
         assert model.hits == 0 and model.other == [], (model.hits, model.other)                        # the model server heard nothing
         denied = [x for x in via_proxy.egress_log + via_listener.egress_log if "decision=deny" in x]
-        assert denied and all(x == f"ACCESS decision=deny host=harness2-proxy.internal port={model.port} reason=unix-route-path-denied"
-                              for x in denied), denied
+        assert denied and all(x == (f"ACCESS decision=deny host=harness2-proxy.internal port={model.port} "
+                                    f"reason=unix-route-path-denied method={method} path={path}")
+                              for x in denied), denied                                                  # method and path, nothing else
         assert not [x for x in via_proxy.egress_log if "decision=allow" in x]
-        assert path not in "".join(via_proxy.egress_log + via_listener.egress_log)                     # a path is never logged
 
 
 def test_the_bridge_directory_is_private_and_gone_after_the_session(verified, proposer_image, ws):
