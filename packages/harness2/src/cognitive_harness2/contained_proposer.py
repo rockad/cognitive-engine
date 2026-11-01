@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import channels, trajectory, upstream_egress, workspace_harvest
+from . import channels, proposer_hint, trajectory, upstream_egress, workspace_harvest
 from .image import ImageRef
 from .model_gate import GATE, ModelGate
 from .sandbox import VerifiedDocker
@@ -239,6 +239,7 @@ def _build_class(up: Upstream) -> type:
     class ContainedProposer(Base):    # type: ignore[valid-type, misc]
         session: SessionConfig | None = None
         real_kind: str = ""
+        hint_block: str = ""            # the runner's ENVIRONMENT RULES (`proposer_hint`); "" = none. Never set on a selector.
 
         def __post_init__(self) -> None:
             super().__post_init__()
@@ -401,11 +402,32 @@ def _build_class(up: Upstream) -> type:
                 shutil.copyfile(src, dst, follow_symlinks=False)
                 os.chmod(dst, 0o644)
 
+        # ── the runner's environment rules, in front of upstream's system text ─
+
+        def call(self, mission: str, context_dir: Any, label: str, *, system: str = "", timeout: int | None = None,
+                 max_attempts: int | None = None, harvest: str | None = None) -> Any:
+            """Upstream's `Proposer.call` (same signature), with `hint_block` prepended to the system text when there is
+            one. It goes in HERE (not in `_contained`) so upstream's cache key and its audit `system.md` both carry what
+            the session was given: flipping the flag re-asks, and the audit shows the block."""
+            if self.hint_block:
+                system = f"{self.hint_block}\n{system}" if system else self.hint_block
+            return super().call(mission, context_dir, label, system=system, timeout=timeout, max_attempts=max_attempts,
+                                harvest=harvest)
+
         # ── the Reply says which channel it really came from ──────────────────
 
         def _write_audit(self, r: Any, mission: str, system: str, cache_key: str = "") -> None:
             r.channel = self.real_kind
             super()._write_audit(r, mission, system, cache_key)
+            paths = self._paths(r.label, cache_key)
+            if not paths or not paths["meta"].is_file():
+                return
+            meta = json.loads(paths["meta"].read_text(encoding="utf-8"))
+            hinted = bool(self.hint_block) and system.startswith(self.hint_block)
+            meta["hint"] = hinted
+            if hinted:             # the block verbatim and a short hash, so two runs can be told apart by one field
+                meta["hint_sha"], meta["hint_block"] = proposer_hint.digest(self.hint_block), self.hint_block
+            paths["meta"].write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
         def _cached(self, label: str, cache_key: str = "", *, require_workspace: bool = False) -> Any:
             r = super()._cached(label, cache_key, require_workspace=require_workspace)
@@ -419,14 +441,16 @@ def _build_class(up: Upstream) -> type:
 # ── construction ──────────────────────────────────────────────────────────────────
 
 def make_proposer(up: Upstream, session: SessionConfig, *, audit_dir: Path | str | None = None, effort: str = "high",
-                  steps: int = 120, timeout: int | None = None, attempts: int = 1) -> Any:
-    """A `ContainedProposer` for the session's channel. `attempts=1` is the deviation from upstream's default of 2."""
+                  steps: int = 120, timeout: int | None = None, attempts: int = 1,
+                  hint: proposer_hint.ProposerHint | None = None) -> Any:
+    """A `ContainedProposer` for the session's channel. `attempts=1` is the deviation from upstream's default of 2.
+    `hint` is the runner's ENVIRONMENT RULES block for proposer sessions (`proposer_hint.build_hint`); None means none."""
     ch = session.channel_obj
     cls = contained_proposer_class(up)
     spec = up.spec.ChannelSpec(kind=CARRIER_KIND[ch.kind], model=ch.model, effort=effort, steps=steps,
                                timeout=int(timeout if timeout is not None else session.timeout_s))
     return cls(spec, audit_dir=Path(audit_dir) if audit_dir else None, attempts=attempts, project="", region="",
-               session=session, real_kind=ch.kind)
+               session=session, real_kind=ch.kind, hint_block=hint.text if hint is not None else "")
 
 
 def make_selector_prop(proposer: Any, *, channel: str | None = None) -> Any:

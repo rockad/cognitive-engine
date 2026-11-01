@@ -878,7 +878,7 @@ def test_the_hard_plan_shows_the_set_keeps_the_budgets_and_puts_it_in_the_approv
     # nothing else differs: the budgets, caps and checks are the same lines
     only_easy = [x for x in easy.splitlines() if x not in hard.splitlines()]
     only_hard = [x for x in hard.splitlines() if x not in easy.splitlines()]
-    assert all(("task" in x or "classification" in x or "stage1 run --approve" in x) for x in only_easy + only_hard), (only_easy, only_hard)
+    assert all(("task" in x or "classification" in x or "proposer hint" in x or "stage1 run --approve" in x) for x in only_easy + only_hard), (only_easy, only_hard)
 
 
 def test_the_hard_plan_is_as_side_effect_free_as_the_easy_one(rig, up, monkeypatch):
@@ -925,6 +925,50 @@ def test_an_easy_run_records_the_set_too_and_its_adapter_is_the_easy_one(rig, up
             stdin=TTY(), stdout=TTY(), tty=HumanTTY(), run_task=fake_run_task)
     assert seen["task"] == "household/sum-1" and seen["adapter"].ts is stage1.ss.EASY and seen["adapter"].spec.name == "sum-signed"
     assert json.loads((rig.runs / sweep / "report.json").read_text())["task_set"] == "easy"
+
+
+# ── the proposer hint (stage 1c): `--proposer-hint {on,off}` ──
+
+def test_the_plan_shows_the_hint_flag_on_for_hard_off_for_easy_and_the_approve_command_spells_it_only_when_given(rig, up):
+    easy, hard = plan_text(rig), plan_text(rig, "--task-set", "hard")
+    assert "proposer hint    off  (default for the easy set;" in easy and "--proposer-hint on flips it" in easy
+    assert "proposer hint    on  (default for the hard set;" in hard and "--proposer-hint off flips it" in hard
+    for text in (easy, hard):
+        cmd = next(line.strip() for line in text.splitlines() if "stage1 run --approve" in line)
+        assert "--proposer-hint" not in cmd                                   # a default is not spelled out
+    forced = plan_text(rig, "--task-set", "hard", "--proposer-hint", "off")
+    assert "proposer hint    off  (--proposer-hint;" in forced
+    cmd = next(line.strip() for line in forced.splitlines() if "stage1 run --approve" in line)
+    assert build_parser().parse_args(shlex.split(cmd)[5:]).proposer_hint == "off"
+
+
+def hint_run(rig, up, monkeypatch, sweep, *extra):
+    seen = {}
+
+    def fake_run_task(task, k, **kw):
+        seen["prop"], seen["selector"] = kw["prop"], kw["selector_prop"]
+        return type("R", (), {"status": "ok", "modes": {}, "errors": [], "selections": {}})()
+    monkeypatch.setattr(stage1, "new_sweep_id", lambda: sweep)
+    run_run(rig.parse("run", "--approve", "local-ollama", *extra), environ={}, probes=rig.probes(),
+            stdin=TTY(), stdout=TTY(), tty=HumanTTY(), run_task=fake_run_task)
+    run_dir = rig.runs / sweep
+    return seen, json.loads((run_dir / "report.json").read_text()), next(e for e in events(run_dir) if e["event"] == "sweep_start")
+
+
+def test_a_hard_run_gives_the_proposer_the_block_but_not_the_selector_and_records_it(rig, up, monkeypatch):
+    seen, rep, start = hint_run(rig, up, monkeypatch, "stage1-20261030T000000Z-dd01", "--task-set", "hard")
+    assert seen["prop"].hint_block.startswith("ENVIRONMENT RULES") and seen["selector"].hint_block == ""
+    sha = stage1.proposer_hint.digest(seen["prop"].hint_block)
+    assert rep["proposer_hint"] == start["proposer_hint"] == {"on": True, "source": "default for the hard set", "sha": sha}
+
+
+def test_the_easy_run_has_no_block_by_default_and_off_reproduces_run_4_on_the_hard_set(rig, up, monkeypatch):
+    seen, rep, _ = hint_run(rig, up, monkeypatch, "stage1-20261030T000000Z-dd02")
+    assert seen["prop"].hint_block == "" and rep["proposer_hint"] == {"on": False, "source": "default for the easy set", "sha": None}
+    seen, rep, _ = hint_run(rig, up, monkeypatch, "stage1-20261030T000000Z-dd03", "--task-set", "hard", "--proposer-hint", "off")
+    assert seen["prop"].hint_block == "" and rep["proposer_hint"] == {"on": False, "source": "--proposer-hint", "sha": None}
+    seen, rep, _ = hint_run(rig, up, monkeypatch, "stage1-20261030T000000Z-dd04", "--proposer-hint", "on")
+    assert seen["prop"].hint_block and rep["proposer_hint"]["on"] is True and rep["proposer_hint"]["source"] == "--proposer-hint"
 
 
 # ── what the proxy refused by method and path (stage-1b: 5-10 unix-route-path-denied per session, unidentified) ──

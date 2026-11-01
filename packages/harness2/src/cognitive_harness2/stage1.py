@@ -49,7 +49,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
-from . import channels, egress, image, ollama_guard, run_scope, sandbox, sum_signed as ss, sum_signed_hard as ss_hard, task_sets, upstream_egress, upstream_import
+from . import channels, egress, image, ollama_guard, proposer_hint, run_scope, sandbox, sum_signed as ss, sum_signed_hard as ss_hard, task_sets, upstream_egress, upstream_import
 from . import session_runner as sr
 from .contained_proposer import (OPENCODE_PROMPT, SessionConfig, build_command, make_proposer, make_selector_prop,
                                  session_env, TMP_EXEC)
@@ -73,6 +73,7 @@ OLLAMA_TIMEOUT_S = 3.0
 EXCERPT = 160
 FAKE_CLI = Path(__file__).with_name("selftest_fake_opencode.sh")
 EXPECTED_P, EXPECTED_R = 3, 4                # upstream's budget identity at k=1 (P = 3k, R = 4k)
+HINT_CHOICES = ("on", "off")                 # --proposer-hint
 HOST_SESSION_WARNINGS = ("the session runs agent tools (shell and file access) on this host", "HOME and any file-based credentials")
 CANDIDATES = (("systemprompt", "systemprompt.md"), ("memory", "LongTermMEMORY.md"),
               ("tool_guidance", "tool_descriptions/tool_guidance.md"))
@@ -110,6 +111,7 @@ class Settings:
     per_session_s: float = PER_SESSION_S
     cli: str | None = None                   # host path of opencode (--opencode / env / ~/.opencode/bin/opencode / PATH)
     runs_dir: Path = field(default_factory=default_runs_dir)   # PARENT of the per-sweep directory
+    proposer_hint: str | None = None         # "on" / "off" (--proposer-hint); None: on for the hard set, off for the easy one
 
     def __post_init__(self) -> None:
         try:
@@ -119,6 +121,18 @@ class Settings:
         except ValueError as e:
             raise Stage1Error(str(e)) from None
         object.__setattr__(self, "task", task)
+        if self.proposer_hint not in (None, *HINT_CHOICES):
+            raise Stage1Error(f"--proposer-hint must be one of: {', '.join(HINT_CHOICES)}")
+
+    @property
+    def hint_on(self) -> bool:
+        """Does a proposer session get the ENVIRONMENT RULES block? The flag when given, else on for the hard set only
+        (so a command without the flag reproduces run #4 on the easy set, and the hard set gets the hint by default)."""
+        return self.proposer_hint == "on" if self.proposer_hint is not None else self.task_set == "hard"
+
+    @property
+    def hint_source(self) -> str:
+        return "--proposer-hint" if self.proposer_hint is not None else f"default for the {self.task_set} set"
 
     @property
     def ts(self) -> ss.TaskSet:
@@ -358,7 +372,9 @@ def approve_command(s: Settings, plan_cli: str | None, profile_path: str | None,
         parts += ["--opencode", plan_cli]
     if s.task_set != task_sets.DEFAULT:                          # the default is not spelled out: an old command means what it did
         parts += ["--task-set", s.task_set]
-    if s.wall_s is not None:                                    # the figure the plan will actually hold to
+    if s.proposer_hint is not None:                              # spelled out only when asked for: the default is in the plan
+        parts += ["--proposer-hint", s.proposer_hint]
+    if s.wall_s is not None:                                   # the figure the plan will actually hold to
         parts += ["--wall-s", f"{wall_s if wall_s is not None else s.wall_s:g}"]
     parts += ["--per-session-s", f"{s.per_session_s:g}", "--runs-dir", str(s.runs_dir)]
     return " ".join(shlex.quote(p) for p in parts)
@@ -377,6 +393,8 @@ def format_plan(s: Settings, pre: Preflight, plan: SweepPlan | None, refusals: S
               f"classification   {s.classification}  (the {s.ts.spec_name} task, the harness and every prompt are synthetic)",
               f"task set         {s.task_set}  ({s.ts.description})",
               f"task             {s.task}, k={K}, modes={','.join(MODES)}, reflection skipped, attempts 1",
+              f"proposer hint    {'on' if s.hint_on else 'off'}  ({s.hint_source}; the runner's ENVIRONMENT RULES block in front of "
+              f"each proposer session's system text, never a solver's; --proposer-hint {'off' if s.hint_on else 'on'} flips it)",
               f"expected         P={EXPECTED_P} proposer sessions (inv1, dom1, agg1) and R={EXPECTED_R} solver rollouts "
               f"(base1, inv1, dom1, agg1), one model call at a time",
               f"caps             sessions {ch.caps.sessions}, total wall {wall:g} s ({wall / 60:g} min), cost ${ch.caps.cost_usd:g}",
@@ -937,6 +955,8 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
     res: Any = None
     adapter: AuditedAdapter | None = None
     budget = g.make_budget()
+    hint = proposer_hint.build_hint(ctx.surface) if s.hint_on else None
+    hint_info = {"on": hint is not None, "source": s.hint_source, "sha": hint.sha if hint else None}
 
     def observer(event: str, fields: Mapping[str, Any]) -> None:
         if event in ("session_start", "session_end"):
@@ -948,6 +968,7 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
 
     audit.emit("sweep_start", sweep_id=g.sweep_id, channel=g.channel, model=ch.model, endpoint=ch.endpoints[0],
                approved_for_real_model=ctx.approved_for_real_model, k=K, modes=list(MODES), task=s.task, task_set=s.task_set,
+               proposer_hint=hint_info,
                caps=ch.caps.to_dict(),
                per_session_s=g.per_session_s, max_wall_s=g.max_wall_s,
                max_proposer_sessions=g.max_proposer_sessions, max_solver_sessions=g.max_solver_sessions)
@@ -976,7 +997,7 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
             verified=ctx.verified, image=ctx.image, profile=s.profile, channel=s.channel, zdr=s.zdr,
             classification=s.classification, scratch_root=str(proposer_scratch), cli_paths={"opencode": ctx.cli},
             timeout_s=g.per_session_s, api_path=API_PATH, gate_wait_s=g.max_wall_s, budget=budget, observer=observer)
-        prop = make_proposer(ctx.up, session, audit_dir=ctx.run_dir / "proposer-audit", timeout=int(g.per_session_s))
+        prop = make_proposer(ctx.up, session, audit_dir=ctx.run_dir / "proposer-audit", timeout=int(g.per_session_s), hint=hint)
         spec = ctx.up.spec.BenchSpec(**{**ss.spec_fields(adapter_root), "name": s.ts.spec_name},
                                      prompts=ctx.up.spec.BenchPrompts(**s.ts.prompt_fields),
                                      channels={"proposer": prop.spec, "selector": prop.spec})
@@ -1027,7 +1048,8 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
         "started_at": started_at, "finished_at": now_iso(), "wall_s": round(time.monotonic() - t0, 3),
         "channel": {"name": ch.name, "kind": ch.kind, "model": ch.model, "endpoint": ch.endpoints[0],
                     "retention": ch.retention, "caps": ch.caps.to_dict()},
-        "task": s.task, "task_set": s.task_set, "k": K, "modes": list(MODES), "classification": s.classification,
+        "task": s.task, "task_set": s.task_set, "proposer_hint": hint_info, "k": K, "modes": list(MODES),
+        "classification": s.classification,
         "grant": g.to_dict(),
         "ledger": ledger, "budget_identity": {"expected_P": EXPECTED_P, "expected_R": EXPECTED_R, "ok": identity_ok},
         "stages": stages, "selection": selection,
@@ -1083,7 +1105,8 @@ def _settings_from(args: argparse.Namespace, environ: Mapping[str, str]) -> Sett
             raise Stage1Error(f"{name} must be a positive number of seconds")
     return Settings(profile=profile, channel=args.channel or CHANNEL, classification=args.classification, wall_s=wall,
                     per_session_s=float(per), cli=args.opencode, runs_dir=runs,
-                    task_set=getattr(args, "task_set", None) or task_sets.DEFAULT)
+                    task_set=getattr(args, "task_set", None) or task_sets.DEFAULT,
+                    proposer_hint=getattr(args, "proposer_hint", None))
 
 
 def run_plan(args: argparse.Namespace, *, environ: Mapping[str, str], probes: Probes | None = None,
@@ -1513,6 +1536,10 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--task-set", default=task_sets.DEFAULT, choices=task_sets.NAMES,
                         help="easy: sum-signed, 5 clean amounts, the base harness already passes it (default); "
                              "hard: sum-signed-hard, 12 amounts in mixed notations the base harness does not explain")
+    common.add_argument("--proposer-hint", choices=HINT_CHOICES, default=None,
+                        help="on: put the runner's ENVIRONMENT RULES (which harness files are mutable and which are "
+                             "read-only) in front of each proposer session's system text; off: do not (run #4's behaviour). "
+                             "Default: on for --task-set hard, off for easy")
     sub.add_parser("plan", parents=[common], help="read-only: validate, preflight, print the plan and the approve command")
     run = sub.add_parser("run", parents=[common], help="approve and run the sweep (the only place a real model is called)")
     run.add_argument("--approve", metavar="CHANNEL", help="the channel you approve; a phrase must also be typed on a terminal")
@@ -1522,6 +1549,8 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--task-set", default=task_sets.DEFAULT, choices=task_sets.NAMES,
                     help="hard: also prove the improvement loop (an edit is harvested, checked, run as a candidate and adopted; "
                          "forbidden edits are refused), one sweep per scenario")
+    st.add_argument("--proposer-hint", choices=HINT_CHOICES, default=None,
+                    help="as for plan and run (default: on for --task-set hard, off for easy)")
     st.add_argument("--scenario", choices=SCENARIOS, help="run only this fake-proposer scenario (default: all of the task set's)")
     return p
 
