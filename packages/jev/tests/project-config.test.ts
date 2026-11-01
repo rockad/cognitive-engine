@@ -145,7 +145,9 @@ describe('a project ceiling tightens the Workflow guard', () => {
     setProject({ guard: { ceiling: 'sonnet' } });
     expect(await decide(workflow(`await agent('p', { model: 'opus' })`, 'claude-opus-5-5'))).toBe('ask');
     expect(await decide(workflow(`await agent('p', { model: 'sonnet' })`, 'claude-opus-5-5'))).toBeNull();
-    expect(await decide(workflow(`await agent('p')`, 'claude-opus-5-5'))).toBeNull();
+    // an agent() with no model runs on the session model (opus), which is above the ceiling
+    expect(await decide(workflow(`await agent('p')`, 'claude-opus-5-5'))).toBe('ask');
+    expect(await decide(workflow(`await agent('p')`, 'claude-sonnet-5-5'))).toBeNull();
   });
 });
 
