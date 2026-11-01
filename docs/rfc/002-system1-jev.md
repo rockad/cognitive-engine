@@ -34,7 +34,7 @@ Establishes Track 1 of Cognitive Engine: migrating the TypeSafe Jev System 1 cop
   - Secondary: Streamable HTTP daemon on `127.0.0.1:8115/mcp` when supervised via `engine up`.
 - **Multi-Harness Adapters (`adapters/`)**:
   - **Antigravity**: Sidecar integration and MCP registration (`~/.gemini/config/mcp_config.json`).
-  - **Claude Code**: Native plugin bundle (`.claude-plugin/plugin.json`) and MCP registration (no custom session hooks, per Oct 27 settings consolidation).
+  - **Claude Code**: Native plugin bundle (`.claude-plugin/plugin.json`) and MCP registration. Hooks are not prohibited; Track 1 ships only the narrow subagent guard (see the Track 1 branch).
   - **OpenCode**: V2 plugin bundle and event interceptors.
   - **CLI Installer**: Unified `engine install-adapters` command configuring all three environments turnkey.
 

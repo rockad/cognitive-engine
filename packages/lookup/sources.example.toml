@@ -1,0 +1,114 @@
+# Copy this somewhere outside the repo, point LOOKUP_MANIFEST at it, and edit.
+#
+# THIS FILE IS THE ONLY DECLARATION OF WHAT MAY BE INDEXED. There is no "index
+# everything except…" mode and no recursive discovery from a parent directory:
+# adding data is an edit here, visible in a diff. That is not stylistic. The
+# disks a source lives on usually hold other things too, and an exclusion list
+# is a rule someone can forget, while an inclusion list makes everything else
+# structurally absent. Three layers enforce it: nothing undeclared is mounted
+# into the container, `manifest.py` matches only the declared globs, and
+# `pipeline.py` re-checks every document's resolved path against its declared
+# root before writing — refusing anything that escapes, including via symlink.
+#
+# A SOURCE IS A SOURCE. There are no per-corpus special cases and nothing here
+# is taught about a particular kind of material. The only structural difference
+# between the two examples below is that one is read through a Docker volume
+# because it lives on a network share.
+#
+# After editing: `uv run lookup mounts --write` regenerates the container's
+# read-only mounts from this file, so the mount list cannot drift from the
+# declaration. Then `docker compose up -d`.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# A source on this machine's own disk.
+# ─────────────────────────────────────────────────────────────────────────────
+[[source]]
+name = "notes"
+description = "Whatever you keep notes in. One source, one root, explicit globs."
+# ${VAR} resolves from the environment — ANY variable, so a root can be written
+# relative to something machine-local and the manifest stays portable. A plain
+# absolute path works too. An unset variable is an error rather than an empty
+# string, because a root that silently became `/notes` would index the wrong
+# tree, and that is what the inclusion principle exists to prevent.
+root = "${LOOKUP_HOME}/notes"
+# Where this material came from, and therefore what a reader may do with a fact
+# found here. `open` — a company-wide channel, an unrestricted page, anything
+# already published — is free to reuse. `gated` — a DM, a private channel, a
+# permission-restricted page — is usable only after the fact is verified
+# against its source and signed off. Nothing is ever banned: provenance decides
+# the ceremony, not whether the material may be used.
+#
+# Omitting the key leaves the source `unstated`, which is reported as such on
+# every result and handled as gated. That is the deliberate default: an
+# undeclared source is of unknown provenance and unknown resolves to gated, so
+# defaulting to `open` would silently assert the one thing that cannot be taken
+# back once a fact has been reused on the strength of it. An invalid value is a
+# manifest error, not a silent fallback.
+visibility = "open"
+include = ["*.md", "**/*.md"]
+# Pruned during the walk, not filtered after it. On a network share the
+# difference was 34 s against 3 s, because 3,080 of 3,610 files sat under one
+# excluded directory and were visited only to be discarded.
+exclude_names = [".git", ".obsidian", "node_modules"]
+extractor = "docs.markdown"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# A source on a network share, read over SMB and never copied.
+# ─────────────────────────────────────────────────────────────────────────────
+[[source]]
+name = "share"
+description = """A share on another machine. Nothing is mirrored locally, so
+nothing goes stale and nothing has to travel but the index itself."""
+# The path the share is mounted at INSIDE the container. Set it to the path you
+# mount the same share at on this machine, and a path in a search result opens
+# on both sides.
+root = "/Volumes/share"
+# This one holds material from restricted places, so a fact from it needs
+# verification and sign-off before it is reused anywhere else.
+visibility = "gated"
+# One location, written several ways. Purely declarative: document identity is
+# address-independent already, so an alias changes nothing about what is
+# indexed. What it buys is a check — `mounts --write` accepts any address on
+# this list, normalises it to the //host/share form the kernel wants, and
+# REFUSES one that is not listed, so a mistyped host cannot quietly mount a
+# different share under a source name that already holds documents.
+aliases = [
+  "smb://fileserver/share",
+  "smb://fileserver.lan/share",
+  "smb://192.168.1.50/share",
+]
+include = ["*.md", "**/*.md", "*.txt", "**/*.txt"]
+exclude_names = [".git"]
+extractor = "docs.markdown"
+
+# How this source is mounted — declared HERE, not named in the compose file.
+# The volume name is derived from the source name (`src_share`), so the stack
+# contains no per-corpus name and nothing has to be taught about a particular
+# kind of material. Docker mounts this inside its VM, so only SMB is in the
+# read path; bind-mounting your own SMB mount instead pays SMB *and* the
+# host-to-VM filesystem bridge, which measured 34 s against 3 s for one walk.
+#
+# ⚠️ Credentials are ${...} REFERENCES, never values. `mounts --write` emits
+# them verbatim for `docker compose` to interpolate from .env at `up` time, so
+# a password never lands in a generated file. Name the variables whatever you
+# like — nothing in the tool invents or expects a particular name.
+#
+# ⚠️ Renaming this source orphans its volume: the old `src_<oldname>` is left
+# behind and a new one created. Nothing is lost when the volume is a network
+# share, because it holds no data — it *is* the share — but `docker volume rm`
+# is needed to tidy up. The same applies to changing `device`: a named volume's
+# options are fixed when it is created, so compose reuses the existing one and
+# reports success until it is removed.
+[source.volume]
+type = "cifs"
+device = "//192.168.1.50/share"
+options = "ro,vers=3.0,nounix,noserverino"
+username = "${SHARE_USER}"
+password = "${SHARE_PASS}"
+
+# ⚠️ A source that is declared but unreachable KEEPS its documents: away from
+# the network it reports MISSING, the index keeps answering from what it last
+# saw, and results whose paths cannot be opened are marked. Its file ledger is
+# discarded, so the next pass that finds it re-reads and re-hashes everything
+# rather than trusting a pre-gap mtime. A source removed from this file loses
+# its documents — that is the deliberate way to forget one.
