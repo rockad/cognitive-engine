@@ -26,13 +26,15 @@ import {
   formatVerdict,
   guardErrorVerdict,
   type GuardHarness,
+  type GuardSink,
   type Verdict
 } from './guard.js';
+import { writeWorkflowPin } from './workflow-pin.js';
 import { appendClaudeDecision } from './claude-audit.js';
 
 const HARNESSES: Record<
   GuardHarness,
-  { jevHarness: 'claude-code' | 'antigravity'; evaluate: (input: any) => Verdict | null }
+  { jevHarness: 'claude-code' | 'antigravity'; evaluate: (input: any, sink?: GuardSink) => Verdict | null }
 > = {
   claude: { jevHarness: 'claude-code', evaluate: evaluateClaude },
   antigravity: { jevHarness: 'antigravity', evaluate: evaluateAntigravity }
@@ -127,7 +129,11 @@ export async function run(harnessArg: string | undefined, stdin: string, deps: H
       );
     }
     if (derived === 'off') return null;
-    verdict = harness.evaluate(JSON.parse(stdin));
+    const input = JSON.parse(stdin);
+    const sink: GuardSink = {};
+    verdict = harness.evaluate(input, sink);
+    // Bind the decision to the text it analysed (workflow-pin.ts); the PostToolUse recorder checks it.
+    if (sink.workflow) writeWorkflowPin(input?.tool_use_id, input?.session_id, sink.workflow.decision, sink.workflow.scripts);
   } catch (err) {
     verdict = guardErrorVerdict(err);
     verdict.audit = { kind: 'guard-error' };

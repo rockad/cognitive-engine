@@ -34,7 +34,7 @@ Agents spawned inside a `Workflow` do not pass through the `Agent|Task` hook (ve
 ## Requirements
 
 - Claude Code **>= 2.1.295**: the guard entries use `"onFailure": "block"`, so a crashing, timing-out or missing hook blocks the tool call instead of failing open. Older versions ignore the key and fail open.
-- The two recorder hooks (`SessionStart`, `PostModelSwitch`) are log-only and deliberately fail open.
+- The three recorder hooks (`SessionStart`, `PostModelSwitch`, and `PostToolUse` for `Workflow`) only observe and deliberately fail open; `PostToolUse` prints only when a workflow file changed after the guard analysed it.
 
 ## Install
 

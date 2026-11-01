@@ -74,6 +74,17 @@ The Workflow hook parses the script with acorn and asks for anything it cannot r
 
 Not followed, still ask: `let`/`var`, parameters, destructuring, call results, templates with `${}`, concatenation, spreads (arguments, options, objects), computed keys from data, options held in a variable, aliasing of `agent`/`workflow`, `eval`, `Function`, dynamic `import()`, `globalThis` and the rest of the escape set, and `this` outside a class body. The tests are table-driven (`tests/workflow-guard-literals.test.ts`, `tests/workflow-guard-hardening.test.ts`); every bypass shape from the earlier reviews is in an ask table.
 
+### Workflow guard: the script can change after it is analysed
+
+The hook analyses the script text it reads at `PreToolUse`; Claude Code reads the file again to run it. What the hook can and cannot see (`src/workflow-pin.ts`):
+
+- **Every call is re-analysed from the current content.** A `scriptPath` (or saved `name`, or a nested `workflow()` file) that was edited since an earlier call is judged on what it says now, never on an earlier verdict. A resume (`resumeFromRunId`) is analysed from the file like any other call. There is deliberately no extra "content differs from the last approved hash" prompt: it would ask after every edit of a script that is still clean.
+- **Every decision is bound to the text it analysed.** The ask text lists each analysed file with `sha256:<first 16 hex>` and its size, the `ask` audit record carries the full hashes (never the text), and the hook writes a pin (`~/.config/jev/claude_sessions/workflow-pins/<tool_use_id>.json`, hashes only) for both allows and asks.
+- **Drift is reported after the run.** `PostToolUse` (matcher `Workflow`, `record-hook.ts PostToolUse`) re-hashes the files named in the pin. A file that changed or disappeared writes a `workflow_changed` audit event (both hashes) and prints a `systemMessage` for the user; a clean run prints nothing and consumes the pin.
+- **Silent when Jev is off.** With mode `off` (explicit, or no config file) the hook returns before it evaluates anything, so no pin exists and the recorder does nothing. A malformed config asks before any analysis and writes no pin.
+
+Cannot see or do: hold the file still between the analysis and Claude Code's read (the window is not closed, only audited); a file swapped and restored inside the window; an inline `script` (hashed, but it has no file to re-check); what Claude Code actually runs on a `resumeFromRunId` (the file or a saved copy of the earlier run) is not observable from the hook. The drift report is detection, not prevention: by then the run has happened.
+
 ### Session model (Claude Code)
 
 The ceiling is the session's model, which Claude Code does not put in any `PreToolUse` payload. The guard builds it from two pieces of evidence and orders them by time (`resolveSessionModel`, `src/session-model.ts`):

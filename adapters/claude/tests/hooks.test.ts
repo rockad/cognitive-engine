@@ -19,7 +19,7 @@ describe('hooks.json failure policy', () => {
   });
 
   it('recorder hooks stay fail-open', () => {
-    for (const event of ['SessionStart', 'PostModelSwitch']) {
+    for (const event of ['SessionStart', 'PostModelSwitch', 'PostToolUse']) {
       for (const h of handlers(event)) {
         expect(h.command).toContain('record-hook.ts"');
         expect(h.onFailure).toBeUndefined();
