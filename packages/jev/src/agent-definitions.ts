@@ -5,7 +5,9 @@
  *      `$CLAUDE_PROJECT_DIR/.claude/agents` when the cwd is outside it;
  *   2. `~/.claude/agents/<name>.md`;
  *   3. installed plugins' `agents/<name>.md`, found through `~/.claude/plugins/installed_plugins.json`
- *      (read-only). A namespaced name `plugin:agent` only looks in the plugin called `plugin`.
+ *      (read-only), enabled plugins first per `enabledPlugins` in the settings files, then the rest
+ *      (never fewer definitions than a plain search of all). A namespaced name `plugin:agent` only
+ *      looks in the plugin called `plugin`.
  *
  * The name is restricted to file-name characters (one `:` allowed, as the plugin separator), so a
  * path-like name never escapes the directories. A name that resolves to no file is "not found",
@@ -70,26 +72,59 @@ function projectAgentDirs(cwd: string | undefined): string[] {
   return dirs;
 }
 
-/** `agents/` dirs of installed plugins as `[pluginName, dir]`. A missing or odd manifest yields none. */
-function pluginAgentDirs(): Array<[string, string]> {
-  const out: Array<[string, string]> = [];
+/**
+ * `enabledPlugins` as Claude Code layers it: `~/.claude/settings.json`, then each project's
+ * `.claude/settings.json` and `.claude/settings.local.json` (later layers win). Only a literal
+ * `true` enables a plugin key (`name@marketplace`). Unreadable or odd files contribute nothing.
+ */
+function enabledPluginKeys(cwd: string | undefined): Set<string> {
+  const files = [path.join(homeDir(), '.claude', 'settings.json')];
+  // Project roots: the parents of the project `.claude/agents` dirs, farthest (project root) first.
+  for (const agents of [...projectAgentDirs(cwd)].reverse()) {
+    const claudeDir = path.dirname(agents);
+    files.push(path.join(claudeDir, 'settings.json'), path.join(claudeDir, 'settings.local.json'));
+  }
+  const state = new Map<string, boolean>();
+  for (const file of files) {
+    let enabled: unknown;
+    try {
+      enabled = JSON.parse(fs.readFileSync(file, 'utf8'))?.enabledPlugins;
+    } catch {
+      continue;
+    }
+    if (!enabled || typeof enabled !== 'object' || Array.isArray(enabled)) continue;
+    for (const [key, value] of Object.entries(enabled)) state.set(key, value === true);
+  }
+  return new Set([...state].filter(([, on]) => on).map(([key]) => key));
+}
+
+/**
+ * `agents/` dirs of installed plugins as `[pluginName, dir]`: enabled plugins (per
+ * `enabledPlugins` in the settings files, when readable) first, then every other installed plugin,
+ * each group in manifest order. Ordering only: no plugin is ever left out. A missing or odd
+ * manifest yields none.
+ */
+function pluginAgentDirs(cwd: string | undefined): Array<[string, string]> {
+  const out: Array<{ name: string; dir: string; key: string }> = [];
   let doc: any;
   try {
     doc = JSON.parse(fs.readFileSync(path.join(homeDir(), '.claude', 'plugins', 'installed_plugins.json'), 'utf8'));
   } catch {
-    return out;
+    return [];
   }
   const plugins = doc?.plugins;
-  if (!plugins || typeof plugins !== 'object' || Array.isArray(plugins)) return out;
+  if (!plugins || typeof plugins !== 'object' || Array.isArray(plugins)) return [];
   for (const [key, installs] of Object.entries(plugins)) {
     const name = key.split('@')[0];
     if (!name || !Array.isArray(installs)) continue;
     for (const inst of installs) {
       const p = (inst as any)?.installPath;
-      if (typeof p === 'string' && path.isAbsolute(p)) out.push([name, path.join(p, 'agents')]);
+      if (typeof p === 'string' && path.isAbsolute(p)) out.push({ name, dir: path.join(p, 'agents'), key });
     }
   }
-  return out;
+  const enabled = enabledPluginKeys(cwd);
+  const ordered = [...out.filter((e) => enabled.has(e.key)), ...out.filter((e) => !enabled.has(e.key))];
+  return ordered.map((e) => [e.name, e.dir]);
 }
 
 /** The directories searched for `subagentType`, nearest first (empty for an invalid name). */
@@ -101,7 +136,7 @@ export function agentLookupDirs(subagentType: unknown, cwd: string | undefined):
     for (const d of projectAgentDirs(cwd)) dirs.add(d);
     dirs.add(path.join(homeDir(), '.claude', 'agents'));
   }
-  for (const [plugin, dir] of pluginAgentDirs()) if (!parsed.plugin || plugin === parsed.plugin) dirs.add(dir);
+  for (const [plugin, dir] of pluginAgentDirs(cwd)) if (!parsed.plugin || plugin === parsed.plugin) dirs.add(dir);
   return [...dirs];
 }
 
@@ -111,8 +146,16 @@ export function describeAgentLookup(cwd: string | undefined): string {
   return (
     `${project.length > 0 ? project.join(', ') : '<cwd>/.claude/agents'} (hook cwd up to the project root), ` +
     `${path.join(homeDir(), '.claude', 'agents')}, and the agents/ dir of each plugin in ` +
-    `${path.join(homeDir(), '.claude', 'plugins', 'installed_plugins.json')} (a "plugin:agent" name only looks in that plugin)`
+    `${path.join(homeDir(), '.claude', 'plugins', 'installed_plugins.json')} (enabled plugins first; a "plugin:agent" name only looks in that plugin)`
   );
+}
+
+/**
+ * The sentence both guards use when a subagent's definition cannot be found. The caller prefixes
+ * what was looked up (the agent name or type) and passes the lookup description.
+ */
+export function missingAgentDetail(lookup: string): string {
+  return `no definition for it could be found, so the model it will run on cannot be checked against the session ceiling. Looked in ${lookup}.`;
 }
 
 export function readAgentDefinition(subagentType: string | undefined, cwd: string | undefined): AgentDefinition {

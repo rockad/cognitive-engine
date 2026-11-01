@@ -47,7 +47,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as acorn from 'acorn';
-import { readAgentDefinition, type AgentDefinition } from './agent-definitions.js';
+import { describeAgentLookup, missingAgentDetail, readAgentDefinition, type AgentDefinition } from './agent-definitions.js';
 import { assessModelRequest } from './models.js';
 
 /** Largest script (inline or file) the guard will parse. Bigger asks. */
@@ -74,6 +74,8 @@ export interface WorkflowResolver {
   readScriptFile(file: string): { text: string; label: string } | { error: string };
   findNamedWorkflow(name: string): { text: string; label: string } | { error: string };
   agentDefinition(agentType: string): AgentDefinition;
+  /** Where agent definitions are looked up, for the ask text (same words as the Agent guard's). */
+  describeLookup?(): string;
 }
 
 /** A resolver that finds nothing: every file, name and agent definition is "not found". */
@@ -109,7 +111,8 @@ export function fsResolver(cwd: string | undefined): WorkflowResolver {
       }
       return { error: `workflow "${name}" not found in .claude/workflows (project or user)` };
     },
-    agentDefinition: (agentType) => readAgentDefinition(agentType, base)
+    agentDefinition: (agentType) => readAgentDefinition(agentType, base),
+    describeLookup: () => describeAgentLookup(base)
   };
 }
 
@@ -626,7 +629,8 @@ export function checkScriptText(
       case 'agentType': {
         const def = resolver.agentDefinition(f.agentType);
         if (!def.found) {
-          sites.push({ file: label, line: f.line, col: f.col, reason: `agentType "${f.agentType}" has no definition in .claude/agents, so its model cannot be read` });
+          const lookup = resolver.describeLookup?.() ?? 'no agent definition directory (nothing is searched)';
+          sites.push({ file: label, line: f.line, col: f.col, reason: `agentType ${JSON.stringify(f.agentType)} is not an agent Jev can read: ${missingAgentDetail(lookup)}` });
         } else if (def.model !== null) {
           const s = modelSite(label, f, def.model, sessionModel, `agentType "${f.agentType}" definition:`);
           if (s) sites.push(s);
