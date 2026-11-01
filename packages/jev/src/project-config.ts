@@ -1,15 +1,18 @@
 /**
  * Project-level Jev config for the guard: it may TIGHTEN the user config, never loosen it.
  *
- * File: `.agents/jev.json`, else `.jev.json`, in the nearest directory (from the hook cwd upward)
- * that has one, the same names and order the loader uses (`findProjectConfigFile`). Discovery here
- * uses lstat, so a dangling symlink is a file that cannot be read, not "no file".
+ * Files: `.agents/jev.json` and `.jev.json` in the hook cwd and in every parent up to the project root
+ * (`CLAUDE_PROJECT_DIR`, else the git root; see project-root.ts). ALL of them count: the lowest
+ * valid `guard.ceiling` and the highest mode win, and one malformed file makes the result malformed,
+ * so a nested file can never cancel an ancestor's ceiling. Files above the project root are not read.
+ * Discovery uses lstat, so a dangling symlink is a file that cannot be read, not "no file".
  *
  * Read by the guard hook only. Keys it looks at (everything else is ignored, and never makes the
  * file malformed):
  * - `guard.ceiling`: a model Jev can rank. The guard compares requests against the LOWER of the
  *   session model and this ceiling, so a repository can cap what its sessions may delegate to.
- *   A ceiling above the session model changes nothing.
+ *   A ceiling above the session model changes nothing. Subagents that inherit the session model
+ *   (no model, `inherit`, a built-in type, a definition without a model) are ranked too.
  * - `defaults.mode`, `harnesses.<harness>.mode`: resolved like the user config. They can keep or
  *   raise the user's mode and never lower it (`tightenMode`); for the guard `on` and `on-demand`
  *   behave the same, so this is recorded in the audit and nothing more.
@@ -27,29 +30,37 @@ import * as fsSync from 'node:fs';
 import * as path from 'node:path';
 import { DEFAULT_CONFIG_IO, VALID_JEV_MODES, readConfigFile, type JevHarness, type JevMode } from './core/config.js';
 import { compareModels, parseModel } from './models.js';
+import { projectDirs } from './project-root.js';
 
 export type ProjectConfig =
   | { state: 'none' }
   | { state: 'malformed'; file: string; problems: string[] }
   | { state: 'valid'; file: string; mode: JevMode | null; ceiling: string | null };
 
-/** Nearest project config file from `startDir` up, `.agents/jev.json` before `.jev.json` in each directory. */
-export function findProjectConfig(startDir: string): string | null {
-  let dir = path.resolve(startDir);
-  for (;;) {
+/**
+ * Every project config file that applies to `startDir`, nearest first: `.agents/jev.json` and
+ * `.jev.json` in each directory from the cwd up to the project root (project-root.ts). Files above
+ * the project root are not read. Both names in one directory count, `.agents/jev.json` first.
+ */
+export function findProjectConfigs(startDir: string): string[] {
+  const files: string[] = [];
+  for (const dir of projectDirs(path.resolve(startDir))) {
     for (const rel of [path.join('.agents', 'jev.json'), '.jev.json']) {
       const file = path.join(dir, rel);
       try {
         fsSync.lstatSync(file);
-        return file;
+        files.push(file);
       } catch {
         // not here
       }
     }
-    const parent = path.dirname(dir);
-    if (parent === dir) return null;
-    dir = parent;
   }
+  return files;
+}
+
+/** The nearest project config file from `startDir` up, or null. */
+export function findProjectConfig(startDir: string): string | null {
+  return findProjectConfigs(startDir)[0] ?? null;
 }
 
 const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -90,15 +101,8 @@ function guardProblems(cfg: unknown): string[] {
   return out;
 }
 
-/** Read and validate the project config that applies to `startDir`, for `harness`. Never throws. */
-export function inspectProjectConfig(startDir: string | undefined, harness: JevHarness = 'claude-code'): ProjectConfig {
-  let file: string | null;
-  try {
-    file = findProjectConfig(startDir && path.isAbsolute(startDir) ? startDir : process.cwd());
-  } catch {
-    return { state: 'none' };
-  }
-  if (!file) return { state: 'none' };
+/** Read and validate ONE project config file. A file that is gone by now counts as none. */
+function inspectOne(file: string, harness: JevHarness): ProjectConfig {
   const read = readConfigFile(file, DEFAULT_CONFIG_IO);
   if (read.kind === 'missing') return { state: 'none' };
   if (read.kind === 'problem') return { state: 'malformed', file, problems: [read.problem] };
@@ -120,6 +124,44 @@ export function inspectProjectConfig(startDir: string | undefined, harness: JevH
 }
 
 const MODE_RANK: Record<JevMode, number> = { off: 0, 'on-demand': 1, on: 2 };
+
+/**
+ * Read and validate the project config that applies to `startDir`, for `harness`. Never throws.
+ *
+ * EVERY file from the cwd up to the project root counts, so a nested file can never cancel an
+ * ancestor's ceiling: the lowest valid ceiling and the highest mode across them win, and one
+ * malformed file anywhere on the way makes the whole result malformed (the nearest malformed file
+ * is the one reported). `file` is the file the effective ceiling came from, else the nearest file.
+ */
+export function inspectProjectConfig(startDir: string | undefined, harness: JevHarness = 'claude-code'): ProjectConfig {
+  let files: string[];
+  try {
+    files = findProjectConfigs(startDir && path.isAbsolute(startDir) ? startDir : process.cwd());
+  } catch {
+    return { state: 'none' };
+  }
+  let mode: JevMode | null = null;
+  let ceiling: string | null = null;
+  let ceilingFile: string | null = null;
+  let nearest: string | null = null;
+  for (const file of files) {
+    const one = inspectOne(file, harness);
+    if (one.state === 'malformed') return one;
+    if (one.state === 'none') continue;
+    nearest ??= one.file;
+    if (one.mode !== null && (mode === null || MODE_RANK[one.mode] > MODE_RANK[mode])) mode = one.mode;
+    if (one.ceiling !== null) {
+      const next = parseModel(one.ceiling);
+      const have = ceiling === null ? 'unknown' : parseModel(ceiling);
+      if (ceiling === null || (next !== 'unknown' && have !== 'unknown' && compareModels(next, have) < 0)) {
+        ceiling = one.ceiling;
+        ceilingFile = one.file;
+      }
+    }
+  }
+  if (nearest === null) return { state: 'none' };
+  return { state: 'valid', file: ceilingFile ?? nearest, mode, ceiling };
+}
 
 /**
  * The effective mode: the stricter of the user's and the project's, where the project can only keep
