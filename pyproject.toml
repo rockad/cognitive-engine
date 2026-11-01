@@ -3,10 +3,31 @@ name = "cognitive-engine"
 version = "1.0.0"
 description = "Autonomous Cognitive Substrate: System 1 Coprocessor (Jev), System 2 Recursive Optimizer (Harness²), and Unified SQLite Memory"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["cognitive-memory", "cognitive-lookup"]
 
 [tool.uv.workspace]
 members = [
     "packages/harness2",
-    "packages/memory"
+    "packages/memory",
+    "packages/lookup",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=1.2.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["packages/memory/tests", "packages/lookup/tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+# Both packages use a `tests/` package with its own __init__; importlib mode
+# keeps the two `tests` namespaces from colliding in one run.
+addopts = "--import-mode=importlib"
+
+# Installed into the root environment so a bare `uv run pytest` can import both
+# packages without `--all-packages`.
+[tool.uv.sources]
+cognitive-memory = { workspace = true }
+cognitive-lookup = { workspace = true }
