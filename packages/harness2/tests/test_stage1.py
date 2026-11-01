@@ -380,21 +380,31 @@ def test_the_phrase_without_the_nonce_never_approves_even_when_the_stored_phrase
     assert not confirm_on_terminal(phrase, stdin=TTY(), stdout=TTY(), environ={}, tty=HumanTTY(phrase))
 
 
-@pytest.mark.parametrize("name", ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "ANTIGRAVITY_AGENT", "GEMINI_CLI",
+def _assert_hint(text: str, name: str) -> None:
+    """A user-set marker (CODEX_SANDBOX*, ANTIGRAVITY*, ...) gets the `env -u NAME` hint; a Claude Code runtime variable never does
+    (that command would be a ready-made bypass for the very agent that triggered the refusal): it is told to use its own terminal."""
+    if name in stage1.CLAUDE_RUNTIME_ENV:
+        assert "env -u" not in text and f"-u {name}" not in text and "own terminal" in text
+    else:
+        assert f"env -u {name} " in text                                          # how to run it from a plain terminal
+
+
+@pytest.mark.parametrize("name", ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID", "CLAUDE_JOB_DIR",
+                                  "ANTIGRAVITY_AGENT", "GEMINI_CLI",
                                   "GEMINI_CLI_HOME", "AGY_SESSION", "OPENCODE", "CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED"])
 def test_an_agent_harness_marker_refuses_the_approval_and_nothing_overrides_it(rig, up, monkeypatch, capsys, name):
     phrase = confirmation_phrase("local-ollama", "stage1-x")
     with pytest.raises(stage1.ApprovalRefused) as ei:
         confirm_on_terminal(phrase, stdin=TTY(), stdout=TTY(), environ={name: "1"}, tty=HumanTTY())
     assert name in str(ei.value) and "no flag" in str(ei.value)
-    assert f"env -u {name} " in str(ei.value)                                   # how to run it from a plain terminal
+    _assert_hint(str(ei.value), name)
     Traps(monkeypatch, rig.fake.port)
     term = HumanTTY()
     code = run_run(rig.parse("run", "--approve", "local-ollama"), environ={name: "1"}, probes=rig.probes(),
                    stdin=TTY(), stdout=TTY(), tty=term)
     err = capsys.readouterr().err
     assert code == 2 and name in err and "agent-harness environment" in err and "nothing was started" in err
-    assert f"env -u {name} " in err
+    _assert_hint(err, name)
     assert term.getvalue() == "" and rig.calls == {"gate": 0, "resolve": 0, "ollama": 0} and not rig.runs.exists()
 
 
@@ -408,16 +418,34 @@ def test_a_variable_a_person_sets_in_their_own_profile_is_not_an_agent_marker(na
     assert confirm_on_terminal(phrase, stdin=TTY(), stdout=TTY(), environ={name: "1"}, tty=HumanTTY())
 
 
-def test_the_refusal_names_every_offending_variable_and_the_env_u_command_for_all_of_them():
-    env = {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli", "CLAUDE_CODE_SESSION_ID": "s", "HOME": "/h", "OPENCODE_CONFIG": "/x"}
+def test_the_refusal_names_every_offending_variable_and_the_env_u_command_only_for_the_user_set_ones():
+    env = {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli", "CLAUDE_CODE_SESSION_ID": "s", "HOME": "/h", "OPENCODE_CONFIG": "/x",
+           "CODEX_SANDBOX": "1", "ANTIGRAVITY_AGENT": "1"}
     with pytest.raises(stage1.ApprovalRefused) as ei:
         stage1.refuse_in_agent_environment(env)
     text = str(ei.value)
-    for name in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID"):
+    for name in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "CODEX_SANDBOX", "ANTIGRAVITY_AGENT"):
         assert name in text
     assert "OPENCODE_CONFIG" not in text and "HOME" not in text and "/x" not in text            # a value is never shown
-    assert "env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_SESSION_ID stage1 run" in text
-    assert "plain terminal" in text and "no flag" in text
+    assert "env -u ANTIGRAVITY_AGENT -u CODEX_SANDBOX stage1 run" in text                       # only the user-set ones
+    assert "-u CLAUDE" not in text and "own terminal" in text and "no flag" in text
+
+
+def test_the_refusal_prints_no_env_u_for_the_claude_code_runtime_variables_at_all():
+    env = {n: "1" for n in stage1.CLAUDE_RUNTIME_ENV}
+    with pytest.raises(stage1.ApprovalRefused) as ei:
+        stage1.refuse_in_agent_environment(env)
+    text = str(ei.value)
+    assert "env -u" not in text and " -u " not in text and "own terminal" in text and "no flag" in text
+    assert all(n in text or "more" in text for n in stage1.CLAUDE_RUNTIME_ENV)
+
+
+def test_claude_pid_and_claude_job_dir_are_agent_markers_and_the_assumption_is_documented():
+    assert {"CLAUDE_PID", "CLAUDE_JOB_DIR"} <= set(stage1.AGENT_ENV_EXACT) and {"CLAUDE_PID", "CLAUDE_JOB_DIR"} <= set(stage1.CLAUDE_RUNTIME_ENV)
+    assert stage1.agent_markers({"CLAUDE_PID": "1", "CLAUDE_JOB_DIR": "/x", "HOME": "/h"}) == ["CLAUDE_JOB_DIR", "CLAUDE_PID"]
+    assert set(stage1.CLAUDE_RUNTIME_ENV) <= set(stage1.AGENT_ENV_EXACT) and "OPENCODE" not in stage1.CLAUDE_RUNTIME_ENV
+    readme = (Path(__file__).parent.parent / "README.md").read_text()
+    assert "CLAUDE_PID" in readme and "CLAUDE_JOB_DIR" in readme and "assum" in readme
     many = {f"CODEX_SANDBOX_V{i:02d}": "1" for i in range(40)}
     with pytest.raises(stage1.ApprovalRefused) as ei:
         stage1.refuse_in_agent_environment(many)

@@ -596,9 +596,18 @@ def confirmation_phrase(channel: str, sweep_id: str) -> str:
 # Claude Code: the runtime variables it sets in every session it starts (verified in a child of this code's own session,
 # 2026-11-01). NOT a CLAUDE_CODE_ prefix: that namespace also holds user settings (CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE,
 # CLAUDE_CODE_USE_VERTEX, ...) that a person legitimately exports in their own shell profile, which refused a real terminal.
-AGENT_ENV_EXACT = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_EXECPATH",
-                   "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_MESSAGING_SOCKET",
-                   "CLAUDE_CODE_BRIDGE_SESSION_ID", "OPENCODE")
+#
+# CLAUDE_PID and CLAUDE_JOB_DIR are ASSUMED to be set by Claude Code only in its own sessions: both are present in the agent
+# sessions this code was built in and absent from the author's own terminal, as far as is known. Unverified beyond that; if a
+# person's own profile exports either, the refusal names it and they must unset it for the run (see the README).
+#
+# A refusal never prints an `env -u NAME` bypass for the Claude Code runtime names: that would hand the very agent that
+# triggered it a ready-made command that defeats the gate. It says "run it from your own terminal" instead. The hint is kept
+# for the other markers, which a person may well have set in their own shell (CODEX_SANDBOX*, ANTIGRAVITY*, OPENCODE, ...).
+CLAUDE_RUNTIME_ENV = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_EXECPATH",
+                      "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_MESSAGING_SOCKET",
+                      "CLAUDE_CODE_BRIDGE_SESSION_ID", "CLAUDE_PID", "CLAUDE_JOB_DIR")
+AGENT_ENV_EXACT = (*CLAUDE_RUNTIME_ENV, "OPENCODE")
 AGENT_ENV_PREFIXES = ("CODEX_SANDBOX", "ANTIGRAVITY", "GEMINI_CLI", "AGY_")
 AGENT_ENV_SHOW = 12              # names listed in a refusal (and in its `env -u` command); the rest are counted
 TTY_PATH = "/dev/tty"
@@ -630,12 +639,18 @@ def refuse_in_agent_environment(environ: Mapping[str, str]) -> None:
     if found:
         shown = found[:AGENT_ENV_SHOW]
         more = f" and {len(found) - len(shown)} more" if len(found) > len(shown) else ""
-        unset = "env " + " ".join(f"-u {n}" for n in shown) + " stage1 run ..."
+        user_set = [n for n in shown if n not in CLAUDE_RUNTIME_ENV]
+        claude = any(n in CLAUDE_RUNTIME_ENV for n in shown)
+        hint = ""
+        if user_set:
+            hint = ("; if " + ("one of the non-Claude ones" if claude else "one of these") + " is your own setting, drop it for the run: env "
+                    + " ".join(f"-u {n}" for n in user_set) + " stage1 run ...")
+        if claude:
+            hint = " Claude Code's own variables are not a setting to drop: run it from your own terminal" + (hint or ".")
         raise ApprovalRefused(
             "refusing to take an approval inside an agent-harness environment (" + ", ".join(shown) + more +
             "): the approval must come from a person at their own terminal. There is no flag to override this. "
-            "From a plain terminal (one that is not an agent session) it just works; if one of these is your own setting, "
-            f"drop it for the run: {unset}")
+            "From a plain terminal (one that is not an agent session) it just works" + ("." if claude else "") + hint)
 
 
 def new_nonce(words: int = 4) -> str:
