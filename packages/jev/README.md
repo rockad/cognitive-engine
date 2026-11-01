@@ -59,6 +59,21 @@ Ported from `agentic-hub/plugins/jev` v2.3.0. Of the Claude Code hooks, only the
 
 `bun src/hook.ts claude|antigravity` is a narrow `PreToolUse` guard (`src/guard.ts`). Claude Code asks before a subagent runs on a model above the session's (version-aware ranking, `src/models.ts`); Antigravity asks before any Pro-class subagent. It is the only enforcement point (`jev_dispatch` and its clamp are advice). For a call with no `model`, the model comes from the subagent's definition, looked up from the hook cwd up to the project root (`CLAUDE_PROJECT_DIR`, else the git root), then `~/.claude/agents`, then installed plugins (`plugin:agent` names look only in that plugin); a subagent type that is not a Claude Code built-in (`general-purpose`, `Explore`, `Plan`, `statusline-setup`, `claude-code-guide`) and has no definition found asks, as the Workflow guard does. It is deterministic, makes no network calls, and runs in Jev modes `on` and `on-demand` (not `off`); once active, it asks rather than passing silently when it cannot evaluate a call. A malformed Jev config fails loudly: see Configuration.
 
+### Project config: tighten only
+
+A repository can carry `.agents/jev.json` (else `.jev.json`; the nearest directory from the hook cwd upward that has one, `.agents/jev.json` first in each directory, the loader's names and order). The guard hook reads it for one purpose: to tighten the user config. It can never loosen it (`src/project-config.ts`).
+
+```json
+{ "guard": { "ceiling": "sonnet" }, "defaults": { "mode": "on" } }
+```
+
+Precedence, in full:
+
+- **User mode `off` wins.** With the user's mode `off` (explicit, or no config file, the fresh-install default) the guard is silent and the project file is not read at all, so a repository cannot switch the guard on for a user who turned it off, and a broken project file cannot make it noisy.
+- **`guard.ceiling`** (a model Jev can rank) lowers the model the guard compares requests against: the LOWER of the session model and the ceiling. A session on opus with a `sonnet` ceiling asks before a subagent runs on opus. A ceiling above the session model changes nothing. An unknown session model still asks. It applies to Agent/Task calls and to Workflow literals; the Antigravity Pro rule has no model ceiling and ignores it. The ask text names the ceiling and the file, and the audit record carries `projectCeiling` (its `sessionModel` is the effective, lowered one).
+- **`defaults.mode` / `harnesses.<harness>.mode`** can keep or raise the user's mode (`off` < `on-demand` < `on`) and never lower it; a project `off` is ignored. For the guard `on` and `on-demand` act alike, so this only shows in the audit (`mode`). The MCP tools are unchanged: `jev_get_mode` and the loader still take no mode from a project file (`sanitizeProjectConfig`).
+- **A project file that cannot be trusted asks on every guarded call**, naming the file and the problems, like a malformed user config: unreadable, not a regular file, a dangling symlink, over 1 MB, not valid JSON, not an object, `defaults`, `harnesses`, `harnesses.<h>` or `guard` that is not an object, a mode that is not `off`/`on-demand`/`on`, a `guard.ceiling` that is not a string or not a model Jev can rank. Every other key is ignored and never makes the file malformed (the loader's own project keys, such as `timeouts`, are validated by the loader, not here).
+
 ### Agent definition lookup
 
 Both guards (the Agent/Task guard and the Workflow guard's `agentType`) read a subagent's `model:` from its definition file, nearest first: project `.claude/agents` from the hook cwd up to the project root, `~/.claude/agents`, then installed plugins. Plugins are searched in this order: those enabled per `enabledPlugins` (`~/.claude/settings.json`, then the project's `.claude/settings.json` and `settings.local.json`, later layers winning, only a literal `true` enables), then every other installed plugin, each group in manifest order. This only orders the search: a disabled or unlisted plugin's definition is still found, so a lookup never finds fewer definitions than a plain search of all. Unreadable settings leave the manifest order.

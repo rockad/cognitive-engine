@@ -25,16 +25,18 @@ import {
   evaluateClaude,
   formatVerdict,
   guardErrorVerdict,
+  type ConfigScope,
   type GuardHarness,
-  type GuardSink,
+  type GuardContext,
   type Verdict
 } from './guard.js';
 import { writeWorkflowPin } from './workflow-pin.js';
+import { inspectProjectConfig, tightenMode } from './project-config.js';
 import { appendClaudeDecision } from './claude-audit.js';
 
 const HARNESSES: Record<
   GuardHarness,
-  { jevHarness: 'claude-code' | 'antigravity'; evaluate: (input: any, sink?: GuardSink) => Verdict | null }
+  { jevHarness: 'claude-code' | 'antigravity'; evaluate: (input: any, sink?: GuardContext) => Verdict | null }
 > = {
   claude: { jevHarness: 'claude-code', evaluate: evaluateClaude },
   antigravity: { jevHarness: 'antigravity', evaluate: evaluateAntigravity }
@@ -60,10 +62,14 @@ function isGuardedCall(harnessArg: string, stdin: string): boolean {
  * it as some default mode, possibly `off`, so the guard fails loudly on every guarded call: an
  * `ask` naming the file and the problems, a stderr line, and a `config_malformed` audit event.
  */
-function configMalformedResponse(harnessArg: GuardHarness, file: string, problems: string[], stdin: string): string | null {
+function configMalformedResponse(harnessArg: GuardHarness, file: string, problems: string[], stdin: string, scope: ConfigScope = 'user'): string | null {
   if (!isGuardedCall(harnessArg, stdin)) return null;
-  const verdict = configMalformedVerdict(file, problems);
-  process.stderr.write(`[jev] config ${file} is malformed (${problems.join('; ')}): the subagent guard asks on every guarded call. Run /jev status, or set jev off.\n`);
+  const verdict = configMalformedVerdict(file, problems, scope);
+  process.stderr.write(
+    scope === 'project'
+      ? `[jev] project config ${file} is malformed (${problems.join('; ')}): the subagent guard asks on every guarded call. Fix or remove that file.\n`
+      : `[jev] config ${file} is malformed (${problems.join('; ')}): the subagent guard asks on every guarded call. Run /jev status, or set jev off.\n`
+  );
   if (harnessArg === 'claude') {
     let toolName: unknown;
     let sessionId: unknown;
@@ -74,7 +80,7 @@ function configMalformedResponse(harnessArg: GuardHarness, file: string, problem
     } catch {
       // unparseable input: audit without the tool name
     }
-    appendClaudeDecision({ event: 'config_malformed', tool_name: toolName, session_id: sessionId, file, problems });
+    appendClaudeDecision({ event: 'config_malformed', ...(scope === 'project' ? { scope } : {}), tool_name: toolName, session_id: sessionId, file, problems });
   }
   return formatVerdict(harnessArg, verdict);
 }
@@ -130,8 +136,13 @@ export async function run(harnessArg: string | undefined, stdin: string, deps: H
     }
     if (derived === 'off') return null;
     const input = JSON.parse(stdin);
-    const sink: GuardSink = {};
+    // A project file may only tighten (project-config.ts); one that cannot be read asks.
+    const project = inspectProjectConfig(input?.cwd, harness.jevHarness);
+    if (project.state === 'malformed') return configMalformedResponse(harnessArg as GuardHarness, project.file, project.problems, stdin, 'project');
+    const sink: GuardContext = project.state === 'valid' ? { projectCeiling: project.ceiling, projectCeilingFile: project.file } : {};
     verdict = harness.evaluate(input, sink);
+    // The user's mode, raised (never lowered) by the project's; for the guard on and on-demand act alike.
+    if (verdict) verdict.audit = { ...verdict.audit, mode: tightenMode(derived, project.state === 'valid' ? project.mode : null) };
     // Bind the decision to the text it analysed (workflow-pin.ts); the PostToolUse recorder checks it.
     if (sink.workflow) writeWorkflowPin(input?.tool_use_id, input?.session_id, sink.workflow.decision, sink.workflow.scripts);
   } catch (err) {
