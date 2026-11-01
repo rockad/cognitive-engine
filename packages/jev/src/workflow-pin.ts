@@ -14,13 +14,16 @@
  * inside the window is not seen; an inline `script` has no file to re-check; what Claude Code runs
  * on a `resumeFromRunId` (the file or a saved copy of the earlier run) is not observable here.
  *
- * Nothing in this module runs unless the guard ran: with Jev off the hook returns before it
- * evaluates anything, so no pin exists and the recorder stays silent.
+ * Nothing in this module reports unless the guard ran and Jev is still on: with Jev off the hook
+ * returns before it evaluates anything, so no pin exists, and a pin written while Jev was on is
+ * dropped without a word if Jev was switched off before the run ended (the recorder reads the
+ * current mode).
  */
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { appendClaudeDecision } from './claude-audit.js';
+import { inspectJevConfigFile, resolveJevModeFromConfig, type JevConfigFileInspection } from './core/config.js';
 import { claudeStateDir, safeSessionId } from './session-model.js';
 import { MAX_SCRIPT_BYTES, type ScriptFact } from './workflow-guard.js';
 
@@ -105,22 +108,37 @@ function currentHash(file: string): string | null {
 }
 
 export interface PostToolUseResult {
-  status: 'unchanged' | 'changed' | 'no-pin' | 'ignored' | 'error';
+  status: 'unchanged' | 'changed' | 'no-pin' | 'off' | 'ignored' | 'error';
   /** JSON for the hook's stdout; present only on drift. */
   output?: string;
 }
 
 /**
- * PostToolUse for Workflow: re-hash every file the PreToolUse analysis read and compare. Consumes
- * the pin. Never throws. Silent (`no-pin`) when the guard did not run for this call.
+ * Whether Jev is off for Claude Code right now, as the guard hook derives it from the user config
+ * (a missing file is off). A config that cannot be trusted is NOT off: the guard asks loudly in
+ * that state, so a drift report is not suppressed either.
  */
-export function recordPostToolUse(stdin: string): PostToolUseResult {
+function jevIsOff(inspect: () => JevConfigFileInspection): boolean {
+  const inspection = inspect();
+  if (inspection.state === 'missing') return true;
+  if (inspection.state === 'malformed') return false;
+  return resolveJevModeFromConfig(inspection.config, 'claude-code') === 'off';
+}
+
+/**
+ * PostToolUse for Workflow: re-hash every file the PreToolUse analysis read and compare. Consumes
+ * the pin. Never throws. Silent (`no-pin`) when the guard did not run for this call, and silent
+ * (`off`, the pin dropped) when Jev has been switched off since: a pin written while Jev was on
+ * is not reported after the user turned it off.
+ */
+export function recordPostToolUse(stdin: string, inspect: () => JevConfigFileInspection = inspectJevConfigFile): PostToolUseResult {
   try {
     const input = JSON.parse(stdin);
     if (input?.tool_name !== 'Workflow') return { status: 'ignored' };
     const pin = readPin(input?.tool_use_id);
     if (!pin) return { status: 'no-pin' };
     dropPin(input?.tool_use_id);
+    if (jevIsOff(inspect)) return { status: 'off' };
     const drift: Array<{ file: string; analysed: string; current: string | null }> = [];
     for (const s of pin.scripts) {
       if (typeof s?.label !== 'string' || !path.isAbsolute(s.label)) continue; // inline: no file to re-check
