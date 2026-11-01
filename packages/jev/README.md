@@ -65,6 +65,15 @@ Both guards (the Agent/Task guard and the Workflow guard's `agentType`) read a s
 
 When no definition is found both guards ask, in the same words: the agent is named, with the sentence "no definition for it could be found, so the model it will run on cannot be checked against the session ceiling" and every location searched. A Workflow `agentType` that names a Claude Code built-in (`Explore`, `Plan`, ...) still asks, since the Workflow guard has no built-in list; the Agent/Task guard passes built-ins.
 
+### Workflow guard: what counts as provably harmless
+
+The Workflow hook parses the script with acorn and asks for anything it cannot read as a plain `agent()` call. Two shapes that used to ask although they were harmless are now followed (`src/workflow-guard.ts`):
+
+- **`const` bindings.** A name with exactly one binding in the whole script (no shadowing, parameter, assignment or redeclaration), declared `const`, in scope at the use, and initialised with a string literal or a flat object of string literals, is a known string. The object must only ever be read (`cfg.a`, `cfg[key]`): never assigned into, deleted from, destructured, called, aliased, spread or passed. `model: M`, `{model}`, `model: cfg[key]`, a computed key `{[k]: v}`, a computed member `o[k]` and `workflow(W)` then behave as if the literal were written there. The value is not trusted, only followed: the model is still ranked against the session, and a key that spells `constructor`, `__proto__`, `agent` and so on still asks.
+- **`this` in a class body.** Method, constructor, field initialiser, static block and functions nested there are strict code, where `this` is never the global object. A computed key and an `extends` clause use the outer `this` and still ask.
+
+Not followed, still ask: `let`/`var`, parameters, destructuring, call results, templates with `${}`, concatenation, spreads (arguments, options, objects), computed keys from data, options held in a variable, aliasing of `agent`/`workflow`, `eval`, `Function`, dynamic `import()`, `globalThis` and the rest of the escape set, and `this` outside a class body. The tests are table-driven (`tests/workflow-guard-literals.test.ts`, `tests/workflow-guard-hardening.test.ts`); every bypass shape from the earlier reviews is in an ask table.
+
 ### Session model (Claude Code)
 
 The ceiling is the session's model, which Claude Code does not put in any `PreToolUse` payload. The guard builds it from two pieces of evidence and orders them by time (`resolveSessionModel`, `src/session-model.ts`):

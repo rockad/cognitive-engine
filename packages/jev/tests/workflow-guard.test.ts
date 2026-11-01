@@ -139,7 +139,7 @@ describe('adversarial table: anything not understood asks', () => {
     ['template literal with an expression', 'await agent(`p`, {model: `${tier}`})'],
     ['model from args', `await agent('p', {model: args.model})`],
     ['model from a variable', `const m = 'opus'\nawait agent('p', {model: m})`],
-    ['shorthand model', `const model = 'haiku'\nawait agent('p', {model})`],
+    ['shorthand model from a let', `let model = 'haiku'\nawait agent('p', {model})`],
     ['conditional model', `await agent('p', {model: cond ? 'haiku' : 'opus'})`],
     ['concatenated model', `await agent('p', {model: 'op' + 'us'})`],
     ['non-string model', `await agent('p', {model: 5})`],
