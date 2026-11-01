@@ -796,7 +796,8 @@ def test_live_a_vm_reaches_our_proxy_and_nothing_else(tmp_path):
     got = json.loads(r.stdout.strip().splitlines()[-1])
     print("\nLIVE in-VM results:", json.dumps(got, sort_keys=True), f"\nsession wall {r.duration_s:.1f}s; egress:", sr.egress_summary(r.egress_log))
     assert (got["models"], got["tags"], got["chat"]) == (200, 200, 200), got
-    for what in ("chat_other_model", "delete", "pull", "ps", "example_com", "host_ssh_port", "real_ollama_port", "next_port"):
+    for what in ("chat_other_model", "delete", "pull", "ps", "example_com", "host_ssh_port", "real_ollama_port", "next_port",
+                 "ipv6_loopback", "ipv6_loopback_name"):
         assert got[what] == 403, (what, got)
     assert got["connect_tunnel"] != 200 and got["connect_tunnel"] in (403, "RemoteDisconnected", "ConnectionResetError", "ConnectionError",
                                                                       "TimeoutError", "timeout", "BrokenPipeError", 502, 400, 405), got

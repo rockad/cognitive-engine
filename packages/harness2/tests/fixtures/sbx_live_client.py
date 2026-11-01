@@ -58,6 +58,8 @@ out = {
     "real_ollama_port": via_proxy("GET", f"http://{HOST}:11434/api/tags"),
     "next_port": via_proxy("GET", f"http://{HOST}:{PORT + 1}/v1/models"),
     "connect_tunnel": via_proxy("CONNECT", f"{HOST}:{PORT}"),
+    "ipv6_loopback": via_proxy("GET", f"http://[::1]:{PORT}/api/tags"),            # no rule names it, whatever listens there
+    "ipv6_loopback_name": via_proxy("GET", f"http://ip6-localhost:{PORT}/api/tags"),
     "direct_to_model_port": raw(HOST, PORT),
     "direct_to_gateway_model_port": raw("gateway.docker.internal", PORT),
     "vm_loopback_model_port": raw("127.0.0.1", PORT),
