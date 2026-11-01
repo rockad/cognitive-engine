@@ -231,6 +231,8 @@ class Probes:
     which: Callable[[str], str | None] = shutil.which
     # Which runtime model sessions use. Docker (and no sbx process at all) unless `COGNITIVE_HARNESS2_MODEL_SANDBOX=sbx`.
     model_runtime: Callable[[Mapping[str, str]], sbx_session.ModelRuntime] = sbx_session.choose_model_runtime
+    # Removes leaked `h2m-` sbx sandboxes of dead runs, whatever the model runtime is; best effort, `run` only (never `plan`).
+    sweep_stale: Callable[[Mapping[str, str], Callable[[str], str | None]], list[str]] = sbx_session.sweep_stale_if_installed
 
 
 def _guard(name: str, fn: Callable[[], tuple[bool, str]]) -> Check:
@@ -1162,6 +1164,12 @@ def run_run(args: argparse.Namespace, *, environ: Mapping[str, str], probes: Pro
     sweep_id = new_sweep_id()
     run_dir = s.runs_dir / sweep_id
     pr = probes or Probes(environ=environ)
+    try:                      # before the preflight can refuse: a leak of a hard-killed run must go even if this run cannot start
+        swept = pr.sweep_stale(environ, pr.which)
+    except Exception:  # noqa: BLE001 - housekeeping never blocks a run
+        swept = []
+    if swept:
+        err("removed stale sbx leftover(s): " + ", ".join(swept))
     pre = preflight(s, pr)
     if not pre.ok:
         for c in pre.failing():

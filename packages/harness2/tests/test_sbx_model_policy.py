@@ -117,12 +117,6 @@ def test_selection_refuses_everything_else(text, needle):
     assert why and needle in why
 
 
-def test_a_stale_rule_names_its_sandbox():
-    assert ss.stale_rule_sandboxes(doc(DENY_ALL, ours(), ours("other"))) == [NAME]
-    assert ss.stale_rule_sandboxes(doc(DENY_ALL)) == []
-    assert ss.stale_rule_sandboxes("garbage") == []
-
-
 # ── a session: the listing that applies to ONE sandbox ────────────────────────────
 
 def session_doc(*extra, rules=None) -> str:
@@ -230,3 +224,80 @@ def test_only_a_version_the_live_test_passed_on_is_verified():
     """Adding a version here is the act of verifying the model route against it: run
     `COGNITIVE_HARNESS2_SBX_LIVE=1 pytest tests/test_sbx_session.py -k live` on it first."""
     assert ss.VERIFIED_SBX_MODEL_VERSIONS == frozenset({"0.50.1"})
+
+
+# ── names that carry their owner, and who may call a sandbox stale ────────────────
+
+import os  # noqa: E402
+
+linux_only = pytest.mark.skipif(ss.current_owner() is None, reason="the owner identity needs /proc (Linux)")
+ME = ss.Owner(boot="0badc0de", ns="f0000000", start=5000)
+
+
+def test_a_name_carries_the_owner_and_round_trips():
+    n = ss.sandbox_name("aabbccddeeff", pid=4242, scope="deadbeef", owner=ME)
+    assert n == "h2m-deadbeef-4242-0badc0de-f0000000-1388-aabbccddeeff"
+    assert ss.parse_sandbox_name(n) == ("deadbeef", 4242, "aabbccddeeff")
+    assert ss.parse_owner(n) == ME
+    assert re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", n)
+    wide = ss.sandbox_name("aabbccddeeff", pid=4194304, scope="deadbeef", owner=ss.Owner("ffffffff", "ffffffff", 0xFFFFFFFFFF))
+    assert re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", wide)                     # the longest it can get still fits
+
+
+def test_a_legacy_name_has_no_owner_and_is_never_judged():
+    legacy = ss.sandbox_name("aabbccddeeff", pid=4242, scope=None)
+    assert ss.parse_owner(legacy) is None and ss.parse_sandbox_name(legacy) == (None, 4242, "aabbccddeeff")
+    assert ss.is_stale(legacy, ME) is False                                    # a pid alone proves nothing
+
+
+@pytest.mark.parametrize("name", ["h2m-0-1-0badc0de-f0000000-zz-aabbccddeeff", "h2m-0-1-0badc0d-f0000000-1-aabbccddeeff",
+                                  "h2m-0-1-0badc0de-f0000000-aabbccddeeff", "h2m-0-1-0badc0de-f0000000-1-aabbccddeeffaa"])
+def test_a_half_formed_owner_does_not_parse(name):
+    assert ss.parse_sandbox_name(name) is None
+
+
+@linux_only
+def test_my_own_name_carries_my_own_identity():
+    me = ss.current_owner()
+    assert me is not None and ss.parse_owner(ss.sandbox_name("aabbccddeeff")) == me
+    assert ss.parse_sandbox_name(ss.sandbox_name("aabbccddeeff"))[1] == os.getpid()
+
+
+def stale(name: str, me: ss.Owner | None = ME, **proc) -> bool:
+    return ss.is_stale(name, me, proc_start=proc.get("proc_start", lambda pid: None))
+
+
+def owned(pid: int, owner: ss.Owner) -> str:
+    return ss.sandbox_name("aabbccddeeff", pid=pid, owner=owner)
+
+
+def test_same_host_same_namespace_a_gone_process_is_stale_and_a_living_one_is_not():
+    assert stale(owned(77, ME), proc_start=lambda pid: None) is True                     # no such process
+    assert stale(owned(77, ME), proc_start=lambda pid: ME.start) is False                # alive, the very process
+    assert stale(owned(77, ME), proc_start=lambda pid: ME.start + 1) is True             # the pid was recycled by another process
+
+
+def test_another_pid_namespace_is_not_judged_because_its_pids_mean_nothing_here():
+    other = ss.Owner(ME.boot, "f0000001", ME.start)
+    assert stale(owned(77, other), proc_start=lambda pid: None) is False                 # not even when pid 77 does not exist here
+
+
+def test_another_boot_is_stale_because_no_process_survives_a_reboot():
+    old = ss.Owner("11111111", ME.ns, ME.start)
+    assert stale(owned(77, old), proc_start=lambda pid: ME.start) is True
+    assert stale(owned(77, ss.Owner("11111111", "f0000001", 3)), proc_start=lambda pid: ME.start) is True
+
+
+def test_nothing_is_judged_when_my_own_identity_is_unknown_or_the_process_table_is_unreadable():
+    assert ss.is_stale(owned(77, ME), None, proc_start=lambda pid: None) is False
+
+    def unreadable(pid):
+        raise OSError("hidepid")
+    assert stale(owned(77, ME), proc_start=unreadable) is False
+
+
+@linux_only
+def test_the_process_start_time_is_read_from_proc():
+    start = ss._proc_start(os.getpid())
+    assert isinstance(start, int) and start > 0 and ss._proc_start(os.getpid()) == start
+    assert ss._proc_start(2 ** 22 + 12345) is None

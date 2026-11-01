@@ -182,7 +182,7 @@ def test_the_whole_flow_every_argv_and_the_order(world):
     out = world.runner().run(world.spec(tmpfs_dirs=(sr.HOME + "/.local/share",)))
     assert (out.exit_code, out.timed_out, out.role) == (0, False, "proposer")
     v = world.verbs()
-    assert v == ["version", "policy ls", "settings", "ls",
+    assert v == ["ls", "version", "policy ls", "settings",             # the stale sweep first, then the preflight
                  "create", "ls", *["policy allow"] * 5, "policy ls", *["policy check"] * 6,
                  "exec", "exec", "cp", "exec", "exec", "exec", "exec",
                  *["policy rm"] * 5, "rm", "ls", "policy ls", "ls"]
@@ -459,10 +459,19 @@ def test_a_rule_that_cannot_be_removed_by_id_still_dies_with_its_sandbox(world):
 
 # ── the stale sweep ───────────────────────────────────────────────────────────────
 
+ME = ss.current_owner()
+needs_proc = pytest.mark.skipif(ME is None, reason="the owner identity needs /proc (Linux)")
+
+
 def dead_pid() -> int:
     p = subprocess.Popen(["true"])
     p.wait()
     return p.pid
+
+
+def owned(session: str, *, pid: int, scope: str | None, owner: "ss.Owner | None" = None) -> str:
+    """A sandbox name as a process with this pid and owner identity would have made it (default: this host, this pid namespace)."""
+    return ss.sandbox_name(session, pid=pid, scope=scope, owner=owner or (ME if pid != os.getpid() else ME))
 
 
 def seed(world, names, rules_for=()):
@@ -473,13 +482,15 @@ def seed(world, names, rules_for=()):
             f.write(f"old-{n}\t{n}\tGET\t/api/tags\tlocalhost:40000\n")
 
 
+@needs_proc
 def test_the_sweep_removes_only_h2m_sandboxes_of_dead_owners_in_this_scope(world, monkeypatch):
     monkeypatch.setenv(run_scope.ENV, "aaaaaaaa")
     dead = dead_pid()
-    mine_dead = ss.sandbox_name("000000000001", pid=dead, scope="aaaaaaaa")
-    mine_live = ss.sandbox_name("000000000002", pid=os.getpid(), scope="aaaaaaaa")
-    other_scope = ss.sandbox_name("000000000003", pid=dead, scope="bbbbbbbb")
-    unscoped = ss.sandbox_name("000000000004", pid=dead, scope=None)
+    gone = ss.Owner(ME.boot, ME.ns, 1)                           # whatever it was, no process with this pid exists now
+    mine_dead = owned("000000000001", pid=dead, scope="aaaaaaaa", owner=gone)
+    mine_live = owned("000000000002", pid=os.getpid(), scope="aaaaaaaa")
+    other_scope = owned("000000000003", pid=dead, scope="bbbbbbbb", owner=gone)
+    unscoped = owned("000000000004", pid=dead, scope=None, owner=gone)
     users = ["my-own-sandbox", "harness2-aabbccddeeff", "claude-project"]
     seed(world, [mine_dead, mine_live, other_scope, unscoped, *users], rules_for=[mine_dead, mine_live])
     removed = world.runner().sweep_stale()
@@ -488,18 +499,59 @@ def test_the_sweep_removes_only_h2m_sandboxes_of_dead_owners_in_this_scope(world
     assert [line.split("\t")[1] for line in world.rules()] == [mine_live]             # the dead one's rule went with it
 
 
+@needs_proc
 def test_without_a_run_scope_every_dead_owners_h2m_sandbox_is_removed(world, monkeypatch):
     monkeypatch.delenv(run_scope.ENV, raising=False)
-    dead = dead_pid()
-    names = [ss.sandbox_name("00000000000a", pid=dead, scope=None), ss.sandbox_name("00000000000b", pid=dead, scope="cccccccc")]
-    live = ss.sandbox_name("00000000000c", pid=os.getpid(), scope=None)
+    dead, gone = dead_pid(), ss.Owner(ME.boot, ME.ns, 1)
+    names = [owned("00000000000a", pid=dead, scope=None, owner=gone), owned("00000000000b", pid=dead, scope="cccccccc", owner=gone)]
+    live = owned("00000000000c", pid=os.getpid(), scope=None)
     seed(world, [*names, live, "somebody-elses"])
     assert sorted(world.runner().sweep_stale()) == sorted(f"sandbox {n}" for n in names)
     assert sorted(world.listed()) == sorted([live, "somebody-elses"])
 
 
+@needs_proc
+def test_a_recycled_pid_does_not_keep_a_leak_alive(world, monkeypatch):
+    """The owner's pid is alive in this namespace, but it is another process (its start time differs): the sandbox is a leak."""
+    monkeypatch.delenv(run_scope.ENV, raising=False)
+    recycled = owned("0000000000a1", pid=os.getpid(), scope=None, owner=ss.Owner(ME.boot, ME.ns, ME.start + 7))
+    seed(world, [recycled], rules_for=[recycled])
+    assert world.runner().sweep_stale() == [f"sandbox {recycled}"]
+    assert world.listed() == [] and world.rules() == []
+
+
+@needs_proc
+def test_a_sandbox_of_another_pid_namespace_is_left_alone_even_when_its_pid_does_not_exist_here(world, monkeypatch):
+    """A process in a devcontainer or a second WSL distro shares the sbx daemon but not our pids: pid 42 over there is nothing here."""
+    monkeypatch.delenv(run_scope.ENV, raising=False)
+    foreign = owned("0000000000b1", pid=dead_pid(), scope=None, owner=ss.Owner(ME.boot, "f0000fff", 99))
+    seed(world, [foreign], rules_for=[foreign])
+    assert world.runner().sweep_stale() == []
+    assert world.listed() == [foreign] and len(world.rules()) == 1
+
+
+@needs_proc
+def test_a_sandbox_of_an_earlier_boot_is_removed_because_no_process_survives_a_reboot(world, monkeypatch):
+    monkeypatch.delenv(run_scope.ENV, raising=False)
+    old = owned("0000000000c1", pid=os.getpid(), scope=None, owner=ss.Owner("00000000", ME.ns, ME.start))
+    seed(world, [old], rules_for=[old])
+    assert world.runner().sweep_stale() == [f"sandbox {old}"]
+    assert world.listed() == []
+
+
+@needs_proc
+def test_a_name_without_an_owner_is_never_swept_and_nor_is_anything_that_is_not_ours(world, monkeypatch):
+    monkeypatch.delenv(run_scope.ENV, raising=False)
+    legacy = ss.sandbox_name("0000000000d1", pid=dead_pid(), scope=None)               # a dead pid, but no proof of whose it was
+    lookalikes = ["h2m-0-1-0badc0de-f0000000-1-aabbccddeeffaa", "H2M-0-1-aabbccddeeff", "h2-sbxm-leftover", "h2m-x"]
+    seed(world, [legacy, *lookalikes])
+    assert world.runner().sweep_stale() == []
+    assert sorted(world.listed()) == sorted([legacy, *lookalikes])
+
+
+@needs_proc
 def test_a_run_sweeps_stale_sandboxes_before_it_creates_its_own(world):
-    stale = ss.sandbox_name("0000000000ee", pid=dead_pid(), scope=run_scope.current())
+    stale = owned("0000000000ee", pid=dead_pid(), scope=run_scope.current(), owner=ss.Owner(ME.boot, ME.ns, 1))
     seed(world, [stale], rules_for=[stale])
     world.runner().run(world.spec())
     verbs = world.calls()
@@ -508,9 +560,61 @@ def test_a_run_sweeps_stale_sandboxes_before_it_creates_its_own(world):
     assert world.listed() == [] and world.rules() == []
 
 
+@needs_proc
+@pytest.mark.parametrize("env", [
+    pytest.param({"FAKE_SBX_VERSION": "v0.0.1"}, id="an unverified version"),
+    pytest.param({"FAKE_SBX_EXTRA": json.dumps([{"id": "g", "scope": "global", "resource_type": "http", "decision": "allow", "resources": ["**"],
+                                                  "status": "active", "methods": ["ANY"]}])}, id="a global http allow"),
+    pytest.param({"FAKE_SBX_EXTRA": json.dumps([{"id": "x", "scope": "global", "resource_type": "port_forward", "decision": "allow"}])},
+                 id="a rule of a kind nobody has seen"),
+])
+def test_a_leaked_sandbox_is_removed_by_the_next_run_even_when_its_preflight_refuses(world, env):
+    """The hard-killed run's sandbox holds a running VM and a read-write mount: the sweep cannot wait for a preflight that passes."""
+    stale = owned("0000000000ef", pid=dead_pid(), scope=run_scope.current(), owner=ss.Owner(ME.boot, ME.ns, 1))
+    seed(world, [stale], rules_for=[stale])
+    with pytest.raises(SessionRefused):
+        world.runner(env=env).run(world.spec())
+    assert world.listed() == [] and world.rules() == []
+    assert "create" not in world.verbs()
+
+
+@needs_proc
+def test_a_leaked_sandbox_is_removed_by_the_next_run_even_when_the_daemon_policy_cannot_be_read(world):
+    stale = owned("0000000000f0", pid=dead_pid(), scope=run_scope.current(), owner=ss.Owner(ME.boot, ME.ns, 1))
+    seed(world, [stale])
+    with pytest.raises(SessionRefused):
+        world.runner(env={"FAKE_SBX_POLICY_FILE": str(world.root / "missing.json")}).run(world.spec())
+    assert world.listed() == []
+
+
 def test_a_sweep_that_cannot_list_sandboxes_does_not_stop_a_session_that_will_fail_on_its_own(world):
     r = world.runner(env={"FAKE_SBX_LS": "fail"})
     assert r.sweep_stale() == []
+
+
+@needs_proc
+def test_the_module_level_sweep_is_what_stage1_calls_whatever_the_model_runtime_is(world, monkeypatch):
+    monkeypatch.delenv(run_scope.ENV, raising=False)
+    stale = owned("0000000000a2", pid=dead_pid(), scope=None, owner=ss.Owner(ME.boot, ME.ns, 1))
+    seed(world, [stale, "someone-elses"], rules_for=[stale])
+    assert ss.sweep_stale_sandboxes(str(FAKE), world.env) == [f"sandbox {stale}"]
+    assert world.listed() == ["someone-elses"] and world.rules() == []
+    assert ss.sweep_stale_if_installed(world.env, lambda name: None) == []                  # no sbx on PATH: nothing at all
+    seed(world, [stale])
+    assert ss.sweep_stale_if_installed(world.env, lambda name: str(FAKE) if name == "sbx" else None) == [f"sandbox {stale}"]
+
+
+def test_the_module_level_sweep_never_starts_a_daemon(world, tmp_path):
+    """No socket that answers: not even `sbx ls` is run (asking could start the daemon)."""
+    before = len(world.calls())
+    env = {**world.env, "XDG_STATE_HOME": str(tmp_path / "elsewhere")}
+    assert ss.sweep_stale_sandboxes(str(FAKE), env) == []
+    assert len(world.calls()) == before
+
+
+def test_stale_rule_sandboxes_is_gone():
+    """It had no caller: rules go with their sandbox (`sbx rm`), so the sweep keys on the sandbox, never on a rule."""
+    assert not hasattr(ss, "stale_rule_sandboxes")
 
 
 # ── the rest of the contract ──────────────────────────────────────────────────────

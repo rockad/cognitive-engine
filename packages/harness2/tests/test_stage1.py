@@ -231,6 +231,47 @@ def test_a_failing_preflight_refuses_a_run_before_anything_is_created(rig, up, m
     assert not rig.runs.exists() and not any(rig.ws.iterdir())
 
 
+def test_a_run_sweeps_stale_sbx_sandboxes_before_the_preflight_can_refuse_it(rig, up, monkeypatch, capsys):
+    """A sandbox leaked by a hard-killed run holds a running VM and a read-write mount. Whatever the model runtime is, and
+    even when this run's preflight refuses, the next run removes it first."""
+    Traps(monkeypatch, rig.fake.port)
+    order: list[str] = []
+
+    def boom_gate():
+        order.append("preflight")
+        raise sandbox.SandboxUnavailable("not rootless")
+
+    probes = rig.probes(gate=boom_gate)
+    probes.sweep_stale = lambda environ, which: order.append("sweep") or ["sandbox h2m-0-1-aabbccddeeff"]
+    code = run_run(rig.parse("run", "--approve", "local-ollama"), environ={}, probes=probes,
+                   stdin=TTY("approve local-ollama anything\n"), stdout=TTY())
+    err = capsys.readouterr().err
+    assert code == 2 and order == ["sweep", "preflight"]
+    assert "removed stale sbx leftover(s): sandbox h2m-0-1-aabbccddeeff" in err
+    assert not rig.runs.exists()
+
+
+def test_a_sweep_that_breaks_does_not_stop_a_run(rig, up, monkeypatch, capsys):
+    Traps(monkeypatch, rig.fake.port)
+
+    def broken(environ, which):
+        raise RuntimeError("sbx is on fire")
+
+    probes = rig.probes(gate=lambda: (_ for _ in ()).throw(sandbox.SandboxUnavailable("not rootless")))
+    probes.sweep_stale = broken
+    code = run_run(rig.parse("run", "--approve", "local-ollama"), environ={}, probes=probes,
+                   stdin=TTY("approve local-ollama anything\n"), stdout=TTY())
+    assert code == 2 and "not rootless" in capsys.readouterr().err        # the preflight still ran and refused for its own reason
+
+
+def test_the_plan_and_the_selftest_remove_nothing(rig):
+    calls: list[int] = []
+    probes = rig.probes()
+    probes.sweep_stale = lambda environ, which: calls.append(1) or []
+    run_plan(rig.parse("plan"), environ={}, probes=probes, out=io.StringIO())
+    assert calls == []                                                    # `plan` is read-only
+
+
 def test_the_ollama_probe_against_nothing_and_against_the_wrong_model(rig):
     s = socket.socket()
     s.bind(("127.0.0.1", 0))

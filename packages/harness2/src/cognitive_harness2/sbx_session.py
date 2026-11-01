@@ -41,7 +41,8 @@ RUNTIME_DOCKER, RUNTIME_SBX, RUNTIME_REFUSED = "docker", "sbx", "refused"
 VERIFIED_SBX_MODEL_VERSIONS: frozenset[str] = frozenset({"0.50.1"})
 
 NAME_PREFIX = "h2m"
-_NAME = re.compile(r"^h2m-(?:([0-9a-f]{8,32})|0)-([0-9]{1,10})-([0-9a-f]{12})$")
+# groups: 1 scope, 2 pid, then (3 boot, 4 pid namespace, 5 start time) together or not at all, 6 session id
+_NAME = re.compile(r"^h2m-(?:([0-9a-f]{8,32})|0)-([0-9]{1,10})(?:-([0-9a-f]{8})-([0-9a-f]{1,8})-([0-9a-f]{1,10}))?-([0-9a-f]{12})$")
 _SCOPE_SANDBOX = "sandbox:"
 _DENY_ACTIONS = frozenset({"net:connect:tcp", "net:connect:udp"})
 _RULE_HOST = re.compile(r"^localhost:([0-9]{1,5})$")
@@ -64,18 +65,88 @@ def model_sandbox_setting(environ: Mapping[str, str]) -> tuple[str, str | None]:
 
 # ── names ─────────────────────────────────────────────────────────────────────────
 
-def sandbox_name(session_id: str, *, pid: int | None = None, scope: str | None = None) -> str:
-    """`h2m-<run scope or 0>-<owner pid>-<session id>`: a leftover can be attributed to a dead owner (and, in tests, to one
-    pytest process) from its name alone. sbx has no labels."""
+@dataclass(frozen=True)
+class Owner:
+    """Who made a sandbox, as far as a later process can tell. `boot` is the first 8 hex digits of the kernel's boot id (every
+    process of an earlier boot is gone), `ns` the pid-namespace inode in hex (a pid means something only inside its own
+    namespace, and a devcontainer or a second WSL distro shares the sbx daemon but not our pids), `start` the process start time in
+    clock ticks since boot (a recycled pid has another one)."""
+    boot: str
+    ns: str
+    start: int
+
+
+def _proc_start(pid: int) -> int | None:
+    """The start time (clock ticks since boot) of process `pid` in THIS pid namespace, or None when there is no such process (or it
+    is a zombie or dead). `OSError` when /proc cannot say: the caller then judges nothing."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    try:
+        fields = raw[raw.rindex(")") + 2:].split()          # after the `(comm)`, which may contain spaces and parentheses
+        state, start = fields[0], int(fields[19])
+    except (ValueError, IndexError):
+        raise OSError(f"cannot read /proc/{pid}/stat") from None
+    return None if state in ("Z", "X") else start
+
+
+def current_owner() -> Owner | None:
+    """This process's `Owner`, or None when it cannot be read (not Linux): its sandboxes then carry no owner and are never swept."""
+    try:
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip().replace("-", "")[:8].lower()
+        ns = re.fullmatch(r"pid:\[([0-9]+)\]", os.readlink("/proc/self/ns/pid"))
+        start = _proc_start(os.getpid())
+    except OSError:
+        return None
+    if not (re.fullmatch(r"[0-9a-f]{8}", boot) and ns and start is not None and len(format(int(ns.group(1)), "x")) <= 8):
+        return None
+    return Owner(boot, format(int(ns.group(1)), "x"), start)
+
+
+def sandbox_name(session_id: str, *, pid: int | None = None, scope: str | None = None, owner: Owner | None = None) -> str:
+    """`h2m-<run scope or 0>-<owner pid>-<boot>-<pid namespace>-<start time>-<session id>`. A leftover can be attributed to its
+    owner, and shown to be dead, from its name alone (sbx has no labels). With no `pid` the name is this process's, with its
+    own `Owner` when /proc can say. A `pid` given without an `owner` makes the legacy name `h2m-<scope>-<pid>-<id>`, which carries
+    no proof of anything and is never swept."""
     if not re.fullmatch(r"[0-9a-f]{12}", session_id):
         raise ValueError("the session id must be 12 lowercase hex characters")
-    return f"{NAME_PREFIX}-{scope or '0'}-{os.getpid() if pid is None else pid}-{session_id}"
+    if pid is None:
+        pid, owner = os.getpid(), owner or current_owner()
+    tail = f"-{owner.boot}-{owner.ns}-{owner.start:x}" if owner is not None else ""
+    return f"{NAME_PREFIX}-{scope or '0'}-{pid}{tail}-{session_id}"
 
 
 def parse_sandbox_name(name: str) -> tuple[str | None, int, str] | None:
     """(scope, pid, session id) of a sandbox name this module made, else None."""
     m = _NAME.fullmatch(name) if isinstance(name, str) else None
-    return (m.group(1), int(m.group(2)), m.group(3)) if m else None
+    return (m.group(1), int(m.group(2)), m.group(6)) if m else None
+
+
+def parse_owner(name: str) -> Owner | None:
+    """The `Owner` in a sandbox name this module made; None for a legacy name or one that is not ours."""
+    m = _NAME.fullmatch(name) if isinstance(name, str) else None
+    return Owner(m.group(3), m.group(4), int(m.group(5), 16)) if m and m.group(3) else None
+
+
+def is_stale(name: str, me: Owner | None, *, proc_start: Callable[[int], int | None] = _proc_start) -> bool:
+    """True only when `name` is ours AND carries an owner AND that owner is provably gone, seen from `me`:
+    - another boot: every process of it is gone, so yes;
+    - the same boot, another pid namespace: its pids mean nothing here, so NO (it may well be alive);
+    - the same boot and namespace: the pid is not running, or is running with another start time (it was recycled).
+    A legacy name (no owner), no identity of `me`, or an unreadable /proc judges nothing. A pid alone is never proof."""
+    parsed, owner = parse_sandbox_name(name), parse_owner(name)
+    if parsed is None or owner is None or me is None:
+        return False
+    if owner.boot != me.boot:
+        return True
+    if owner.ns != me.ns:
+        return False
+    try:
+        start = proc_start(parsed[1])
+    except OSError:
+        return False
+    return start is None or start != owner.start
 
 
 # ── reading `sbx policy ls --json` ────────────────────────────────────────────────
@@ -166,14 +237,6 @@ def model_policy_problem(policy_json: str, *, ollama_port: int | None = None) ->
     if not deny_all:
         return "no active global network deny-all rule (`**`, tcp and udp): the policy is not deny-all"
     return None
-
-
-def stale_rule_sandboxes(policy_json: str) -> list[str]:
-    """The `h2m-` sandboxes that currently own a network or http rule, sorted. Unreadable input gives none."""
-    rules, problem = _rules(policy_json)
-    if problem or rules is None:
-        return []
-    return sorted({o for r in rules if _is_net(r) and (o := _sandbox_of(r)) and parse_sandbox_name(o)})
 
 
 def sandbox_policy_problem(policy_json: str, name: str, port: int, *, ollama_port: int | None = None) -> str | None:
@@ -376,18 +439,6 @@ def _shielded_teardown():
                     signal.signal(hup, previous)
 
 
-def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except (PermissionError, OverflowError, ValueError):
-        return True
-    return True
-
-
 def _memory_arg(memory: str) -> str:
     """`--memory` for sbx: the session limit, but never below sbx's 512 MiB minimum."""
     m = _MEM.fullmatch(memory)
@@ -464,14 +515,16 @@ class SbxSessionRunner(sr.ProposerSessionRunner):
         return plan
 
     def _gate(self) -> None:
-        """The preflight, run for every session (the daemon, policy or settings can change between runs): the same checks
-        `SbxRunner` makes, with this route's reading of the policy. Then the stale sweep (best effort)."""
+        """The stale sweep (best effort), then the preflight, run for every session (the daemon, policy or settings can change
+        between runs): the same checks `SbxRunner` makes, with this route's reading of the policy. The sweep comes FIRST: a sandbox
+        leaked by a hard-killed run is a running VM with a read-write mount, and a preflight that refuses (a version, a policy, a
+        setting) must not be the reason it stays."""
+        with contextlib.suppress(Exception):
+            self.sweep_stale()
         try:
             self._sbx._preflight()
         except sandbox.SandboxUnavailable as e:
             raise sr.SessionRefused(f"sbx cannot be used for a model session: {e}") from None
-        with contextlib.suppress(Exception):
-            self.sweep_stale()
 
     # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -490,24 +543,8 @@ class SbxSessionRunner(sr.ProposerSessionRunner):
     # ── the stale sweep ───────────────────────────────────────────────────────────
 
     def sweep_stale(self) -> list[str]:
-        """Remove every `h2m-` sandbox whose owner process is dead (with a run scope set, only that scope's). A sandbox's rules
-        go with it. Never touches a sandbox of a live process, of another scope when scoped, or one that is not ours.
-        Returns what was removed. A listing that fails removes nothing."""
-        try:
-            ls = self._ctl("ls", "-q", what="ls")
-        except sandbox.SandboxUnavailable:
-            return []
-        if ls.returncode != 0:
-            return []
-        scope, removed = run_scope.current(), []
-        for name in ls.stdout.split():
-            parsed = parse_sandbox_name(name)
-            if parsed is None or (scope is not None and parsed[0] != scope) or _pid_alive(parsed[1]):
-                continue
-            with contextlib.suppress(sandbox.SandboxUnavailable):
-                self._ctl("rm", "--force", name, what="rm --force")
-            removed.append(f"sandbox {name}")
-        return removed
+        """`sweep_stale_sandboxes` with this runner's sbx, environment and control timeout. Run before every session's preflight."""
+        return sweep_stale_sandboxes(self.sbx_path, self.environ, timeout=self.control_timeout_s)
 
     reap_all = sweep_stale
 
@@ -825,6 +862,45 @@ def make_runner(runtime: ModelRuntime | None, verified: sandbox.VerifiedDocker |
     if kw.pop("egress_network", None) is not None or kw.pop("_test_allow_cidrs", ()):
         raise sr.SessionRefused("egress_network and test_allow_cidrs are Docker options: the sbx route has no egress network")
     return SbxSessionRunner(runtime.sbx_path, channel, environ=environ, **kw)
+
+
+def sweep_stale_sandboxes(sbx_path: str, environ: Mapping[str, str] | None = None, *, timeout: int = 60) -> list[str]:
+    """Remove the `h2m-` sandboxes that are provably leaks of a dead run (`is_stale`: an owner in the name, seen from this process;
+    never a pid alone, never another pid namespace's, never a name without an owner, never a sandbox that is not ours), with a run
+    scope set only that scope's. A sandbox's rules go with it. Returns `sandbox NAME` for each removed.
+
+    Read-only until it has something to remove, and it never starts the daemon: nothing is run unless the daemon socket already
+    answers. A listing that fails removes nothing. Called by every `SbxSessionRunner` before its preflight, and by `stage1 run`
+    before its own, whatever the model runtime is."""
+    environ = os.environ if environ is None else environ
+    if not sandbox._sbx_daemon_reachable(environ):
+        return []
+    env = sandbox._sbx_env(environ)
+    try:
+        ls = subprocess.run([sbx_path, "ls", "-q"], capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL, env=env)
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    if ls.returncode != 0:
+        return []
+    scope, me, removed = run_scope.current(), current_owner(), []
+    for name in ls.stdout.split():
+        parsed = parse_sandbox_name(name)
+        if parsed is None or (scope is not None and parsed[0] != scope) or not is_stale(name, me):
+            continue
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+            subprocess.run([sbx_path, "rm", "--force", name], capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL, env=env)
+        removed.append(f"sandbox {name}")
+    return removed
+
+
+def sweep_stale_if_installed(environ: Mapping[str, str], which: Callable[[str], str | None] = shutil.which) -> list[str]:
+    """`sweep_stale_sandboxes` for whatever `sbx` is on PATH; nothing at all when there is none. Best effort: never raises."""
+    try:
+        path = which("sbx")
+        return sweep_stale_sandboxes(path, environ) if path else []
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def leftover_sandboxes(sbx_path: str, session_ids: Sequence[str], *, environ: Mapping[str, str] | None = None) -> list[str]:
