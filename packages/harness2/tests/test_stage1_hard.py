@@ -649,7 +649,7 @@ def test_with_no_edit_adopted_only_the_base_extras_run_and_a_hint_off_sweep_says
     assert r["rollouts_plan"]["extra_base_run"] == [f"base{i}" for i in range(2, 9)] and r["rollouts_plan"]["extra_final_run"] == []
     assert "extra rollouts: no edited harness was adopted" in printed.getvalue()
     assert "pass rate base 0/8 (0%); no edited harness adopted" in printed.getvalue()
-    assert "pass rate base 0/1 (0%), final agg1 0/1 (0%)  (one sample each: not a measurement)" in printed.getvalue()
+    assert "one sample each" not in printed.getvalue()          # the base is measured 8 times: the one-sample caveat does not apply
 
 
 @pytest.mark.requires_rootless_docker

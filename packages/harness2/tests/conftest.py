@@ -17,6 +17,24 @@ sys.path.insert(0, str(Path(__file__).parent))
 from cognitive_harness2 import image, run_scope, sandbox  # noqa: E402  (after the sys.path tweak above)
 
 
+@pytest.fixture(autouse=True)
+def _interruptible_signals():
+    """A job started with `&` or `nohup` inherits SIGINT (and SIGHUP) as SIG_IGN, and Python then installs no handler for
+    it, so the tests that deliver a REAL signal to this process would see nothing. Give each test the default handlers
+    an interactive run has, and put the inherited ones back afterwards. Only a handler that is SIG_IGN is replaced."""
+    import signal
+    restore = {}
+    for sig, default in ((signal.SIGINT, signal.default_int_handler), (signal.SIGHUP, signal.SIG_DFL)):
+        try:
+            if signal.getsignal(sig) == signal.SIG_IGN:
+                restore[sig] = signal.signal(sig, default)
+        except ValueError:                      # not the main thread: nothing to do
+            pass
+    yield
+    for sig, previous in restore.items():
+        signal.signal(sig, previous)
+
+
 @pytest.fixture(scope="session")
 def verified() -> sandbox.VerifiedDocker:
     """The rootless gate, run against the proposer image's pinned base (present locally)."""
