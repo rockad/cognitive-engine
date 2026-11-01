@@ -38,8 +38,11 @@
  * - `x.agent` read off a plain unbound name (such as `args`) is allowed: it is data unless the
  *   sandbox exposes an object that holds the function. Unknown sandbox objects are not modelled.
  * - Options of `pipeline`/`parallel`/`phase` helpers are not inspected, only `agent()` and `meta`.
- * - The script is checked as written. It cannot see a file changing between the check and the run,
- *   or what a saved workflow resolves to if Claude Code's lookup differs from `fsResolver`.
+ * - The script is checked as written, on every call (a scriptPath re-invocation is re-read and
+ *   re-analysed). The hook cannot see a file changing between the check and Claude Code's own read,
+ *   or what a saved workflow resolves to if Claude Code's lookup differs from `fsResolver`. Each
+ *   decision is bound to the sha256 of the text analysed (`scripts` on the decision, see
+ *   workflow-pin.ts), and a PostToolUse recorder reports drift after the run.
  * - Intentional false positives (always ask): `this` outside a class body, a variable-key lookup
  *   such as `o[k]` unless `k` is a followed `const`, and a local method that happens to be called
  *   `agent` or `workflow`.
@@ -56,6 +59,7 @@
  *   functions nested there) is strict-mode code and never the global object. A computed key and an
  *   `extends` clause use the outer `this`, so they still ask.
  */
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -80,6 +84,16 @@ export interface WorkflowDecision {
   sites: CallSite[];
   /** Ask text naming each offending call site; empty when allowed. */
   message: string;
+  /** The sha256 of every script text that was analysed (inline, file, named, nested), for allow and ask alike. */
+  scripts: ScriptFact[];
+}
+
+/** What the analysis read: bind a decision to this exact text. Never carries the text itself. */
+export interface ScriptFact {
+  /** `<inline>`, or the resolved file path. */
+  label: string;
+  sha256: string;
+  bytes: number;
 }
 
 /** Everything the analysis needs from the outside world, injectable so tests need no filesystem. */
@@ -791,11 +805,14 @@ export function checkScriptText(
   sessionModel: string | null,
   resolver: WorkflowResolver = NO_FS_RESOLVER,
   label = '<inline>',
-  depth = 0
+  depth = 0,
+  facts?: ScriptFact[]
 ): CallSite[] {
-  if (Buffer.byteLength(script, 'utf8') > MAX_SCRIPT_BYTES) {
+  const bytes = Buffer.byteLength(script, 'utf8');
+  if (bytes > MAX_SCRIPT_BYTES) {
     return [{ file: label, line: 1, col: 1, reason: `script is over the ${MAX_SCRIPT_BYTES} byte limit` }];
   }
+  facts?.push({ label, sha256: crypto.createHash('sha256').update(script).digest('hex'), bytes });
   const sites: CallSite[] = [];
   for (const f of parseFindings(script)) {
     switch (f.kind) {
@@ -825,7 +842,7 @@ export function checkScriptText(
         }
         const target = f.ref.scriptPath !== undefined ? resolver.readScriptFile(f.ref.scriptPath) : resolver.findNamedWorkflow(f.ref.name as string);
         if ('error' in target) sites.push({ file: label, line: f.line, col: f.col, reason: `nested workflow: ${target.error}` });
-        else sites.push(...checkScriptText(target.text, sessionModel, resolver, target.label, depth + 1));
+        else sites.push(...checkScriptText(target.text, sessionModel, resolver, target.label, depth + 1, facts));
         break;
       }
     }
@@ -835,12 +852,16 @@ export function checkScriptText(
 
 const MAX_LISTED = 10;
 
-function describe(sites: CallSite[], sessionModel: string | null): string {
+function describe(sites: CallSite[], sessionModel: string | null, scripts: ScriptFact[]): string {
   const shown = sites.slice(0, MAX_LISTED).map((s) => `- ${s.file}:${s.line}:${s.col} ${s.reason}`);
   if (sites.length > MAX_LISTED) shown.push(`- and ${sites.length - MAX_LISTED} more`);
+  // The hashes let the user see which exact text this ask is about; the audit and the PostToolUse
+  // drift check use the same ones.
+  const read = scripts.slice(0, MAX_LISTED).map((s) => `- ${s.label} sha256:${s.sha256.slice(0, 16)} (${s.bytes} bytes)`);
   return (
     `[jev] This workflow cannot be cleared against the session model ${sessionModel ? `"${sessionModel}"` : '(unknown)'}:\n` +
     `${shown.join('\n')}\n` +
+    (read.length > 0 ? `Analysed text:\n${read.join('\n')}\n` : '') +
     'Approve to run it as is, or deny and change those calls to inherit the session model.'
   );
 }
@@ -856,7 +877,8 @@ export function evaluateWorkflowInput(
   sessionModel: string | null,
   resolver: WorkflowResolver = fsResolver(cwd)
 ): WorkflowDecision {
-  const ask = (sites: CallSite[]): WorkflowDecision => ({ decision: 'ask', sites, message: describe(sites, sessionModel) });
+  const scripts: ScriptFact[] = [];
+  const ask = (sites: CallSite[]): WorkflowDecision => ({ decision: 'ask', sites, message: describe(sites, sessionModel, scripts), scripts });
   const shape = (reason: string) => ask([{ file: '<tool_input>', line: 0, col: 0, reason }]);
 
   if (!toolInput || typeof toolInput !== 'object' || Array.isArray(toolInput)) return shape('Workflow tool_input is not an object');
@@ -867,19 +889,19 @@ export function evaluateWorkflowInput(
 
   const sites: CallSite[] = [];
   try {
-    if (input.script !== undefined) sites.push(...checkScriptText(input.script as string, sessionModel, resolver, '<inline>'));
+    if (input.script !== undefined) sites.push(...checkScriptText(input.script as string, sessionModel, resolver, '<inline>', 0, scripts));
     if (input.scriptPath !== undefined) {
       const r = resolver.readScriptFile(input.scriptPath as string);
       if ('error' in r) sites.push({ file: input.scriptPath as string, line: 0, col: 0, reason: r.error });
-      else sites.push(...checkScriptText(r.text, sessionModel, resolver, r.label));
+      else sites.push(...checkScriptText(r.text, sessionModel, resolver, r.label, 0, scripts));
     }
     if (input.name !== undefined) {
       const r = resolver.findNamedWorkflow(input.name as string);
       if ('error' in r) sites.push({ file: input.name as string, line: 0, col: 0, reason: r.error });
-      else sites.push(...checkScriptText(r.text, sessionModel, resolver, r.label));
+      else sites.push(...checkScriptText(r.text, sessionModel, resolver, r.label, 0, scripts));
     }
   } catch (err) {
     sites.push({ file: '<guard>', line: 0, col: 0, reason: `workflow analysis failed (${err instanceof Error ? err.message : String(err)})` });
   }
-  return sites.length === 0 ? { decision: 'allow', sites: [], message: '' } : ask(sites);
+  return sites.length === 0 ? { decision: 'allow', sites: [], message: '', scripts } : ask(sites);
 }

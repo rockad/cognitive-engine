@@ -15,7 +15,7 @@
 import { modelTierRank } from './core/governance.js';
 import { describeAgentLookup, missingAgentDetail, readAgentDefinition } from './agent-definitions.js';
 import { assessModelRequest } from './models.js';
-import { evaluateWorkflowInput } from './workflow-guard.js';
+import { evaluateWorkflowInput, type ScriptFact } from './workflow-guard.js';
 import { resolveSessionModel, sessionModelFromTranscript, type SessionModelSource } from './session-model.js';
 
 export { sessionModelFromTranscript };
@@ -28,6 +28,15 @@ export interface Verdict {
 }
 
 export type GuardHarness = 'claude' | 'antigravity';
+
+/**
+ * Facts the evaluation leaves for the hook entrypoint beyond the verdict: for a Workflow call, the
+ * decision and the hashes of the script text analysed (see workflow-pin.ts). A caller that does not
+ * pass one gets none, and `evaluateClaude` then has no side effects.
+ */
+export interface GuardSink {
+  workflow?: { decision: 'allow' | 'ask'; scripts: ScriptFact[] };
+}
 
 export interface AgentCall {
   description?: string;
@@ -121,9 +130,10 @@ export function decideAntigravitySubagents(subagents: AntigravitySubagent[]): Ve
 }
 
 /** Claude Code Workflow call -> verdict (see workflow-guard.ts). Shape mismatches ask and are audited. */
-export function evaluateClaudeWorkflow(input: any): Verdict | null {
+export function evaluateClaudeWorkflow(input: any, sink?: GuardSink): Verdict | null {
   const session = resolveSessionModel(input);
   const decision = evaluateWorkflowInput(input.tool_input, input.cwd, session.model);
+  if (sink) sink.workflow = { decision: decision.decision, scripts: decision.scripts };
   if (decision.decision === 'allow') return null;
   return {
     decision: 'ask',
@@ -134,12 +144,13 @@ export function evaluateClaudeWorkflow(input: any): Verdict | null {
       session_id: input.session_id,
       sessionModel: session.model,
       sessionModelSource: session.source,
+      scripts: decision.scripts,
       sites: decision.sites.map((s) => ({ file: s.file, line: s.line, col: s.col, reason: s.reason }))
     }
   };
 }
 /** Claude Code PreToolUse input -> verdict. */
-export function evaluateClaude(input: any): Verdict | null {
+export function evaluateClaude(input: any, sink?: GuardSink): Verdict | null {
   if (typeof input?.tool_name !== 'string') {
     return {
       decision: 'ask',
@@ -147,7 +158,7 @@ export function evaluateClaude(input: any): Verdict | null {
       audit: { kind: 'malformed-input' }
     };
   }
-  if (input.tool_name === 'Workflow') return evaluateClaudeWorkflow(input);
+  if (input.tool_name === 'Workflow') return evaluateClaudeWorkflow(input, sink);
   if (input?.tool_name !== 'Agent' && input?.tool_name !== 'Task') return null;
   const raw = input.tool_input ?? {};
   if (typeof raw !== 'object' || Array.isArray(raw)) {

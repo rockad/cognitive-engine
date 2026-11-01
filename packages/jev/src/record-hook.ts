@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Log-only recorder hook for Claude Code: `bun record-hook.ts SessionStart|PostModelSwitch`.
+ * Recorder hook for Claude Code: `bun record-hook.ts SessionStart|PostModelSwitch|PostToolUse`.
  *
  * - PostModelSwitch: writes the session's current model to the per-session state file the guard
  *   reads, and audits the change with its source. The payload fields come from the Claude Code
@@ -10,13 +10,17 @@
  *   its id. A `resume` keeps the state file but writes a resume marker: the model may have changed
  *   with no PostModelSwitch, so the guard discards evidence older than the marker. Old state files
  *   are pruned.
+ * - PostToolUse (matcher `Workflow`): re-hashes the workflow files the PreToolUse guard analysed and
+ *   reports a file that changed since (workflow-pin.ts). Silent unless there is drift or the guard
+ *   did not run for the call (Jev off), in which case it does nothing.
  *
- * It only observes. It never blocks, never prints, and always exits 0: a failure here must not
- * affect the session, and the guard's transcript fallback covers a missing state file. It also
+ * It only observes. It never blocks, prints only that drift message, and always exits 0: a failure
+ * here must not affect the session, and the guard's transcript fallback covers a missing state file. It also
  * never interferes with Claude Code's own "switch models when a message is flagged" fallbacks;
  * those arrive as ordinary model changes (source `auto`) and are recorded like any other.
  */
 import { appendClaudeDecision } from './claude-audit.js';
+import { pruneWorkflowPins, recordPostToolUse } from './workflow-pin.js';
 import { clearSessionState, markSessionResumed, pruneSessionState, writeSessionState } from './session-model.js';
 
 const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
@@ -39,12 +43,14 @@ export function record(event: string | undefined, stdin: string, now: Date = new
       });
       return 'recorded';
     }
+    if (event === 'PostToolUse') return recordPostToolUse(stdin).status;
     if (event === 'SessionStart') {
       const source = str(input?.source);
       if (source === 'startup' || source === 'clear') clearSessionState(input?.session_id);
       // A resume can change the model with no PostModelSwitch: mark it so older evidence is dropped.
       if (source === 'resume') markSessionResumed(input?.session_id, now);
       pruneSessionState();
+      pruneWorkflowPins();
       return 'session-start';
     }
     return 'ignored';
@@ -55,7 +61,13 @@ export function record(event: string | undefined, stdin: string, now: Date = new
 
 if (import.meta.main) {
   try {
-    record(process.argv[2], await Bun.stdin.text());
+    const stdin = await Bun.stdin.text();
+    if (process.argv[2] === 'PostToolUse') {
+      const result = recordPostToolUse(stdin);
+      if (result.output) process.stdout.write(`${result.output}\n`);
+    } else {
+      record(process.argv[2], stdin);
+    }
   } catch {
     // log-only: nothing to do
   }
