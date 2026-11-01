@@ -32,6 +32,7 @@ import http.client
 import importlib
 import io
 import json
+import math
 import os
 import re
 import secrets
@@ -74,6 +75,35 @@ EXCERPT = 160
 FAKE_CLI = Path(__file__).with_name("selftest_fake_opencode.sh")
 EXPECTED_P, EXPECTED_R = 3, 4                # upstream's budget identity at k=1 (P = 3k, R = 4k)
 HINT_CHOICES = ("on", "off")                 # --proposer-hint
+MAX_ROLLOUTS = 64                            # --rollouts: a sanity ceiling; the profile's caps.sessions is the real bound
+
+
+@dataclass(frozen=True)
+class RolloutPlan:
+    """The session arithmetic of one sweep at `--rollouts n`, from upstream's own plan (P, R) plus what OUR runner adds.
+
+    Upstream rolls base1, inv1, dom1 and agg1 once each (R = 4 at k=1) and has no knob for more: `run_task` builds
+    `labels = [base1..basek]` and `recursion.run_parallel` rolls each candidate once. `n` is the number of rollouts of the
+    base harness and of the delivered final: upstream's own one plus `n - 1` more of each, made after `run_task` by
+    `run_extra_rollouts`. inv1 and dom1 are upstream's evidence for the aggregator and stay at one each."""
+    n: int
+    proposer: int               # P: upstream's proposer sessions
+    upstream_rollouts: int      # upstream's R
+    extra_base: int
+    extra_final: int
+
+    @property
+    def rollouts(self) -> int:
+        return self.upstream_rollouts + self.extra_base + self.extra_final
+
+    @property
+    def sessions(self) -> int:
+        return self.proposer + self.rollouts
+
+
+def rollout_plan(n: int, *, upstream_p: int, upstream_r: int, finals: int = K) -> RolloutPlan:
+    """The arithmetic for `n` rollouts per arm: `finals` is the number of delivered finals (k, one per mode here)."""
+    return RolloutPlan(n=n, proposer=upstream_p, upstream_rollouts=upstream_r, extra_base=n - 1, extra_final=(n - 1) * finals)
 HOST_SESSION_WARNINGS = ("the session runs agent tools (shell and file access) on this host", "HOME and any file-based credentials")
 CANDIDATES = (("systemprompt", "systemprompt.md"), ("memory", "LongTermMEMORY.md"),
               ("tool_guidance", "tool_descriptions/tool_guidance.md"))
@@ -112,6 +142,7 @@ class Settings:
     cli: str | None = None                   # host path of opencode (--opencode / env / ~/.opencode/bin/opencode / PATH)
     runs_dir: Path = field(default_factory=default_runs_dir)   # PARENT of the per-sweep directory
     proposer_hint: str | None = None         # "on" / "off" (--proposer-hint); None: on for the hard set, off for the easy one
+    rollouts: int = 1                        # --rollouts: rollouts of the base and of the delivered final (1 = upstream's own)
 
     def __post_init__(self) -> None:
         try:
@@ -123,6 +154,8 @@ class Settings:
         object.__setattr__(self, "task", task)
         if self.proposer_hint not in (None, *HINT_CHOICES):
             raise Stage1Error(f"--proposer-hint must be one of: {', '.join(HINT_CHOICES)}")
+        if not (isinstance(self.rollouts, int) and not isinstance(self.rollouts, bool) and 1 <= self.rollouts <= MAX_ROLLOUTS):
+            raise Stage1Error(f"--rollouts must be a whole number from 1 to {MAX_ROLLOUTS}")
 
     @property
     def hint_on(self) -> bool:
@@ -357,11 +390,17 @@ def build_plan(s: Settings, pre: Preflight, surface: Any) -> SweepPlan:
         max_sessions=ch.caps.sessions, max_wall_seconds=s.wall_s if s.wall_s is not None else ch.caps.wall_s,
         max_cost_or_tokens=CostCap("usd", 0.01), proposer=proposer_decision(s, root), readiness=pre.readiness(),
         profile=s.profile, channel=s.channel, classification=s.classification, zdr=s.zdr)
-    total = plan.planned_sessions + plan.planned_rollouts
-    if (plan.planned_sessions, plan.planned_rollouts) != (EXPECTED_P, EXPECTED_R) or total > ch.caps.sessions:
-        raise SweepRefused([f"stage 1 expects P={EXPECTED_P} proposer sessions and R={EXPECTED_R} rollouts within the channel's "
-                            f"{ch.caps.sessions} sessions, but upstream plans P={plan.planned_sessions}, R={plan.planned_rollouts}"])
-    return plan
+    if (plan.planned_sessions, plan.planned_rollouts) != (EXPECTED_P, EXPECTED_R):
+        raise SweepRefused([f"stage 1 expects P={EXPECTED_P} proposer sessions and R={EXPECTED_R} rollouts, "
+                            f"but upstream plans P={plan.planned_sessions}, R={plan.planned_rollouts}"])
+    rp = rollout_plan(s.rollouts, upstream_p=plan.planned_sessions, upstream_r=plan.planned_rollouts)
+    if rp.sessions > ch.caps.sessions:
+        raise SweepRefused([
+            f"{rp.sessions} sessions are planned (P={rp.proposer} proposer + R={rp.rollouts} solver rollouts at --rollouts "
+            f"{s.rollouts}) but channel {s.channel!r} allows caps.sessions = {ch.caps.sessions} in {s.profile.source}; "
+            f"raise caps.sessions to at least {rp.sessions} there, or lower --rollouts"])
+    # the extra rollouts are session budget too: the grant, the budget and the run-time checks are all made from this plan
+    return dataclasses.replace(plan, planned_rollouts=rp.rollouts)
 
 
 def approve_command(s: Settings, plan_cli: str | None, profile_path: str | None, wall_s: float | None = None) -> str:
@@ -374,6 +413,8 @@ def approve_command(s: Settings, plan_cli: str | None, profile_path: str | None,
         parts += ["--task-set", s.task_set]
     if s.proposer_hint is not None:                              # spelled out only when asked for: the default is in the plan
         parts += ["--proposer-hint", s.proposer_hint]
+    if s.rollouts != 1:
+        parts += ["--rollouts", str(s.rollouts)]
     if s.wall_s is not None:                                   # the figure the plan will actually hold to
         parts += ["--wall-s", f"{wall_s if wall_s is not None else s.wall_s:g}"]
     parts += ["--per-session-s", f"{s.per_session_s:g}", "--runs-dir", str(s.runs_dir)]
@@ -386,7 +427,9 @@ def format_plan(s: Settings, pre: Preflight, plan: SweepPlan | None, refusals: S
     L: list[str] = ["STAGE 1: local smoke run, k=1  (this is a PLAN: nothing was started)", ""]
     if ch is not None:
         wall = plan.max_wall_seconds if plan else (s.wall_s or ch.caps.wall_s)
-        worst = (EXPECTED_P + EXPECTED_R) * s.per_session_s
+        rp = rollout_plan(s.rollouts, upstream_p=EXPECTED_P, upstream_r=EXPECTED_R)
+        n = s.rollouts
+        worst = rp.sessions * s.per_session_s
         L += [f"channel          {ch.name}  ({ch.kind}, retention {ch.retention}, max classification {ch.max_classification})",
               f"endpoint         {ch.endpoints[0]}{API_PATH}  (loopback; reached from the containers over the host bridge)",
               f"model            {ch.model}",
@@ -395,10 +438,17 @@ def format_plan(s: Settings, pre: Preflight, plan: SweepPlan | None, refusals: S
               f"task             {s.task}, k={K}, modes={','.join(MODES)}, reflection skipped, attempts 1",
               f"proposer hint    {'on' if s.hint_on else 'off'}  ({s.hint_source}; the runner's ENVIRONMENT RULES block in front of "
               f"each proposer session's system text, never a solver's; --proposer-hint {'off' if s.hint_on else 'on'} flips it)",
-              f"expected         P={EXPECTED_P} proposer sessions (inv1, dom1, agg1) and R={EXPECTED_R} solver rollouts "
-              f"(base1, inv1, dom1, agg1), one model call at a time",
+              f"expected         P={rp.proposer} proposer sessions (inv1, dom1, agg1) and R={rp.rollouts} solver rollouts "
+              + ("(base1, inv1, dom1, agg1)" if n == 1 else f"(base1..base{n}, inv1, dom1, agg1 and its {n - 1} repeats)")
+              + ", one model call at a time",
+              f"rollouts         {n}  " + ("(upstream's own: base1, inv1, dom1, agg1 once each)" if n == 1 else
+                                          f"(base1..base{n} ({n}), the delivered final agg1 ({n}), and inv1, dom1 once each; "
+                                          f"upstream rolls one base and one final, the other {n - 1} of each are this runner's)"),
+              f"sessions         {rp.proposer} + {rp.rollouts} = {rp.sessions} sessions (profile cap {ch.caps.sessions})"
+              + ("" if rp.sessions <= ch.caps.sessions else
+                 f": OVER the cap, so this plan is refused; set caps.sessions to at least {rp.sessions}"),
               f"caps             sessions {ch.caps.sessions}, total wall {wall:g} s ({wall / 60:g} min), cost ${ch.caps.cost_usd:g}",
-              f"timeouts         {s.per_session_s:g} s per session; worst case {worst:g} s for {EXPECTED_P + EXPECTED_R} sessions"
+              f"timeouts         {s.per_session_s:g} s per session; worst case {worst:g} s for {rp.sessions} sessions"
               + (f", which is MORE than the {wall:g} s wall: the sweep stops starting sessions at the deadline" if worst > wall else ""),
               f"container        2 GB, 2 CPUs, 256 pids, read-only root, no capabilities, user 65534 (per session)",
               f"leaves machine   nothing: no hosted endpoint, no credential, no egress network",
@@ -796,6 +846,10 @@ def check_grant(ctx: "SweepContext", *, now: float | None = None) -> None:
     if (g.max_proposer_sessions > p.planned_sessions or g.max_solver_sessions > p.planned_rollouts
             or g.max_wall_s > p.max_wall_seconds):
         raise ExecutionRefused("the grant is larger than the approved plan")
+    cap = s.ch.caps.sessions
+    if g.max_sessions > cap:                  # the profile's own cap, even when plan and grant agree with each other
+        raise ExecutionRefused(f"the grant allows {g.max_sessions} sessions but channel {s.channel!r} has "
+                               f"caps.sessions = {cap}; raise it in the profile or lower --rollouts")
 
 
 def _ledger_view(res: Any) -> dict | None:
@@ -811,6 +865,49 @@ def _stage_view(res: Any) -> list[dict]:
             for st in (mode.get("stages") or []) if isinstance(st, dict)]
 
 
+def _natural(label: str) -> list:
+    """Sort key putting `base2` before `base10` and `agg1` before `agg1.r2`."""
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", label)]
+
+
+def arm_of(label: str, final_label: str | None) -> str:
+    """Which arm of the comparison a rollout belongs to: `base` (base1..baseN), `final` (the delivered final's own rollout
+    and its repeats `<final>.r2`..) or `other` (inv1 and dom1, upstream's evidence for the aggregator: not compared)."""
+    if re.fullmatch(r"base\d+", label):
+        return "base"
+    if final_label and (label == final_label or re.fullmatch(re.escape(final_label) + r"\.r\d+", label)):
+        return "final"
+    return "other"
+
+
+def arm_rates(rollouts: Sequence[Mapping[str, Any]], final_label: str | None) -> dict:
+    """Per arm: its labels, n (every rollout of the arm, a dead one included), how many passed, failed, or were unusable (the
+    session died or the judge gave no verdict), and the pass rate over n (None for an empty arm). A dead rollout is NOT
+    dropped from n: it counts as not passed, and `unusable` says how many there were."""
+    out: dict[str, dict] = {}
+    for arm in ("base", "final"):
+        mine = sorted((r for r in rollouts if arm_of(r["label"], final_label) == arm), key=lambda r: _natural(r["label"]))
+        passed = sum(1 for r in mine if r.get("passed") is True)
+        failed = sum(1 for r in mine if r.get("passed") is False)
+        unusable = sum(1 for r in mine if r.get("ok") is False or r.get("passed") is None)
+        out[arm] = {"labels": [r["label"] for r in mine], "n": len(mine), "passed": passed, "failed": failed,
+                    "unusable": unusable, "rate": passed / len(mine) if mine else None}
+    return out
+
+
+def fisher_two_sided(a: int, n1: int, b: int, n2: int) -> float:
+    """Fisher's exact test, two-sided: `a` of `n1` passed in one arm, `b` of `n2` in the other. The probability, under 'the
+    two arms have one pass rate', of a split at least as unlikely as the one seen."""
+    total = a + b
+    lo, hi = max(0, total - n2), min(n1, total)
+
+    def p(x: int) -> float:
+        return math.comb(n1, x) * math.comb(n2, total - x) / math.comb(n1 + n2, total)
+
+    seen = p(a)
+    return min(1.0, sum(p(x) for x in range(lo, hi + 1) if p(x) <= seen * (1 + 1e-9)))
+
+
 def _selection_view(res: Any, rollouts: Sequence[Mapping[str, Any]]) -> dict | None:
     """What upstream's selection did with the one mode, and what our own verdicts say about it.
 
@@ -819,8 +916,12 @@ def _selection_view(res: Any, rollouts: Sequence[Mapping[str, Any]]) -> dict | N
     otherwise delivers it. `chosen_is_base` is therefore always false, and no score is read. So `adopted` here means:
     the delivered final is an `agg` harness that differs from the base (`chosen_tree_is_base` false). Whether that edit
     HELPED is a separate fact, from this runner's own verdicts on the base and chosen rollouts, which selection never sees.
-    `verdict`: improved (base failed, chosen passed), regressed (the reverse), unchanged (same result), base-kept (no
-    accepted edit reached the final), or unknown."""
+
+    `verdict`, from one rollout each (`--rollouts 1`, an anecdote and said so in `evidence`): improved (base failed, chosen
+    passed), regressed (the reverse), unchanged (same result), base-kept (no accepted edit reached the final), or unknown.
+    From more rollouts it is a comparison of RATES and never a win: higher-rate, lower-rate or same-rate (base-kept and
+    unknown as before), with `base_rate` / `chosen_rate` as passed-over-n and `fisher_p`, a two-sided exact test of the
+    two counts, which `evidence` turns into words. A dead rollout counts in n as not passed."""
     sel = (getattr(res, "selections", None) or {}).get("agg")
     if not isinstance(sel, dict):
         return None
@@ -829,20 +930,38 @@ def _selection_view(res: Any, rollouts: Sequence[Mapping[str, Any]]) -> dict | N
     tree_is_base = sel.get("chosen_tree_is_base")
     adopted = bool(sel.get("ok") and chosen and tree_is_base is False)
     base_passed, chosen_passed = by.get("base1"), by.get(chosen) if chosen else None
+    arms = arm_rates(rollouts, chosen)
+    bn, cn = arms["base"], arms["final"]
+    single = bn["n"] <= 1 and cn["n"] <= 1
+    fisher_p: float | None = None
+    evidence = ""
     if not adopted:
         verdict = "base-kept"
-    elif base_passed is False and chosen_passed is True:
-        verdict = "improved"
-    elif base_passed is True and chosen_passed is False:
-        verdict = "regressed"
-    elif base_passed is not None and base_passed == chosen_passed:
-        verdict = "unchanged"
-    else:
+    elif single:
+        evidence = "one sample each: an anecdote, not a measurement"
+        if base_passed is False and chosen_passed is True:
+            verdict = "improved"
+        elif base_passed is True and chosen_passed is False:
+            verdict = "regressed"
+        elif base_passed is not None and base_passed == chosen_passed:
+            verdict = "unchanged"
+        else:
+            verdict = "unknown"
+    elif bn["unusable"] == bn["n"] or cn["unusable"] == cn["n"]:
         verdict = "unknown"
+        evidence = "an arm has no usable rollout"
+    else:
+        fisher_p = fisher_two_sided(cn["passed"], cn["n"], bn["passed"], bn["n"])
+        verdict = ("higher-rate" if cn["rate"] > bn["rate"] else "lower-rate" if cn["rate"] < bn["rate"] else "same-rate")
+        evidence = (f"Fisher exact two-sided p={fisher_p:.3g}: a gap this size is unlikely to be chance; still one task and one "
+                    "proposer draw, so it measures this final harness, not the method" if fisher_p < 0.05 else
+                    f"Fisher exact two-sided p={fisher_p:.2f}: not significant at these sizes; report the rates and claim nothing")
     return {"ok": bool(sel.get("ok")), "trivial": bool(sel.get("trivial")), "chosen_label": chosen,
             "chosen_is_base": bool(sel.get("chosen_is_base")), "chosen_tree_is_base": tree_is_base, "adopted": adopted,
             "n_candidates": sel.get("n_candidates"), "dropped": list(sel.get("dropped") or [])[:10],
             "base_passed": base_passed, "chosen_passed": chosen_passed, "verdict": verdict,
+            "base_rate": {"passed": bn["passed"], "n": bn["n"]}, "chosen_rate": {"passed": cn["passed"], "n": cn["n"]},
+            "fisher_p": fisher_p, "evidence": evidence,
             "harness_fingerprint": sel.get("harness_fingerprint")}
 
 
@@ -851,9 +970,76 @@ def selection_line(report: Mapping[str, Any]) -> str:
     if not sel:
         return ""
     word = {True: "passed", False: "failed", None: "no verdict"}
-    return (f"selection {sel['verdict']}: final {sel['chosen_label']} "
-            f"({'an edited harness was adopted' if sel['adopted'] else 'the base harness was kept'}); "
-            f"base1 {word[sel['base_passed']]}, {sel['chosen_label']} {word[sel['chosen_passed']]}\n")
+    head = (f"selection {sel['verdict']}: final {sel['chosen_label']} "
+            f"({'an edited harness was adopted' if sel['adopted'] else 'the base harness was kept'}); ")
+    br, cr = sel.get("base_rate") or {}, sel.get("chosen_rate") or {}
+    if max(br.get("n", 0), cr.get("n", 0)) > 1:
+        return head + f"pass rate base {br['passed']}/{br['n']}, {sel['chosen_label']} {cr['passed']}/{cr['n']}" + \
+            (f"; {sel['evidence']}" if sel.get("evidence") else "") + "\n"
+    return head + (f"base1 {word[sel['base_passed']]}, {sel['chosen_label']} {word[sel['chosen_passed']]}"
+                   + (f"; {sel['evidence']}" if sel.get("evidence") else "") + "\n")
+
+
+def pass_rate_line(report: Mapping[str, Any]) -> str:
+    """`pass rate base 4/8 (50%), final agg1 7/8 (88%)`: n_passed/n for both arms, from the report's `pass_rates`."""
+    pr = report.get("pass_rates")
+    if not pr:
+        return ""
+
+    def part(name: str, arm: Mapping[str, Any]) -> str:
+        if not arm["n"]:
+            return f"{name} none"
+        extra = f", {arm['unusable']} unusable" if arm["unusable"] else ""
+        return f"{name} {arm['passed']}/{arm['n']} ({arm['rate'] * 100:.0f}%{extra})"
+    final = f"final {pr['final_label']}" if pr.get("final_label") else "final"
+    one = pr["base"]["n"] <= 1 and pr["final"]["n"] <= 1 and pr["final"]["n"] > 0
+    return f"pass rate {part('base', pr['base'])}, {part(final, pr['final'])}" + \
+        ("  (one sample each: not a measurement)" if one else "") + "\n"
+
+
+def run_extra_rollouts(adapter: Any, res: Any, *, up: Any, runs_root: Path, task: str, k: int, n: int, audit: Any,
+                       exhausted: Callable[[], bool]) -> dict:
+    """The rollouts upstream does not make: base2..baseN and `<final>.r2`..`<final>.rN`, after `run_task`, through the same
+    adapter (so each is a real solver session under the grant and the budget, and each is audited and judged like the rest).
+
+    Upstream rolls ONE base and ONE of each candidate; `run_task` takes no count. The extras use upstream's own run-id
+    namespace (`Namespace.run_id`) and, for the final, the harness directory upstream wrote for the delivered final
+    (`<task dir>/harnesses/<final>`), so they are the same harnesses upstream rolled once. They alternate (base2, final.r2,
+    base3, ...) so a drift in the model or the GPU over the run does not fall on one arm. They run only when an edited
+    harness was adopted: with no edit the final IS the base and there is nothing to compare. A rollout that dies is
+    counted (and is not in the pass count); a spent budget stops the rest. Returns
+    `{base, final, errors, skipped}`: the labels run, one `label: error` per failure, and why the rest did not run."""
+    out: dict[str, Any] = {"base": [], "final": [], "errors": [], "skipped": None}
+    if n <= 1:
+        return out
+    sel = (getattr(res, "selections", None) or {}).get("agg")
+    chosen = sel.get("chosen_label") if isinstance(sel, dict) else None
+    if not (isinstance(sel, dict) and sel.get("ok") and chosen):
+        out["skipped"] = "upstream's selection gave no usable final"
+    elif sel.get("chosen_tree_is_base") is not False:
+        out["skipped"] = f"no edited harness was adopted (the final {chosen} is the base): nothing to compare, no extra rollout run"
+    else:
+        ns = up.schedule.Namespace(adapter.spec.name, adapter.substrate.name, "agg", k)
+        hdir = ns.task_dir(runs_root, task) / "harnesses" / chosen
+        if not hdir.is_dir():
+            out["skipped"] = f"the harness directory of the final {chosen} is not on disk"
+    if out["skipped"]:
+        audit.emit("extra_rollouts_skipped", n=n, reason=out["skipped"])
+        return out
+    plan = [(label, None if arm == "base" else hdir) for i in range(2, n + 1)
+            for arm, label in (("base", f"base{i}"), ("final", f"{chosen}.r{i}"))]
+    audit.emit("extra_rollouts_start", n=n, chosen=chosen, planned=len(plan))
+    for done, (label, harness_dir) in enumerate(plan):
+        if exhausted():
+            out["skipped"] = f"the sweep budget ran out: {done} of {len(plan)} extra rollouts ran"
+            break
+        try:
+            adapter.execute(task, harness_dir, ns.run_id(task, label))
+        except Exception as e:  # noqa: BLE001 - one dead rollout is a result (an unusable one), not the end of the sweep
+            out["errors"].append(f"{label}: {type(e).__name__}: {sr.sanitize_terminal(str(e))[:200]}")
+        out["base" if harness_dir is None else "final"].append(label)
+    audit.emit("extra_rollouts_end", ran=len(out["base"]) + len(out["final"]), errors=len(out["errors"]), skipped=out["skipped"])
+    return out
 
 
 def sessions_view(starts: Sequence[Mapping[str, Any]], ends: Sequence[Mapping[str, Any]], *,
@@ -954,6 +1140,7 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
     error: BaseException | None = None
     res: Any = None
     adapter: AuditedAdapter | None = None
+    extra: dict[str, Any] = {"base": [], "final": [], "errors": [], "skipped": None}      # the rollouts OUR runner adds (n > 1)
     budget = g.make_budget()
     hint = proposer_hint.build_hint(ctx.surface) if s.hint_on else None
     hint_info = {"on": hint is not None, "source": s.hint_source, "sha": hint.sha if hint else None}
@@ -1009,6 +1196,8 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
         res = run(s.task, K, adapter=adapter, prop=prop, runs_root=runs_root, modes=MODES, libraries=None,
                   selector_prop=make_selector_prop(prop))
         audit.emit("run_task_end", status=getattr(res, "status", None))
+        extra = run_extra_rollouts(adapter, res, up=ctx.up, runs_root=runs_root, task=s.task, k=K, n=s.rollouts, audit=audit,
+                                   exhausted=lambda: budget.snapshot()["remaining_s"] <= 0)
     except BaseException as e:   # noqa: BLE001 - audited, torn down below, reported
         error = e
         audit.emit("error", type=type(e).__name__, message=sr.sanitize_terminal(str(e))[:300])
@@ -1028,8 +1217,11 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
         status = str(getattr(res, "status", "unknown"))
     if dirty:
         status = f"{status}+dirty"
-    rollouts = sorted((adapter.rollouts.values() if adapter else []), key=lambda r: r["label"])
+    rollouts = sorted((adapter.rollouts.values() if adapter else []), key=lambda r: _natural(r["label"]))
     selection = _selection_view(res, rollouts) if res is not None else None
+    final_label = selection["chosen_label"] if selection else None
+    pass_rates = {"final_label": final_label, **arm_rates(rollouts, final_label)}
+    rp = rollout_plan(s.rollouts, upstream_p=EXPECTED_P, upstream_r=EXPECTED_R)
     with ids_lock:
         summary = sessions_view(list(starts), list(ends),
                                 rollout_errors=[x for r in rollouts for x in (r.get("errors") or [])],
@@ -1055,8 +1247,16 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
         "stages": stages, "selection": selection,
         "rollouts": [{k: r.get(k) for k in ("label", "run_id", "ok", "passed", "n_passed", "n_criteria", "delivered",
                                               "exit_code", "timed_out", "n_events", "duration_s", "error", "errors",
-                                              "answer_excerpt")}
+                                              "answer_excerpt")} | {"arm": arm_of(r["label"], final_label)}
                      for r in rollouts],
+        # n_passed / n per arm, over every rollout of the arm (a dead one counts as not passed): the measurement `selection`
+        # is judged on. `rollouts_plan` is the session arithmetic and what the extra rollouts did.
+        "pass_rates": pass_rates,
+        "rollouts_plan": {"n": rp.n, "upstream_rollouts": rp.upstream_rollouts, "extra_base_planned": rp.extra_base,
+                          "extra_final_planned": rp.extra_final, "rollouts_planned": rp.rollouts,
+                          "sessions_planned": rp.sessions, "extra_base_run": list(extra["base"]),
+                          "extra_final_run": list(extra["final"]), "extra_errors": list(extra["errors"]),
+                          "extra_skipped": extra["skipped"]},
         "rollouts_passed": sum(1 for r in rollouts if r.get("passed") is True),
         "rollouts_failed": sum(1 for r in rollouts if r.get("passed") is False or not r.get("ok")),
         "sessions": {"counts": snapshot["counts"], "refusals": snapshot["refusals"], "remaining_s": snapshot["remaining_s"],
@@ -1072,7 +1272,7 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
         json.dump(report, fh, indent=2, sort_keys=True)
         fh.write("\n")
     audit.emit("sweep_end", status=status, wall_s=report["wall_s"], ledger=ledger, rollouts_passed=report["rollouts_passed"],
-               rollouts_failed=report["rollouts_failed"], report=str(report_path))
+               rollouts_failed=report["rollouts_failed"], pass_rates=pass_rates, report=str(report_path))
     code = (130 if isinstance(error, KeyboardInterrupt) else 3 if dirty else
             1 if error is not None or res is None or not identity_ok or no_model else 0)
     return SweepOutcome(report, code)
@@ -1106,7 +1306,7 @@ def _settings_from(args: argparse.Namespace, environ: Mapping[str, str]) -> Sett
     return Settings(profile=profile, channel=args.channel or CHANNEL, classification=args.classification, wall_s=wall,
                     per_session_s=float(per), cli=args.opencode, runs_dir=runs,
                     task_set=getattr(args, "task_set", None) or task_sets.DEFAULT,
-                    proposer_hint=getattr(args, "proposer_hint", None))
+                    proposer_hint=getattr(args, "proposer_hint", None), rollouts=getattr(args, "rollouts", 1))
 
 
 def run_plan(args: argparse.Namespace, *, environ: Mapping[str, str], probes: Probes | None = None,
@@ -1209,7 +1409,10 @@ def _approved(s: Settings, plan: SweepPlan, pre: Preflight, up: Any, surface: An
     out.write(f"\nstatus {r['status']}  wall {r['wall_s']:g} s  ledger {r['ledger'] and (r['ledger']['P'], r['ledger']['R'])}  "
               f"rollouts passed {r['rollouts_passed']}, failed {r['rollouts_failed']}\n")
     out.writelines(sessions_lines(r))
+    out.write(pass_rate_line(r))
     out.write(selection_line(r))
+    if r.get("rollouts_plan", {}).get("extra_skipped"):
+        out.write(f"extra rollouts: {r['rollouts_plan']['extra_skipped']}\n")
     out.write(f"audit  {audit.path}\nreport {run_dir / 'report.json'}\n")
     return outcome.exit_code
 
@@ -1540,6 +1743,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="on: put the runner's ENVIRONMENT RULES (which harness files are mutable and which are "
                              "read-only) in front of each proposer session's system text; off: do not (run #4's behaviour). "
                              "Default: on for --task-set hard, off for easy")
+    common.add_argument("--rollouts", type=int, default=1, metavar="N",
+                        help=f"rollouts of the base harness AND of the delivered final, each (default 1 = upstream's own single "
+                             f"one; 1..{MAX_ROLLOUTS}). Upstream rolls one of each, so the other N-1 are made by this runner "
+                             "after it; sessions = 3 proposers + (4 + 2*(N-1)) rollouts must fit the profile's caps.sessions")
     sub.add_parser("plan", parents=[common], help="read-only: validate, preflight, print the plan and the approve command")
     run = sub.add_parser("run", parents=[common], help="approve and run the sweep (the only place a real model is called)")
     run.add_argument("--approve", metavar="CHANNEL", help="the channel you approve; a phrase must also be typed on a terminal")
@@ -1551,6 +1758,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "forbidden edits are refused), one sweep per scenario")
     st.add_argument("--proposer-hint", choices=HINT_CHOICES, default=None,
                     help="as for plan and run (default: on for --task-set hard, off for easy)")
+    st.add_argument("--rollouts", type=int, default=1, metavar="N",
+                    help="as for plan and run: N rollouts of the base and of the delivered final (the fake profile gets "
+                         "caps.sessions = 3 + 4 + 2*(N-1) to match)")
     st.add_argument("--scenario", choices=SCENARIOS, help="run only this fake-proposer scenario (default: all of the task set's)")
     return p
 
