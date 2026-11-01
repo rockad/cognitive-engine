@@ -425,7 +425,7 @@ Following the approved architectural clarification, work is partitioned by speci
 | **Architectural Governance & PR Remediation** | **Antigravity** | Gemini 3.8 Flash | Dedicated Worktree (`/home/rockad/projects/cognitive-engine-track1`) | Coordinates PR #3 review remediations (WS9), multi-track dependency tracking, RFC alignment. |
 | **Verification Gates & Quality Acceptance** | **Antigravity** | Gemini 3.8 Flash + `jev_judge` | Assigned Worktree | Runs test suites (`bun test`, `uv run pytest`), diff validation, and binary quality gating. |
 | **Git, PRs & Review Coordination with @Doc-Cr** | **Antigravity** | Gemini 3.8 Flash | Assigned Worktree | Branch checkout, semantic commits, PR management, and GitHub review updates. |
-| **Session State & Cross-Harness Continuity** | **Unified Memory** | Recall (:8110) & Lookup (:8100) | Live Bridge File | Synchronizes state via `/home/rockad/.agents/antigravity-claude-bridge-cognitive-engine.md` across both harnesses. |
+| **Session State & Cross-Harness Continuity** | **Unified Memory** | Recall (:8110) & Lookup (:8100) | Live channel `~/.agents/antigravity-claude-bridge-cognitive-engine.md` (append-only; protocol in `~/.agents/agent-bridge-protocol.md`; shared tracker `~/.agents/cognitive-engine-tasklist.md`) | Synchronizes state across both harnesses through that channel only. The repo no longer carries a handoff file. |
 
 ### 6.2 Dedicated Worktree Protocol
 
@@ -434,7 +434,7 @@ To guarantee zero race conditions between Antigravity and Claude Code:
   - Antigravity Track 1 Worktree: `/home/rockad/projects/cognitive-engine-track1`
   - Claude Code Working Directory: Dedicated worktree created via `git worktree add ../cognitive-engine-<track> <branch>`
 - **No Shared Working Trees**: Never run parallel edits or branch switches in the same worktree directory.
-- **Git Push Coordination**: Push feature branches cleanly and notify the other harness via `antigravity-claude-bridge.md` before initiating dependent work.
+- **Git Push Coordination**: Push feature branches cleanly and notify the other harness via the live channel (`~/.agents/antigravity-claude-bridge-cognitive-engine.md`) before initiating dependent work.
 
 ### 6.3 Operating Modes
 
@@ -445,7 +445,7 @@ To guarantee zero race conditions between Antigravity and Claude Code:
 
 #### Mode B: Dual-Harness Ping-Pong (Implement in Claude Code, Verify in Antigravity)
 1. **Briefing Phase (Antigravity)**:
-   - Antigravity scaffolds a self-contained, clipboard-ready **Harness Prompt Brief** in `antigravity-claude-bridge.md` specifying target files, invariants, and tests.
+   - Antigravity scaffolds a self-contained, clipboard-ready **Harness Prompt Brief** in the live channel (`~/.agents/antigravity-claude-bridge-cognitive-engine.md`) specifying target files, invariants, and tests.
 2. **Coding Phase (Claude Code)**:
    - Claude Code launches in its dedicated worktree, implements the brief, runs local checks, and commits.
 3. **Verification & Quality Gate Phase (Antigravity)**:
