@@ -178,7 +178,7 @@ def test_a_right_answer_is_collected_scored_and_cleaned_up(rig):
     m = r.metrics(d)
     assert m["role"] == "solver" and m["exit_code"] == 0 and m["timed_out"] is False and m["delivered"] is True
     assert m["collected"] == ["output/answer.txt"] and m["n_events"] == 4 and m["harvest"]["ok"] is True
-    assert m["reclaimed"] is True and m["egress"] == []
+    assert m["reclaimed"] is True and [x for x in m["egress"] if not x.startswith("ACCESS-SUMMARY ")] == []   # no decisions; the proxy's closing counters line is not one
     assert json.loads((d / ".adapt_complete").read_text())["run_id"] == "right-1"
     assert r.adapter.delivered(d) and r.adapter.artifacts_intact(d)
     assert not list(r.wsroot.iterdir())                                   # the workspace is gone

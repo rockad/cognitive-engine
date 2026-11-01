@@ -66,8 +66,9 @@ def test_a_text_reply_round_trip_through_bridge_and_proxy(verified, proposer_ima
     assert [e["type"] for e in p.events] == ["text"] and text_of(p.events) == ["THE-STUB-SAYS-HI"]
     assert {"type", "timestamp", "sessionID", "part"} <= set(p.events[0]) and p.events[0]["part"]["type"] == "text"
     # the model was reached, through the proxy only: every egress line is the proxy alias (an allow), nothing denied
-    assert r.egress_log and all(re.fullmatch(r"ACCESS decision=allow host=harness2-proxy\.internal port=\d+ reason=unix-route", x)
-                                for x in r.egress_log), r.egress_log
+    decisions = [x for x in r.egress_log if not x.startswith(sr.SUMMARY_PREFIX)]               # the closing counters line is not a decision
+    assert decisions and all(re.fullmatch(r"ACCESS decision=allow host=harness2-proxy\.internal port=\d+ reason=unix-route", x)
+                             for x in decisions), r.egress_log
     summary = sr.egress_summary(r.egress_log)
     assert summary["model_requests"] == 2 and summary["egress_denied"] == 0 and summary["denied_hosts"] == []   # GET + POST
     # what opencode asked the model: GET /api/tags once, then ONE chat request (the --title word skips title generation)

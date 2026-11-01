@@ -326,7 +326,9 @@ def test_the_proxy_log_has_decisions_and_only_decisions(probe, egress_world):
     denied = [line for line in log if "decision=deny" in line]
     assert any("host=example.com port=443 reason=not-allow-listed" in line for line in denied)
     assert any("host=169.254.169.254" in line for line in denied) and any("ambiguous-numeric-host" in line for line in denied)
-    assert all(re.fullmatch(r"ACCESS decision=(allow|deny) host=\S+ port=\d+ reason=[a-z-]+", line) for line in log)
+    decisions = [line for line in log if not line.startswith(sr.SUMMARY_PREFIX)]               # the closing counters line is not a decision
+    assert all(re.fullmatch(r"ACCESS decision=(allow|deny) host=\S+ port=\d+ reason=[a-z-]+", line) for line in decisions)
+    assert len(log) - len(decisions) <= 1                                                       # and there is at most one of it
     seen = egress_world.log()
     assert seen.count("CONN 9000") == 2 and "CONN 9001" not in seen     # only the two allowed requests ever reached the endpoint
 
@@ -730,7 +732,7 @@ def test_the_bypass_covers_the_sessions_own_loopback_only_every_other_name_still
         denied = r.run(spec(ws, "pget", url))
         assert "pget=HTTP403" in denied.stdout and any("decision=deny" in line for line in denied.egress_log), (url, denied)
     own = r.run(spec(ws, "pget", "http://127.0.0.1:9000/"))                              # bypassed, so it is the session's own (empty) loopback
-    assert "pget=ERR" in own.stdout and not own.egress_log, own
+    assert "pget=ERR" in own.stdout and not [x for x in own.egress_log if not x.startswith(sr.SUMMARY_PREFIX)], own
     assert "CONN 9001" not in egress_world.log()
 
 
