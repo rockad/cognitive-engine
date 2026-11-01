@@ -363,7 +363,7 @@ _PROXY_STOP_GRACE_S = 3.0
 _MAX_PROXY_LOG_BYTES = 8 * 1024 * 1024
 _SBX_EXEC_FAILURE = sandbox._SBX_EXEC_FAILURE
 _MEM = re.compile(r"^([1-9][0-9]{0,5})([kmg])$")
-_ADDED = re.compile(r"\bAdded rule (\S+)")
+_ADDED = re.compile(r"\bAdded rule (\S+)(?:[^\n]*?\(scope: ([^)\s]+)\))?")
 
 
 def _free_ports(n: int, avoid: Sequence[int | None] = ()) -> list[int]:
@@ -459,6 +459,7 @@ class _Live:
     proxy: subprocess.Popen | None = None
     client: subprocess.Popen | None = None
     rule_ids: list[str] = field(default_factory=list)
+    stray_rules: list[tuple[str, str | None]] = field(default_factory=list)    # (id, sandbox) of rules sbx added with a scope other than ours
     log_text: str = ""
     port: int | None = None
 
@@ -619,6 +620,15 @@ class SbxSessionRunner(sr.ProposerSessionRunner):
             m = _ADDED.search(p.stdout)
             if not m:
                 raise sr.SessionError("`sbx policy allow network` did not say which rule it added")
+            if m.group(2) != f"{_SCOPE_SANDBOX}{name}":
+                # `--sandbox` was ignored or misread: the rule is not scoped to this sandbox (global, or another's). It would apply
+                # to every sandbox, and `policy rm --sandbox NAME` would miss it: take it back by id, globally, and refuse.
+                scope = m.group(2) or ""
+                live.stray_rules.append((m.group(1), scope[len(_SCOPE_SANDBOX):] if scope.startswith(_SCOPE_SANDBOX) else None))
+                with contextlib.suppress(sandbox.SandboxUnavailable):
+                    self._remove_stray_rules(live.stray_rules)
+                raise sr.SessionError(f"`sbx policy allow network --sandbox {name}` added rule {m.group(1)} with the scope "
+                                      f"{m.group(2) or 'none given'!r}, not '{_SCOPE_SANDBOX}{name}': it was removed again and the session is refused")
             live.rule_ids.append(m.group(1))
         listing = self._must("policy", "ls", "--json", name, what="policy ls").stdout
         problem = sandbox_policy_problem(listing, name, port, ollama_port=self.ollama_port)
@@ -715,6 +725,14 @@ class SbxSessionRunner(sr.ProposerSessionRunner):
             with contextlib.suppress(sandbox.SandboxUnavailable):
                 self._ctl("policy", "rm", "network", "--sandbox", name, "--id", rule, "--force", what="policy rm network")
 
+    def _remove_stray_rules(self, stray: Sequence[tuple[str, str | None]]) -> None:
+        """Remove rules that were added with a scope other than ours, by id: globally (no `--sandbox`) for a global one, with
+        `--sandbox OTHER` for a rule scoped to another sandbox. A sandbox's `rm` does not take them, so nothing else will."""
+        for rule, owner in stray:
+            with contextlib.suppress(sandbox.SandboxUnavailable):
+                self._ctl("policy", "rm", "network", *(["--sandbox", owner] if owner else []), "--id", rule, "--force",
+                          what="policy rm network")
+
     def _remove_sandbox(self, name: str) -> None:
         with contextlib.suppress(sandbox.SandboxUnavailable):
             self._sbx._destroy(name)
@@ -724,6 +742,7 @@ class SbxSessionRunner(sr.ProposerSessionRunner):
         the proxy (its final summary is read); the bridge; the private directory."""
         cleanup.run(self._kill_client, live)
         cleanup.run(self._remove_rules, name, live.rule_ids)
+        cleanup.run(self._remove_stray_rules, live.stray_rules)
         cleanup.run(self._remove_sandbox, name)
         cleanup.run(self._stop_proxy, live)
         cleanup.run(sr.ProposerSessionRunner._close_stack, stack)
@@ -738,8 +757,11 @@ class SbxSessionRunner(sr.ProposerSessionRunner):
             if doc is None:
                 left.append(f"rules of {name}: could not be listed")
             else:
-                left += [f"rule {r.get('id')} of sandbox {name}" for r in doc.get("rules", [])
-                         if isinstance(r, dict) and _sandbox_of(r) == name]
+                ours = {*live.rule_ids, *(rid for rid, _ in live.stray_rules)}
+                # by scope (everything the sandbox owns) OR by id (a rule WE added, whatever scope sbx gave it: a global allow outlives
+                # the sandbox and is a daemon-wide side effect)
+                left += [f"rule {r.get('id')} of sandbox {name}" if _sandbox_of(r) == name else f"rule {r.get('id')} (scope {r.get('scope')!r})"
+                         for r in doc.get("rules", []) if isinstance(r, dict) and (_sandbox_of(r) == name or r.get("id") in ours)]
         except (sandbox.SandboxUnavailable, ValueError, AttributeError):
             left.append(f"rules of {name}: could not be listed")
         try:

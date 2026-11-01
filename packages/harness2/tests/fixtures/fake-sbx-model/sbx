@@ -10,7 +10,8 @@
 # FAKE_SBX_EXTRA (JSON array of rules added to every listing), FAKE_SBX_EXTRA_FOR_SANDBOX (only to `policy ls NAME`),
 # FAKE_SBX_CHECK=allowed, FAKE_SBX_GATEWAY (what `printenv HTTP_PROXY` says), FAKE_SBX_NO_CLI=1 (`test -x` fails),
 # FAKE_SBX_SESSION (a bash script run as the session; FAKE_SBX_PORT is the port named by the first rule),
-# FAKE_SBX_EXEC_RC/OUT/ERR, FAKE_SBX_EXEC_HANG=1, FAKE_SBX_LS=fail.
+# FAKE_SBX_EXEC_RC/OUT/ERR, FAKE_SBX_EXEC_HANG=1, FAKE_SBX_LS=fail, FAKE_SBX_ADDED_SCOPE=global|other|none (what scope `policy allow`
+# reports and stores: an sbx that ignored --sandbox, a rule of somebody else's sandbox, or a line with no scope at all).
 set -u
 D="${FAKE_SBX_DIR:?FAKE_SBX_DIR is required}"
 mkdir -p "$D"; touch "$D/sandboxes" "$D/rules" "$D/workspaces"
@@ -24,8 +25,9 @@ emit_policy() {  # $1: optional sandbox name
   if [ -n "${1:-}" ] && [ -n "${FAKE_SBX_EXTRA_FOR_SANDBOX:-}" ]; then extra="$FAKE_SBX_EXTRA_FOR_SANDBOX"; fi
   jq -Rn --slurpfile base "${FAKE_SBX_POLICY_FILE:?}" --arg only "${1:-}" --argjson extra "$extra" '
     [inputs | split("\t") | select(length==5) | {id:.[0], sb:.[1], method:.[2], path:.[3], host:.[4]}] as $r
-    | {rules: ($base[0].rules + $extra + [ $r[] | select($only=="" or .sb==$only) | {id:.id, name:.id,
-        scope:("sandbox:"+.sb), applies_to:("sandbox:"+.sb), resource_type:"http", decision:"allow", resources:[.host],
+    | {rules: ($base[0].rules + $extra + [ $r[] | select($only=="" or .sb==$only or .sb=="-") | {id:.id, name:.id,
+        scope:(if .sb=="-" then "global" else "sandbox:"+.sb end), applies_to:(if .sb=="-" then "all" else "sandbox:"+.sb end),
+        resource_type:"http", decision:"allow", resources:[.host],
         origin:"scoped", layer:"local", status:"active", editable:true, sandbox_id:.sb,
         actions:["http:request:"+(.method|ascii_downcase)], methods:[.method], http_targets:[{host:.host, path:.path}]} ])}' "$D/rules"
 }
@@ -49,13 +51,32 @@ case "${1:-}" in
         if [ "${FAKE_SBX_ALLOW_FAIL_AT:-0}" = "$c" ]; then echo "error: allow network rule: request failed: 500" >&2; exit 1; fi
         exists "$n" || { echo "error: allow network rule: sandbox \"$n\" not found" >&2; exit 1; }
         id="rule-$c-$n"
-        printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$n" "$method" "$path" "$res" >> "$D/rules"
-        echo "Added rule $id to policy local (scope: sandbox:$n): $method $res$path" ;;
+        case "${FAKE_SBX_ADDED_SCOPE:-}" in
+          global)  # an sbx that ignored --sandbox: the rule is GLOBAL, and says so
+            printf '%s\t%s\t%s\t%s\t%s\n' "$id" "-" "$method" "$path" "$res" >> "$D/rules"
+            echo "Added rule $id to policy local (scope: global): $method $res$path" ;;
+          other)   # a rule scoped to somebody else's sandbox
+            printf '%s\t%s\t%s\t%s\t%s\n' "$id" "somebody-else" "$method" "$path" "$res" >> "$D/rules"
+            echo "Added rule $id to policy local (scope: sandbox:somebody-else): $method $res$path" ;;
+          none)    # no scope in the line at all
+            printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$n" "$method" "$path" "$res" >> "$D/rules"
+            echo "Added rule $id to policy local: $method $res$path" ;;
+          *)
+            printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$n" "$method" "$path" "$res" >> "$D/rules"
+            echo "Added rule $id to policy local (scope: sandbox:$n): $method $res$path" ;;
+        esac ;;
       rm)
-        # policy rm network --sandbox N --id ID --force
+        # policy rm network [--sandbox N] --id ID --force: with --sandbox only that sandbox's rules, without it only global ones
         [ "${FAKE_SBX_POLICY_RM:-}" = fail ] && { echo "error: rm rule failed" >&2; exit 1; }
-        id="$7"
-        grep -v "^$id	" "$D/rules" > "$D/rules.new"; mv "$D/rules.new" "$D/rules"
+        shift 3; sb="-"; id=""
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --sandbox) sb="$2"; shift 2 ;;
+            --id) id="$2"; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        awk -F'\t' -v id="$id" -v sb="$sb" '!($1==id && $2==sb)' "$D/rules" > "$D/rules.new"; mv "$D/rules.new" "$D/rules"
         echo "Removed rule from policy local: id=$id" ;;
       check)
         # policy check network --sandbox N --json TARGET

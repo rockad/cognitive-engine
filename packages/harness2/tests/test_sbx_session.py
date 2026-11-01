@@ -457,6 +457,36 @@ def test_a_rule_that_cannot_be_removed_by_id_still_dies_with_its_sandbox(world):
     assert r.leftovers == () and world.rules() == [] and world.listed() == []
 
 
+# ── the scope of an added rule ────────────────────────────────────────────────────
+
+def test_a_rule_added_with_the_wrong_scope_is_removed_again_and_the_session_stops_before_anything_runs(world):
+    """`allow network --sandbox N` must say `(scope: sandbox:N)`. If it says global, the allow reaches EVERY sandbox: remove it
+    (a global rule is removed without --sandbox), name it, and refuse."""
+    with pytest.raises(SessionError, match="scope"):
+        world.runner(env={"FAKE_SBX_ADDED_SCOPE": "global"}).run(world.spec())
+    assert world.rules() == [] and world.listed() == [] and world.runtime_leftovers() == []
+    calls = world.calls()
+    assert any(c[:3] == ["policy", "rm", "network"] and "--sandbox" not in c and "--id" in c for c in calls)   # the global form
+    assert not any(c[0] == "exec" for c in calls)                       # nothing ran in the sandbox
+
+
+@pytest.mark.parametrize("scope", ["other", "none"])
+def test_a_rule_that_names_another_sandbox_or_no_scope_is_refused_too(world, scope):
+    with pytest.raises(SessionError, match="scope"):
+        world.runner(env={"FAKE_SBX_ADDED_SCOPE": scope}).run(world.spec())
+    assert world.listed() == [] and not any(c[0] == "exec" for c in world.calls())
+
+
+def test_a_wrongly_scoped_rule_that_cannot_be_removed_is_reported_as_a_leftover_whatever_its_scope(world):
+    """The sandbox goes with its own rules, but a GLOBAL allow to our port outlives it: it must be reported, not forgotten."""
+    with pytest.raises(SessionCleanupError) as e:
+        world.runner(env={"FAKE_SBX_ADDED_SCOPE": "global", "FAKE_SBX_POLICY_RM": "fail"}).run(world.spec())
+    left = " ".join(e.value.leftovers)
+    assert "rule rule-1-" in left and "sandbox h2m-" not in left
+    assert len(world.rules()) == 1
+    (world.fake / "rules").write_text("")
+
+
 # ── the stale sweep ───────────────────────────────────────────────────────────────
 
 ME = ss.current_owner()
