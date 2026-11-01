@@ -14,7 +14,7 @@
  */
 import { modelTierRank } from './core/governance.js';
 import { describeAgentLookup, missingAgentDetail, readAgentDefinition } from './agent-definitions.js';
-import { assessModelRequest } from './models.js';
+import { assessInherited, assessModelRequest, inheritsSessionModel, type InheritCheck } from './models.js';
 import { evaluateWorkflowInput, type ScriptFact } from './workflow-guard.js';
 import { resolveSessionModel, sessionModelFromTranscript, type SessionModel, type SessionModelSource } from './session-model.js';
 import { lowerModel } from './project-config.js';
@@ -51,15 +51,18 @@ export interface GuardContext {
  * project ceiling, with a note for the ask text when the ceiling is what lowered it. Without a
  * ceiling (or when the session model is unknown or unrankable) it is the session model unchanged.
  */
-function ceilingFor(session: SessionModel, ctx: GuardContext | undefined): { model: string | null; note: string } {
+function ceilingFor(session: SessionModel, ctx: GuardContext | undefined): { model: string | null; note: string; inherit: InheritCheck | null } {
   const ceiling = ctx?.projectCeiling;
-  if (!ceiling) return { model: session.model, note: '' };
+  if (!ceiling) return { model: session.model, note: '', inherit: null };
+  // What a subagent that inherits the session model runs on is the REAL session model, which the
+  // ceiling can be below: it is ranked against the ceiling too.
+  const inherit: InheritCheck = { sessionModel: session.model, ceiling };
   const model = lowerModel(session.model, ceiling);
   const note =
     model !== session.model
       ? ` The project ceiling "${ceiling}"${ctx?.projectCeilingFile ? ` (${ctx.projectCeilingFile})` : ''} is below the session model "${session.model}", so it is the limit here; a project file can only tighten the ceiling.`
       : '';
-  return { model, note };
+  return { model, note, inherit };
 }
 
 export interface AgentCall {
@@ -75,7 +78,8 @@ const STRONG_RANK = 3;
 /**
  * Claude Code Agent/Task call: ask when the model the subagent will run on is above the session's.
  * That is the call's own `model`, or, when the call sets none, the `model` in the subagent's
- * definition file. "inherit" or no model runs on the session model, so it passes.
+ * definition file. "inherit" or no model runs on the session model, so it passes, unless a project
+ * ceiling is set (`inherit`): then the session model is ranked against the ceiling.
  *
  * Ranking is version-aware (see models.ts). Equal or lower passes silently. A requested model Jev
  * cannot rank, or a session model that is unknown, asks.
@@ -84,10 +88,12 @@ export function decideClaudeAgentCall(
   call: AgentCall,
   sessionModel: string | null,
   definitionModel: string | null = null,
-  sessionModelSource: SessionModelSource = 'none'
+  sessionModelSource: SessionModelSource = 'none',
+  inherit: InheritCheck | null = null
 ): Verdict | null {
   const model = call.model !== undefined ? call.model : definitionModel;
-  const assessment = assessModelRequest(model, sessionModel);
+  // A call that runs on the session model is ranked against the project ceiling when there is one.
+  const assessment = inherit && inheritsSessionModel(model) ? assessInherited(inherit) : assessModelRequest(model, sessionModel);
   if (assessment.kind === 'allowed') return null;
   const advice =
     assessment.kind === 'escalation'
@@ -157,7 +163,7 @@ export function decideAntigravitySubagents(subagents: AntigravitySubagent[]): Ve
 export function evaluateClaudeWorkflow(input: any, sink?: GuardContext): Verdict | null {
   const session = resolveSessionModel(input);
   const effective = ceilingFor(session, sink);
-  const decision = evaluateWorkflowInput(input.tool_input, input.cwd, effective.model);
+  const decision = evaluateWorkflowInput(input.tool_input, input.cwd, effective.model, undefined, effective.inherit);
   if (sink) sink.workflow = { decision: decision.decision, scripts: decision.scripts };
   if (decision.decision === 'allow') return null;
   return {
@@ -204,7 +210,7 @@ export function evaluateClaude(input: any, sink?: GuardContext): Verdict | null 
     if (unknown) return { ...unknown, audit: { ...unknown.audit, ...facts } };
     definitionModel = agentDefinitionModel(call.subagent_type, input.cwd);
   }
-  const verdict = decideClaudeAgentCall(call, effective.model, definitionModel, session.source);
+  const verdict = decideClaudeAgentCall(call, effective.model, definitionModel, session.source, effective.inherit);
   return verdict ? { ...verdict, reason: verdict.reason + effective.note, audit: { ...verdict.audit, ...facts } } : null;
 }
 

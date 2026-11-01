@@ -109,3 +109,36 @@ export function assessModelRequest(requested: string | null | undefined, session
   }
   return { kind: 'allowed' };
 }
+
+/**
+ * What a subagent that INHERITS the session model runs on, checked against a project ceiling: the
+ * real session model and the ceiling a project file set.
+ */
+export interface InheritCheck {
+  sessionModel: string | null;
+  ceiling: string;
+}
+
+/**
+ * Assess a subagent that runs on the session model (no model, `inherit`, a built-in type, a
+ * definition without a model) against a project ceiling. Allowed when the session model is not above
+ * the ceiling. A session model above it is an escalation. A session model that is unknown or that
+ * Jev cannot rank cannot be compared with the ceiling, so it asks.
+ */
+export function assessInherited(check: InheritCheck): ModelAssessment {
+  const session = check.sessionModel ? parseModel(check.sessionModel) : 'unknown';
+  const ceiling = parseModel(check.ceiling);
+  if (session === 'unknown' || ceiling === 'unknown') {
+    return {
+      kind: 'unknown-session',
+      reason: `the subagent inherits the session model, which ${check.sessionModel ? `("${check.sessionModel}") Jev cannot rank` : 'could not be determined'}, so it cannot be checked against the project ceiling "${check.ceiling}"`
+    };
+  }
+  if (compareModels(session, ceiling) > 0) {
+    return {
+      kind: 'escalation',
+      reason: `the subagent inherits the session model "${check.sessionModel}" (${formatParsedModel(session)}), which is stronger than the project ceiling "${check.ceiling}" (${formatParsedModel(ceiling)})`
+    };
+  }
+  return { kind: 'allowed' };
+}

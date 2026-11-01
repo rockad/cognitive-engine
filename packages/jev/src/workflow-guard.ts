@@ -8,7 +8,8 @@
  *
  * Fail closed: only a small set of shapes is understood, and everything else asks.
  * - `agent(prompt)` / `agent(prompt, {model: 'literal', agentType: 'literal', ...})`: understood.
- *   A literal model is ranked against the session model (models.ts); no model inherits (allowed);
+ *   A literal model is ranked against the session model (models.ts); no model inherits (allowed,
+ *   unless a project ceiling is set: then the session model is ranked against the ceiling);
  *   an agentType's model comes from its definition file, and a missing definition asks.
  * - `workflow('name')` / `workflow({scriptPath: 'literal'})`: resolved and analysed one level deep.
  * - Anything else asks: aliasing, passing the function as a value, member or computed access,
@@ -65,7 +66,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as acorn from 'acorn';
 import { describeAgentLookup, missingAgentDetail, readAgentDefinition, type AgentDefinition } from './agent-definitions.js';
-import { assessModelRequest } from './models.js';
+import { assessInherited, assessModelRequest, inheritsSessionModel, type InheritCheck } from './models.js';
 
 /** Largest script (inline or file) the guard will parse. Bigger asks. */
 export const MAX_SCRIPT_BYTES = 512 * 1024;
@@ -148,6 +149,8 @@ export function fsResolver(cwd: string | undefined): WorkflowResolver {
 type Finding =
   | { kind: 'model'; model: string; where: string; line: number; col: number }
   | { kind: 'agentType'; agentType: string; line: number; col: number }
+  /** An agent() call that names no model of its own: it runs on the session model. */
+  | { kind: 'inherit'; line: number; col: number }
   | { kind: 'nested'; ref: { name?: string; scriptPath?: string }; line: number; col: number }
   | { kind: 'unverifiable'; reason: string; line: number; col: number };
 
@@ -317,11 +320,15 @@ function analyseAgentCall(call: Node, out: Finding[], ctx: Bindings): void {
     return;
   }
   const [first, second] = call.arguments;
-  if (first?.type === 'ObjectExpression') analyseOptions(first, out, ctx);
+  const mine: Finding[] = [];
+  if (first?.type === 'ObjectExpression') analyseOptions(first, mine, ctx);
   if (second !== undefined) {
-    if (second.type === 'ObjectExpression') analyseOptions(second, out, ctx);
-    else out.push({ kind: 'unverifiable', reason: 'agent() options are not an object literal', ...pos(second) });
+    if (second.type === 'ObjectExpression') analyseOptions(second, mine, ctx);
+    else mine.push({ kind: 'unverifiable', reason: 'agent() options are not an object literal', ...pos(second) });
   }
+  // No model and no agentType: the call runs on the session model (ranked only under a project ceiling).
+  if (!mine.some((f) => f.kind === 'model' || f.kind === 'agentType' || f.kind === 'unverifiable')) mine.push({ kind: 'inherit', ...pos(call) });
+  out.push(...mine);
 }
 
 function analyseWorkflowCall(call: Node, out: Finding[], ctx: Bindings): void {
@@ -789,8 +796,16 @@ function parseFindings(script: string): Finding[] {
 
 // ── Evaluation ─────────────────────────────────────────────────────────────────────────────────
 
-function modelSite(file: string, f: { line: number; col: number }, requested: string, session: string | null, what: string): CallSite | null {
-  const a = assessModelRequest(requested, session);
+function modelSite(
+  file: string,
+  f: { line: number; col: number },
+  requested: string | null,
+  session: string | null,
+  what: string,
+  inherit: InheritCheck | null = null
+): CallSite | null {
+  // A model that means "the session model" is ranked against the project ceiling when there is one.
+  const a = inherit && inheritsSessionModel(requested) ? assessInherited(inherit) : assessModelRequest(requested, session);
   if (a.kind === 'allowed') return null;
   return { file, line: f.line, col: f.col, reason: `${what} ${a.reason}` };
 }
@@ -806,7 +821,8 @@ export function checkScriptText(
   resolver: WorkflowResolver = NO_FS_RESOLVER,
   label = '<inline>',
   depth = 0,
-  facts?: ScriptFact[]
+  facts?: ScriptFact[],
+  inherit: InheritCheck | null = null
 ): CallSite[] {
   const bytes = Buffer.byteLength(script, 'utf8');
   if (bytes > MAX_SCRIPT_BYTES) {
@@ -820,7 +836,12 @@ export function checkScriptText(
         sites.push({ file: label, line: f.line, col: f.col, reason: f.reason });
         break;
       case 'model': {
-        const s = modelSite(label, f, f.model, sessionModel, f.where === 'model' ? 'agent() call:' : 'meta.phases:');
+        const s = modelSite(label, f, f.model, sessionModel, f.where === 'model' ? 'agent() call:' : 'meta.phases:', inherit);
+        if (s) sites.push(s);
+        break;
+      }
+      case 'inherit': {
+        const s = modelSite(label, f, null, sessionModel, 'agent() call with no model:', inherit);
         if (s) sites.push(s);
         break;
       }
@@ -829,8 +850,8 @@ export function checkScriptText(
         if (!def.found) {
           const lookup = resolver.describeLookup?.() ?? 'no agent definition directory (nothing is searched)';
           sites.push({ file: label, line: f.line, col: f.col, reason: `agentType ${JSON.stringify(f.agentType)} is not an agent Jev can read: ${missingAgentDetail(lookup)}` });
-        } else if (def.model !== null) {
-          const s = modelSite(label, f, def.model, sessionModel, `agentType "${f.agentType}" definition:`);
+        } else {
+          const s = modelSite(label, f, def.model, sessionModel, `agentType "${f.agentType}" definition:`, inherit);
           if (s) sites.push(s);
         }
         break;
@@ -842,7 +863,7 @@ export function checkScriptText(
         }
         const target = f.ref.scriptPath !== undefined ? resolver.readScriptFile(f.ref.scriptPath) : resolver.findNamedWorkflow(f.ref.name as string);
         if ('error' in target) sites.push({ file: label, line: f.line, col: f.col, reason: `nested workflow: ${target.error}` });
-        else sites.push(...checkScriptText(target.text, sessionModel, resolver, target.label, depth + 1, facts));
+        else sites.push(...checkScriptText(target.text, sessionModel, resolver, target.label, depth + 1, facts, inherit));
         break;
       }
     }
@@ -875,7 +896,8 @@ export function evaluateWorkflowInput(
   toolInput: unknown,
   cwd: string | undefined,
   sessionModel: string | null,
-  resolver: WorkflowResolver = fsResolver(cwd)
+  resolver: WorkflowResolver = fsResolver(cwd),
+  inherit: InheritCheck | null = null
 ): WorkflowDecision {
   const scripts: ScriptFact[] = [];
   const ask = (sites: CallSite[]): WorkflowDecision => ({ decision: 'ask', sites, message: describe(sites, sessionModel, scripts), scripts });
@@ -889,16 +911,16 @@ export function evaluateWorkflowInput(
 
   const sites: CallSite[] = [];
   try {
-    if (input.script !== undefined) sites.push(...checkScriptText(input.script as string, sessionModel, resolver, '<inline>', 0, scripts));
+    if (input.script !== undefined) sites.push(...checkScriptText(input.script as string, sessionModel, resolver, '<inline>', 0, scripts, inherit));
     if (input.scriptPath !== undefined) {
       const r = resolver.readScriptFile(input.scriptPath as string);
       if ('error' in r) sites.push({ file: input.scriptPath as string, line: 0, col: 0, reason: r.error });
-      else sites.push(...checkScriptText(r.text, sessionModel, resolver, r.label, 0, scripts));
+      else sites.push(...checkScriptText(r.text, sessionModel, resolver, r.label, 0, scripts, inherit));
     }
     if (input.name !== undefined) {
       const r = resolver.findNamedWorkflow(input.name as string);
       if ('error' in r) sites.push({ file: input.name as string, line: 0, col: 0, reason: r.error });
-      else sites.push(...checkScriptText(r.text, sessionModel, resolver, r.label, 0, scripts));
+      else sites.push(...checkScriptText(r.text, sessionModel, resolver, r.label, 0, scripts, inherit));
     }
   } catch (err) {
     sites.push({ file: '<guard>', line: 0, col: 0, reason: `workflow analysis failed (${err instanceof Error ? err.message : String(err)})` });
