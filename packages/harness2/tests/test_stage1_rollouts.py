@@ -293,9 +293,26 @@ def test_the_extra_labels_are_safe_run_ids():
     assert flat_run_id("sum-signed-hard-cognitive-agg1/household/hard-1/agg1.r8").endswith("agg1.r8")
 
 
-def test_no_adopted_edit_means_nothing_to_measure_and_no_extra_rollout_runs(up, tmp_path):
+def _labels(ad):
+    return [rid.rsplit("/", 1)[-1] for _t, _h, rid in ad.calls]
+
+
+def test_with_no_adopted_edit_the_base_extras_still_run_and_only_the_finals_repeats_do_not(up, tmp_path):
+    """Decided 2026-11-01: the baseline pass rate over N is a result in itself, so base2..baseN always run."""
     ad, out, *_ = extras(up, tmp_path, 8, selection(chosen_tree_is_base=True))
-    assert ad.calls == [] and "no edited harness was adopted" in out["skipped"]
+    assert _labels(ad) == [f"base{i}" for i in range(2, 9)] and all(h is None for _t, h, _r in ad.calls)
+    assert out["base"] == [f"base{i}" for i in range(2, 9)] and out["final"] == []
+    assert "no edited harness was adopted" in out["skipped"] and "base2..base8 run" in out["skipped"]
+    assert "the final's repeats do not" in out["skipped"] and out["errors"] == []
+
+
+@pytest.mark.parametrize("n", [2, 3, 8])
+def test_the_number_of_base_extras_is_n_minus_one_adopted_or_not(up, tmp_path, n):
+    adopted_ad, adopted, *_ = extras(up, tmp_path / "a", n)
+    none_ad, none, *_ = extras(up, tmp_path / "b", n, selection(chosen_tree_is_base=True))
+    assert len(adopted["base"]) == len(none["base"]) == n - 1
+    assert len(adopted["final"]) == n - 1 and none["final"] == []
+    assert len(adopted_ad.calls) == 2 * (n - 1) and len(none_ad.calls) == n - 1
 
 
 @pytest.mark.parametrize("res,why", [
@@ -303,14 +320,110 @@ def test_no_adopted_edit_means_nothing_to_measure_and_no_extra_rollout_runs(up, 
     (selection(ok=False), "selection"),
     (selection(chosen_label=""), "selection"),
 ])
-def test_a_missing_or_failed_selection_skips_the_extras_with_a_reason(up, tmp_path, res, why):
+def test_a_missing_or_failed_selection_runs_the_base_extras_only_and_says_why(up, tmp_path, res, why):
     ad, out, *_ = extras(up, tmp_path, 8, res)
-    assert ad.calls == [] and why in out["skipped"]
+    assert _labels(ad) == [f"base{i}" for i in range(2, 9)] and out["final"] == [] and why in out["skipped"]
 
 
-def test_a_missing_final_harness_directory_skips_the_extras_rather_than_measure_the_base_twice(up, tmp_path):
+def test_a_missing_final_harness_directory_runs_the_base_extras_and_not_the_finals_repeats(up, tmp_path):
     ad, out, *_ = extras(up, tmp_path, 8, make_dir=False)
-    assert ad.calls == [] and "harness directory" in out["skipped"]
+    assert _labels(ad) == [f"base{i}" for i in range(2, 9)] and out["final"] == []
+    assert "harness directory" in out["skipped"]
+
+
+def test_the_audit_says_the_final_extras_were_skipped_and_the_base_extras_started(up, tmp_path):
+    audit = Audit()
+    extras(up, tmp_path, 3, selection(chosen_tree_is_base=True), audit=audit)
+    kinds = [e for e, _f in audit.events]
+    assert kinds == ["extra_rollouts_skipped", "extra_rollouts_start", "extra_rollouts_end"]
+    assert audit.events[0][1]["base_extras_run"] is True and audit.events[1][1] == {"n": 3, "chosen": None, "planned": 2}
+
+
+def test_the_session_cap_worst_case_still_counts_the_final_extras():
+    """The cap check, the grant and the budget use the worst case: 2 (n - 1) extras, though a no-edit sweep runs n - 1."""
+    rp = stage1.rollout_plan(8, upstream_p=3, upstream_r=4)
+    assert rp.sessions == 21 and rp.extra_base == 7 and rp.extra_final == 7
+
+
+class FakeBudget:
+    def __init__(self, **snap):
+        self.snap = {"remaining_s": 100.0, "exhausted": False, "role_caps": {"solver": 10}, "counts": {"solver": 3, "proposer": 3, "total": 6}, **snap}
+
+    def snapshot(self):
+        return self.snap
+
+
+@pytest.mark.parametrize("snap,expect", [
+    ({}, False),
+    ({"remaining_s": 0.0}, True),
+    ({"exhausted": True}, True),                                        # the sweep's total session cap or the wall clock
+    ({"counts": {"solver": 10, "proposer": 3, "total": 13}}, True),     # the solver role cap, wall clock fine
+    ({"counts": {"solver": 9, "proposer": 3, "total": 12}}, False),
+    ({"role_caps": {}}, False),
+])
+def test_the_sweep_is_exhausted_by_the_wall_clock_or_by_a_session_cap(snap, expect):
+    assert stage1.sweep_exhausted(FakeBudget(**snap)) is expect
+
+
+def test_a_session_cap_stops_the_extras_as_a_stop_and_not_as_dead_rollouts(up, tmp_path):
+    budget = FakeBudget()
+    ad = FakeAdapter(tmp_path)
+    real_execute = ad.execute
+
+    def execute(*a, **k):
+        out = real_execute(*a, **k)
+        budget.snap["counts"]["solver"] += 1                              # each rollout takes a solver session
+        return out
+    ad.execute = execute
+    _ad, out, *_ = extras(up, tmp_path, 8, adapter=ad, exhausted=lambda: stage1.sweep_exhausted(budget))
+    assert len(ad.calls) == 7 and out["errors"] == [] and "budget" in out["skipped"] and "7 of 14" in out["skipped"]
+
+
+def test_the_report_gives_the_baseline_rate_and_says_no_edited_harness_was_adopted():
+    res = adopted_res()
+    res.selections["agg"]["chosen_tree_is_base"] = True
+    rolls = rolls_for([True] * 3 + [False] * 5, [False])
+    v = stage1._selection_view(res, rolls)
+    arms = stage1.arm_rates(rolls, "agg1")
+    line = stage1.pass_rate_line({"pass_rates": {"final_label": "agg1", **arms}, "selection": v})
+    assert line == "pass rate base 3/8 (38%); no edited harness adopted\n"
+    sel = stage1.selection_line({"selection": v})
+    assert sel == ("selection base-kept: final agg1 (the base harness was kept); pass rate base 3/8; no edited harness adopted\n")
+    assert "agg1 " not in line                                                    # the final is the base: not an arm
+
+
+def test_an_unusable_base_rollout_still_shows_in_the_baseline_line():
+    res = adopted_res()
+    res.selections["agg"]["chosen_tree_is_base"] = True
+    rolls = rolls_for([True, True, None], [False])
+    line = stage1.pass_rate_line({"pass_rates": {"final_label": "agg1", **stage1.arm_rates(rolls, "agg1")},
+                                  "selection": stage1._selection_view(res, rolls)})
+    assert line == "pass rate base 2/3 (67%, 1 unusable); no edited harness adopted\n"
+
+
+def test_with_one_rollout_and_no_edit_the_old_lines_stay():
+    res = adopted_res()
+    res.selections["agg"]["chosen_tree_is_base"] = True
+    rolls = rolls_for([False], [False])
+    line = stage1.pass_rate_line({"pass_rates": {"final_label": "agg1", **stage1.arm_rates(rolls, "agg1")},
+                                  "selection": stage1._selection_view(res, rolls)})
+    assert line == "pass rate base 0/1 (0%), final agg1 0/1 (0%)  (one sample each: not a measurement)\n"
+
+
+def test_the_plan_text_says_which_extras_are_certain_and_which_depend_on_an_adopted_edit(tmp_path, up):
+    rig4, fake = rig_with(tmp_path, sessions=13, wall_s=5400)
+    try:
+        code, text = plan_out(rig4, "--rollouts", "4", "--task-set", "hard")
+        assert code == 0, text
+        assert "the 3 base repeats always run, the final's only if an edited harness is adopted" in text
+        assert "13 sessions (profile cap 13), the worst case: 3 fewer if no edited harness is adopted" in text
+    finally:
+        fake.__exit__(None, None, None)
+
+
+def test_the_default_plan_has_no_rollout_extras_to_explain(rig, up):
+    code, text = plan_out(rig)
+    assert code == 0 and "fewer if no edited" not in text and "always run" not in text
 
 
 def test_a_rollout_that_dies_is_counted_and_the_rest_still_run(up, tmp_path):

@@ -13,7 +13,9 @@ bridge and the allow-list proxy. One model call at a time (the model gate). $0. 
 Stage 1c (two flags, defaults unchanged): `--proposer-hint on|off` puts the runner's ENVIRONMENT RULES block (which harness
 files are kept, which are read-only) in front of each proposer session (`proposer_hint`; on for the hard set by default), and
 `--rollouts N` rolls the base and the delivered final N times each. Upstream fixes R = 4k, so the extra rollouts are made here,
-after `run_task` (`run_extra_rollouts`), and count as sessions: P + R = 3 + (4 + 2 (N - 1)) must fit the profile's caps.sessions.
+after `run_task` (`run_extra_rollouts`), and count as sessions: P + R = 3 + (4 + 2 (N - 1)) must fit the profile's caps.sessions
+(the worst case). The N - 1 base repeats always run; the N - 1 repeats of the final run only if an edited harness was adopted, so
+with no edit a sweep uses N - 1 fewer sessions and reports the baseline pass rate alone.
 
 `plan` changes nothing. It reads the profile, asks the policy, runs the pinned read-only `docker info` and
 `docker image inspect`, and sends ONE `GET /api/tags` to the loopback Ollama (no bytes beyond that, no model is loaded).
@@ -90,7 +92,10 @@ class RolloutPlan:
     Upstream rolls base1, inv1, dom1 and agg1 once each (R = 4 at k=1) and has no knob for more: `run_task` builds
     `labels = [base1..basek]` and `recursion.run_parallel` rolls each candidate once. `n` is the number of rollouts of the
     base harness and of the delivered final: upstream's own one plus `n - 1` more of each, made after `run_task` by
-    `run_extra_rollouts`. inv1 and dom1 are upstream's evidence for the aggregator and stay at one each."""
+    `run_extra_rollouts`. inv1 and dom1 are upstream's evidence for the aggregator and stay at one each.
+
+    `sessions` is the WORST case, and it is what the cap check, the grant and the budget use: sessions = P + R +
+    (n - 1 base extras, always run) + (n - 1 final extras per final, run only if an edited harness was adopted)."""
     n: int
     proposer: int               # P: upstream's proposer sessions
     upstream_rollouts: int      # upstream's R
@@ -448,8 +453,10 @@ def format_plan(s: Settings, pre: Preflight, plan: SweepPlan | None, refusals: S
               + ", one model call at a time",
               f"rollouts         {n}  " + ("(upstream's own: base1, inv1, dom1, agg1 once each)" if n == 1 else
                                           f"(base1..base{n} ({n}), the delivered final agg1 ({n}), and inv1, dom1 once each; "
-                                          f"upstream rolls one base and one final, the other {n - 1} of each are this runner's)"),
+                                          f"upstream rolls one base and one final, the other {n - 1} of each are this runner's; the {n - 1} "
+                                          f"base repeats always run, the final's only if an edited harness is adopted)"),
               f"sessions         {rp.proposer} + {rp.rollouts} = {rp.sessions} sessions (profile cap {ch.caps.sessions})"
+              + ("" if n == 1 else f", the worst case: {(n - 1) * K} fewer if no edited harness is adopted (its {n - 1} repeats of the final do not run)")
               + ("" if rp.sessions <= ch.caps.sessions else
                  f": OVER the cap, so this plan is refused; set caps.sessions to at least {rp.sessions}"),
               f"caps             sessions {ch.caps.sessions}, total wall {wall:g} s ({wall / 60:g} min), cost ${ch.caps.cost_usd:g}",
@@ -1008,6 +1015,8 @@ def selection_line(report: Mapping[str, Any]) -> str:
     head = (f"selection {sel['verdict']}: final {sel['chosen_label']} "
             f"({'an edited harness was adopted' if sel['adopted'] else 'the base harness was kept'}); ")
     br, cr = sel.get("base_rate") or {}, sel.get("chosen_rate") or {}
+    if not sel["adopted"] and br.get("n", 0) > 1:        # the base measured N times, nothing to compare it with
+        return head + f"pass rate base {br['passed']}/{br['n']}; no edited harness adopted\n"
     if max(br.get("n", 0), cr.get("n", 0)) > 1:
         return head + f"pass rate base {br['passed']}/{br['n']}, {sel['chosen_label']} {cr['passed']}/{cr['n']}" + \
             (f"; {sel['evidence']}" if sel.get("evidence") else "") + "\n"
@@ -1026,10 +1035,23 @@ def pass_rate_line(report: Mapping[str, Any]) -> str:
             return f"{name} none"
         extra = f", {arm['unusable']} unusable" if arm["unusable"] else ""
         return f"{name} {arm['passed']}/{arm['n']} ({arm['rate'] * 100:.0f}%{extra})"
+    sel = report.get("selection")
+    if sel is not None and not sel.get("adopted") and pr["base"]["n"] > 1:
+        # no edited harness reached the final: the final IS the base, so the baseline over N is the whole result
+        return f"pass rate {part('base', pr['base'])}; no edited harness adopted\n"
     final = f"final {pr['final_label']}" if pr.get("final_label") else "final"
     one = pr["base"]["n"] <= 1 and pr["final"]["n"] <= 1 and pr["final"]["n"] > 0
     return f"pass rate {part('base', pr['base'])}, {part(final, pr['final'])}" + \
         ("  (one sample each: not a measurement)" if one else "") + "\n"
+
+
+def sweep_exhausted(budget: Any) -> bool:
+    """True when no further solver session may start: the wall clock is spent, the sweep's session cap is reached, or the
+    solver role cap is. (It used to look at the wall clock only, so a refusal by session count showed up as one dead
+    rollout after another, counted as unusable in both arms, instead of as a stop.)"""
+    snap = budget.snapshot()
+    cap = (snap.get("role_caps") or {}).get("solver")
+    return bool(snap["remaining_s"] <= 0 or snap["exhausted"] or (cap is not None and snap["counts"]["solver"] >= cap))
 
 
 def run_extra_rollouts(adapter: Any, res: Any, *, up: Any, runs_root: Path, task: str, k: int, n: int, audit: Any,
@@ -1040,33 +1062,39 @@ def run_extra_rollouts(adapter: Any, res: Any, *, up: Any, runs_root: Path, task
     Upstream rolls ONE base and ONE of each candidate; `run_task` takes no count. The extras use upstream's own run-id
     namespace (`Namespace.run_id`) and, for the final, the harness directory upstream wrote for the delivered final
     (`<task dir>/harnesses/<final>`), so they are the same harnesses upstream rolled once. They alternate (base2, final.r2,
-    base3, ...) so a drift in the model or the GPU over the run does not fall on one arm. They run only when an edited
-    harness was adopted: with no edit the final IS the base and there is nothing to compare. A rollout that dies is
-    counted (and is not in the pass count); a spent budget stops the rest. Returns
-    `{base, final, errors, skipped}`: the labels run, one `label: error` per failure, and why the rest did not run."""
+    base3, ...) so a drift in the model or the GPU over the run does not fall on one arm. The final's repeats run only
+    when an edited harness was adopted: with no edit the final IS the base and there is nothing to compare. The BASE extras
+    (base2..baseN) always run: the baseline pass rate over N is a result in itself, whatever the proposer did (decided 2026-11-01). A
+    rollout that dies is counted (and is not in the pass count); a spent budget (wall clock or session count, see
+    `sweep_exhausted`) stops the rest. Returns `{base, final, errors, skipped}`: the labels run, one `label: error` per
+    failure, and why the rest did not run (`skipped`: the final's repeats not run for want of an adopted edit, and/or the
+    budget stop)."""
     out: dict[str, Any] = {"base": [], "final": [], "errors": [], "skipped": None}
     if n <= 1:
         return out
     sel = (getattr(res, "selections", None) or {}).get("agg")
     chosen = sel.get("chosen_label") if isinstance(sel, dict) else None
+    ns = up.schedule.Namespace(adapter.spec.name, adapter.substrate.name, "agg", k)
+    hdir: Path | None = None
+    why_no_final = None
     if not (isinstance(sel, dict) and sel.get("ok") and chosen):
-        out["skipped"] = "upstream's selection gave no usable final"
+        why_no_final = "upstream's selection gave no usable final"
     elif sel.get("chosen_tree_is_base") is not False:
-        out["skipped"] = f"no edited harness was adopted (the final {chosen} is the base): nothing to compare, no extra rollout run"
+        why_no_final = f"no edited harness was adopted (the final {chosen} is the base): nothing to compare it with"
     else:
-        ns = up.schedule.Namespace(adapter.spec.name, adapter.substrate.name, "agg", k)
         hdir = ns.task_dir(runs_root, task) / "harnesses" / chosen
         if not hdir.is_dir():
-            out["skipped"] = f"the harness directory of the final {chosen} is not on disk"
-    if out["skipped"]:
-        audit.emit("extra_rollouts_skipped", n=n, reason=out["skipped"])
-        return out
+            hdir, why_no_final = None, f"the harness directory of the final {chosen} is not on disk"
+    if why_no_final:
+        out["skipped"] = f"{why_no_final}: base2..base{n} run, the final's repeats do not"
+        audit.emit("extra_rollouts_skipped", n=n, reason=out["skipped"], base_extras_run=True)
     plan = [(label, None if arm == "base" else hdir) for i in range(2, n + 1)
-            for arm, label in (("base", f"base{i}"), ("final", f"{chosen}.r{i}"))]
-    audit.emit("extra_rollouts_start", n=n, chosen=chosen, planned=len(plan))
+            for arm, label in (("base", f"base{i}"), ("final", f"{chosen}.r{i}")) if arm == "base" or hdir is not None]
+    audit.emit("extra_rollouts_start", n=n, chosen=chosen if hdir is not None else None, planned=len(plan))
     for done, (label, harness_dir) in enumerate(plan):
         if exhausted():
-            out["skipped"] = f"the sweep budget ran out: {done} of {len(plan)} extra rollouts ran"
+            stop = f"the sweep budget ran out: {done} of {len(plan)} extra rollouts ran"
+            out["skipped"] = f"{out['skipped']}; {stop}" if out["skipped"] else stop
             break
         try:
             adapter.execute(task, harness_dir, ns.run_id(task, label))
@@ -1232,7 +1260,7 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
                   selector_prop=make_selector_prop(prop))
         audit.emit("run_task_end", status=getattr(res, "status", None))
         extra = run_extra_rollouts(adapter, res, up=ctx.up, runs_root=runs_root, task=s.task, k=K, n=s.rollouts, audit=audit,
-                                   exhausted=lambda: budget.snapshot()["remaining_s"] <= 0)
+                                   exhausted=lambda: sweep_exhausted(budget))
     except BaseException as e:   # noqa: BLE001 - audited, torn down below, reported
         error = e
         audit.emit("error", type=type(e).__name__, message=sr.sanitize_terminal(str(e))[:300])
@@ -1822,8 +1850,14 @@ def hard_selftest_problems(r: Mapping[str, Any]) -> list[str]:
                     adopted=False, verdict="base-kept", base_passed=False, chosen_passed=False)
         if {k: sel.get(k) for k in want} != want:
             bad.append(f"selection should deliver a base-equal agg1 and the runner say base-kept: {sel}")
-        if n > 1 and (extra_base or extra_final or "no edited harness was adopted" not in str(plan.get("extra_skipped"))):
-            bad.append(f"with no edit adopted no extra rollout should run, and the plan should say why: {plan}")
+        if n > 1:                                            # the baseline is measured N times whatever the proposer did
+            if len(extra_base) != n - 1 or extra_final or plan.get("extra_errors") \
+                    or "no edited harness was adopted" not in str(plan.get("extra_skipped")):
+                bad.append(f"with no edit adopted the {n - 1} base repeats should run, no repeat of the final should, and the plan "
+                           f"should say why: {plan}")
+            pr = r.get("pass_rates") or {}
+            if (pr.get("base") or {}).get("passed") != 0 or (pr.get("base") or {}).get("n") != n:
+                bad.append(f"the pass rate of the base should be 0/{n}: {pr}")
     else:
         bad.append(f"the hard selftest has no expectations for scenario {scenario!r}")
     return bad

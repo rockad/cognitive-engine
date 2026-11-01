@@ -285,20 +285,19 @@ def test_an_unknown_scenario_or_task_is_a_problem_not_a_pass():
 # ── stage 1c: the same verdicts at --rollouts N, and the proposer hint ──
 
 def golden_n(scenario: str, n: int, *, hint: bool = True) -> dict:
-    """`golden`, as a sweep at `--rollouts n` would report it (the extras of the adopt scenario run; of a refusal, they do not)."""
+    """`golden`, as a sweep at `--rollouts n` would report it (the base repeats always run; the final's repeats only in the adopt scenario)."""
     r = golden(scenario)
     inst = hd.instance(TASK)
     naive, right = f"Total: {hd.naive_total(inst.input_text)}\n", inst.expected_line + "\n"
     adopt = scenario == "format-rules"
-    eb = [f"base{i}" for i in range(2, n + 1)] if adopt else []
+    eb = [f"base{i}" for i in range(2, n + 1)]
     ef = [f"agg1.r{i}" for i in range(2, n + 1)] if adopt else []
     r["rollouts"] += [{"label": x, "passed": False, "n_passed": 2, "answer_excerpt": naive} for x in eb]
     r["rollouts"] += [{"label": x, "passed": True, "n_passed": 3, "answer_excerpt": right} for x in ef]
-    nb = n if adopt else 1
     r["rollouts_plan"] = {"n": n, "extra_base_run": eb, "extra_final_run": ef, "extra_errors": [],
                           "extra_skipped": None if adopt or n == 1 else "no edited harness was adopted (the final agg1 is the base): "
-                                                                         "nothing to compare, no extra rollout run"}
-    r["pass_rates"] = {"final_label": "agg1", "base": {"passed": 0, "n": nb}, "final": {"passed": nb if adopt else 0, "n": nb}}
+                                                                         f"nothing to compare it with: base2..base{n} run, the final's repeats do not"}
+    r["pass_rates"] = {"final_label": "agg1", "base": {"passed": 0, "n": n}, "final": {"passed": n if adopt else 0, "n": n if adopt else 1}}
     if adopt and n > 1:
         r["selection"].update(verdict="higher-rate", fisher_p=stage1.fisher_two_sided(n, n, 0, n))
     sha = stage1.proposer_hint.digest("ENVIRONMENT RULES x\n")
@@ -331,14 +330,22 @@ def test_the_eight_rollout_adopt_scenario_notices_each_way_the_measurement_could
     assert any(needle in p for p in hard_selftest_problems(r)), (name, hard_selftest_problems(r))
 
 
-def test_a_refusal_scenario_at_eight_rollouts_must_not_run_the_extras_and_must_say_why():
+def test_a_refusal_scenario_at_eight_rollouts_runs_the_base_extras_not_the_finals_and_must_say_why():
     r = golden_n("forbid-script", 8)
+    assert r["rollouts_plan"]["extra_base_run"] == [f"base{i}" for i in range(2, 9)] and r["rollouts_plan"]["extra_final_run"] == []
     r["rollouts_plan"]["extra_skipped"] = None
-    assert any("no extra rollout should run" in p for p in hard_selftest_problems(r))
+    assert any("base repeats should run" in p for p in hard_selftest_problems(r))                  # it must say why
     r = golden_n("forbid-script", 8)
-    r["rollouts_plan"]["extra_base_run"] = ["base2"]
-    r["rollouts"].append({"label": "base2", "passed": False, "n_passed": 2, "answer_excerpt": f"Total: {hd.naive_total(hd.instance(TASK).input_text)}\n"})
-    assert any("no extra rollout should run" in p for p in hard_selftest_problems(r))
+    r["rollouts_plan"]["extra_final_run"] = ["agg1.r2"]                                             # a repeat of the final ran
+    r["rollouts"].append({"label": "agg1.r2", "passed": False, "n_passed": 2})
+    assert any("base repeats should run" in p for p in hard_selftest_problems(r))
+    r = golden_n("forbid-script", 8)
+    r["rollouts_plan"]["extra_base_run"].pop()                                                      # a base repeat is missing
+    r["rollouts"].pop()
+    assert any("base repeats should run" in p for p in hard_selftest_problems(r))
+    r = golden_n("forbid-script", 8)
+    r["pass_rates"]["base"]["n"] = 1                                                                # measured once, as before
+    assert any("pass rate of the base should be 0/8" in p for p in hard_selftest_problems(r))
 
 
 def test_selftest_problems_counts_the_extra_rollouts_as_sessions_that_must_have_run():
@@ -626,7 +633,7 @@ def test_eight_rollouts_and_the_hint_run_21_sessions_and_report_pass_rates_not_a
 
 
 @pytest.mark.requires_rootless_docker
-def test_with_no_edit_adopted_the_extra_rollouts_do_not_run_and_a_hint_off_sweep_says_so(tmp_path, verified, proposer_image, up):
+def test_with_no_edit_adopted_only_the_base_extras_run_and_a_hint_off_sweep_says_so(tmp_path, verified, proposer_image, up):
     base = tmp_path / "st"
     base.mkdir()
     base.chmod(0o755)
@@ -634,12 +641,14 @@ def test_with_no_edit_adopted_the_extra_rollouts_do_not_run_and_a_hint_off_sweep
                            proposer_hint="off")
     r = outcome.report
     assert outcome.exit_code == 0 and selftest_problems(outcome) == [], r
-    assert r["sessions"]["counts"] == {"proposer": 3, "solver": 4, "total": 7}                  # 7 of the 21 the plan allowed
+    assert r["sessions"]["counts"] == {"proposer": 3, "solver": 11, "total": 14}                # 4 + the 7 base repeats: 14 of the 21 the plan allowed
     assert r["rollouts_plan"]["sessions_planned"] == 21 and "no edited harness was adopted" in r["rollouts_plan"]["extra_skipped"]
     assert r["proposer_hint"] == {"on": False, "source": "--proposer-hint", "sha": None}
     assert [a["hint"] for a in r["_proposer_audit"]] == [False] * 3
-    assert r["selection"]["verdict"] == "base-kept" and r["pass_rates"]["base"]["n"] == 1
+    assert r["selection"]["verdict"] == "base-kept" and r["pass_rates"]["base"]["n"] == 8
+    assert r["rollouts_plan"]["extra_base_run"] == [f"base{i}" for i in range(2, 9)] and r["rollouts_plan"]["extra_final_run"] == []
     assert "extra rollouts: no edited harness was adopted" in printed.getvalue()
+    assert "pass rate base 0/8 (0%); no edited harness adopted" in printed.getvalue()
     assert "pass rate base 0/1 (0%), final agg1 0/1 (0%)  (one sample each: not a measurement)" in printed.getvalue()
 
 
