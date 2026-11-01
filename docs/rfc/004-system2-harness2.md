@@ -371,12 +371,12 @@ The following architectural assumptions are tracked and verified across slice sp
 5. **Local model viability**: **VERIFIED by run #4 and the benchmark (section 9.2)** for `gemma4:e4b` 16k with thinking ON. `gemma4:12b` is **DISPROVEN** on this host (8 GB GPU shared with the desktop).
 6. **Native `sbx` MicroVMs**: **VERIFIED live (2026-10-31, v0.50.1)**. The real command flow is `create` / `cp` / `exec` / `rm --force`, and its daemon needs the `kvm` gid (started via `sg kvm`). `sbx` is now the AUTO default for model-free untrusted execution, with a loud Docker fallback; model sessions stay on Docker (section 9.7).
 7. **Live OpenRouter Quota Response Schema**: **STILL UNVERIFIED**. Field names for `GET /api/v1/key` are verified against mock schemas but pending validation against live endpoint responses (Stage 2).
-8. **Accepted proposer edit applied and re-scored**: **STILL UNVERIFIED**. No proposer edit has been accepted in run #4 or in the three stage 1b runs (sections 9.3 and 9.4).
+8. **Accepted proposer edit applied and re-scored**: **STILL UNVERIFIED**. No proposer edit has been accepted in run #4, the three stage 1b runs or stage 1c (sections 9.3, 9.4 and 9.11).
 9. **`claude_cli` token delivery (value vs file)**: **STILL UNVERIFIED / unsolved** (Stage 3).
 
 ---
 
-## 9. Stage 1 Results and Lessons (2026-10-30/31)
+## 9. Stage 1 Results and Lessons (2026-10-30 to 11-01)
 
 ### 9.1 Runs
 
@@ -420,9 +420,9 @@ Stage 1b added a harder task set so that a proposer edit could be accepted and r
 
 Honest reading:
 - **The loop is unproven.** No run produced an accepted edit, so apply, frontmatter freeze on a live edit, and re-score have still never run on a real candidate.
-- The base harness passes about half the time at k=1, so a pass/fail difference between harnesses is noise, not signal.
+- The base harness was estimated to pass about half the time at k=1 (earlier estimate, superseded by the 0/8 measurement in section 9.11), so a pass/fail difference between harnesses at k=1 is noise, not signal.
 - The two refusals are evidence that the slot table works against a real proposer (it stopped a `c7` edit), not evidence that the optimizer improves anything.
-- Next step: improve the proposer's signal by telling it which files are mutable. Check first that the upstream rules allow this.
+- The proposed next step, telling the proposer which files are mutable, was tried in stage 1c and did not stop illegal edits (section 9.11).
 
 ### 9.5 Route filter and model pinning
 
@@ -455,7 +455,7 @@ What it does not guarantee: a process running as the same user can allocate and 
 | AUTO | `sbx` selected but it fails before the candidate starts (create, image, staging) | Docker for the rest of that runner's life, with a warning (`sbx-run-failed`); never after the candidate has started |
 | `docker` | Any | Docker is forced; `sbx` is never tried |
 | `sbx` | Any model-free | `sbx`, or fail closed if it is unavailable (no Docker fallback) |
-| any | Model sessions (proposer channels) | Docker only; model sessions stay on Docker |
+| any | Model sessions (proposer channels) | Docker by default; an opt-in `sbx` model route exists (`COGNITIVE_HARNESS2_MODEL_SANDBOX=sbx`), not yet proven by a real run (section 9.11) |
 | any | Neither runtime available | Fail closed; no code runs |
 
 Precondition for selecting `sbx`: both host-reach settings (`ssh.agentForwardingEnabled`, `browser.enabled`) must be off and no daemon restart pending. Under AUTO a violation means a fallback to Docker with the reason; only in `sbx` mode does it refuse (`COGNITIVE_HARNESS2_SBX_ALLOW_HOST_SETTINGS=1` overrides these two settings only, for the live tests). Earlier text in this RFC that described `sbx` as "unverified", "not installed" or only selected on explicit opt-in is superseded by this section.
@@ -466,7 +466,8 @@ The slot table (section 6.2 item 5) is now enforced on every task set, easy and 
 
 ### 9.9 Known gaps and open items
 
-- **Proposer signal**: no accepted proposer edit yet (section 9.4); hint the proposer which files are mutable once the upstream rules are confirmed to allow it.
+- **Proposer signal**: no accepted proposer edit yet (sections 9.4, 9.11). The mutable-files hint did not stop illegal edits. Improvement-loop experiments are stopped by user decision (2026-11-01) until a smarter proposer (stage 2, separate go); keeping the legal parts of a proposal is an unchosen option that deviates from upstream.
+- **`sbx` model-session route**: exists, opt-in (`COGNITIVE_HARNESS2_MODEL_SANDBOX=sbx`); not yet proven by a real stage-1 run on `sbx` (section 9.11).
 - **Test isolation**: done. Leak checks use per-run ids rather than daemon-wide counts, so a concurrent agent's containers no longer break the "nothing left behind" assertions.
 - **`claude_cli` token delivery** (value vs file): unsolved.
 - **Stages 2 and 3**: user-gated, not started. Stage 2 (OpenRouter, zdr strict, dollar cap) and Stage 3 (Claude and Antigravity channels, zdr off, open content only) each need a separate user go.
@@ -479,3 +480,42 @@ The slot table (section 6.2 item 5) is now enforced on every task set, easy and 
 Correction (2026-11-01): the first pass was requested on Fable 5.1 but the harness served it with Sonnet 5.5 (the transcript records `claude-sonnet-5-5`; the user's subscription has no Fable), so it was a Sonnet adversarial review, not a Fable one. Two later read-only passes ran on Opus 5.5 (verified from their transcripts): one on the fix diffs and the guard backlog, one on the `sbx` model route. Fixes made after those Opus passes have not been re-reviewed by a stronger model.
 
 The first pass found no critical issue and no smuggling path out of a contained session. It led to these fixes in the same body of work: the Jev Agent-guard unknown-agent hole (HIGH), approval gate hardening (section 9.6), model pinning in the proxy (section 9.5), `ACCESS-SUMMARY` counters, non-interruptible teardown, the slot table on every task set (section 9.8), and lower-severity items.
+
+### 9.11 Stage 1c: hinted run with 8 rollouts (2026-11-01)
+
+Stage 1c asked two things: does telling the proposer which files are mutable stop illegal edits, and does a measured baseline (8 rollouts instead of 3) make a later harness difference readable. One real run, local `gemma4-e4b-16k`, hard task set, $0.
+
+| Item | Value |
+|---|---|
+| Run id | `stage1-20261101T185011Z-d08d` |
+| Flags | `--task-set hard --rollouts 8 --proposer-hint on`; profile `caps.sessions=21` |
+| Sessions | 14 of 21 planned ran (3 proposers plus 11 solver rollouts), 441 s |
+| Health | All exit 0, no timeouts, no denied requests, teardown clean |
+| Verdict | `base-kept` |
+
+Baseline (rollouts `base1`..`base8`): **0 of 8 passed**. Answers: -302.27, -1292.27, -1191.31, -292.27, 10572.61, -291.27, -291.27, 7729.49; the correct answer is -1291.27. The baseline on the hard task is a measurement now. The "about half" in section 9.4 was an earlier estimate and is superseded. The unedited starting harness rolled in `dom1` and `agg1` (passed) and `inv1` (failed): 2 of 3, not separable from luck.
+
+Proposer hint: the runner's `ENVIRONMENT RULES` block, derived from the slot table and recorded in the audit, did **not** stop illegal edits.
+- The INV proposer changed `scripts/calculate_total.py` (`c7`).
+- The DOM proposer changed `scripts/ledger_sum.py` (`c7`).
+- The slot table refused both. A refusal discards the whole proposal, including its legal parts (`systemprompt.md`, a skill file, `tool_guidance`).
+- The AGG proposer made no change.
+
+No edited harness was adopted, so the 7 extra final rollouts did not run (extras for the base always run, decision 2026-11-01).
+
+Honest reading:
+- No proposer edit has been accepted in any real run: 5 real hard-set runs across gemma and qwen. The loop is unproven; this run does not change that.
+- The 4B local proposers' habit is to write the answer into a script, which the slot table refuses.
+- The slot table again worked against a real proposer.
+
+**Decision (user, 2026-11-01): stop the improvement-loop experiments for now.**
+- The plumbing is accepted as proven: contained sessions, route filter and model pinning, approval gate, `sbx` route, slot table, harvest, teardown and audit.
+- The loop is to be tested later with a smarter proposer. Stage 2 (hosted model via OpenRouter, zdr strict, a dollar cap) needs a separate user go. Stage 3 (Claude and Antigravity subscription channels) is deferred; only the credential-delivery design note exists (`~/.agents/cognitive-engine-stage3-credential-delivery-design.md`).
+- Options recorded, not chosen:
+  - Keep a proposal's legal parts and drop only its forbidden files. This deviates from upstream's whole-proposal refusal and would need a decision.
+  - A smarter proposer (the path above).
+  - Stop.
+
+Also recorded on 2026-11-01:
+- The approval gate's Claude Code markers were narrowed to the exact runtime variables listed in section 9.6, after a user's own `CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE` setting refused a real terminal.
+- The `sbx` model-session route exists and is opt-in (`COGNITIVE_HARNESS2_MODEL_SANDBOX=sbx`). It has not been proven by a real stage-1 run on `sbx`; model sessions on the default path stay on Docker (section 9.7).

@@ -258,7 +258,7 @@ Governed by user decisions made via `/clarify` on 2026-10-29. Slice 3b wires ups
    - **`WS-E` Stage 1 Local Smoke Runner**: Execute Stage 1 smoke test ($k=1$, 3 sessions, 4 rollouts, demo task, `opencode` -> `ollama gemma4-e4b-16k`, 2 GB / 2 CPU / 45m wall cap, $0 cost). **COMPLETE: run #4 succeeded 2026-10-31** (see 3.3.3).
    - *Adversarial Gate*: Each workstream step undergoes read-only adversarial review by Antigravity on its own quota prior to human approval gates.
 
-#### 3.3.3 Stage 1 Results and Open Items (2026-10-31)
+#### 3.3.3 Stage 1 Results and Open Items (2026-10-31, updated 2026-11-01)
 
 Full write-up: [RFC 004 section 9](../rfc/004-system2-harness2.md).
 
@@ -268,7 +268,14 @@ Full write-up: [RFC 004 section 9](../rfc/004-system2-harness2.md).
 - **Route filter DONE**: allow-list `GET /api/tags`, `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/completions`, `POST /api/show`; the model is pinned to the approved model in the proxy; the denial log records method and path.
 - **Test isolation DONE**: leak checks use per-run ids, not daemon-wide counts.
 - **sbx DONE**: v0.50.1 verified live and now the AUTO default for model-free untrusted execution, with a loud Docker fallback. `docker` forces Docker, `sbx` fails closed, model sessions stay on Docker, and both host-reach settings must be off.
-- **Stage 1b DONE (hard task set)**: `sum-signed-hard`, a weak base harness, `--task-set {easy,hard}`. Three real runs (gemma x2, qwen x1) accepted no proposer edit. The INV proposer edited a `c7` script twice and the slot table refused it; the qwen proposers made no edit; the base harness passes about half the time at k=1, so pass/fail is noise. **The improvement loop is still unproven.**
+- **Stage 1b DONE (hard task set)**: `sum-signed-hard`, a weak base harness, `--task-set {easy,hard}`. Three real runs (gemma x2, qwen x1) accepted no proposer edit. The INV proposer edited a `c7` script twice and the slot table refused it; the qwen proposers made no edit; the base harness was estimated at about half at k=1 (earlier estimate, superseded by the 0/8 measurement in stage 1c), so pass/fail at k=1 was noise. **The improvement loop is still unproven.**
+- **Stage 1c DONE (hinted run, 8 rollouts, 2026-11-01)**: run `stage1-20261101T185011Z-d08d`, local `gemma4-e4b-16k`, hard task set, $0, `--rollouts 8 --proposer-hint on`. 14 of 21 planned sessions ran (3 proposers plus 11 solver rollouts) in 441 s; all exit 0, no timeouts, no denied requests, teardown clean; verdict `base-kept`.
+  - The baseline is now a measurement: `base1`..`base8` passed 0 of 8 (correct -1291.27). The unedited starting harness rolled 2 of 3 in the proposer-stage rollouts (`dom1`, `agg1` passed, `inv1` failed), not separable from luck.
+  - The proposer hint (the runner's `ENVIRONMENT RULES` block, derived from the slot table) did not stop illegal edits: the INV proposer changed `scripts/calculate_total.py` and the DOM proposer `scripts/ledger_sum.py` (both `c7`); the slot table refused both, and a refusal discards the whole proposal including its legal parts. The AGG proposer made no change. No edited harness was adopted, so the 7 extra final rollouts did not run.
+  - **No proposer edit has been accepted in any real run** (5 real hard-set runs across gemma and qwen). The loop is unproven.
+  - **Decision (user, 2026-11-01): stop the improvement-loop experiments for now.** The plumbing (contained sessions, route filter and model pinning, approval gate, `sbx` route, slot table, harvest, teardown, audit) is accepted as proven. The loop is to be tested later with a smarter proposer: stage 2 (hosted model via OpenRouter, zdr strict, a dollar cap) needs a separate user go; stage 3 (Claude/Antigravity subscription channels) is deferred, with only the credential-delivery design note (`~/.agents/cognitive-engine-stage3-credential-delivery-design.md`) in existence. Options recorded, not chosen: keep a proposal's legal parts and drop only its forbidden files (deviates from upstream's whole-proposal refusal; needs a decision), a smarter proposer, stop.
+  - The approval gate's Claude Code markers were narrowed on 2026-11-01 to the exact runtime variables (RFC 004 section 9.6), after a user's own `CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE` setting refused a real terminal.
+  - The `sbx` model-session route exists and is opt-in (`COGNITIVE_HARNESS2_MODEL_SANDBOX=sbx`); not yet proven by a real stage-1 run on `sbx`.
 - **Independent read-only verification** (requested as Fable 5.1, actually served by Sonnet 5.5; see RFC 004 section 9.10): no critical issue and no smuggling path. Fixed in the same body of work:
   - Jev Agent-guard unknown-agent hole (HIGH).
   - Approval gate hardening (honest limit: a same-user process can drive a pty; markers are refused; `/dev/tty` plus a nonce).
@@ -284,9 +291,10 @@ Full write-up: [RFC 004 section 9](../rfc/004-system2-harness2.md).
   - #6 bench -> #5's branch.
   - Docs PR (`docs/stage1-findings`) -> `main` after #5. It overlaps RFC 002 and this plan with #3 and #5; the second to merge resolves.
 - **Open items**:
-  - Improve proposer signal: hint the proposer which files are mutable (check the upstream rules allow it first).
-  - Stage 2 (OpenRouter, zdr strict, $ cap): the user's separate go.
-  - Stage 3 (Claude/Antigravity channels, zdr off, open content only): the user's separate go.
+  - Improvement-loop experiments: stopped by user decision (2026-11-01). The mutable-files hint was tried (stage 1c) and did not stop illegal edits. To be resumed with a smarter proposer; keeping a proposal's legal parts is an unchosen option that would need a decision.
+  - Stage 2 (OpenRouter, zdr strict, $ cap): the user's separate go; the first test of the loop with a smarter proposer.
+  - Stage 3 (Claude/Antigravity channels, zdr off, open content only): deferred; only the credential-delivery design note exists.
+  - `sbx` model-session route (opt-in): not yet proven by a real stage-1 run.
   - `claude_cli` token delivery: unsolved.
   - Guard backlog: click-through false positives on `this`/variable keys, the resume model gap, project configs.
   - Track 4.
@@ -382,11 +390,12 @@ WS5 and WS6 are independent. **WS6 is done and committed on `feat/track1-jev-ada
 | **WS-B** | **Track 3 (Slice 3b runner)** | `feat/track3-harness2` | `packages/harness2/` | `ubuntu:26.04` rootless Docker base image, host unix-socket bridge, forward proxy container, and session runner | Claude Code (`code-engineer`) | `flash` |
 | **WS-C** | **Track 3 (Slice 3b binding)** | `feat/track3-harness2` | `packages/harness2/` | Upstream `Proposer` subclass with duck-typing couplings workaround, container runner binding, and `agy_cli` adapter | Claude Code (`code-engineer`) | `flash` |
 | **WS-E** | **Track 3 (Slice 3b smoke)** | `feat/track3-harness2` | `packages/harness2/` | **Complete**: Stage 1 run #4 succeeded 2026-10-31 (P=3, R=4, 7/7 reached the model, 127 s, $0). No accepted proposer edit yet | Claude Code (`code-engineer`) | `flash` |
-| **WS-1b** | **Track 3 (Stage 1b)** | `feat/track3-harness2` | `packages/harness2/` | **Complete 2026-10-31**: hard task set (`sum-signed-hard`, weak base harness, `--task-set {easy,hard}`); 3 real runs (gemma x2, qwen x1), no proposer edit accepted yet (loop unproven; see 3.3.3). Open: improve proposer signal |  Claude Code (`code-engineer`) | `flash` |
+| **WS-1b** | **Track 3 (Stage 1b)** | `feat/track3-harness2` | `packages/harness2/` | **Complete 2026-10-31**: hard task set (`sum-signed-hard`, weak base harness, `--task-set {easy,hard}`); 3 real runs (gemma x2, qwen x1), no proposer edit accepted yet (loop unproven; see 3.3.3). Open: none; see WS-1c |  Claude Code (`code-engineer`) | `flash` |
+| **WS-1c** | **Track 3 (Stage 1c)** | `feat/track3-harness2` | `packages/harness2/` | **Complete 2026-11-01**: hinted run, 8 rollouts (`--task-set hard --rollouts 8 --proposer-hint on`); baseline 0/8; hint did not stop illegal `c7` edits; verdict `base-kept`. **Improvement-loop experiments stopped by user decision**; loop to be tested with a smarter proposer later (see 3.3.3) | Claude Code (`code-engineer`) | `flash` |
 | **WS-RF** | **Track 3 (hardening)** | `feat/track3-harness2` | `packages/harness2/` | **Complete**: route allow-list (`GET /api/tags`, `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/completions`, `POST /api/show`), model pinned to the approved model, denial log with method and path | Claude Code (`code-engineer`) | `flash` |
 | **WS-TI** | **Track 3 (tests)** | `feat/track3-harness2` | `packages/harness2/tests/` | **Complete**: per-run ids for leak checks on the shared rootless daemon | Claude Code (`qa-engineer`) | `flash` |
 | **WS-SBX** | **Track 3 (sbx)** | `feat/track3-harness2` | `packages/harness2/` | **Complete**: `sbx` v0.50.1 verified live; now the AUTO default for model-free untrusted execution with loud Docker fallback (`docker` forces Docker, `sbx` fails closed); model sessions stay on Docker; both host-reach settings must be off | Claude Code (`code-engineer`) | `flash` |
-| **Stage 2 / 3** | **Track 3 (gated)** | n/a | n/a | **User-gated, not started**: Stage 2 (OpenRouter, zdr strict, $ cap) and Stage 3 (Claude/Antigravity channels, zdr off, open content only) each need a separate user go; Stage 3 also needs `claude_cli` token delivery | n/a | n/a |
+| **Stage 2 / 3** | **Track 3 (gated)** | n/a | n/a | **User-gated, not started**: Stage 2 (OpenRouter, zdr strict, $ cap; the next test of the loop with a smarter proposer) needs a separate user go; Stage 3 (Claude/Antigravity channels, zdr off, open content only) is deferred; Stage 3 also needs `claude_cli` token delivery | n/a | n/a |
 
 ---
 
