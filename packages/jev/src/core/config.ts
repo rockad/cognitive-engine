@@ -543,20 +543,20 @@ export interface JevConfigIo {
   readFile: (file: string) => Buffer;
 }
 
-const DEFAULT_CONFIG_IO: JevConfigIo = {
+export const DEFAULT_CONFIG_IO: JevConfigIo = {
   lstat: (f) => fsSync.lstatSync(f),
   stat: (f) => fsSync.statSync(f),
   readFile: (f) => fsSync.readFileSync(f)
 };
 
-type ConfigFileRead = { kind: 'missing' } | { kind: 'problem'; problem: string } | { kind: 'text'; text: string };
+export type ConfigFileRead = { kind: 'missing' } | { kind: 'problem'; problem: string } | { kind: 'text'; text: string };
 
 /**
  * Reads the config file once, defensively: lstat first so a dangling symlink is not mistaken for
  * "no file", a size check before and after the read, and a regular-file check so a FIFO or
  * directory is never read. A path with no entry at all is `missing`.
  */
-function readConfigFile(file: string, io: JevConfigIo): ConfigFileRead {
+export function readConfigFile(file: string, io: JevConfigIo): ConfigFileRead {
   let isLink = false;
   try {
     isLink = io.lstat(file).isSymbolicLink();

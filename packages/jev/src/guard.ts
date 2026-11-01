@@ -16,7 +16,8 @@ import { modelTierRank } from './core/governance.js';
 import { describeAgentLookup, missingAgentDetail, readAgentDefinition } from './agent-definitions.js';
 import { assessModelRequest } from './models.js';
 import { evaluateWorkflowInput, type ScriptFact } from './workflow-guard.js';
-import { resolveSessionModel, sessionModelFromTranscript, type SessionModelSource } from './session-model.js';
+import { resolveSessionModel, sessionModelFromTranscript, type SessionModel, type SessionModelSource } from './session-model.js';
+import { lowerModel } from './project-config.js';
 
 export { sessionModelFromTranscript };
 
@@ -29,13 +30,36 @@ export interface Verdict {
 
 export type GuardHarness = 'claude' | 'antigravity';
 
+/** Which config file could not be trusted: the user's or a project's. */
+export type ConfigScope = 'user' | 'project';
+
 /**
  * Facts the evaluation leaves for the hook entrypoint beyond the verdict: for a Workflow call, the
  * decision and the hashes of the script text analysed (see workflow-pin.ts). A caller that does not
  * pass one gets none, and `evaluateClaude` then has no side effects.
  */
-export interface GuardSink {
+export interface GuardContext {
+  /** In: a valid project config's `guard.ceiling` (project-config.ts) and the file it came from. */
+  projectCeiling?: string | null;
+  projectCeilingFile?: string;
+  /** Out: for a Workflow call, the decision and the script hashes (workflow-pin.ts). */
   workflow?: { decision: 'allow' | 'ask'; scripts: ScriptFact[] };
+}
+
+/**
+ * The session model the call is compared against: the lower of the real session model and the
+ * project ceiling, with a note for the ask text when the ceiling is what lowered it. Without a
+ * ceiling (or when the session model is unknown or unrankable) it is the session model unchanged.
+ */
+function ceilingFor(session: SessionModel, ctx: GuardContext | undefined): { model: string | null; note: string } {
+  const ceiling = ctx?.projectCeiling;
+  if (!ceiling) return { model: session.model, note: '' };
+  const model = lowerModel(session.model, ceiling);
+  const note =
+    model !== session.model
+      ? ` The project ceiling "${ceiling}"${ctx?.projectCeilingFile ? ` (${ctx.projectCeilingFile})` : ''} is below the session model "${session.model}", so it is the limit here; a project file can only tighten the ceiling.`
+      : '';
+  return { model, note };
 }
 
 export interface AgentCall {
@@ -130,19 +154,21 @@ export function decideAntigravitySubagents(subagents: AntigravitySubagent[]): Ve
 }
 
 /** Claude Code Workflow call -> verdict (see workflow-guard.ts). Shape mismatches ask and are audited. */
-export function evaluateClaudeWorkflow(input: any, sink?: GuardSink): Verdict | null {
+export function evaluateClaudeWorkflow(input: any, sink?: GuardContext): Verdict | null {
   const session = resolveSessionModel(input);
-  const decision = evaluateWorkflowInput(input.tool_input, input.cwd, session.model);
+  const effective = ceilingFor(session, sink);
+  const decision = evaluateWorkflowInput(input.tool_input, input.cwd, effective.model);
   if (sink) sink.workflow = { decision: decision.decision, scripts: decision.scripts };
   if (decision.decision === 'allow') return null;
   return {
     decision: 'ask',
-    reason: decision.message,
+    reason: decision.message + effective.note,
     audit: {
       kind: 'workflow',
       tool_name: 'Workflow',
       session_id: input.session_id,
       sessionModel: session.model,
+      ...(sink?.projectCeiling ? { projectCeiling: sink.projectCeiling } : {}),
       sessionModelSource: session.source,
       scripts: decision.scripts,
       sites: decision.sites.map((s) => ({ file: s.file, line: s.line, col: s.col, reason: s.reason }))
@@ -150,7 +176,7 @@ export function evaluateClaudeWorkflow(input: any, sink?: GuardSink): Verdict | 
   };
 }
 /** Claude Code PreToolUse input -> verdict. */
-export function evaluateClaude(input: any, sink?: GuardSink): Verdict | null {
+export function evaluateClaude(input: any, sink?: GuardContext): Verdict | null {
   if (typeof input?.tool_name !== 'string') {
     return {
       decision: 'ask',
@@ -170,15 +196,16 @@ export function evaluateClaude(input: any, sink?: GuardSink): Verdict | null {
   }
   const call = raw as AgentCall;
   const session = resolveSessionModel(input);
-  const facts = { tool_name: input.tool_name, session_id: input.session_id };
+  const effective = ceilingFor(session, sink);
+  const facts = { tool_name: input.tool_name, session_id: input.session_id, ...(sink?.projectCeiling ? { projectCeiling: sink.projectCeiling } : {}) };
   let definitionModel: string | null = null;
   if (call.model === undefined) {
     const unknown = unknownAgentVerdict(call, input.cwd);
     if (unknown) return { ...unknown, audit: { ...unknown.audit, ...facts } };
     definitionModel = agentDefinitionModel(call.subagent_type, input.cwd);
   }
-  const verdict = decideClaudeAgentCall(call, session.model, definitionModel, session.source);
-  return verdict ? { ...verdict, audit: { ...verdict.audit, ...facts } } : null;
+  const verdict = decideClaudeAgentCall(call, effective.model, definitionModel, session.source);
+  return verdict ? { ...verdict, reason: verdict.reason + effective.note, audit: { ...verdict.audit, ...facts } } : null;
 }
 
 /** Antigravity PreToolUse input -> verdict. A malformed subagent list fails closed (ask). */
@@ -203,8 +230,20 @@ export function guardErrorVerdict(err: unknown): Verdict {
  * The verdict for every guarded call while the Jev config cannot be trusted. Never an allow and
  * never limited to escalations: the user cannot know whether Jev is meant to be on or off.
  */
-export function configMalformedVerdict(file: string, problems: string[]): Verdict {
+export function configMalformedVerdict(file: string, problems: string[], scope: ConfigScope = 'user'): Verdict {
   const list = problems.map((p) => `- ${p}`).join('\n');
+  if (scope === 'project') {
+    return {
+      decision: 'ask',
+      reason:
+        `[jev] The project Jev config ${file} cannot be read, so the subagent guard cannot tell what it tightens and asks on every guarded call.\n` +
+        `Problems:\n${list}\n` +
+        'Fix: repair the file or remove it. A project file can only tighten the user config (a lower `guard.ceiling` model such as ' +
+        '{"guard":{"ceiling":"sonnet"}}, a mode that is not lower than yours); it can never turn the guard off or raise the ceiling. ' +
+        'Approve this call only if you intended it.',
+      audit: { kind: 'project-config-malformed', file, problems }
+    };
+  }
   const stray = problems.some((p) => p.startsWith("top-level 'mode'"));
   return {
     decision: 'ask',
