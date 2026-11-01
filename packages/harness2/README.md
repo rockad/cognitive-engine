@@ -477,7 +477,7 @@ uv run python -m cognitive_harness2.stage1 run --approve local-ollama --opencode
 uv run python -m cognitive_harness2.stage1 selftest            # --keep-in DIR keeps the audit and report
 ```
 
-Options: `--wall-s N` (total wall clock; it can only LOWER the profile's `wall_s`, raise that in the profile), `--per-session-s N` (default 600), `--runs-dir DIR` (the PARENT of the per-sweep directory, default `~/.local/state/cognitive-engine/harness2-stage1`), `--classification` (default `open`: the task, the harness and every prompt are synthetic), `--channel` (default `local-ollama`), `--task-set easy|hard` (default `easy`; `hard` is stage 1b, below).
+Options: `--wall-s N` (total wall clock; it can only LOWER the profile's `wall_s`, raise that in the profile), `--per-session-s N` (default 600), `--runs-dir DIR` (the PARENT of the per-sweep directory, default `~/.local/state/cognitive-engine/harness2-stage1`), `--classification` (default `open`: the task, the harness and every prompt are synthetic), `--channel` (default `local-ollama`), `--task-set easy|hard` (default `easy`; `hard` is stage 1b, below), `--proposer-hint on|off` (default on for `hard`, off for `easy`) and `--rollouts N` (default 1; both are stage 1c, below).
 
 `plan` prints the channel, endpoint, model, caps, expected P and R, timeouts, classification, that nothing leaves the machine, each preflight result and the exact `run` command. What `plan` does: read the profile, ask the channel policy, run the pinned read-only `docker info` and `docker image inspect`, send one `GET /api/tags` to the loopback Ollama. It creates no file, directory, container, network or socket, and `plan` is the default command.
 
@@ -634,6 +634,82 @@ It proves the pipeline CAN run the loop: harvest, validation, candidate rollout 
 - **An adopted edit is not a better harness.** See the selection section: at k=1 it is adopted because it exists. Judge `improved` against the `answer_excerpt` of `base1` and `agg1` before believing it, and expect a candidate that passes by luck.
 - **The cost is the same as stage 1** (seven sessions, one model call at a time, the same caps, about the same duration; twelve lines of input instead of five change little).
 - What would be a real signal: repeating the run over several instances and sweeps. This runner runs one task per sweep (`household/hard-1`); the other eight instances are there for that, behind a future flag.
+
+## Stage 1c: hinted run with 8 rollouts
+
+**Why.** The first real hard-set runs (2026-11-01) showed two things. The INV proposer wrote the answer into a script (slot c7, refused by the slot table, twice) and the qwen proposers made no edit: nothing told a proposer which files the runner keeps. And the base harness passes about half the time at k=1, so one pass or fail is noise. Stage 1c adds two flags and changes nothing else: the same task set, k=1, `modes=('agg',)`, the same gate and the same containers.
+
+### The proposer hint (`--proposer-hint on|off`)
+
+A short **ENVIRONMENT RULES** block, written by this runner and not by upstream, goes in front of each proposer session's system text: the harness files whose edits are kept (`systemprompt.md`, `LongTermMEMORY.md`, `tool_descriptions/tool_guidance.md`, and the bodies of `sub_agents/<name>/AGENT.md` and `skills/<name>/SKILL.md`), the ones whose edit gets the **whole proposal discarded** (`guardrails.md`, `scripts/<name>.py`, `plugin/<name>.ts`), and two plain rules (put instructions in words in a mutable file; never write the answer to a task into a file). `proposer_hint.py` derives both lists from the slot table (`upstream_surface.layout`, the same partition `check_surface` makes), so the text cannot drift from the table; a test holds it to it (every named mutable path classifies as mutable, every named read-only path as denied). It is never prepended to a solver rollout or to the selector.
+
+- Default: **on for `--task-set hard`, off for `easy`**. `--proposer-hint off` reproduces run #4's proposer prompts exactly.
+- Audit: each proposer session's `proposer-audit/<label>.<key>.meta.json` has `hint` (true or false) and, when true, `hint_sha` (12 hex digits) and `hint_block` (the block verbatim); `<label>.<key>.system.md` is the system text the session was given. `report.json` and the `sweep_start` event carry `proposer_hint: {on, source, sha}`, and `plan` prints the flag and where its value came from.
+
+### Rollouts (`--rollouts N`)
+
+**Upstream fixes R.** `schedule.run_task` rolls `base1..basek` and `recursion.run_parallel` rolls each candidate once, so R = 4k (4 at k=1: base1, inv1, dom1, agg1) and no parameter takes a rollout count. This runner therefore makes the extra rollouts itself, **after** `run_task` returns and without touching upstream: `run_extra_rollouts` calls the same adapter's `execute` for `base2..baseN` (no harness) and for `agg1.r2..agg1.rN` (the very harness directory upstream wrote for the delivered `agg1`), in upstream's own run-id namespace, alternating base and final so a drift in the model or the GPU does not fall on one arm. Each is a real solver session under the grant and the budget, judged and audited like the rest.
+
+`--rollouts N` is the number of rollouts of **the base and of the delivered final, each**. The default, 1, is upstream's own single one of each, so every existing command, plan and report means what it did. `inv1` and `dom1` are upstream's evidence for the aggregator and stay at one rollout each.
+
+**The session arithmetic, from the code** (`stage1.rollout_plan`; upstream's P and R come from `harness2.core.ledger`, not from this table):
+
+| `--rollouts` | P | R = 4 + 2 (N - 1) | sessions = P + R |
+| --- | --- | --- | --- |
+| 1 (default) | 3 | 4 | **7** |
+| 4 | 3 | 10 | 13 |
+| 8 | 3 | 18 | **21** |
+
+At N = 8 that is 3 proposers + 8 base + 8 final + inv1 + dom1 = **21 sessions**, not 19: the two upstream rollouts of the candidates that are not delivered are real sessions. If you sized a profile for 19, it is two short and `plan` refuses it.
+
+**The profile cap is checked, in plan and in run.** `build_plan` refuses a plan over the channel's `caps.sessions` (`plan` shows NOT READY, `run` exits 2 with nothing created) and names the number to put in the profile: `21 sessions are planned ... allows caps.sessions = 7 ...; raise caps.sessions to at least 21 there, or lower --rollouts`. The extra rollouts are in the plan's `planned_rollouts`, so the `ExecutionGrant` and its `SweepBudget` are made from them and no session beyond them can start, and `check_grant` refuses, before anything is created, a grant over the profile's cap even when it agrees with the plan. `plan` prints `P + R = total sessions (profile cap C)` and the wall-clock worst case, sessions x `--per-session-s` (21 x 600 s = 12600 s, which `plan` flags as more than the wall: the sweep stops starting sessions at the deadline).
+
+**When the extras do not run.** Only when an edited harness was adopted. If every proposer stage kept the base, the delivered final IS the base and there is nothing to compare, so no extra rollout runs (the report's `rollouts_plan.extra_skipped` says so, and the run ends with an `extra rollouts:` line). The plan still reserves the 21 sessions; the sweep uses 7.
+
+**What the report says.** Every rollout has an `arm` (`base`, `final`, or `other` for `inv1` and `dom1`), `pass_rates` holds `n_passed / n` for the base arm and the final arm (a rollout that died counts in n as not passed, and `unusable` says how many), and the run prints `pass rate base 4/8 (50%), final agg1 7/8 (88%)`. The selection verdict from more than one rollout is a comparison of rates, never a win: `higher-rate`, `lower-rate` or `same-rate`, with a two-sided Fisher exact p-value and its meaning in words (`not significant at these sizes: report the rates and claim nothing`, or `unlikely to be chance; still one task and one proposer draw, so it measures this final harness, not the method`). With one rollout each the old verdicts stay (`improved`, `regressed`, ...) and the line says `one sample each: not a measurement`. Eight against eight is still one task and one proposer draw: a clear gap there says the delivered harness is better than the base on this instance, not that the method works.
+
+### The profile line to change
+
+The default profile allows 7 sessions and 2700 s. For 21 sessions, change these two lines of the `[channels.local-ollama.caps]` table (in a **copy**; the template and your `~/h2-stage1/channels.toml` are not edited by this runner):
+
+```toml
+sessions = 21       # P = 3 proposer + R = 18 solver rollouts at --rollouts 8
+wall_s = 5400       # 90 minutes for the whole sweep (21 sessions: about 257 s each on average)
+```
+
+```bash
+cp ~/h2-stage1/channels.toml ~/h2-stage1/channels-1c.toml
+sd '^sessions = 7\b' 'sessions = 21' ~/h2-stage1/channels-1c.toml && sd '^wall_s = 2700\b' 'wall_s = 5400' ~/h2-stage1/channels-1c.toml
+```
+
+### The commands
+
+```bash
+P=~/h2-stage1/channels-1c.toml
+
+# Rehearsal with the fakes on the real daemon (no model; about 50 s): 21 sessions, the hint, the pass rates.
+uv run python -m cognitive_harness2.stage1 selftest --task-set hard --scenario format-rules --rollouts 8 --proposer-hint on
+
+# The plan: read-only. It shows `proposer hint on`, `P=3 ... R=18`, `3 + 18 = 21 sessions (profile cap 21)` and the worst case.
+uv run python -m cognitive_harness2.stage1 plan --profile $P --task-set hard --rollouts 8 --opencode ~/.opencode/bin/opencode
+
+# The run: the same approval gate as stage 1. The hint is on by default for the hard set.
+uv run python -m cognitive_harness2.stage1 run --approve local-ollama --profile $P --task-set hard --rollouts 8 --opencode ~/.opencode/bin/opencode
+
+# The control, for run #4's proposer prompts: the same sweep with the hint off.
+uv run python -m cognitive_harness2.stage1 run --approve local-ollama --profile $P --task-set hard --rollouts 8 --proposer-hint off --opencode ~/.opencode/bin/opencode
+```
+
+`selftest` takes both flags too (`--rollouts N` gives the fake profile exactly the `caps.sessions` the arithmetic needs). Read a result:
+
+```bash
+R=<runs-dir>/<sweep id>
+jq '{proposer_hint, rollouts_plan, pass_rates: (.pass_rates | {final_label, base: {passed: .base.passed, n: .base.n}, final: {passed: .final.passed, n: .final.n}}), selection: (.selection | {verdict, base_rate, chosen_rate, fisher_p, evidence})}' $R/report.json
+jq -r '.rollouts[] | [.label, .arm, .passed, .n_passed] | @tsv' $R/report.json                      # per-rollout pass/fail
+jq '{hint, hint_sha, label}' $R/proposer-audit/*.meta.json                                         # what each proposer was given
+```
+
+What the selftest proves: the plan, the grant and the budget at 21 sessions; the extras run in upstream's namespace on the delivered harness; the hint reaches exactly the three proposer audits and no solver; no extra rollout runs when no edit was adopted; the report's rates and verdict. What it does not: that a real model reacts to the hint, or that 8 rollouts are enough to see a real effect.
 
 ## Channel profile
 

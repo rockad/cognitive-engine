@@ -10,6 +10,11 @@ reflection session skipped (`run_task(..., libraries=None)`), attempts forced to
 Every session is `opencode` in a rootless Docker container, reaching Ollama on this machine's loopback through the host
 bridge and the allow-list proxy. One model call at a time (the model gate). $0. Nothing leaves the machine.
 
+Stage 1c (two flags, defaults unchanged): `--proposer-hint on|off` puts the runner's ENVIRONMENT RULES block (which harness
+files are kept, which are read-only) in front of each proposer session (`proposer_hint`; on for the hard set by default), and
+`--rollouts N` rolls the base and the delivered final N times each. Upstream fixes R = 4k, so the extra rollouts are made here,
+after `run_task` (`run_extra_rollouts`), and count as sessions: P + R = 3 + (4 + 2 (N - 1)) must fit the profile's caps.sessions.
+
 `plan` changes nothing. It reads the profile, asks the policy, runs the pinned read-only `docker info` and
 `docker image inspect`, and sends ONE `GET /api/tags` to the loopback Ollama (no bytes beyond that, no model is loaded).
 It creates no file, directory, container, network or socket, and prints the exact command that approves the sweep.
@@ -1465,12 +1470,12 @@ class FakeOllama:
         self._thread.join(5)
 
 
-def selftest_profile(root: Path, port: int, *, wall_s: int = 600) -> channels.ChannelProfile:
+def selftest_profile(root: Path, port: int, *, wall_s: int = 600, sessions: int = 7) -> channels.ChannelProfile:
     return channels.validate({
         "workspace_roots": [str(root)],
         "channels": {CHANNEL: {"kind": "opencode", "provider": "ollama", "endpoint": f"http://127.0.0.1:{port}/v1",
                                "model": "ollama/gemma4:12b", "retention": "local", "max_classification": "restricted",
-                               "approval": "per-sweep", "caps": {"sessions": 7, "wall_s": wall_s, "cost_usd": 0}}}},
+                               "approval": "per-sweep", "caps": {"sessions": sessions, "wall_s": wall_s, "cost_usd": 0}}}},
         source="<selftest>")
 
 
@@ -1549,15 +1554,36 @@ def harness_evidence(run_dir: Path, ts: ss.TaskSet, surface: Any) -> dict:
     return ev
 
 
+def proposer_audit_evidence(run_dir: Path) -> list[dict]:
+    """What the proposer audit (`proposer-audit/<label>.<key>.meta.json` and `.system.md`) says about the hint, per stage
+    session: the meta's `hint` flag, its hash, whether the recorded block matches that hash, and whether the system text the
+    session was given starts with the block. Read by the selftest only; nothing here is printed or logged."""
+    out = []
+    for meta_path in sorted((run_dir / "proposer-audit").glob("*.meta.json")):
+        with contextlib.suppress(OSError, ValueError):
+            meta = json.loads(meta_path.read_text())
+            system = meta_path.with_name(meta_path.name.removesuffix(".meta.json") + ".system.md")
+            text = system.read_text(encoding="utf-8") if system.is_file() else ""
+            block = meta.get("hint_block") or ""
+            out.append({"label": meta.get("label"), "hint": meta.get("hint"), "hint_sha": meta.get("hint_sha"),
+                        "block_matches_sha": bool(block) and proposer_hint.digest(block) == meta.get("hint_sha"),
+                        "system_starts_with_block": bool(block) and text.startswith(block)})
+    return out
+
+
 def run_selftest(*, base: Path | None = None, out: TextIO | None = None, probes: Probes | None = None,
-                 wall_s: int = 600, per_session_s: float = 120.0, grant_edit: Callable[[ExecutionGrant], ExecutionGrant] | None = None,
+                 wall_s: int | None = None, per_session_s: float = 120.0,
+                 grant_edit: Callable[[ExecutionGrant], ExecutionGrant] | None = None,
                  cli_text: str | None = None, run_task: Callable[..., Any] | None = None,
-                 task_set: str = task_sets.DEFAULT, scenario: str | None = None) -> SweepOutcome:
+                 task_set: str = task_sets.DEFAULT, scenario: str | None = None, proposer_hint: str | None = None,
+                 rollouts: int = 1) -> SweepOutcome:
     """The WHOLE pipeline, with a fake opencode and a fake endpoint: profile -> preflight -> plan -> grant -> contained
     sessions on the real rootless daemon -> report -> teardown. No model is called and no real CLI runs.
 
     `scenario` is what the fake PROPOSER does (see `SCENARIOS`); the default is the old sign-check line on the easy set and
-    the scripted format-rules edit on the hard set. `cli_text`, when given, replaces the fake CLI whole."""
+    the scripted format-rules edit on the hard set. `cli_text`, when given, replaces the fake CLI whole.
+    `proposer_hint` and `rollouts` are the stage-1 flags of the same names (the fake profile gets exactly the
+    `caps.sessions` the rollout arithmetic needs, and `wall_s` defaults to 600 s plus 60 s per session beyond seven)."""
     out = out or sys.stdout
     if not FAKE_CLI.is_file():
         raise Stage1Error(f"the fake opencode {FAKE_CLI} is missing")
@@ -1575,9 +1601,12 @@ def run_selftest(*, base: Path | None = None, out: TextIO | None = None, probes:
         cli = bindir / "opencode"
         cli.write_text(cli_text if cli_text is not None else selftest_cli_text(scenario))
         cli.chmod(0o755)
+        sane = rollouts if isinstance(rollouts, int) and not isinstance(rollouts, bool) and rollouts >= 1 else 1   # Settings refuses the rest
+        rp = rollout_plan(sane, upstream_p=EXPECTED_P, upstream_r=EXPECTED_R)
+        wall = wall_s if wall_s is not None else 600 + 60 * (rp.sessions - 7)
         with FakeOllama() as fake:
-            s = Settings(profile=selftest_profile(wsroot, fake.port, wall_s=wall_s), per_session_s=per_session_s,
-                         cli=str(cli), runs_dir=root / "runs", task_set=task_set)
+            s = Settings(profile=selftest_profile(wsroot, fake.port, wall_s=wall, sessions=rp.sessions), per_session_s=per_session_s,
+                         cli=str(cli), runs_dir=root / "runs", task_set=task_set, proposer_hint=proposer_hint, rollouts=rollouts)
             pr = probes or Probes(environ={})
             pre = preflight(s, pr)
             if not pre.ok:
@@ -1597,6 +1626,7 @@ def run_selftest(*, base: Path | None = None, out: TextIO | None = None, probes:
             report["_run_dir"] = str(run_dir)
             report["_scenario"] = scenario
             report["_harness"] = harness_evidence(run_dir, s.ts, surface)
+            report["_proposer_audit"] = proposer_audit_evidence(run_dir)
             report["_fake_endpoint_hits"] = fake.hits
             report["_fake_endpoint_rejected"] = [list(x) for x in fake.rejected]
             return SweepOutcome(report, code)
@@ -1610,19 +1640,23 @@ def selftest_problems(outcome: SweepOutcome) -> list[str]:
     always was (all four rollouts correct, no stage fell back); the hard set by `hard_selftest_problems`."""
     r, bad = outcome.report, []
     hard = r.get("task_set") == "hard"
+    plan = r.get("rollouts_plan") or {}
+    ran_r = EXPECTED_R + len(plan.get("extra_base_run") or []) + len(plan.get("extra_final_run") or [])   # upstream's four + ours
     if outcome.exit_code != 0:
         bad.append(f"exit code {outcome.exit_code}, status {r.get('status')}")
     led = r.get("ledger") or {}
     if (led.get("P"), led.get("R")) != (EXPECTED_P, EXPECTED_R):
         bad.append(f"ledger P={led.get('P')} R={led.get('R')}, expected P={EXPECTED_P} R={EXPECTED_R}")
     counts = r["sessions"]["counts"]
-    if (counts.get("proposer"), counts.get("solver")) != (EXPECTED_P, EXPECTED_R):
-        bad.append(f"sessions run: proposer {counts.get('proposer')}, solver {counts.get('solver')}")
-    if len(r["rollouts"]) != EXPECTED_R:
-        bad.append(f"{len(r['rollouts'])} rollouts ran, expected {EXPECTED_R}")
+    if (counts.get("proposer"), counts.get("solver")) != (EXPECTED_P, ran_r):
+        bad.append(f"sessions run: proposer {counts.get('proposer')}, solver {counts.get('solver')}, expected {EXPECTED_P} and {ran_r}")
+    if len(r["rollouts"]) != ran_r:
+        bad.append(f"{len(r['rollouts'])} rollouts ran, expected {ran_r}")
+    if plan.get("extra_errors"):
+        bad.append(f"extra rollouts failed: {plan['extra_errors']}")
     if not hard:
-        if r["rollouts_passed"] != EXPECTED_R:
-            bad.append(f"rollouts: {r['rollouts_passed']} of {len(r['rollouts'])} passed, expected {EXPECTED_R} of {EXPECTED_R}")
+        if r["rollouts_passed"] != ran_r:
+            bad.append(f"rollouts: {r['rollouts_passed']} of {len(r['rollouts'])} passed, expected {ran_r} of {ran_r}")
         if any(st.get("fell_back") for st in r["stages"]):
             bad.append("a proposer stage fell back")
     t = r["teardown"]
@@ -1633,11 +1667,31 @@ def selftest_problems(outcome: SweepOutcome) -> list[str]:
     for status, host in r.get("_fake_endpoint_rejected") or []:
         bad.append(f"the fake model endpoint refused a request with HTTP {status} as a real Ollama would: Host {host!r}")
     sv = r.get("sessions_summary") or {}
-    if sv.get("started") != EXPECTED_P + EXPECTED_R or sv.get("reached_model") != sv.get("started"):
+    if sv.get("started") != EXPECTED_P + ran_r or sv.get("reached_model") != sv.get("started"):
         bad.append(f"the fake model endpoint was reached by {sv.get('reached_model')} of {sv.get('started')} sessions, "
-                   f"expected all {EXPECTED_P + EXPECTED_R}")
+                   f"expected all {EXPECTED_P + ran_r}")
     if hard:
         bad += hard_selftest_problems(r)
+    return bad + hint_selftest_problems(r)
+
+
+def hint_selftest_problems(r: Mapping[str, Any]) -> list[str]:
+    """What the selftest asserts about the proposer hint: the report says what the flag was, and the proposer audit of each
+    of the three stage sessions agrees (hint true with the block, its matching hash and the block in front of the system
+    text the session was given, or hint false with none of them). Nothing to check when a report carries neither."""
+    info, audit = r.get("proposer_hint"), r.get("_proposer_audit")
+    if info is None or audit is None:
+        return []
+    bad: list[str] = []
+    if sorted(str(a.get("label", "")).split(".")[0] for a in audit) != ["agg1", "dom1", "inv1"]:
+        bad.append(f"the proposer audit holds {[a.get('label') for a in audit]}, expected one session each for inv1, dom1 and agg1")
+    for a in audit:
+        if a.get("hint") is not info.get("on"):
+            bad.append(f"{a.get('label')}: the audit says hint={a.get('hint')} but the sweep ran with hint={info.get('on')}")
+        elif info.get("on") and not (a.get("hint_sha") == info.get("sha") and a.get("block_matches_sha") and a.get("system_starts_with_block")):
+            bad.append(f"{a.get('label')}: the audit does not hold the block, its hash and the system text that carries it")
+        elif not info.get("on") and (a.get("hint_sha") or a.get("system_starts_with_block")):
+            bad.append(f"{a.get('label')}: hint is off but the audit records a block")
     return bad
 
 
@@ -1669,13 +1723,17 @@ def hard_selftest_problems(r: Mapping[str, Any]) -> list[str]:
     sel = r.get("selection") or {}
     ev = r.get("_harness") or {}
     mchecks = ev.get("mutation_checks") or []
-    if sorted(stages) != ["agg1", "dom1", "inv1"] or sorted(rollouts) != ["agg1", "base1", "dom1", "inv1"]:
+    plan = r.get("rollouts_plan") or {}
+    n = plan.get("n", 1)
+    extra_base, extra_final = list(plan.get("extra_base_run") or []), list(plan.get("extra_final_run") or [])
+    if sorted(stages) != ["agg1", "dom1", "inv1"] or sorted(rollouts) != sorted(["agg1", "base1", "dom1", "inv1", *extra_base, *extra_final]):
         return bad + [f"unexpected stages {sorted(stages)} or rollouts {sorted(rollouts)}"]
     naive_line = f"Total: {ss_hard.naive_total(inst.input_text)}"
-    base = rollouts["base1"]
-    if base.get("passed") is not False or base.get("n_passed") != 2 or (base.get("answer_excerpt") or "").strip() != naive_line:
-        bad.append(f"base1 must fail on the total alone, with the weak reader's answer {naive_line!r}: "
-                   f"passed={base.get('passed')} n_passed={base.get('n_passed')} answer={base.get('answer_excerpt')!r}")
+    for label in ["base1", *extra_base]:                    # every base rollout, upstream's and ours, is the weak reader's
+        base = rollouts[label]
+        if base.get("passed") is not False or base.get("n_passed") != 2 or (base.get("answer_excerpt") or "").strip() != naive_line:
+            bad.append(f"{label} must fail on the total alone, with the weak reader's answer {naive_line!r}: "
+                       f"passed={base.get('passed')} n_passed={base.get('n_passed')} answer={base.get('answer_excerpt')!r}")
     if "error" in ev:
         bad.append(ev["error"])
     if scenario == "format-rules":
@@ -1698,9 +1756,23 @@ def hard_selftest_problems(r: Mapping[str, Any]) -> list[str]:
                                     or c.get("slots") != {"systemprompt.md": "c1"} for c in mchecks):
             bad.append(f"expected three accepted mutation_check events on systemprompt.md (c1), got {mchecks}")
         want = dict(ok=True, trivial=True, chosen_label="agg1", chosen_is_base=False, chosen_tree_is_base=False,
-                    adopted=True, verdict="improved", base_passed=False, chosen_passed=True)
+                    adopted=True, verdict="improved" if n == 1 else "higher-rate", base_passed=False, chosen_passed=True)
         if {k: sel.get(k) for k in want} != want:
-            bad.append(f"selection should adopt the edited agg1 and be judged improved: {sel}")
+            bad.append(f"selection should adopt the edited agg1 and be judged {want['verdict']}: {sel}")
+        if n > 1:                                            # the rollouts of ours: all there, all as expected, reported as rates
+            if len(extra_base) != n - 1 or len(extra_final) != n - 1 or plan.get("extra_skipped") or plan.get("extra_errors"):
+                bad.append(f"expected {n - 1} extra base and {n - 1} extra final rollouts, run without error: {plan}")
+            for label in extra_final:
+                ro = rollouts[label]
+                if ro.get("passed") is not True or (ro.get("answer_excerpt") or "").strip() != inst.expected_line:
+                    bad.append(f"extra final rollout {label} should pass with {inst.expected_line!r}: passed={ro.get('passed')} "
+                               f"answer={ro.get('answer_excerpt')!r}")
+            pr = r.get("pass_rates") or {}
+            if (pr.get("base") or {}).get("passed") != 0 or (pr.get("base") or {}).get("n") != n \
+                    or (pr.get("final") or {}).get("passed") != n or (pr.get("final") or {}).get("n") != n:
+                bad.append(f"pass rates should be base 0/{n} and final {n}/{n}: {pr}")
+            if not (isinstance(sel.get("fisher_p"), float) and sel["fisher_p"] < 0.05) or "improved" in str(sel.get("verdict")):
+                bad.append(f"{n} rollouts of each should give a significant rate gap and never the word improved: {sel}")
     elif scenario in REFUSED_BY:
         for label in ("inv1", "dom1", "agg1"):
             st, ro = stages[label], rollouts[label]
@@ -1718,6 +1790,8 @@ def hard_selftest_problems(r: Mapping[str, Any]) -> list[str]:
                     adopted=False, verdict="base-kept", base_passed=False, chosen_passed=False)
         if {k: sel.get(k) for k in want} != want:
             bad.append(f"selection should deliver a base-equal agg1 and the runner say base-kept: {sel}")
+        if n > 1 and (extra_base or extra_final or "no edited harness was adopted" not in str(plan.get("extra_skipped"))):
+            bad.append(f"with no edit adopted no extra rollout should run, and the plan should say why: {plan}")
     else:
         bad.append(f"the hard selftest has no expectations for scenario {scenario!r}")
     return bad
@@ -1765,6 +1839,15 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def selftest_detail(report: Mapping[str, Any]) -> str:
+    """The second line of a selftest's summary: the sessions that ran, the hint and the pass rates (the first line is pinned)."""
+    sv, plan = report.get("sessions_summary") or {}, report.get("rollouts_plan") or {}
+    hint = report.get("proposer_hint") or {}
+    return (f"  {sv.get('started')} sessions (3 proposer + {sv.get('started', 0) - 3} rollouts; planned {plan.get('sessions_planned')}), "
+            f"proposer hint {'on, ' + str(hint.get('sha')) if hint.get('on') else 'off'}; "
+            + (pass_rate_line(report).strip() or "no pass rate"))
+
+
 HARD_SCENARIOS = ("format-rules", "forbid-guardrails", "forbid-executable", "forbid-frontmatter", "forbid-script")
 
 
@@ -1778,7 +1861,8 @@ def run_hard_selftests(args: argparse.Namespace) -> int:
         if args.keep_in:
             base = Path(args.keep_in).resolve() / scenario
             base.mkdir(parents=True, exist_ok=True)
-        outcome = run_selftest(base=base, task_set=args.task_set, scenario=scenario, out=io.StringIO())
+        outcome = run_selftest(base=base, task_set=args.task_set, scenario=scenario, out=io.StringIO(),
+                               proposer_hint=args.proposer_hint, rollouts=args.rollouts)
         problems = selftest_problems(outcome)
         for p in problems:
             print(f"selftest[{args.task_set}/{scenario}] FAILED: {p}", file=sys.stderr)
@@ -1788,6 +1872,7 @@ def run_hard_selftests(args: argparse.Namespace) -> int:
               f"selection {sel.get('verdict')} (final {sel.get('chosen_label')}, "
               f"{'edited harness adopted' if sel.get('adopted') else 'base harness kept'}), "
               f"teardown clean: {not outcome.report['teardown']['docker_leftovers'] and not outcome.report['teardown']['scratch_left']}")
+        print(selftest_detail(outcome.report))
         failed += bool(problems)
     return 1 if failed else 0
 
@@ -1806,7 +1891,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.cmd == "selftest" and args.task_set != task_sets.DEFAULT:
             return run_hard_selftests(args)
         if args.cmd == "selftest":
-            outcome = run_selftest(base=Path(args.keep_in).resolve() if args.keep_in else None)
+            outcome = run_selftest(base=Path(args.keep_in).resolve() if args.keep_in else None, proposer_hint=args.proposer_hint,
+                                 rollouts=args.rollouts)
             problems = selftest_problems(outcome)
             for p in problems:
                 print(f"selftest FAILED: {p}", file=sys.stderr)
@@ -1815,6 +1901,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                   f"R={outcome.report['ledger'] and outcome.report['ledger']['R']}, "
                   f"rollouts {outcome.report['rollouts_passed']}/{len(outcome.report['rollouts'])} correct, "
                   f"teardown clean: {not outcome.report['teardown']['docker_leftovers'] and not outcome.report['teardown']['scratch_left']}")
+            print(selftest_detail(outcome.report))
             return 1 if problems else 0
         parser.print_help()
         return 2
