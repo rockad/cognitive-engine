@@ -7,7 +7,9 @@
  *   binary's schema (the event never fired headless): `to_model`, `from_model`, `requested_model`,
  *   `source`. It reads `to_model` and falls back to `model`.
  * - SessionStart: carries no model. A fresh session (`startup`, `clear`) drops any stale state for
- *   its id; `resume` keeps it. Old state files are pruned.
+ *   its id. A `resume` keeps the state file but writes a resume marker: the model may have changed
+ *   with no PostModelSwitch, so the guard discards evidence older than the marker. Old state files
+ *   are pruned.
  *
  * It only observes. It never blocks, never prints, and always exits 0: a failure here must not
  * affect the session, and the guard's transcript fallback covers a missing state file. It also
@@ -15,18 +17,18 @@
  * those arrive as ordinary model changes (source `auto`) and are recorded like any other.
  */
 import { appendClaudeDecision } from './claude-audit.js';
-import { clearSessionState, pruneSessionState, writeSessionState } from './session-model.js';
+import { clearSessionState, markSessionResumed, pruneSessionState, writeSessionState } from './session-model.js';
 
 const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
 
 /** Handle one hook payload. Returns what it did, for tests; never throws. */
-export function record(event: string | undefined, stdin: string): string {
+export function record(event: string | undefined, stdin: string, now: Date = new Date()): string {
   try {
     const input = JSON.parse(stdin);
     if (event === 'PostModelSwitch') {
       const to = str(input?.to_model) ?? str(input?.model);
       if (!to) return 'no-model';
-      writeSessionState(input?.session_id, to, str(input?.source));
+      writeSessionState(input?.session_id, to, str(input?.source), now);
       appendClaudeDecision({
         event: 'model_change',
         session_id: str(input?.session_id),
@@ -40,6 +42,8 @@ export function record(event: string | undefined, stdin: string): string {
     if (event === 'SessionStart') {
       const source = str(input?.source);
       if (source === 'startup' || source === 'clear') clearSessionState(input?.session_id);
+      // A resume can change the model with no PostModelSwitch: mark it so older evidence is dropped.
+      if (source === 'resume') markSessionResumed(input?.session_id, now);
       pruneSessionState();
       return 'session-start';
     }
