@@ -14,10 +14,11 @@
  * inside the window is not seen; an inline `script` has no file to re-check; what Claude Code runs
  * on a `resumeFromRunId` (the file or a saved copy of the earlier run) is not observable here.
  *
- * Nothing in this module reports unless the guard ran and Jev is still on: with Jev off the hook
- * returns before it evaluates anything, so no pin exists, and a pin written while Jev was on is
- * dropped without a word if Jev was switched off before the run ended (the recorder reads the
- * current mode).
+ * Nothing in this module says anything unless the guard ran and Jev is still on: with Jev off the
+ * hook returns before it evaluates anything, so no pin exists, and a pin written while Jev was on
+ * is consumed without any stdout or warning if Jev was switched off before the run ended (the
+ * recorder reads the current mode). Drift is still written to the audit in that case: the decision
+ * was made while Jev was on, and switching it off in between must not erase the evidence.
  */
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
@@ -127,9 +128,9 @@ function jevIsOff(inspect: () => JevConfigFileInspection): boolean {
 
 /**
  * PostToolUse for Workflow: re-hash every file the PreToolUse analysis read and compare. Consumes
- * the pin. Never throws. Silent (`no-pin`) when the guard did not run for this call, and silent
- * (`off`, the pin dropped) when Jev has been switched off since: a pin written while Jev was on
- * is not reported after the user turned it off.
+ * the pin. Never throws. Silent (`no-pin`) when the guard did not run for this call. When Jev has
+ * been switched off since (`off`, the pin dropped) there is no stdout and no warning, but drift is
+ * still audited.
  */
 export function recordPostToolUse(stdin: string, inspect: () => JevConfigFileInspection = inspectJevConfigFile): PostToolUseResult {
   try {
@@ -138,14 +139,16 @@ export function recordPostToolUse(stdin: string, inspect: () => JevConfigFileIns
     const pin = readPin(input?.tool_use_id);
     if (!pin) return { status: 'no-pin' };
     dropPin(input?.tool_use_id);
-    if (jevIsOff(inspect)) return { status: 'off' };
+    const off = jevIsOff(inspect);
     const drift: Array<{ file: string; analysed: string; current: string | null }> = [];
     for (const s of pin.scripts) {
       if (typeof s?.label !== 'string' || !path.isAbsolute(s.label)) continue; // inline: no file to re-check
       const current = currentHash(s.label);
       if (current !== s.sha256) drift.push({ file: s.label, analysed: s.sha256, current });
     }
-    if (drift.length === 0) return { status: 'unchanged' };
+    if (drift.length === 0) return { status: off ? 'off' : 'unchanged' };
+    // The audit record is written even when Jev has since been switched off: the decision was made
+    // while it was on, and a model that can call jev_set_mode must not be able to erase the evidence.
     for (const d of drift) {
       appendClaudeDecision({
         event: 'workflow_changed',
@@ -158,6 +161,7 @@ export function recordPostToolUse(stdin: string, inspect: () => JevConfigFileIns
         decision: pin.decision
       });
     }
+    if (off) return { status: 'off' }; // no stdout, no warning: Jev is off
     const lines = drift.map((d) => `- ${d.file}: analysed sha256:${d.analysed.slice(0, 16)}, now ${d.current ? `sha256:${d.current.slice(0, 16)}` : 'missing or unreadable'}`);
     const message =
       `[jev] A workflow file changed between the guard's analysis (${pin.decision}) and the end of the run, so what ran may not be what was checked:\n${lines.join('\n')}\n` +

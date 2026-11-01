@@ -10,8 +10,9 @@ import { clearConfigCacheForTesting } from '../src/core/config.ts';
 
 /**
  * The PostToolUse drift recorder checks the CURRENT Jev mode: a pin written while Jev was on is
- * dropped silently when Jev was switched off before the run ended. A missing config means off. A
- * config that cannot be trusted is not off, so drift is still reported.
+ * dropped without any stdout or warning when Jev was switched off before the run ended, but its drift
+ * is still written to the audit (the decision was made while Jev was on). A missing config means
+ * off. A config that cannot be trusted is not off, so drift is still reported.
  */
 let tmp = '';
 let savedEnv: NodeJS.ProcessEnv = {};
@@ -73,16 +74,40 @@ describe('drift is reported only while Jev is on', () => {
     ['claude-code harness mode off', { defaults: { mode: 'on' }, harnesses: { 'claude-code': { mode: 'off' } } }]
   ];
   for (const [name, config] of off) {
-    it(`silent and consumed when Jev was switched off after the pin: ${name}`, async () => {
+    it(`no stdout or warning, pin consumed, drift still audited when Jev was switched off after the pin: ${name}`, async () => {
       const file = await pinnedAndEdited();
       setConfig(config);
       const r = recordPostToolUse(post(file));
       expect(r.status).toBe('off');
       expect(r.output).toBeUndefined();
-      expect(audit().some((l) => l.event === 'workflow_changed')).toBe(false);
       expect(fs.readdirSync(pinDir())).toHaveLength(0); // the pin is dropped, not kept for a later run
+      // the decision was made while Jev was on: switching it off must not erase the evidence
+      const records = audit().filter((l) => l.event === 'workflow_changed');
+      expect(records).toHaveLength(1);
+      expect(records[0]).toMatchObject({ tool_name: 'Workflow', tool_use_id: 'toolu_01ABC', session_id: 's1', file, decision: 'allow' });
+      expect(records[0].analysed_sha256).not.toBe(records[0].current_sha256);
     });
   }
+
+  it('Jev switched off and the file unchanged: nothing is audited', async () => {
+    const file = path.join(tmp, 'w.js');
+    fs.writeFileSync(file, `await agent('p')`);
+    await run('claude', pre(file));
+    setConfig({ defaults: { mode: 'off' } });
+    const r = recordPostToolUse(post(file));
+    expect(r.status).toBe('off');
+    expect(audit().some((l) => l.event === 'workflow_changed')).toBe(false);
+  });
+
+  it('Jev switched off and the file deleted: the drift is audited with a null current hash', async () => {
+    const file = await pinnedAndEdited();
+    fs.rmSync(file);
+    setConfig({ defaults: { mode: 'off' } });
+    expect(recordPostToolUse(post(file)).output).toBeUndefined();
+    const records = audit().filter((l) => l.event === 'workflow_changed');
+    expect(records).toHaveLength(1);
+    expect(records[0].current_sha256).toBeNull();
+  });
 
   it('silent when the config file was removed (no config means off)', async () => {
     const file = await pinnedAndEdited();
@@ -109,7 +134,7 @@ describe('drift is reported only while Jev is on', () => {
     const file = await pinnedAndEdited();
     setConfig({ defaults: { mode: 'off' } });
     expect(record('PostToolUse', post(file))).toBe('off');
-    expect(audit().some((l) => l.event === 'workflow_changed')).toBe(false);
+    expect(audit().filter((l) => l.event === 'workflow_changed')).toHaveLength(1);
   });
 
   it('a switch back on affects only later pins: an off-time call leaves nothing to report', async () => {
