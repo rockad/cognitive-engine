@@ -44,7 +44,7 @@
  *   or what a saved workflow resolves to if Claude Code's lookup differs from `fsResolver`. Each
  *   decision is bound to the sha256 of the text analysed (`scripts` on the decision, see
  *   workflow-pin.ts), and a PostToolUse recorder reports drift after the run.
- * - Intentional false positives (always ask): `this` outside a class body, a variable-key lookup
+ * - Intentional false positives (always ask): `this` outside a class body or as a bare value in one, a variable-key lookup
  *   such as `o[k]` unless `k` is a followed `const`, and a local method that happens to be called
  *   `agent` or `workflow`.
  *
@@ -57,8 +57,11 @@
  *   with `${}`, concatenation, spreads, and objects that are assigned into, aliased or passed on
  *   are not followed.
  * - `this` inside a class body (method, constructor, field initialiser, static block, and
- *   functions nested there) is strict-mode code and never the global object. A computed key and an
- *   `extends` clause use the outer `this`, so they still ask.
+ *   functions nested there) is allowed only as the object of a non-computed member access whose
+ *   name is neither watched nor an escape (`this.x`, `this.x = v`, `this.x()`). Strict mode only
+ *   stops the implicit substitution of the global object; a caller can still pass it, so bare
+ *   `this` flowing as a value (argument, spread, return, right-hand side, computed object) asks.
+ *   A computed key and an `extends` clause use the outer `this`, so they still ask.
  */
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
@@ -686,12 +689,24 @@ function visit(node: Node, parent: Node, key: string, out: Finding[], ctx: Bindi
       }
       return;
     }
-    case 'ThisExpression':
-      // Class bodies are strict code, where `this` is the instance, a constructor or undefined,
-      // never the global object. Everywhere else (top level, plain functions, object methods) it
-      // could be the global object, which holds agent().
-      if (!strictThis) ask('`this` can be the global object, which holds agent()');
+    case 'ThisExpression': {
+      // Strict mode (class bodies) only stops the IMPLICIT substitution of the global object: a
+      // caller can still pass it as `this` (`C.run.call(globalThis)`, a host callback). So even in
+      // a class body `this` is allowed only as the object of a non-computed member whose name is
+      // not watched or an escape (`this.x`, `this.x = v`, `this.x()`); `this` flowing as a value
+      // (argument, spread, return, right-hand side, computed object) could hand the script agent().
+      // Outside a class body it could be the global object outright.
+      if (!strictThis) {
+        ask('`this` can be the global object, which holds agent()');
+        break;
+      }
+      const member = parent?.type === 'MemberExpression' && key === 'object' && !parent.computed ? parent.property : null;
+      const name = member && (member.type === 'Identifier' || member.type === 'PrivateIdentifier') ? member.name : null;
+      if (name === null || WATCHED.has(name) || ESCAPES.has(name) || MEMBER_ESCAPES.has(name)) {
+        ask('`this` is used as a value in a class body, and a caller can pass the global object as `this`, which holds agent()');
+      }
       break;
+    }
     case 'MetaProperty':
       if (node.meta?.name === 'import') ask('`import.meta` cannot be inspected');
       break;
