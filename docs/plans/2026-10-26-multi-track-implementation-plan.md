@@ -269,7 +269,7 @@ Full write-up: [RFC 004 section 9](../rfc/004-system2-harness2.md).
 - **Test isolation DONE**: leak checks use per-run ids, not daemon-wide counts.
 - **sbx DONE**: v0.50.1 verified live and now the AUTO default for model-free untrusted execution, with a loud Docker fallback. `docker` forces Docker, `sbx` fails closed, model sessions stay on Docker, and both host-reach settings must be off.
 - **Stage 1b DONE (hard task set)**: `sum-signed-hard`, a weak base harness, `--task-set {easy,hard}`. Three real runs (gemma x2, qwen x1) accepted no proposer edit. The INV proposer edited a `c7` script twice and the slot table refused it; the qwen proposers made no edit; the base harness passes about half the time at k=1, so pass/fail is noise. **The improvement loop is still unproven.**
-- **Fable 5.1 final verification**: no critical issue and no smuggling path. Fixed in the same body of work:
+- **Independent read-only verification** (requested as Fable 5.1, actually served by Sonnet 5.5; see RFC 004 section 9.10): no critical issue and no smuggling path. Fixed in the same body of work:
   - Jev Agent-guard unknown-agent hole (HIGH).
   - Approval gate hardening (honest limit: a same-user process can drive a pty; markers are refused; `/dev/tty` plus a nonce).
   - Model pinning in the proxy.

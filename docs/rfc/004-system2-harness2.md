@@ -437,7 +437,7 @@ Everything else is refused, which closes the ollama management API that run #4 l
 
 ### 9.6 Approval gate: the true guarantee and the residual limit
 
-The approval of a real-model sweep (`stage1 run --approve <channel>`, `confirm_on_terminal`) is a human-in-the-loop control. What it does (hardened 2026-10-31 after the Fable 5.1 review):
+The approval of a real-model sweep (`stage1 run --approve <channel>`, `confirm_on_terminal`) is a human-in-the-loop control. What it does (hardened 2026-10-31 after an independent adversarial review, section 9.10):
 - The process must have a controlling terminal: the confirmation is read from `/dev/tty`, never from stdin, so pipes, redirected stdin and scripts without a tty are refused.
 - The typed text is the approval phrase plus a fresh four-word nonce shown on the terminal, so a prewritten answer does not work.
 - The command refuses to run, with no flag to override it, when the environment carries a known agent-harness marker (`CLAUDECODE`, `CLAUDE_CODE_*`, `ANTIGRAVITY*`, `GEMINI_CLI*`, `AGY_*`, `OPENCODE*`, `CODEX*`; the Antigravity, Gemini and `AGY_` names are prefix guesses, not names the repo has observed).
@@ -474,6 +474,8 @@ The slot table (section 6.2 item 5) is now enforced on every task set, easy and 
 - **Locks**: `mkdir`-based locks are NOT exclusive under rapid create/remove cycling on this host. The hook uses a lock-free line-number position; `flock` works.
 - **`agy` headless feasibility** (single endpoint `daily-cloudcode-pa.googleapis.com:443`) remains a spike result only.
 
-### 9.10 Final verification (Fable 5.1)
+### 9.10 Independent verification passes
 
-A final verification pass found no critical issue and no smuggling path out of a contained session. It led to these fixes in the same body of work: the Jev Agent-guard unknown-agent hole (HIGH), approval gate hardening (section 9.6), model pinning in the proxy (section 9.5), `ACCESS-SUMMARY` counters, non-interruptible teardown, the slot table on every task set (section 9.8), and lower-severity items.
+Correction (2026-11-01): the first pass was requested on Fable 5.1 but the harness served it with Sonnet 5.5 (the transcript records `claude-sonnet-5-5`; the user's subscription has no Fable), so it was a Sonnet adversarial review, not a Fable one. Two later read-only passes ran on Opus 5.5 (verified from their transcripts): one on the fix diffs and the guard backlog, one on the `sbx` model route. Fixes made after those Opus passes have not been re-reviewed by a stronger model.
+
+The first pass found no critical issue and no smuggling path out of a contained session. It led to these fixes in the same body of work: the Jev Agent-guard unknown-agent hole (HIGH), approval gate hardening (section 9.6), model pinning in the proxy (section 9.5), `ACCESS-SUMMARY` counters, non-interruptible teardown, the slot table on every task set (section 9.8), and lower-severity items.
