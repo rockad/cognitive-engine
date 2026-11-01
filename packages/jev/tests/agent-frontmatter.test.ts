@@ -73,7 +73,6 @@ describe('frontmatter shapes that name a model above the session model ask', () 
     ['UTF-8 BOM before the block', `﻿${fm('model: opus')}`],
     ['BOM and quoted key', `﻿${fm('"model": opus')}`],
     ['CRLF line endings', fm('name: q\nmodel: opus', '\r\n')],
-    ['CR-only line endings', fm('name: q\nmodel: opus', '\r')],
     ['opening delimiter with trailing spaces', `---  \nmodel: opus\n---\nbody\n`],
     ['model after a multi-line block scalar that mentions another model', fm('description: |\n  model: haiku\n  more\nmodel: opus')],
     ['model after a description containing a colon', fm('description: Use this: when needed\nmodel: opus')]
@@ -117,6 +116,8 @@ describe('frontmatter whose model cannot be established asks', () => {
     ['space before the opening delimiter', ` ${fm('model: opus')}`],
     ['Unicode line separator in the block', fm('name: q\u2028model: opus')],
     ['a model Jev cannot rank', fm('model: nonexistent-model')],
+    // Claude Code's block regex needs `\n`, so with CR-only line endings it reads no frontmatter at all
+    ['CR-only line endings', fm('name: q\nmodel: opus', '\r')],
     // a multi-line quoted value is read differently by Claude Code's fallback parser (see agent-frontmatter-differential.test.ts)
     ['model after a multi-line quoted description', fm('description: "line one\nmodel: haiku"\nmodel: opus')],
     // Claude Code only sees a block closed by `---`, so it reads no frontmatter at all here
