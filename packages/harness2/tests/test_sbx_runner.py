@@ -231,8 +231,25 @@ ALLOW = {"id": "r1", "name": "allow-pypi", "resource_type": "network", "decision
          "resources": ["pypi.org"], "status": "active", "actions": ["net:connect:tcp"]}
 
 
+# What a real sbx v0.50.1 printed for an HTTP allow rule (resource_type "http"): the proxy enforces it, `policy check network`
+# does not see it. A candidate sandbox must never be created while one exists.
+HTTP_ALLOW = {"id": "h1", "name": "allow-http", "scope": "global", "applies_to": "all", "resource_type": "http", "decision": "allow",
+              "resources": ["**"], "methods": ["ANY"], "http_targets": [{"host": "**", "path": "/**"}], "status": "active",
+              "actions": ["http:request:get"]}
+PORT_FORWARD = {"id": "pf", "scope": "global", "resource_type": "port_forward", "decision": "allow", "resources": ["**"],
+                "status": "active"}
+
+
 @pytest.mark.parametrize("rules,why", [
     ([DENY, ALLOW], "allow rule exists"),
+    ([DENY, HTTP_ALLOW], "allow rule exists"),                                         # a GLOBAL http allow reaches the gateway proxy
+    ([DENY, {**HTTP_ALLOW, "status": "inactive"}], "allow rule exists"),
+    ([DENY, {**HTTP_ALLOW, "scope": "sandbox:somebody", "applies_to": "sandbox:somebody"}], "allow rule exists"),
+    ([DENY, {**HTTP_ALLOW, "decision": "prompt"}], "unknown decision"),
+    ([DENY, PORT_FORWARD], "unknown resource type"),                                   # fail closed on a kind nobody has seen
+    ([DENY, {**PORT_FORWARD, "decision": "deny"}], "unknown resource type"),
+    ([DENY, {**PORT_FORWARD, "resource_type": "Network"}], "unknown resource type"),
+    ([DENY, {**PORT_FORWARD, "resource_type": "filesystem:exec"}], "unknown resource type"),
     ([DENY, {**ALLOW, "status": "inactive"}], "allow rule exists"),   # an inactive allow is still a refusal
     ([], "no active network deny-all"),
     ([{**DENY, "status": "inactive"}], "no active network deny-all"),
@@ -253,6 +270,22 @@ def test_a_policy_that_is_not_deny_all_is_refused(world, rules, why):
 def test_the_real_captured_policy_is_deny_all():
     assert sandbox.sbx_network_policy_problem(DENY_ALL.read_text()) is None
     assert sandbox.sbx_network_policy_problem(json.dumps({"rules": [DENY]})) is None
+
+
+def test_every_rule_of_the_observed_default_policy_has_an_allow_listed_shape():
+    """The fixture is what `sbx policy ls --json` printed on this host (2026-11-01): the two filesystem rules and the deny-all.
+    The allow-list is these shapes; every rule type outside it is a foreign rule."""
+    doc = json.loads(DENY_ALL.read_text())
+    assert sorted(r["resource_type"] for r in doc["rules"]) == ["filesystem:read", "filesystem:write", "network"]
+    assert sandbox.SBX_NONNETWORK_RULE_TYPES == {"filesystem:read", "filesystem:write"}
+    assert sandbox.sbx_network_policy_problem(DENY_ALL.read_text()) is None
+
+
+def test_the_default_probe_and_every_default_policy_problem_use_the_same_allow_list(world):
+    for rules in ([DENY, HTTP_ALLOW], [DENY, PORT_FORWARD]):
+        text = json.dumps({"rules": rules})
+        assert sandbox.sbx_network_policy_problem(text)
+    assert SbxRunner("/x", environ={}).policy_problem is sandbox.sbx_network_policy_problem
 
 
 def test_filesystem_rules_do_not_matter_to_the_network_check():

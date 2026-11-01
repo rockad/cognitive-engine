@@ -57,7 +57,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
-from . import channels, egress, image, ollama_guard, proposer_hint, run_scope, sandbox, sum_signed as ss, sum_signed_hard as ss_hard, task_sets, upstream_egress, upstream_import
+from . import channels, egress, image, ollama_guard, proposer_hint, run_scope, sandbox, sbx_session, sum_signed as ss, sum_signed_hard as ss_hard, task_sets, upstream_egress, upstream_import
 from . import session_runner as sr
 from .contained_proposer import (OPENCODE_PROMPT, SessionConfig, build_command, make_proposer, make_selector_prop,
                                  session_env, TMP_EXEC)
@@ -232,6 +232,7 @@ class Preflight:
     verified: sandbox.VerifiedDocker | None = None
     image: image.ImageRef | None = None
     cli: str | None = None
+    runtime: sbx_session.ModelRuntime = field(default_factory=lambda: sbx_session.ModelRuntime(sbx_session.RUNTIME_DOCKER, True))
 
     @property
     def ok(self) -> bool:
@@ -285,6 +286,10 @@ class Probes:
     ollama: Callable[[str, int, str], tuple[bool, str]] = probe_ollama
     environ: Mapping[str, str] = field(default_factory=lambda: os.environ)
     which: Callable[[str], str | None] = shutil.which
+    # Which runtime model sessions use. Docker (and no sbx process at all) unless `COGNITIVE_HARNESS2_MODEL_SANDBOX=sbx`.
+    model_runtime: Callable[[Mapping[str, str]], sbx_session.ModelRuntime] = sbx_session.choose_model_runtime
+    # Removes leaked `h2m-` sbx sandboxes of dead runs, whatever the model runtime is; best effort, `run` only (never `plan`).
+    sweep_stale: Callable[[Mapping[str, str], Callable[[str], str | None]], list[str]] = sbx_session.sweep_stale_if_installed
 
 
 def _guard(name: str, fn: Callable[[], tuple[bool, str]]) -> Check:
@@ -343,6 +348,11 @@ def preflight(s: Settings, probes: Probes | None = None) -> Preflight:
         out.image = pr.resolve(out.verified)
         return True, f"{out.image.tag} present locally (never built or pulled by a run)"
     out.checks.append(_guard("image", image_ok))
+
+    def runtime_ok() -> tuple[bool, str]:
+        out.runtime = pr.model_runtime(pr.environ)
+        return out.runtime.ok, out.runtime.line
+    out.checks.append(_guard("model_runtime", runtime_ok))
 
     def cli_ok() -> tuple[bool, str]:
         cli = find_cli(s.cli, pr.environ, pr.which)
@@ -462,9 +472,16 @@ def format_plan(s: Settings, pre: Preflight, plan: SweepPlan | None, refusals: S
               f"caps             sessions {ch.caps.sessions}, total wall {wall:g} s ({wall / 60:g} min), cost ${ch.caps.cost_usd:g}",
               f"timeouts         {s.per_session_s:g} s per session; worst case {worst:g} s for {rp.sessions} sessions"
               + (f", which is MORE than the {wall:g} s wall: the sweep stops starting sessions at the deadline" if worst > wall else ""),
-              f"container        2 GB, 2 CPUs, 256 pids, read-only root, no capabilities, user 65534 (per session)",
-              f"leaves machine   nothing: no hosted endpoint, no credential, no egress network",
-              f"cost class       {plan.cost_class if plan else 'local'}  ($0)", ""]
+              f"runtime          {pre.runtime.line}"]
+        if pre.runtime.kind == sbx_session.RUNTIME_SBX and pre.runtime.ok:
+            L += ["microVM          sbx, per session: 2 GB, 2 CPUs, the VM user has sudo (the VM is the boundary), a pids ulimit of 256 "
+                  "that is advisory, the workspace mounted read-write at the same path",
+                  "leaves machine   nothing: no hosted endpoint, no credential; the VM reaches one host port (our egress proxy) through "
+                  "five sandbox-scoped HTTP rules, and nothing else"]
+        else:
+            L += [f"container        2 GB, 2 CPUs, 256 pids, read-only root, no capabilities, user 65534 (per session)",
+                  f"leaves machine   nothing: no hosted endpoint, no credential, no egress network"]
+        L += [f"cost class       {plan.cost_class if plan else 'local'}  ($0)", ""]
     L.append("preflight (none of these started anything):")
     for c in pre.checks:
         L.append(f"  [{'ok' if c.ok else 'FAIL'}] {c.name:<16} {c.detail}")
@@ -867,6 +884,8 @@ class SweepContext:
     audit: Audit
     approved_for_real_model: bool = True          # approved by the user to call a REAL model (False: the selftest, a fake)
     run_task: Callable[..., Any] | None = None      # tests may replace upstream's run_task
+    # which runtime model sessions use (preflight's `model_runtime`): Docker unless sbx was asked for explicitly and is usable
+    runtime: sbx_session.ModelRuntime = field(default_factory=lambda: sbx_session.ModelRuntime(sbx_session.RUNTIME_DOCKER, True))
 
 
 @dataclass
@@ -1233,8 +1252,8 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
         runs_root = ctx.run_dir / "upstream-runs"
         runs_root.mkdir(exist_ok=True)
 
-        solver_runner = sr.ProposerSessionRunner(
-            ctx.verified, ctx.image, ch, zdr=s.zdr, classification=s.classification, role="solver", budget=budget,
+        solver_runner = sbx_session.make_runner(
+            ctx.runtime, ctx.verified, ctx.image, ch, zdr=s.zdr, classification=s.classification, role="solver", budget=budget,
             workspace_roots=s.profile.workspace_roots, observer=observer)
         solver_env = solver_env_builder(solver_runner)
         execution = SolverExecution(
@@ -1246,7 +1265,8 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
         session = SessionConfig(
             verified=ctx.verified, image=ctx.image, profile=s.profile, channel=s.channel, zdr=s.zdr,
             classification=s.classification, scratch_root=str(proposer_scratch), cli_paths={"opencode": ctx.cli},
-            timeout_s=g.per_session_s, api_path=API_PATH, gate_wait_s=g.max_wall_s, budget=budget, observer=observer)
+            timeout_s=g.per_session_s, api_path=API_PATH, gate_wait_s=g.max_wall_s, budget=budget, observer=observer,
+            runtime=ctx.runtime)
         prop = make_proposer(ctx.up, session, audit_dir=ctx.run_dir / "proposer-audit", timeout=int(g.per_session_s), hint=hint)
         spec = ctx.up.spec.BenchSpec(**{**ss.spec_fields(adapter_root), "name": s.ts.spec_name},
                                      prompts=ctx.up.spec.BenchPrompts(**s.ts.prompt_fields),
@@ -1349,6 +1369,14 @@ def _teardown(ctx: SweepContext, scratch: Path, session_ids: Sequence[str], befo
     if left_docker:
         remove_leftovers(ctx.verified, left_docker)
         left_docker = session_leftovers(ctx.verified, session_ids)
+    rt = ctx.runtime
+    if rt.kind == sbx_session.RUNTIME_SBX and rt.ok and rt.sbx_path:
+        # `docker_leftovers` is "what the model runtime left": with the sbx route it lists sbx sandboxes (their rules go with them)
+        left = sbx_session.leftover_sandboxes(rt.sbx_path, session_ids)
+        if left:
+            sbx_session.remove_leftover_sandboxes(rt.sbx_path, left)
+            left = sbx_session.leftover_sandboxes(rt.sbx_path, session_ids)
+        left_docker = [*left_docker, *left]
     new_entries = sorted(runtime_entries() - before_entries)
     return {"scratch_left": scratch.exists(), "docker_leftovers": left_docker, "sessions_seen": len(session_ids),
             "gate_locked": GATE.locked(), "new_runtime_entries": new_entries}
@@ -1422,6 +1450,12 @@ def run_run(args: argparse.Namespace, *, environ: Mapping[str, str], probes: Pro
     sweep_id = new_sweep_id()
     run_dir = s.runs_dir / sweep_id
     pr = probes or Probes(environ=environ)
+    try:                      # before the preflight can refuse: a leak of a hard-killed run must go even if this run cannot start
+        swept = pr.sweep_stale(environ, pr.which)
+    except Exception:  # noqa: BLE001 - housekeeping never blocks a run
+        swept = []
+    if swept:
+        err("removed stale sbx leftover(s): " + ", ".join(swept))
     pre = preflight(s, pr)
     if not pre.ok:
         for c in pre.failing():
@@ -1465,7 +1499,7 @@ def _approved(s: Settings, plan: SweepPlan, pre: Preflight, up: Any, surface: An
         assert pre.verified is not None and pre.image is not None and pre.cli is not None
         ctx = SweepContext(settings=s, plan=plan, grant=g, approval=approval, verified=pre.verified, image=pre.image,
                            cli=pre.cli, up=up, surface=surface, run_dir=run_dir, audit=audit, approved_for_real_model=real,
-                           run_task=run_task)
+                           run_task=run_task, runtime=pre.runtime)
         outcome = execute_sweep(ctx)
     finally:
         audit.close()

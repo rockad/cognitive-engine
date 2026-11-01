@@ -427,9 +427,33 @@ _SBX_CREATE_TIMEOUT_S = 600  # the daemon may pull the agent image on first use
 _SBX_EXEC_FAILURE = re.compile(r"\s*(failed to start|error: |inspect exec: )")
 
 
+# Rule types seen in `sbx policy ls --json` on sbx v0.50.1 (the default policy of this host, tests/fixtures/sbx_policy_ls_deny_all.json):
+# `network` (the deny-all) and the two filesystem mount rules, which grant no network reach. `http` is a network-reaching rule type
+# (an HTTP allow the sbx proxy enforces; `policy check network` does not see it). EVERY other resource_type is a foreign rule: a
+# policy that holds one is not one this code has judged, so sbx is unusable (fail closed), never skipped.
+SBX_NONNETWORK_RULE_TYPES = frozenset({"filesystem:read", "filesystem:write"})
+
+
+def sbx_rule_is_network(kind: object) -> bool:
+    """True for the rule types that can grant network reach: `network*` and `http`."""
+    return isinstance(kind, str) and (kind.startswith("network") or kind == "http")
+
+
+def sbx_rule_type_problem(rule: dict) -> str | None:
+    """A problem when `rule`'s resource_type is neither a network-reaching type nor on the observed allow-list."""
+    kind = rule.get("resource_type")
+    if not isinstance(kind, str):
+        return "`sbx policy ls --json` has a rule without a resource_type"
+    if sbx_rule_is_network(kind) or kind in SBX_NONNETWORK_RULE_TYPES:
+        return None
+    return (f"a rule of the unknown resource type {kind!r} exists ({rule.get('name') or rule.get('id')!r}): it was not observed on "
+            "this sbx version, so it cannot be judged (fail closed)")
+
+
 def sbx_network_policy_problem(policy_json: str) -> str | None:
     """None only when `sbx policy ls --json` says: an active deny-all (`**`, tcp and udp) network rule exists
-    and NO network rule allows anything (whatever its status). Anything unparseable or unexpected is a problem."""
+    and NO network-reaching rule (`network*` or `http`) allows anything (whatever its status or scope). A rule of any other type than
+    the observed `SBX_NONNETWORK_RULE_TYPES` is foreign and a problem. Anything unparseable or unexpected is a problem."""
     try:
         doc = json.loads(policy_json)
     except ValueError:
@@ -441,10 +465,10 @@ def sbx_network_policy_problem(policy_json: str) -> str | None:
     for rule in rules:
         if not isinstance(rule, dict):
             return "`sbx policy ls --json` has a malformed rule"
-        kind = rule.get("resource_type")
-        if not isinstance(kind, str):
-            return "`sbx policy ls --json` has a rule without a resource_type"
-        if not kind.startswith("network"):
+        problem = sbx_rule_type_problem(rule)
+        if problem:
+            return problem
+        if not sbx_rule_is_network(rule.get("resource_type")):
             continue
         decision = rule.get("decision")
         if decision == "allow":
@@ -602,10 +626,16 @@ class SbxRunner:
                  verified: frozenset[str] | None = None, cpus: int = 1, memory: str = "512m",
                  create_timeout_s: int = _SBX_CREATE_TIMEOUT_S, control_timeout_s: int = 60,
                  max_output_bytes: int = MAX_OUTPUT_BYTES,
-                 fallback: Callable[[dict], SandboxRunner] | None = None):
+                 fallback: Callable[[dict], SandboxRunner] | None = None,
+                 policy_problem: Callable[[str], str | None] | None = None):
         """`fallback` is for `auto` only: given the reason ({code, detail, loud}), it returns the verified Docker runner
         (or raises `SandboxUnavailable`). It is used only for a failure BEFORE the candidate started (`SandboxNotStarted`);
-        None (the `sbx` setting, and the default) keeps the runner strictly fail-closed."""
+        None (the `sbx` setting, and the default) keeps the runner strictly fail-closed.
+
+        `policy_problem` judges `sbx policy ls --json` in the preflight (default `sbx_network_policy_problem`: deny-all
+        and no allow rule at all). The model-session route (`sbx_session`) passes its own, which also tolerates the
+        per-sandbox rules of its own sessions."""
+        self.policy_problem = policy_problem or sbx_network_policy_problem
         self.fallback = fallback
         self._fell_back: SandboxRunner | None = None
         self.sbx_path = sbx_path
@@ -681,7 +711,7 @@ class SbxRunner:
         if version not in self.verified:
             raise SandboxUnavailable(f"sbx version {version} is not in the verified set "
                                      f"({', '.join(sorted(self.verified)) or 'empty'}) (fail closed)")
-        problem = sbx_network_policy_problem(self._must(self._argv("policy", "ls", "--json"), "policy ls").stdout)
+        problem = self.policy_problem(self._must(self._argv("policy", "ls", "--json"), "policy ls").stdout)
         if problem:
             raise SandboxUnavailable(f"{problem} (fail closed)")
         # Re-read on every run, not trusted from the selection probe's cache: the user can flip them in between.
