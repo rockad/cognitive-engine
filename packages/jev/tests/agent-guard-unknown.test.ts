@@ -143,13 +143,14 @@ describe('project-root agents found from a subdirectory cwd', () => {
     expect(call('deep', elsewhere)?.decision).toBe('ask');
   });
 
-  it('the nearest definition wins over one nearer the root', () => {
+  it('a nearer definition does not shadow one at the project root: differing models ask', () => {
     const root = path.join(tmp, 'repo');
     fs.mkdirSync(path.join(root, '.git'), { recursive: true });
     agentFile(path.join(root, '.claude', 'agents'), 'deep', 'model: opus');
     const sub = path.join(root, 'pkg');
     agentFile(path.join(sub, '.claude', 'agents'), 'deep', 'model: haiku');
-    expect(call('deep', sub)).toBeNull();
+    // Claude Code loads project agents from the root, so the cheaper nearer file cannot be trusted
+    expect(call('deep', sub)?.decision).toBe('ask');
   });
 
   it('does not walk above the git root', () => {
