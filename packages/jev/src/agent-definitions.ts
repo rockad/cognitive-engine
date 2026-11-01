@@ -16,11 +16,15 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { parseFrontmatterModel, unreadableModelValue } from './agent-frontmatter.js';
 
 export interface AgentDefinition {
   /** A definition file exists in one of the lookup locations. */
   found: boolean;
-  /** The `model:` from its frontmatter (first definition that sets one), or null. */
+  /**
+   * The `model:` from the first definition found, or null (it sets none, so it inherits). A
+   * frontmatter whose model cannot be established is reported as a value Jev cannot rank.
+   */
   model: string | null;
 }
 
@@ -162,16 +166,19 @@ export function readAgentDefinition(subagentType: string | undefined, cwd: strin
   const result: AgentDefinition = { found: false, model: null };
   const parsed = parseAgentName(subagentType);
   if (!parsed) return result;
+  // The FIRST definition file found decides, as in Claude Code (it uses only the highest-priority
+  // definition). A nearer file with no model means "inherit" and is never skipped for a farther file
+  // that names one; a nearer file whose model cannot be established is never replaced by a farther one.
   for (const dir of agentLookupDirs(subagentType, cwd)) {
+    let text: string;
     try {
-      const text = fs.readFileSync(path.join(dir, `${parsed.agent}.md`), 'utf8');
-      result.found = true;
-      const front = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text)?.[1];
-      const model = front && /^model:\s*(.+?)\s*$/m.exec(front)?.[1]?.replace(/^["']|["']$/g, '');
-      if (model) return { found: true, model };
+      text = fs.readFileSync(path.join(dir, `${parsed.agent}.md`), 'utf8');
     } catch {
-      // no definition here
+      continue; // no definition here
     }
+    const front = parseFrontmatterModel(text);
+    if (front.kind === 'unreadable') return { found: true, model: unreadableModelValue(front.reason) };
+    return { found: true, model: front.kind === 'model' ? front.value : null };
   }
   return result;
 }
