@@ -8,10 +8,10 @@ import { claudeDecisionsFile } from '../src/claude-audit.ts';
 import { clearConfigCacheForTesting } from '../src/core/config.ts';
 
 /**
- * Every project config from the hook cwd up to the project root counts, not just the nearest one:
- * the STRICTEST valid ceiling and the highest mode win, and a malformed file anywhere on the way
- * asks. A nested file can therefore never cancel an ancestor's ceiling. Files above the project root
- * (CLAUDE_PROJECT_DIR, else the git root) are not read.
+ * Every project config from the hook cwd up to the filesystem root counts, not just the nearest one
+ * (and, in a linked worktree, the main checkout's too): the STRICTEST valid ceiling and the highest
+ * mode win, and a malformed file anywhere on the way asks. A nested file can therefore never cancel
+ * an ancestor's ceiling, and the project root or git root is not where the search stops.
  */
 let tmp = '';
 let proj = '';
@@ -121,30 +121,136 @@ describe('a malformed ancestor asks on every guarded call', () => {
   });
 });
 
-describe('files above the project root are not read', () => {
-  it('CLAUDE_PROJECT_DIR bounds the walk: a ceiling above it is ignored', () => {
+describe('the search does not stop at the project root: it runs up to the filesystem root', () => {
+  it('a ceiling in a parent workspace above CLAUDE_PROJECT_DIR counts', () => {
     put(tmp, { guard: { ceiling: 'haiku' } });
     put(proj, {});
     process.env.CLAUDE_PROJECT_DIR = proj;
-    expect(inspectProjectConfig(sub)).toMatchObject({ state: 'valid', ceiling: null });
+    expect(inspectProjectConfig(sub)).toMatchObject({ state: 'valid', ceiling: 'haiku' });
   });
 
-  it('CLAUDE_PROJECT_DIR bounds the walk: a malformed file above it is ignored', () => {
-    put(tmp, '{ not json');
+  it('a malformed file above CLAUDE_PROJECT_DIR still asks', () => {
+    const bad = put(tmp, '{ not json');
     process.env.CLAUDE_PROJECT_DIR = proj;
-    expect(inspectProjectConfig(sub)).toEqual({ state: 'none' });
+    expect(inspectProjectConfig(sub)).toMatchObject({ state: 'malformed', file: bad });
   });
 
-  it('the git root bounds the walk when CLAUDE_PROJECT_DIR is unset', () => {
+  it('a ceiling above the git root counts when CLAUDE_PROJECT_DIR is unset', () => {
+    fs.mkdirSync(path.join(proj, '.git'));
+    put(tmp, { guard: { ceiling: 'haiku' } });
+    put(proj, { guard: { ceiling: 'sonnet' } });
+    expect(inspectProjectConfig(path.join(sub, 'deep'))).toMatchObject({ state: 'valid', ceiling: 'haiku' });
+  });
+
+  it('the strictest wins across the root and a parent workspace, and a looser parent loosens nothing', () => {
+    fs.mkdirSync(path.join(proj, '.git'));
+    put(tmp, { guard: { ceiling: 'opus' } });
+    put(proj, { guard: { ceiling: 'sonnet' } });
+    expect(inspectProjectConfig(sub)).toMatchObject({ state: 'valid', ceiling: 'sonnet' });
+  });
+
+  it('a malformed file above the git root asks', async () => {
     fs.mkdirSync(path.join(proj, '.git'));
     put(tmp, '{ not json');
-    put(proj, { guard: { ceiling: 'sonnet' } });
-    expect(inspectProjectConfig(path.join(sub, 'deep'))).toMatchObject({ state: 'valid', ceiling: 'sonnet' });
+    expect(await decide(agent('haiku', 'claude-sonnet-5-5', sub))).toBe('ask');
+  });
+
+  it('a planted sub/.git does not drop the ancestors ceiling', () => {
+    put(proj, { guard: { ceiling: 'haiku' } });
+    fs.mkdirSync(path.join(sub, '.git'));
+    expect(inspectProjectConfig(path.join(sub, 'deep'))).toMatchObject({ state: 'valid', ceiling: 'haiku' });
   });
 
   it('a file at the project root itself is read', () => {
     process.env.CLAUDE_PROJECT_DIR = proj;
     put(proj, { guard: { ceiling: 'sonnet' } });
     expect(inspectProjectConfig(path.join(sub, 'deep'))).toMatchObject({ ceiling: 'sonnet' });
+  });
+
+  it('CLAUDE_PROJECT_DIR elsewhere than the cwd: its ancestors count too', () => {
+    const other = path.join(tmp, 'elsewhere', 'proj2');
+    fs.mkdirSync(other, { recursive: true });
+    put(path.join(tmp, 'elsewhere'), { guard: { ceiling: 'haiku' } });
+    process.env.CLAUDE_PROJECT_DIR = other;
+    expect(inspectProjectConfig(sub)).toMatchObject({ state: 'valid', ceiling: 'haiku' });
+  });
+});
+
+describe('a linked worktree also treats the main checkout as an ancestor', () => {
+  let main = '';
+  let wt = '';
+
+  /** A main checkout with a real .git directory and a linked worktree whose `.git` is a file pointing into it. */
+  function linkedWorktree(wtDir: string, opts: { commondir?: boolean } = {}) {
+    main = path.join(tmp, 'main');
+    fs.mkdirSync(path.join(main, '.git', 'worktrees', 'wt'), { recursive: true });
+    if (opts.commondir !== false) fs.writeFileSync(path.join(main, '.git', 'worktrees', 'wt', 'commondir'), '../..\n');
+    fs.mkdirSync(wtDir, { recursive: true });
+    fs.writeFileSync(path.join(wtDir, '.git'), `gitdir: ${path.join(main, '.git', 'worktrees', 'wt')}\n`);
+    wt = wtDir;
+  }
+
+  it('a worktree inside the main checkout (.claude/worktrees/X): the main checkout ceiling counts', () => {
+    linkedWorktree(path.join(tmp, 'main', '.claude', 'worktrees', 'wt'));
+    put(main, { guard: { ceiling: 'haiku' } });
+    expect(inspectProjectConfig(wt)).toMatchObject({ state: 'valid', ceiling: 'haiku' });
+  });
+
+  it('a worktree next to the main checkout: the main checkout ceiling counts', () => {
+    linkedWorktree(path.join(tmp, 'sibling-wt'));
+    put(main, { guard: { ceiling: 'haiku' } });
+    expect(inspectProjectConfig(path.join(wt, 'deep-not-yet'))).toMatchObject({ state: 'valid', ceiling: 'haiku' });
+  });
+
+  it('with CLAUDE_PROJECT_DIR set to the worktree the main checkout still counts', () => {
+    linkedWorktree(path.join(tmp, 'sibling-wt'));
+    put(main, { guard: { ceiling: 'haiku' } });
+    process.env.CLAUDE_PROJECT_DIR = wt;
+    expect(inspectProjectConfig(wt)).toMatchObject({ state: 'valid', ceiling: 'haiku' });
+  });
+
+  it('the strictest of the worktree and the main checkout wins', () => {
+    linkedWorktree(path.join(tmp, 'sibling-wt'));
+    put(main, { guard: { ceiling: 'opus' } });
+    put(wt, { guard: { ceiling: 'sonnet' } });
+    expect(inspectProjectConfig(wt)).toMatchObject({ state: 'valid', ceiling: 'sonnet' });
+    put(main, { guard: { ceiling: 'haiku' } });
+    expect(inspectProjectConfig(wt)).toMatchObject({ state: 'valid', ceiling: 'haiku' });
+  });
+
+  it('a malformed file in the main checkout asks', () => {
+    linkedWorktree(path.join(tmp, 'sibling-wt'));
+    const bad = put(main, '{ nope');
+    expect(inspectProjectConfig(wt)).toMatchObject({ state: 'malformed', file: bad });
+  });
+
+  it('a main checkout found without a commondir file (gitdir/../..)', () => {
+    linkedWorktree(path.join(tmp, 'sibling-wt'), { commondir: false });
+    put(main, { guard: { ceiling: 'haiku' } });
+    expect(inspectProjectConfig(wt)).toMatchObject({ ceiling: 'haiku' });
+  });
+
+  it('a relative gitdir pointer is resolved against the worktree', () => {
+    main = path.join(tmp, 'main');
+    wt = path.join(tmp, 'rel-wt');
+    fs.mkdirSync(path.join(main, '.git', 'worktrees', 'wt'), { recursive: true });
+    fs.mkdirSync(wt, { recursive: true });
+    fs.writeFileSync(path.join(wt, '.git'), 'gitdir: ../main/.git/worktrees/wt\n');
+    put(main, { guard: { ceiling: 'haiku' } });
+    expect(inspectProjectConfig(wt)).toMatchObject({ ceiling: 'haiku' });
+  });
+
+  it('a garbage .git file is not an error and adds nothing', () => {
+    wt = path.join(tmp, 'garbage-wt');
+    fs.mkdirSync(wt, { recursive: true });
+    fs.writeFileSync(path.join(wt, '.git'), 'not a pointer');
+    expect(inspectProjectConfig(wt)).toEqual({ state: 'none' });
+  });
+
+  it('a pointer to a missing directory is not an error and adds nothing', () => {
+    wt = path.join(tmp, 'gone-wt');
+    fs.mkdirSync(wt, { recursive: true });
+    fs.writeFileSync(path.join(wt, '.git'), `gitdir: ${path.join(tmp, 'nowhere', '.git', 'worktrees', 'x')}\n`);
+    expect(inspectProjectConfig(wt)).toEqual({ state: 'none' });
   });
 });

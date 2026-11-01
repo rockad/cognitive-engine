@@ -1,11 +1,12 @@
 /**
  * Project-level Jev config for the guard: it may TIGHTEN the user config, never loosen it.
  *
- * Files: `.agents/jev.json` and `.jev.json` in the hook cwd and in every parent up to the project root
- * (`CLAUDE_PROJECT_DIR`, else the git root; see project-root.ts). ALL of them count: the lowest
- * valid `guard.ceiling` and the highest mode win, and one malformed file makes the result malformed,
- * so a nested file can never cancel an ancestor's ceiling. Files above the project root are not read.
- * Discovery uses lstat, so a dangling symlink is a file that cannot be read, not "no file".
+ * Files: `.agents/jev.json` and `.jev.json` in the hook cwd and in every parent up to the filesystem
+ * root, in `CLAUDE_PROJECT_DIR` and its parents, and (in a linked git worktree) in the main checkout
+ * and its parents; see `configDirs` in project-root.ts. The search does NOT stop at the project root
+ * or the git root. ALL of them count: the lowest valid `guard.ceiling` and the highest mode win, and
+ * one malformed file makes the result malformed, so a nested file can never cancel an ancestor's
+ * ceiling. Discovery uses lstat, so a dangling symlink is a file that cannot be read, not "no file".
  *
  * Read by the guard hook only. Keys it looks at (everything else is ignored, and never makes the
  * file malformed):
@@ -30,7 +31,7 @@ import * as fsSync from 'node:fs';
 import * as path from 'node:path';
 import { DEFAULT_CONFIG_IO, VALID_JEV_MODES, readConfigFile, type JevHarness, type JevMode } from './core/config.js';
 import { compareModels, parseModel } from './models.js';
-import { projectDirs } from './project-root.js';
+import { configDirs } from './project-root.js';
 
 export type ProjectConfig =
   | { state: 'none' }
@@ -39,12 +40,13 @@ export type ProjectConfig =
 
 /**
  * Every project config file that applies to `startDir`, nearest first: `.agents/jev.json` and
- * `.jev.json` in each directory from the cwd up to the project root (project-root.ts). Files above
- * the project root are not read. Both names in one directory count, `.agents/jev.json` first.
+ * `.jev.json` in each directory from the cwd up to the FILESYSTEM ROOT (not just the project root),
+ * then the same for `CLAUDE_PROJECT_DIR` and, in a linked git worktree, the main checkout
+ * (`configDirs` in project-root.ts). Both names in one directory count, `.agents/jev.json` first.
  */
 export function findProjectConfigs(startDir: string): string[] {
   const files: string[] = [];
-  for (const dir of projectDirs(path.resolve(startDir))) {
+  for (const dir of configDirs(path.resolve(startDir))) {
     for (const rel of [path.join('.agents', 'jev.json'), '.jev.json']) {
       const file = path.join(dir, rel);
       try {
