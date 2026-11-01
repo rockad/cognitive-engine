@@ -336,3 +336,102 @@ def test_an_interrupt_between_the_two_handler_installs_leaves_the_old_handlers_i
         signal.signal(signal.SIGINT, old_int)
         signal.signal(signal.SIGTERM, old_term)
 
+
+
+# ══ round 3: one shield for the whole teardown, and an incomplete teardown is a SessionCleanupError ═══════════════════════
+# The retry loop used to enter and leave the shield per attempt, and its `except KeyboardInterrupt:` body ran unshielded (a
+# second interrupt there skipped everything); the last attempt's interrupt left as a bare KeyboardInterrupt although nothing
+# had been cleaned. The shield is now entered once, the loop only retries the steps inside it, and a teardown that could not
+# be completed is a SessionCleanupError (the interrupt is its `__cause__`).
+
+def _flaky_teardown(r, failures):
+    """`r._teardown` raising KeyboardInterrupt on its first `failures` calls (all of them when None), recording the handlers it saw."""
+    real, seen = r._teardown, []
+
+    def teardown(*a, **k):
+        seen.append((signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)))
+        if failures is None or len(seen) <= failures:
+            raise KeyboardInterrupt(f"teardown call {len(seen)}")
+        return real(*a, **k)
+    r._teardown = teardown
+    return seen
+
+
+def _counting_shield(monkeypatch):
+    real, entries = sr._shielded_from_interrupts, []
+
+    @__import__("contextlib").contextmanager
+    def shield(*a, **k):
+        entries.append(1)
+        with real(*a, **k):
+            yield
+    monkeypatch.setattr(sr, "_shielded_from_interrupts", shield)
+    return entries
+
+
+def test_retrying_the_steps_does_not_re_enter_the_shield(world, monkeypatch):
+    entries = _counting_shield(monkeypatch)
+    r, plan = make(world)
+    seen = _flaky_teardown(r, 2)
+    with pytest.raises(KeyboardInterrupt):
+        r._execute(plan)
+    assert len(seen) == 3 and len(entries) == 1                    # three tries, ONE shield
+    assert all(i == signal.SIG_IGN and t == signal.SIG_IGN for i, t in seen)      # every retry (and its except body) is shielded
+    assert_fully_cleaned(r, world)
+
+
+def test_a_teardown_that_never_completes_is_a_cleanup_error_not_a_bare_interrupt(world):
+    r, plan = make(world)
+    _flaky_teardown(r, None)
+    with pytest.raises(sr.SessionCleanupError) as ei:
+        r._execute(plan)
+    assert isinstance(ei.value.__cause__, KeyboardInterrupt) and ei.value.leftovers
+
+
+def test_a_shield_that_is_interrupted_on_every_entry_is_a_cleanup_error(world, monkeypatch):
+    r, plan = make(world)
+    monkeypatch.setattr(sr, "_shielded_from_interrupts", _interrupt_entering_the_shield(_raise_ki, 100))
+    with pytest.raises(sr.SessionCleanupError) as ei:
+        r._execute(plan)
+    assert isinstance(ei.value.__cause__, KeyboardInterrupt)
+
+
+def test_the_shield_records_every_handler_before_it_replaces_any(monkeypatch):
+    events = []
+    real_get, real_set = signal.getsignal, signal.signal
+    monkeypatch.setattr(sr.signal, "getsignal", lambda s: (events.append(("get", s)), real_get(s))[1])
+    monkeypatch.setattr(sr.signal, "signal", lambda s, h: (events.append(("set", s)), real_set(s, h))[1])
+    sigs = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    olds = {s: real_get(s) for s in sigs}
+    try:
+        with sr._shielded_from_interrupts(sigs):
+            assert all(real_get(s) == signal.SIG_IGN for s in sigs)
+        assert all(real_get(s) == olds[s] for s in sigs)
+    finally:
+        for s, h in olds.items():
+            real_set(s, h)
+    kinds = [k for k, _ in events]
+    assert kinds[:3] == ["get"] * 3 and kinds[3:6] == ["set"] * 3             # all three read, then all three ignored
+    assert {s for k, s in events if k == "get"} == set(sigs)
+
+
+def test_an_interrupt_during_the_install_restores_every_handler_read_so_far(monkeypatch):
+    sentinel = (lambda *a: None)
+    old = {s: signal.signal(s, sentinel) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    try:
+        real_set, n = signal.signal, [0]
+
+        def flaky(s, h):
+            n[0] += 1
+            if n[0] == 2 and h == signal.SIG_IGN:
+                raise KeyboardInterrupt("mid-install")
+            return real_set(s, h)
+        monkeypatch.setattr(sr.signal, "signal", flaky)
+        with pytest.raises(KeyboardInterrupt):
+            with sr._shielded_from_interrupts((signal.SIGINT, signal.SIGTERM, signal.SIGHUP)):
+                pass
+        monkeypatch.undo()
+        assert all(signal.getsignal(s) is sentinel for s in old)
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
