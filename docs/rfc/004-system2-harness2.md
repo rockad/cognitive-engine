@@ -437,11 +437,12 @@ Everything else is refused, which closes the ollama management API that run #4 l
 
 ### 9.6 Approval gate: the true guarantee and the residual limit
 
-The `experience approve` gate is a human-in-the-loop control. What it guarantees:
-- An agent or script that has no controlling terminal, pipes its input, or passes a flag or marker supplied in-band cannot approve. Marker-style approval is refused.
-- Confirmation is read from `/dev/tty` and must include a per-invocation nonce that the human reads from the prompt and types back, so a prewritten answer does not work.
+The approval of a real-model sweep (`stage1 run --approve <channel>`, `confirm_on_terminal`) is a human-in-the-loop control. What it does (hardened 2026-10-31 after the Fable 5.1 review):
+- The process must have a controlling terminal: the confirmation is read from `/dev/tty`, never from stdin, so pipes, redirected stdin and scripts without a tty are refused.
+- The typed text is the approval phrase plus a fresh four-word nonce shown on the terminal, so a prewritten answer does not work.
+- The command refuses to run, with no flag to override it, when the environment carries a known agent-harness marker (`CLAUDECODE`, `CLAUDE_CODE_*`, `ANTIGRAVITY*`, `GEMINI_CLI*`, `AGY_*`, `OPENCODE*`, `CODEX*`; the Antigravity, Gemini and `AGY_` names are prefix guesses, not names the repo has observed).
 
-What it does not guarantee: a process running as the same user can allocate and drive a pty, and can therefore imitate a human at a terminal. The gate stops accidental and naive automated approval; it is not a defence against a hostile same-user process. The containment of model sessions (section 6.2 item 3) does not rely on this gate; the gate only guards the step where a human accepts staged output.
+What it does not guarantee: a process running as the same user can allocate and drive a pty (`pty.fork`, `script`, `expect`, `tmux send-keys`), read the nonce and type it back, and it can scrub the environment markers. The gate stops pipes, scripts and anything running inside a known agent harness; it is not a defence against a determined same-user process, and the human remains the control. `tests/test_stage1_approval_pty.py` asserts both sides (a pty driver without markers is still approved; with markers it is refused). The containment of model sessions (section 6.2 item 3) does not rely on this gate.
 
 ### 9.7 Sandbox selection: sbx default and fallback matrix
 
@@ -450,13 +451,14 @@ What it does not guarantee: a process running as the same user can allocate and 
 | Runner setting | Work | Result |
 |---|---|---|
 | AUTO (default) | Model-free untrusted execution, `sbx` verified | `sbx` |
-| AUTO | Model-free untrusted execution, `sbx` missing or version not verified | Docker, with a loud warning that names the reason |
+| AUTO | Model-free untrusted execution, `sbx` installed but not selected (version not verified, `/dev/kvm` unusable, daemon down, network policy not deny-all, a host-reach setting on or a restart pending, probe timeout or error) | Docker, with one warning per process that names the reason code (`sbx` simply not installed falls back silently; the reason still shows in the status report) |
+| AUTO | `sbx` selected but it fails before the candidate starts (create, image, staging) | Docker for the rest of that runner's life, with a warning (`sbx-run-failed`); never after the candidate has started |
 | `docker` | Any | Docker is forced; `sbx` is never tried |
 | `sbx` | Any model-free | `sbx`, or fail closed if it is unavailable (no Docker fallback) |
 | any | Model sessions (proposer channels) | Docker only; model sessions stay on Docker |
 | any | Neither runtime available | Fail closed; no code runs |
 
-Precondition for `sbx`: both host-reach settings must be off, otherwise the runner refuses to start. Earlier text in this RFC that described `sbx` as "unverified", "not installed" or only selected on explicit opt-in is superseded by this section.
+Precondition for selecting `sbx`: both host-reach settings (`ssh.agentForwardingEnabled`, `browser.enabled`) must be off and no daemon restart pending. Under AUTO a violation means a fallback to Docker with the reason; only in `sbx` mode does it refuse (`COGNITIVE_HARNESS2_SBX_ALLOW_HOST_SETTINGS=1` overrides these two settings only, for the live tests). Earlier text in this RFC that described `sbx` as "unverified", "not installed" or only selected on explicit opt-in is superseded by this section.
 
 ### 9.8 Slot table enforced on every task set
 
