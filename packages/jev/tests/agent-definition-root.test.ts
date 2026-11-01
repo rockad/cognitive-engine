@@ -44,7 +44,8 @@ afterEach(() => {
 function define(dir: string, name: string, model: string | null) {
   const agents = path.join(dir, '.claude', 'agents');
   fs.mkdirSync(agents, { recursive: true });
-  fs.writeFileSync(path.join(agents, `${name}.md`), model === null ? '---\nname: x\n---\nbody\n' : `---\nname: x\nmodel: ${model}\n---\nbody\n`);
+  // the declared name must be the file's name: Claude Code registers a file under its `name:`
+  fs.writeFileSync(path.join(agents, `${name}.md`), model === null ? `---\nname: ${name}\n---\nbody\n` : `---\nname: ${name}\nmodel: ${model}\n---\nbody\n`);
   return path.join(agents, `${name}.md`);
 }
 function transcript(model: string): string {

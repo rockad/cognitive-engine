@@ -12,6 +12,10 @@
  *      (never fewer definitions than a plain search of all). A namespaced name `plugin:agent` only
  *      looks in the plugin called `plugin`.
  *
+ * Within each directory every `.md` file (subdirectories included) is read and matched on its
+ * frontmatter `name:`, as Claude Code registers agents; see `scanAgentDir` for the conflict rules
+ * (two claimants, a `<name>.md` that declares another name, an unreadable name).
+ *
  * The name is restricted to file-name characters (one `:` allowed, as the plugin separator), so a
  * path-like name never escapes the directories. A name that resolves to no file is "not found",
  * which callers treat as unverifiable and ask about; this module never decides to allow.
@@ -19,7 +23,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { parseFrontmatterModel, unreadableModelValue } from './agent-frontmatter.js';
+import { parseFrontmatterFields, readClaudeCodeName, unreadableModelValue } from './agent-frontmatter.js';
 import { projectDirs } from './project-root.js';
 
 export interface AgentDefinition {
@@ -143,6 +147,121 @@ function modelKey(model: string | null): string {
   return m === '' ? 'inherit' : m;
 }
 
+/** Most `.md` files read from one agents directory tree; past it the directory is a conflict (ask). */
+const MAX_AGENT_FILES = 2000;
+const MAX_AGENT_DEPTH = 8;
+/** An agent file larger than this is not parsed; it can only be a conflict. */
+const MAX_AGENT_FILE_BYTES = 1024 * 1024;
+
+/** Every `.md` file under `root`, subdirectories included, sorted; null when `root` is not a readable directory. */
+function listMarkdown(root: string): { files: string[]; truncated: boolean } | null {
+  const files: string[] = [];
+  const visited = new Set<string>();
+  let truncated = false;
+  const walk = (dir: string, depth: number): boolean => {
+    let real: string;
+    let entries: fs.Dirent[];
+    try {
+      real = fs.realpathSync(dir);
+      if (visited.has(real)) return true;
+      visited.add(real);
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return false;
+    }
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      let isDir = entry.isDirectory();
+      let isFile = entry.isFile();
+      if (entry.isSymbolicLink()) {
+        try {
+          const st = fs.statSync(full);
+          isDir = st.isDirectory();
+          isFile = st.isFile();
+        } catch {
+          continue; // dangling
+        }
+      }
+      if (isDir) {
+        if (depth >= MAX_AGENT_DEPTH) truncated = true;
+        else walk(full, depth + 1);
+      } else if (isFile && /\.md$/i.test(entry.name)) {
+        if (files.length >= MAX_AGENT_FILES) {
+          truncated = true;
+          return true;
+        }
+        files.push(full);
+      }
+    }
+    return true;
+  };
+  return walk(root, 0) ? { files, truncated } : null;
+}
+
+type DirScan =
+  | { kind: 'none' }
+  | { kind: 'conflict'; reason: string }
+  | { kind: 'def'; file: string; model: string | null; unreadable: boolean };
+
+/**
+ * The definition of `agent` in ONE agents directory, as Claude Code would register it: every `.md`
+ * file under it (subdirectories included) is read and registered under its frontmatter `name:`.
+ * - a file whose `name:` is the agent claims it;
+ * - a file called `<agent>.md` with no `name:` at all claims it by its file name (as always);
+ * - a file called `<agent>.md` that declares ANOTHER name, or whose name cannot be read, is a
+ *   conflict (which file Claude Code runs is not known);
+ * - another file whose name cannot be read is a conflict when it could be this agent: Claude Code's
+ *   own reading gives the agent, is unavailable, or the text mentions the agent;
+ * - more than one claimant is a conflict, and so is a tree too large to read.
+ * A conflict makes both guards ask.
+ */
+function scanAgentDir(dir: string, agent: string): DirScan {
+  const listing = listMarkdown(dir);
+  if (listing === null) return { kind: 'none' };
+  const claims: Array<{ file: string; model: string | null; unreadable: boolean }> = [];
+  const conflicts: string[] = [];
+  if (listing.truncated) conflicts.push(`${dir} holds more agent files than Jev reads (${MAX_AGENT_FILES}), or nests deeper than ${MAX_AGENT_DEPTH} levels`);
+  for (const file of listing.files) {
+    const byFileName = path.basename(file).replace(/\.md$/i, '') === agent;
+    let text: string;
+    try {
+      if (fs.statSync(file).size > MAX_AGENT_FILE_BYTES) {
+        if (byFileName) conflicts.push(`${file} is over ${MAX_AGENT_FILE_BYTES} bytes and is not read`);
+        continue;
+      }
+      text = fs.readFileSync(file, 'utf8');
+    } catch {
+      continue; // not readable: not a definition (as before)
+    }
+    const { model, name } = parseFrontmatterFields(text);
+    const claim = () => ({
+      file,
+      unreadable: model.kind === 'unreadable',
+      model: model.kind === 'unreadable' ? unreadableModelValue(model.reason) : model.kind === 'model' ? model.value : null
+    });
+    if (name.kind === 'name') {
+      if (name.value === agent) claims.push(claim());
+      else if (byFileName) conflicts.push(`${file} declares the name "${name.value}", so it is not clear which file defines "${agent}"`);
+    } else if (name.kind === 'none') {
+      if (byFileName) claims.push(claim());
+    } else if (byFileName) {
+      conflicts.push(`${file} has a name that cannot be read (${name.reason})`);
+    } else {
+      const cc = readClaudeCodeName(text);
+      if (cc.kind === 'unreadable') conflicts.push(`${file} has a name that cannot be read (${name.reason})`);
+      else if (cc.kind === 'name' && cc.value === agent) conflicts.push(`${file} may declare the name "${agent}" (${name.reason})`);
+      else if (text.includes(agent)) conflicts.push(`${file} has a name that cannot be read (${name.reason}) and mentions "${agent}"`);
+    }
+  }
+  if (conflicts.length > 0) return { kind: 'conflict', reason: `${conflicts.join('; ')}` };
+  if (claims.length === 0) return { kind: 'none' };
+  if (claims.length > 1) {
+    return { kind: 'conflict', reason: `more than one file in ${dir} defines "${agent}", and which one Claude Code runs is not known: ${claims.map((c) => `${c.file} (${c.model ?? 'no model'})`).join(' vs ')}` };
+  }
+  return { kind: 'def', ...claims[0] };
+}
+
 export function readAgentDefinition(subagentType: string | undefined, cwd: string | undefined): AgentDefinition {
   const result: AgentDefinition = { found: false, model: null };
   const parsed = parseAgentName(subagentType);
@@ -161,21 +280,11 @@ export function readAgentDefinition(subagentType: string | undefined, cwd: strin
   for (const dir of agentLookupDirs(subagentType, cwd)) {
     const inProject = projectDirSet.has(dir);
     if (project.length > 0 && !inProject) break; // past the project: the project definition decided
-    const file = path.join(dir, `${parsed.agent}.md`);
-    let text: string;
-    try {
-      text = fs.readFileSync(file, 'utf8');
-    } catch {
-      continue; // no definition here
-    }
-    const front = parseFrontmatterModel(text);
-    const found = {
-      file,
-      unreadable: front.kind === 'unreadable',
-      model: front.kind === 'unreadable' ? unreadableModelValue(front.reason) : front.kind === 'model' ? front.value : null
-    };
-    if (!inProject) return { found: true, model: found.model };
-    project.push(found);
+    const scan = scanAgentDir(dir, parsed.agent);
+    if (scan.kind === 'none') continue; // no definition here
+    if (scan.kind === 'conflict') return { found: true, model: unreadableModelValue(scan.reason) };
+    if (!inProject) return { found: true, model: scan.model };
+    project.push(scan);
   }
   if (project.length === 0) return result;
   const [first, ...others] = project;
