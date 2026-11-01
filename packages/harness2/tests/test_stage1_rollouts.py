@@ -541,3 +541,38 @@ def test_the_pass_rate_line_names_n_passed_over_n_for_both_arms_and_is_there_for
     died = stage1.arm_rates([roll("base1", True), roll("base2", None, ok=False)], "agg1")
     assert "1 unusable" in stage1.pass_rate_line({"pass_rates": {"final_label": "agg1", **died}})
     assert stage1.pass_rate_line({}) == ""
+
+
+# ══ round 3: a run_task that FAILED (without raising) must not be followed by base extras ══════════════════════════════════
+
+def with_status(status, **kw):
+    res = selection(**kw)
+    res.status = status
+    return res
+
+
+@pytest.mark.parametrize("status", ["base-failed", "failed", "exception", "running"])
+def test_a_failed_run_task_gets_no_extra_rollouts_and_the_report_says_why(up, tmp_path, status):
+    audit = Audit()
+    ad, out, *_ = extras(up, tmp_path, 8, with_status(status), audit=audit)
+    assert ad.calls == [] and out["base"] == [] and out["final"] == [] and out["errors"] == []
+    assert status in out["skipped"] and "run_task" in out["skipped"] and "base2..base8" in out["skipped"]
+    assert [e for e, _f in audit.events] == ["extra_rollouts_skipped"]                       # nothing started, so no start/end pair
+    assert audit.events[0][1] == {"n": 8, "reason": out["skipped"], "base_extras_run": False}
+
+
+@pytest.mark.parametrize("status", ["ok", "partial", "skipped"])
+def test_a_usable_run_task_still_gets_its_base_extras(up, tmp_path, status):
+    ad, out, *_ = extras(up, tmp_path, 3, with_status(status))
+    assert _labels(ad) == ["base2", "agg1.r2", "base3", "agg1.r3"] and out["skipped"] is None
+
+
+def test_a_result_with_no_status_at_all_keeps_the_old_behaviour(up, tmp_path):
+    ad, out, *_ = extras(up, tmp_path, 3)                                                    # `selection()` has no `status`
+    assert len(ad.calls) == 4 and out["skipped"] is None
+
+
+def test_a_failed_run_task_with_n_of_one_is_still_silent(up, tmp_path):
+    audit = Audit()
+    ad, out, *_ = extras(up, tmp_path, 1, with_status("base-failed"), audit=audit)
+    assert ad.calls == [] and out["skipped"] is None and audit.events == []

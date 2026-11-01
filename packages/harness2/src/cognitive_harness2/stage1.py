@@ -95,7 +95,7 @@ class RolloutPlan:
     `run_extra_rollouts`. inv1 and dom1 are upstream's evidence for the aggregator and stay at one each.
 
     `sessions` is the WORST case, and it is what the cap check, the grant and the budget use: sessions = P + R +
-    (n - 1 base extras, always run) + (n - 1 final extras per final, run only if an edited harness was adopted)."""
+    (n - 1 base extras, run unless run_task failed) + (n - 1 final extras per final, run only if an edited harness was adopted)."""
     n: int
     proposer: int               # P: upstream's proposer sessions
     upstream_rollouts: int      # upstream's R
@@ -1093,6 +1093,9 @@ def sweep_exhausted(budget: Any) -> bool:
     return bool(snap["remaining_s"] <= 0 or snap["exhausted"] or (cap is not None and snap["counts"]["solver"] >= cap))
 
 
+RUN_TASK_USABLE_STATUSES = ("ok", "partial", "skipped")      # upstream's TaskResult.status values after which extras make sense
+
+
 def run_extra_rollouts(adapter: Any, res: Any, *, up: Any, runs_root: Path, task: str, k: int, n: int, audit: Any,
                        exhausted: Callable[[], bool]) -> dict:
     """The rollouts upstream does not make: base2..baseN and `<final>.r2`..`<final>.rN`, after `run_task`, through the same
@@ -1103,7 +1106,8 @@ def run_extra_rollouts(adapter: Any, res: Any, *, up: Any, runs_root: Path, task
     (`<task dir>/harnesses/<final>`), so they are the same harnesses upstream rolled once. They alternate (base2, final.r2,
     base3, ...) so a drift in the model or the GPU over the run does not fall on one arm. The final's repeats run only
     when an edited harness was adopted: with no edit the final IS the base and there is nothing to compare. The BASE extras
-    (base2..baseN) always run: the baseline pass rate over N is a result in itself, whatever the proposer did (decided 2026-11-01). A
+    (base2..baseN) always run, whatever the proposer did: the baseline pass rate over N is a result in itself (decided 2026-11-01); the
+    one exception is a `run_task` that came back with a failure status (`base-failed`, say), which skips them and says so. A
     rollout that dies is counted (and is not in the pass count); a spent budget (wall clock or session count, see
     `sweep_exhausted`) stops the rest. Returns `{base, final, errors, skipped}`: the labels run, one `label: error` per
     failure, and why the rest did not run (`skipped`: the final's repeats not run for want of an adopted edit, and/or the
@@ -1111,7 +1115,15 @@ def run_extra_rollouts(adapter: Any, res: Any, *, up: Any, runs_root: Path, task
     out: dict[str, Any] = {"base": [], "final": [], "errors": [], "skipped": None}
     if n <= 1:
         return out
-    sel = (getattr(res, "selections", None) or {}).get("agg")
+    status = getattr(res, "status", None)
+    if isinstance(status, str) and status not in RUN_TASK_USABLE_STATUSES:
+        # `run_task` returned (it did not raise) with a failure status, upstream's `base-failed` for one: no base rollout produced
+        # anything, or the sweep is not in a state to compare. More base rollouts would only spend sessions (and model time) on it.
+        out["skipped"] = (f"run_task ended with status {sr.sanitize_terminal(status)[:40]!r}: base2..base{n} and the final's repeats "
+                          "were not run")
+        audit.emit("extra_rollouts_skipped", n=n, reason=out["skipped"], base_extras_run=False)
+        return out
+    sel =(getattr(res, "selections", None) or {}).get("agg")
     chosen = sel.get("chosen_label") if isinstance(sel, dict) else None
     ns = up.schedule.Namespace(adapter.spec.name, adapter.substrate.name, "agg", k)
     hdir: Path | None = None
