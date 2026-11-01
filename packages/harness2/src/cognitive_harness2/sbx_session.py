@@ -11,6 +11,7 @@ means, the sandbox names, and which runtime model sessions use. `SbxSessionRunne
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -41,8 +42,11 @@ RUNTIME_DOCKER, RUNTIME_SBX, RUNTIME_REFUSED = "docker", "sbx", "refused"
 VERIFIED_SBX_MODEL_VERSIONS: frozenset[str] = frozenset({"0.50.1"})
 
 NAME_PREFIX = "h2m"
-# groups: 1 scope, 2 pid, then (3 boot, 4 pid namespace, 5 start time) together or not at all, 6 session id
-_NAME = re.compile(r"^h2m-(?:([0-9a-f]{8,32})|0)-([0-9]{1,10})(?:-([0-9a-f]{8})-([0-9a-f]{1,8})-([0-9a-f]{1,10}))?-([0-9a-f]{12})$")
+# groups: 1 scope, 2 pid, then (3 boot, 4 pid namespace, 5 start time, 6 machine tag or none) together or not at all, 7 session id
+_NAME = re.compile(r"^h2m-(?:([0-9a-f]{8,32})|0)-([0-9]{1,10})(?:-([0-9a-f]{8})-([0-9a-f]{1,8})-([0-9a-f]{1,10})(?:-([0-9a-f]{4}))?)?"
+                   r"-([0-9a-f]{12})$")
+_NAME_MAX = 63                                             # the longest sandbox name the daemon takes (and the tests' format check)
+_MACHINE_ID_FILES = ("/etc/machine-id", "/var/lib/dbus/machine-id")
 _SCOPE_SANDBOX = "sandbox:"
 _DENY_ACTIONS = frozenset({"net:connect:tcp", "net:connect:udp"})
 _RULE_HOST = re.compile(r"^localhost:([0-9]{1,5})$")
@@ -67,13 +71,29 @@ def model_sandbox_setting(environ: Mapping[str, str]) -> tuple[str, str | None]:
 
 @dataclass(frozen=True)
 class Owner:
-    """Who made a sandbox, as far as a later process can tell. `boot` is the first 8 hex digits of the kernel's boot id (every
-    process of an earlier boot is gone), `ns` the pid-namespace inode in hex (a pid means something only inside its own
-    namespace, and a devcontainer or a second WSL distro shares the sbx daemon but not our pids), `start` the process start time in
-    clock ticks since boot (a recycled pid has another one)."""
+    """Who made a sandbox, as far as a later process can tell. `boot` is the first 8 hex digits of the kernel's boot id (a
+    process of an earlier boot of THIS machine is gone), `ns` the pid-namespace inode in hex (a pid means something only inside its
+    own namespace, and a devcontainer or a second WSL distro shares the sbx daemon but not our pids), `start` the process start time
+    in clock ticks since boot (a recycled pid has another one), `machine` a 4-hex tag of the hashed machine id (None when it cannot
+    be read or the name had no room for it). A different boot id is proof of death only with the same machine tag on both sides:
+    two kernels (a Lima VM and a devcontainer) can share one sbx daemon, each with its own boot id and both alive."""
     boot: str
     ns: str
     start: int
+    machine: str | None = None
+
+
+def _machine_tag() -> str | None:
+    """4 hex digits of a salted hash of the machine id (`/etc/machine-id`), never the id itself; None when it cannot be read.
+    16 bits is enough for what it does (telling the kernels that share one sbx daemon apart); it is not an authenticator."""
+    for path in _MACHINE_ID_FILES:
+        try:
+            raw = Path(path).read_text().strip().lower()
+        except OSError:
+            continue
+        if re.fullmatch(r"[0-9a-f]{32}", raw):
+            return hashlib.sha256(b"cognitive-harness2/h2m/" + raw.encode()).hexdigest()[:4]
+    return None
 
 
 def _proc_start(pid: int) -> int | None:
@@ -101,7 +121,7 @@ def current_owner() -> Owner | None:
         return None
     if not (re.fullmatch(r"[0-9a-f]{8}", boot) and ns and start is not None and len(format(int(ns.group(1)), "x")) <= 8):
         return None
-    return Owner(boot, format(int(ns.group(1)), "x"), start)
+    return Owner(boot, format(int(ns.group(1)), "x"), start, _machine_tag())
 
 
 def sandbox_name(session_id: str, *, pid: int | None = None, scope: str | None = None, owner: Owner | None = None) -> str:
@@ -114,24 +134,28 @@ def sandbox_name(session_id: str, *, pid: int | None = None, scope: str | None =
     if pid is None:
         pid, owner = os.getpid(), owner or current_owner()
     tail = f"-{owner.boot}-{owner.ns}-{owner.start:x}" if owner is not None else ""
-    return f"{NAME_PREFIX}-{scope or '0'}-{pid}{tail}-{session_id}"
+    name = f"{NAME_PREFIX}-{scope or '0'}-{pid}{tail}-{session_id}"
+    if owner is not None and owner.machine and len(name) + len(owner.machine) + 1 <= _NAME_MAX:
+        name = f"{NAME_PREFIX}-{scope or '0'}-{pid}{tail}-{owner.machine}-{session_id}"       # only when it fits: never a longer name
+    return name
 
 
 def parse_sandbox_name(name: str) -> tuple[str | None, int, str] | None:
     """(scope, pid, session id) of a sandbox name this module made, else None."""
     m = _NAME.fullmatch(name) if isinstance(name, str) else None
-    return (m.group(1), int(m.group(2)), m.group(6)) if m else None
+    return (m.group(1), int(m.group(2)), m.group(7)) if m else None
 
 
 def parse_owner(name: str) -> Owner | None:
     """The `Owner` in a sandbox name this module made; None for a legacy name or one that is not ours."""
     m = _NAME.fullmatch(name) if isinstance(name, str) else None
-    return Owner(m.group(3), m.group(4), int(m.group(5), 16)) if m and m.group(3) else None
+    return Owner(m.group(3), m.group(4), int(m.group(5), 16), m.group(6)) if m and m.group(3) else None
 
 
 def is_stale(name: str, me: Owner | None, *, proc_start: Callable[[int], int | None] = _proc_start) -> bool:
     """True only when `name` is ours AND carries an owner AND that owner is provably gone, seen from `me`:
-    - another boot: every process of it is gone, so yes;
+    - another boot, with the SAME machine tag on both sides: that boot is over and every process of it is gone, so yes; with a
+      different or unknown tag NO (a Lima VM and a devcontainer share one sbx daemon with different boot ids, both alive);
     - the same boot, another pid namespace: its pids mean nothing here, so NO (it may well be alive);
     - the same boot and namespace: the pid is not running, or is running with another start time (it was recycled).
     A legacy name (no owner), no identity of `me`, or an unreadable /proc judges nothing. A pid alone is never proof."""
@@ -139,7 +163,7 @@ def is_stale(name: str, me: Owner | None, *, proc_start: Callable[[int], int | N
     if parsed is None or owner is None or me is None:
         return False
     if owner.boot != me.boot:
-        return True
+        return owner.machine is not None and owner.machine == me.machine
     if owner.ns != me.ns:
         return False
     try:
@@ -916,7 +940,7 @@ def make_runner(runtime: ModelRuntime | None, verified: sandbox.VerifiedDocker |
 def sweep_stale_sandboxes(sbx_path: str, environ: Mapping[str, str] | None = None, *, timeout: int = 60) -> list[str]:
     """Remove the `h2m-` sandboxes that are provably leaks of a dead run (`is_stale`: an owner in the name, seen from this process;
     never a pid alone, never another pid namespace's, never a name without an owner, never a sandbox that is not ours), with a run
-    scope set only that scope's. A sandbox's rules go with it. Returns `sandbox NAME` for each removed.
+    scope set only that scope's. A sandbox's rules go with it. Returns `sandbox NAME` for each sandbox whose `sbx rm` exited 0 (not one that failed or timed out).
 
     Read-only until it has something to remove, and it never starts the daemon: nothing is run unless the daemon socket already
     answers. A listing that fails removes nothing. Called by every `SbxSessionRunner` before its preflight, and by `stage1 run`
@@ -936,10 +960,13 @@ def sweep_stale_sandboxes(sbx_path: str, environ: Mapping[str, str] | None = Non
         parsed = parse_sandbox_name(name)
         if parsed is None or (scope is not None and parsed[0] != scope) or not is_stale(name, me):
             continue
-        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
-            subprocess.run([sbx_path, "rm", "--force", name], capture_output=True, text=True, timeout=timeout,
-                           stdin=subprocess.DEVNULL, env=env)
-        removed.append(f"sandbox {name}")
+        try:
+            rm = subprocess.run([sbx_path, "rm", "--force", name], capture_output=True, text=True, timeout=timeout,
+                                stdin=subprocess.DEVNULL, env=env)
+        except (subprocess.TimeoutExpired, OSError):
+            continue                                             # not removed (as far as we know): not reported as removed
+        if rm.returncode == 0:
+            removed.append(f"sandbox {name}")
     return removed
 
 

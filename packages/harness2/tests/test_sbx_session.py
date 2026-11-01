@@ -602,15 +602,6 @@ def test_a_sandbox_of_another_pid_namespace_is_left_alone_even_when_its_pid_does
 
 
 @needs_proc
-def test_a_sandbox_of_an_earlier_boot_is_removed_because_no_process_survives_a_reboot(world, monkeypatch):
-    monkeypatch.delenv(run_scope.ENV, raising=False)
-    old = owned("0000000000c1", pid=os.getpid(), scope=None, owner=ss.Owner("00000000", ME.ns, ME.start))
-    seed(world, [old], rules_for=[old])
-    assert world.runner().sweep_stale() == [f"sandbox {old}"]
-    assert world.listed() == []
-
-
-@needs_proc
 def test_a_name_without_an_owner_is_never_swept_and_nor_is_anything_that_is_not_ours(world, monkeypatch):
     monkeypatch.delenv(run_scope.ENV, raising=False)
     legacy = ss.sandbox_name("0000000000d1", pid=dead_pid(), scope=None)               # a dead pid, but no proof of whose it was
@@ -1183,3 +1174,69 @@ def test_a_teardown_that_never_completes_is_a_cleanup_error_with_the_interrupt_a
     runner, args = calls[-1]                                               # nothing was torn down: do it now, for the fake's sake
     real(runner, *args[:3], sr._Cleanup())
     assert world.listed() == [] and world.rules() == [] and world.runtime_leftovers() == []
+
+
+# ── round 3: a different boot id is proof only on the same machine; `removed` names only what `sbx rm` removed ──────────────
+
+@pytest.fixture
+def machine(tmp_path, monkeypatch):
+    """This host with a known machine id, so the machine tag is the same on every CI machine. Returns (me, a tag of another machine)."""
+    f = tmp_path / "machine-id"
+    f.write_text("0123456789abcdef0123456789abcdef\n")
+    monkeypatch.setattr(ss, "_MACHINE_ID_FILES", (str(f),))
+    me = ss.current_owner()
+    assert me is not None and me.machine
+    return me, ("0000" if me.machine != "0000" else "ffff")
+
+
+@needs_proc
+def test_a_sandbox_of_an_earlier_boot_of_this_machine_is_removed(world, monkeypatch, machine):
+    me, _ = machine
+    monkeypatch.delenv(run_scope.ENV, raising=False)
+    old = ss.sandbox_name("0000000000c1", pid=os.getpid(), scope=None, owner=ss.Owner("00000000", me.ns, me.start, me.machine))
+    seed(world, [old], rules_for=[old])
+    assert world.runner().sweep_stale() == [f"sandbox {old}"]
+    assert world.listed() == []
+
+
+@needs_proc
+def test_a_sandbox_that_may_belong_to_another_kernel_on_the_same_daemon_is_left_alone(world, monkeypatch, machine):
+    """A Lima VM and a devcontainer share one sbx daemon with different boot ids; neither owner is dead."""
+    me, other = machine
+    monkeypatch.delenv(run_scope.ENV, raising=False)
+    foreign = ss.sandbox_name("0000000000c2", pid=dead_pid(), scope=None, owner=ss.Owner("00000000", me.ns, me.start, other))
+    untagged = ss.sandbox_name("0000000000c3", pid=dead_pid(), scope=None, owner=ss.Owner("00000000", me.ns, me.start))
+    seed(world, [foreign, untagged], rules_for=[foreign, untagged])
+    assert world.runner().sweep_stale() == []
+    assert sorted(world.listed()) == sorted([foreign, untagged]) and len(world.rules()) == 2
+
+
+@needs_proc
+def test_an_unreadable_machine_id_here_means_an_earlier_boot_is_not_judged(world, monkeypatch, machine, tmp_path):
+    me, _ = machine
+    monkeypatch.delenv(run_scope.ENV, raising=False)
+    old = ss.sandbox_name("0000000000c4", pid=os.getpid(), scope=None, owner=ss.Owner("00000000", me.ns, me.start, me.machine))
+    seed(world, [old])
+    monkeypatch.setattr(ss, "_MACHINE_ID_FILES", (str(tmp_path / "gone"),))
+    assert world.runner().sweep_stale() == [] and world.listed() == [old]
+
+
+@needs_proc
+@pytest.mark.parametrize("how", ["exit-1", "timeout", "oserror"])
+def test_a_failed_or_timed_out_rm_is_not_reported_as_removed(world, monkeypatch, how):
+    monkeypatch.delenv(run_scope.ENV, raising=False)
+    gone = ss.Owner(ME.boot, ME.ns, 1)
+    a, b = owned("0000000000d3", pid=dead_pid(), scope=None, owner=gone), owned("0000000000d4", pid=dead_pid(), scope=None, owner=gone)
+    seed(world, [a, b])
+    real = subprocess.run
+
+    def run(argv, *args, **kw):
+        if argv[1:3] == ["rm", "--force"] and argv[3] == a:
+            if how == "timeout":
+                raise subprocess.TimeoutExpired(argv, 1)
+            if how == "oserror":
+                raise OSError("gone")
+            return subprocess.CompletedProcess(argv, 1, "", "error")
+        return real(argv, *args, **kw)
+    monkeypatch.setattr(ss.subprocess, "run", run)
+    assert ss.sweep_stale_sandboxes(str(FAKE), world.env) == [f"sandbox {b}"]                    # only the one that really went

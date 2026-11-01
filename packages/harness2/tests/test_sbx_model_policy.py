@@ -282,10 +282,49 @@ def test_another_pid_namespace_is_not_judged_because_its_pids_mean_nothing_here(
     assert stale(owned(77, other), proc_start=lambda pid: None) is False                 # not even when pid 77 does not exist here
 
 
-def test_another_boot_is_stale_because_no_process_survives_a_reboot():
-    old = ss.Owner("11111111", ME.ns, ME.start)
-    assert stale(owned(77, old), proc_start=lambda pid: ME.start) is True
-    assert stale(owned(77, ss.Owner("11111111", "f0000001", 3)), proc_start=lambda pid: ME.start) is True
+MACHINE = "ab12"
+HOST = ss.Owner(ME.boot, ME.ns, ME.start, MACHINE)                  # me, on a host whose machine tag is known
+
+
+def test_another_boot_of_the_same_machine_is_stale_because_no_process_survives_a_reboot():
+    old = ss.Owner("11111111", ME.ns, ME.start, MACHINE)
+    assert stale(owned(77, old), HOST, proc_start=lambda pid: ME.start) is True
+    assert stale(owned(77, ss.Owner("11111111", "f0000001", 3, MACHINE)), HOST, proc_start=lambda pid: ME.start) is True
+
+
+def test_another_boot_is_not_judged_when_it_may_be_another_kernel_sharing_the_sbx_daemon():
+    """A Lima VM and a devcontainer on one daemon have different boot ids and both are alive: a different boot id alone proves
+    nothing. It counts only with the same machine identity on both sides."""
+    other_machine = ss.Owner("11111111", ME.ns, ME.start, "cd34")
+    no_machine = ss.Owner("11111111", ME.ns, ME.start)                              # an older name, or an unreadable /etc/machine-id
+    assert stale(owned(77, other_machine), HOST, proc_start=lambda pid: None) is False
+    assert stale(owned(77, no_machine), HOST, proc_start=lambda pid: None) is False
+    assert stale(owned(77, ss.Owner("11111111", ME.ns, ME.start, MACHINE)), ss.Owner(ME.boot, ME.ns, ME.start), proc_start=lambda pid: None) is False
+    assert stale(owned(77, no_machine), ss.Owner(ME.boot, ME.ns, ME.start), proc_start=lambda pid: None) is False   # unknown on both sides
+
+
+def test_a_name_carries_a_machine_tag_when_it_fits_and_old_names_without_one_still_parse():
+    n = ss.sandbox_name("aabbccddeeff", pid=4242, scope="deadbeef", owner=HOST)
+    assert n == "h2m-deadbeef-4242-0badc0de-f0000000-1388-ab12-aabbccddeeff"
+    assert ss.parse_owner(n) == HOST and ss.parse_sandbox_name(n) == ("deadbeef", 4242, "aabbccddeeff")
+    old = "h2m-deadbeef-4242-0badc0de-f0000000-1388-aabbccddeeff"
+    assert ss.parse_owner(old) == ME and ss.parse_owner(old).machine is None and ss.parse_sandbox_name(old) == ("deadbeef", 4242, "aabbccddeeff")
+    wide = ss.sandbox_name("aabbccddeeff", pid=4194304, scope="deadbeef", owner=ss.Owner("ffffffff", "ffffffff", 0xFFFFFFFFFF, MACHINE))
+    assert re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", wide) and ss.parse_owner(wide).machine is None       # dropped rather than too long
+    assert ss.parse_owner(wide) is not None and ss.parse_sandbox_name(wide) is not None
+
+
+def test_the_machine_tag_is_a_hash_of_the_machine_id_never_the_id_itself(tmp_path, monkeypatch):
+    mid = "0123456789abcdef0123456789abcdef"
+    f = tmp_path / "machine-id"
+    f.write_text(mid + "\n")
+    monkeypatch.setattr(ss, "_MACHINE_ID_FILES", (str(tmp_path / "missing"), str(f)))
+    tag = ss._machine_tag()
+    assert re.fullmatch(r"[0-9a-f]{4}", tag) and tag not in mid and ss._machine_tag() == tag
+    f.write_text("not-a-machine-id\n")
+    assert ss._machine_tag() is None
+    monkeypatch.setattr(ss, "_MACHINE_ID_FILES", (str(tmp_path / "missing"),))
+    assert ss._machine_tag() is None
 
 
 def test_nothing_is_judged_when_my_own_identity_is_unknown_or_the_process_table_is_unreadable():
