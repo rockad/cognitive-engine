@@ -914,28 +914,91 @@ def test_live_the_real_opencode_binary_reaches_the_stub_model_through_the_route(
     assert r.leftovers == () and set(subprocess.run([path, "ls", "-q"], capture_output=True, text=True).stdout.split()) == ls_before
 
 
-def test_the_host_proxy_is_started_so_that_it_dies_with_a_runner_that_is_killed_hard(tmp_path):
-    """No teardown runs after SIGKILL: the proxy must not be left listening for a stale sandbox (`PR_SET_PDEATHSIG`)."""
-    if not sys.platform.startswith("linux"):
-        pytest.skip("PR_SET_PDEATHSIG is Linux only")
+def _gone(pid: int) -> bool:
+    for _ in range(120):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        try:
+            if os.waitpid(pid, os.WNOHANG) != (0, 0):          # not our child: only reached if it was reparented to us
+                return True
+        except ChildProcessError:
+            pass
+        time.sleep(0.05)
+    return False
+
+
+def test_the_host_proxy_dies_with_a_runner_that_is_killed_hard_and_survives_the_thread_that_spawned_it(tmp_path):
+    """No teardown runs after SIGKILL: the proxy must not be left listening for a stale sandbox. It watches a pipe whose other end
+    only the runner process holds (no `preexec_fn`, which can deadlock in a multithreaded parent; no `PR_SET_PDEATHSIG`, which is
+    tied to the spawning THREAD, so it would kill the proxy as soon as that thread ended)."""
     parent = subprocess.Popen([sys.executable, str(HERE / "fixtures" / "pdeathsig_parent.py")], stdout=subprocess.PIPE, text=True)
     try:
         child = int(parent.stdout.readline())              # type: ignore[union-attr]
-        os.kill(child, 0)                                  # alive while its parent is
+        time.sleep(0.5)
+        os.kill(child, 0)                                  # alive although the thread that started it is long gone
         parent.kill()
         parent.wait()
-        for _ in range(100):
-            try:
-                os.kill(child, 0)
-            except ProcessLookupError:
-                return
-            time.sleep(0.05)
-            try:
-                if os.waitpid(child, os.WNOHANG) != (0, 0):          # not our child: only reached if it was reparented to us
-                    return
-            except ChildProcessError:
-                pass
-        pytest.fail("the sleeper outlived its killed parent")
+        assert _gone(child), "the proxy outlived its killed parent"
     finally:
         if parent.poll() is None:
             parent.kill()
+
+
+def test_the_proxy_is_not_spawned_with_preexec_fn(tmp_path, monkeypatch):
+    seen: dict = {}
+    real = subprocess.Popen
+
+    class Spy(real):                                       # type: ignore[misc, valid-type]
+        def __init__(self, *a, **kw):
+            seen.update(kw, argv=a[0])
+            super().__init__(["true"], **{k: v for k, v in kw.items() if k in ("stdin", "stdout", "stderr")})
+
+    monkeypatch.setattr(ss.subprocess, "Popen", Spy)
+    with open(tmp_path / "log", "wb") as log:
+        proc, lifeline = ss._spawn_proxy(sys.executable, "/x/egress_proxy.py", str(tmp_path / "c.json"), log)
+    try:
+        assert "preexec_fn" not in seen and seen["start_new_session"] is True and seen["close_fds"] is True
+        fd = seen["pass_fds"][0]
+        argv = list(seen["argv"])
+        assert argv[1:3] == ["-I", ss.launcher_file()] and argv[3:5] == ["--parent-fd", str(fd)] and argv[5] == "--" and lifeline != fd
+        assert argv[6:] == ["/x/egress_proxy.py", "--config", str(tmp_path / "c.json")]
+    finally:
+        proc.wait()
+        os.close(lifeline)
+
+
+def _proxy_cfg(tmp_path) -> Path:
+    port, forward = ss._free_ports(2)
+    cfg = tmp_path / "p.json"
+    cfg.write_text(json.dumps({"listen_host": "127.0.0.1", "listen_port": forward, "allow": []}))
+    return cfg
+
+
+def test_the_proxy_exits_gracefully_when_its_lifeline_pipe_closes(tmp_path):
+    cfg = _proxy_cfg(tmp_path)
+    with open(tmp_path / "log", "wb") as log:
+        proc, lifeline = ss._spawn_proxy(sys.executable, egress_proxy.__file__, str(cfg), log)
+    for _ in range(200):
+        if egress_proxy.READY_LINE in (tmp_path / "log").read_text(errors="replace"):
+            break
+        time.sleep(0.05)
+    assert proc.poll() is None
+    os.close(lifeline)                                     # what the kernel does when the runner dies
+    assert proc.wait(timeout=15) == 0
+    assert "ACCESS-SUMMARY" in (tmp_path / "log").read_text(errors="replace")           # the same orderly stop as SIGTERM
+
+
+def test_the_launcher_refuses_to_start_on_a_parent_fd_that_is_not_open_or_on_a_bad_command_line(tmp_path):
+    cfg = _proxy_cfg(tmp_path)
+    run = lambda *a: subprocess.run([sys.executable, "-I", ss.launcher_file(), *a], capture_output=True, text=True, timeout=30)  # noqa: E731
+    p = run("--parent-fd", "987", "--", egress_proxy.__file__, "--config", str(cfg))
+    assert p.returncode == 2 and "parent-fd" in p.stderr and "ready" not in p.stderr
+    assert run("--parent-fd", "x", "--", egress_proxy.__file__).returncode == 2
+    assert run(egress_proxy.__file__, "--config", str(cfg)).returncode == 2
+
+
+def test_the_proxy_source_gained_no_host_only_option():
+    """It is baked into the Docker image by content hash: the launcher exists so that changing it was not needed."""
+    assert "parent-fd" not in Path(egress_proxy.__file__).read_text()

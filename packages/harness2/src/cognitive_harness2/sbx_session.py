@@ -384,14 +384,26 @@ def _free_ports(n: int, avoid: Sequence[int | None] = ()) -> list[int]:
             s.close()
 
 
-def _die_with_parent() -> None:
-    """In the child, before exec: SIGTERM me when the process that started me dies (Linux `PR_SET_PDEATHSIG`), so a hard kill
-    of the runner cannot leave the host proxy listening for a stale sandbox. Best effort; other platforms get nothing."""
+def _spawn_proxy(python: str, script: str, config: str, log) -> tuple[subprocess.Popen, int]:
+    """Start the host egress proxy: its own session, output to `log`, and a LIFELINE. The proxy inherits the read end of a pipe whose
+    write end only this process holds (returned: the caller closes it when the proxy is stopped); when this process dies, however
+    it dies, the kernel closes the write end, the proxy reads EOF and stops like on SIGTERM, so a hard kill of the runner cannot leave
+    it listening for a stale sandbox.
+
+    Not `preexec_fn` (CPython documents that it can deadlock in the child when the parent has threads, and stage 1 does), and not
+    `PR_SET_PDEATHSIG` (tied to the thread that spawned the child, not to the process)."""
+    read_end, write_end = os.pipe()
     try:
-        import ctypes
-        ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM)
-    except Exception:  # noqa: BLE001
-        pass
+        proc = subprocess.Popen([python, "-I", launcher_file(), "--parent-fd", str(read_end), "--", script, "--config", config],
+                                stdin=subprocess.DEVNULL,
+                                stdout=log, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True, pass_fds=(read_end,),
+                                env={"PATH": _PATH, "LANG": "C.UTF-8"})
+    except BaseException:
+        os.close(write_end)
+        raise
+    finally:
+        os.close(read_end)
+    return proc, write_end
 
 
 _TERMINATE_SIGNALS = tuple(s for s in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)) if s is not None)
@@ -457,6 +469,7 @@ class _Live:
     """What one session has created so far, for the teardown (which must work from any point of failure)."""
     base: Path | None = None
     proxy: subprocess.Popen | None = None
+    lifeline: int | None = None                  # the write end of the proxy's lifeline pipe (closing it also stops the proxy)
     client: subprocess.Popen | None = None
     rule_ids: list[str] = field(default_factory=list)
     stray_rules: list[tuple[str, str | None]] = field(default_factory=list)    # (id, sandbox) of rules sbx added with a scope other than ours
@@ -571,9 +584,7 @@ class SbxSessionRunner(sr.ProposerSessionRunner):
             os.chmod(cfg, 0o600)
             logf = base / "proxy.log"
             with open(logf, "wb") as out:
-                live.proxy = subprocess.Popen([self.python, "-I", self.proxy_script, "--config", str(cfg)], stdin=subprocess.DEVNULL,
-                                              stdout=out, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True,
-                                              preexec_fn=_die_with_parent, env={"PATH": _PATH, "LANG": "C.UTF-8"})
+                live.proxy, live.lifeline = _spawn_proxy(self.python, self.proxy_script, str(cfg), out)
             deadline = time.monotonic() + _PROXY_READY_S
             while time.monotonic() < deadline:
                 text = logf.read_text(errors="replace")
@@ -601,6 +612,10 @@ class SbxSessionRunner(sr.ProposerSessionRunner):
                     break
                 except subprocess.TimeoutExpired:
                     continue
+        if live.lifeline is not None:
+            with contextlib.suppress(OSError):
+                os.close(live.lifeline)
+            live.lifeline = None
         if live.base is not None:
             with contextlib.suppress(OSError):
                 with open(live.base / "proxy.log", "rb") as f:
@@ -870,6 +885,12 @@ class SbxSessionRunner(sr.ProposerSessionRunner):
 def egress_proxy_file() -> str:
     from . import egress_proxy
     return egress_proxy.__file__
+
+
+def launcher_file() -> str:
+    """The stdlib-only launcher that runs the proxy as a host process with a lifeline (`host_proxy_launcher.py`)."""
+    from . import host_proxy_launcher
+    return host_proxy_launcher.__file__
 
 
 # ═══ choosing the runner, and the sweep's leftover check ═════════════════════════════════════════════════════════════
