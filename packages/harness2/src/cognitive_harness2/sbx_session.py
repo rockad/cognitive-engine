@@ -838,9 +838,13 @@ class SbxSessionRunner(sr.ProposerSessionRunner):
             cleanup = sr._Cleanup()
             with _shielded_teardown():
                 self._teardown_sbx(name, live, stack, cleanup)
+                found = cleanup.run(self._leftovers_sbx, name, live, default=None)      # the proof comes before anything else
+                leftovers = tuple(found or ())
                 if spec.reclaim_workspace:
-                    reclaimed = cleanup.run(self._reclaim_host, plan.workspace, default=False)
-                leftovers = tuple(cleanup.run(self._leftovers_sbx, name, live, default=[]))
+                    # Walk and chmod the host workspace only when the sandbox is proved gone: a VM that is still running (`sbx rm`
+                    # failed, or the listing did) could swap a link under the walk. An unproved teardown leaves the workspace as is.
+                    gone = found is not None and not any(x.startswith(f"sandbox {name}") for x in found)
+                    reclaimed = cleanup.run(self._reclaim_host, plan.workspace, default=False) if gone else False
         if error is None and cleanup.interrupt is not None:
             error = cleanup.interrupt
         log = sr.access_log_lines(live.log_text)

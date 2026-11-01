@@ -457,6 +457,46 @@ def test_a_rule_that_cannot_be_removed_by_id_still_dies_with_its_sandbox(world):
     assert r.leftovers == () and world.rules() == [] and world.listed() == []
 
 
+# ── teardown order: the proof comes before the host-side workspace fix ───────────
+
+def test_the_workspace_is_fixed_only_after_the_teardown_proved_the_sandbox_gone(world, monkeypatch):
+    order: list[str] = []
+    real_left, real_reclaim = ss.SbxSessionRunner._leftovers_sbx, ss.SbxSessionRunner._reclaim_host
+
+    def left(self, name, live):
+        order.append("proof")
+        return real_left(self, name, live)
+
+    def reclaim(workspace):
+        order.append("reclaim")
+        return real_reclaim(workspace)
+
+    monkeypatch.setattr(ss.SbxSessionRunner, "_leftovers_sbx", left)
+    monkeypatch.setattr(ss.SbxSessionRunner, "_reclaim_host", staticmethod(reclaim))
+    r = world.runner().run(world.spec())
+    assert order == ["proof", "reclaim"] and r.reclaimed is True
+
+
+def test_a_sandbox_that_is_still_listed_gets_no_host_side_chmod_walk(world, monkeypatch):
+    """`sbx rm` failed: the VM may still run and change the mount while the host walks it (a swapped symlink)."""
+    seen: list[str] = []
+    monkeypatch.setattr(ss.SbxSessionRunner, "_reclaim_host", staticmethod(lambda ws: seen.append(ws) or True))
+    with pytest.raises(SessionCleanupError) as e:
+        world.runner(env={"FAKE_SBX_RM": "leak"}).run(world.spec())
+    assert seen == [] and e.value.result is not None and e.value.result.reclaimed is False
+    assert any(x.startswith("sandbox h2m-") for x in e.value.leftovers)
+    subprocess.run([str(FAKE), "rm", "--force", world.listed()[0]], env={**os.environ, **world.env}, check=False)
+
+
+def test_a_sandbox_listing_that_fails_also_blocks_the_host_side_chmod_walk(world, monkeypatch):
+    seen: list[str] = []
+    monkeypatch.setattr(ss.SbxSessionRunner, "_reclaim_host", staticmethod(lambda ws: seen.append(ws) or True))
+    with pytest.raises(SessionCleanupError):
+        world.runner(env={"FAKE_SBX_RM": "leak", "FAKE_SBX_LS": "fail"}).run(world.spec())
+    assert seen == []
+    subprocess.run([str(FAKE), "rm", "--force", world.listed()[0]], env={**os.environ, **world.env, "FAKE_SBX_LS": ""}, check=False)
+
+
 # ── the scope of an added rule ────────────────────────────────────────────────────
 
 def test_a_rule_added_with_the_wrong_scope_is_removed_again_and_the_session_stops_before_anything_runs(world):
