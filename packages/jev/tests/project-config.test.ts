@@ -113,11 +113,14 @@ describe('a project ceiling tightens the Agent guard', () => {
     expect(await decide(input)).toBe('ask');
   });
 
-  it('is found from a subdirectory, nearest directory first, .agents/jev.json before .jev.json', async () => {
+  it('is found from a subdirectory; with both file names in one directory the lower ceiling wins', async () => {
     setProject({ guard: { ceiling: 'haiku' } }, '.jev.json');
     expect(inspectProjectConfig(path.join(proj, 'sub', 'deep'))).toMatchObject({ state: 'valid', ceiling: 'haiku', file: path.join(proj, '.jev.json') });
     setProject({ guard: { ceiling: 'sonnet' } }, '.agents/jev.json');
-    expect(inspectProjectConfig(proj)).toMatchObject({ ceiling: 'sonnet', file: path.join(proj, '.agents', 'jev.json') });
+    expect(inspectProjectConfig(proj)).toMatchObject({ ceiling: 'haiku', file: path.join(proj, '.jev.json') });
+    setProject({ guard: { ceiling: 'haiku' } }, '.agents/jev.json');
+    setProject({ guard: { ceiling: 'sonnet' } }, '.jev.json');
+    expect(inspectProjectConfig(proj)).toMatchObject({ ceiling: 'haiku', file: path.join(proj, '.agents', 'jev.json') });
     setProject({ guard: { ceiling: 'haiku' } }, '.jev.json', path.join(proj, 'sub'));
     expect(inspectProjectConfig(path.join(proj, 'sub', 'deep'))).toMatchObject({ ceiling: 'haiku', file: path.join(proj, 'sub', '.jev.json') });
     expect(await decide(agent('sonnet', 'claude-opus-5-5', path.join(proj, 'sub', 'deep')))).toBe('ask');
