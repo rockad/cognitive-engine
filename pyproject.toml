@@ -19,7 +19,8 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["packages/memory/tests", "packages/lookup/tests"]
+testpaths = ["packages/memory/tests", "packages/lookup/tests", "tools/tests"]
+pythonpath = ["tools"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 # Both packages use a `tests/` package with its own __init__; importlib mode
