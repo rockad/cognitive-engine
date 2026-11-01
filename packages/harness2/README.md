@@ -90,7 +90,7 @@ Leave out `onFailure: "block"`: without it a crashing hook is fail-open (verifie
 
 Case, and surrounding blanks, do not matter (`SBX`, ` auto `). `rootless-docker` is accepted as an alias of `docker`. Never rootful Docker, never the host.
 
-**What stays on Docker whatever this says.** The stage-1 proposer and solver sessions (`ProposerSessionRunner`, the egress proxy, the host bridge) call the model, and `sbx` has no route to one: a live test showed that direct sockets from inside a sandbox get no data (the proxy only returns 403), so those sessions use Docker's network design and do not go through `default_runner`. `sbx` is for the model-free, no-network execution of untrusted code (`harness2_probe`, the sum-signed verifier's `container_score`, `Substrate.execute`'s `runner.run`). Nothing in this section changes the session runners.
+**What stays on Docker whatever this says.** The stage-1 proposer and solver sessions (`ProposerSessionRunner`, the egress proxy, the host bridge) call the model, so they do not go through `default_runner`: the global deny-all gives a sandbox no route to a model. `sbx` here is for the model-free, no-network execution of untrusted code (`harness2_probe`, the sum-signed verifier's `container_score`, `Substrate.execute`'s `runner.run`). Nothing in this section changes the session runners. A model session can run on sbx only through its own, separate opt-in, `COGNITIVE_HARNESS2_MODEL_SANDBOX=sbx`, which has a route of its own (a sandbox-scoped rule to our egress proxy): see "sbx model route". `COGNITIVE_HARNESS2_SANDBOX` neither selects nor blocks it.
 
 **Cost.** An sbx-backed run creates a microVM: the create alone is about **4 s** more than a Docker container (`sbx create` about 4 s with the image present, `exec` about 0.6 s, `rm` about 0.7 s; the first run on a host also pulls the shell image), and the whole `run()` (preflight, create, four policy checks, copy in, listing, exec, rm, ls) measured about **10 s** end to end on this host (the eight verifier runs of the live verifier test took 86 s). A caller that executes many candidates pays that per candidate: `harness2_probe` over `n` = 8 candidates takes about 80 s on sbx (a cold image pull can add up to the 600 s create timeout), against a few seconds on Docker, so a client with a typical 60 s tool timeout may give up on it; the work still finishes server-side. `harness2_probe` runs in a worker thread, so `harness2_status`, `harness2_trigger` and the transport keepalive are served while it runs. Set `COGNITIVE_HARNESS2_SANDBOX=docker` to choose the faster, container-grade runner on purpose.
 
@@ -258,6 +258,35 @@ The proposer and solver sessions call a model, so for them `sbx` needs a route t
 **Why the endpoint is rewritten at run time.** The CLI's provider URL is built before a session exists (`runner.local_endpoint`, `http://harness2-proxy.internal:<ollama port>`), but the proxy's port is chosen per session. The sbx runner keeps `local_endpoint` as the logical URL (so every upstream-egress check and the config stay byte-identical to the Docker route) and replaces exactly that origin, in the values of the session's environment only (never argv, never a file), with `http://host.docker.internal:<P>`.
 
 **Lifecycle (`SbxSessionRunner.run`).** sweep stale `h2m-` sandboxes of dead owners -> preflight (daemon, verified version, global policy as defined above, host-reach settings, the same checks `SbxRunner` makes) -> bridge, proxy config, host proxy started and ready -> `sbx create shell --name h2m-... --cpus --memory --skills off WORKSPACE` -> five `policy allow network --sandbox` rules -> read back and check the per-sandbox policy -> read the VM's `HTTP_PROXY` (must be the gateway) -> copy the CLI in -> `sbx exec ... env -i ... CLI ARGS` under the host wall clock -> **teardown, shielded from SIGINT/SIGTERM and each step run whatever the one before did**: remove the rules by id, `sbx rm --force`, prove with `sbx ls -q` and `sbx policy ls --json` that neither the sandbox nor a rule of it remains, stop the host proxy (it prints the final `ACCESS-SUMMARY`), close the bridge, remove the private directory, then the host-side workspace permission fix. A hard kill of the Python process cannot run teardown: the proxy gets `PR_SET_PDEATHSIG` (it dies with its parent), and the sandbox, with its rules, is removed by the next run's startup sweep; until then the rules name a port nothing listens on, and the sweep exists so that a later unrelated process that happens to bind that port is not reachable from a stale VM.
+
+### What was built and what it was measured on
+
+`sbx_session.py`: the pure policy reading and names (`model_policy_problem`, `sandbox_policy_problem`, `stale_rule_sandboxes`, `sandbox_name`), the selection (`choose_model_runtime`, `ModelRuntime`), `SbxSessionRunner` (a `ProposerSessionRunner` subclass: same `authorize`, budget, observer, `SessionResult`, `SessionCleanupError`), `make_runner` (Docker or sbx, never a fallback) and the sweep's leftover check. The runner and the stage-1 wiring change no Docker behaviour (the image tag is unchanged: `egress_proxy.py` and the Dockerfile are untouched, the proxy simply also runs as a host process here).
+
+**Live, on sbx v0.50.1 (2026-11-01), `tests/test_sbx_session.py -k live`, under the shared lock:**
+
+| from inside the VM | result |
+| --- | --- |
+| `GET /v1/models`, `GET /api/tags`, `POST /v1/chat/completions` (pinned model), through the sbx proxy to `host.docker.internal:<P>` | 200, 200, 200 (the stub saw exactly these three, with a `Host` a real Ollama accepts) |
+| `POST /api/delete`, `POST /api/pull`, `GET /api/ps` | 403 from the **sbx** layer: our proxy's own log counts none of them, so the second filter is real |
+| `POST /v1/chat/completions` naming another model | 403 from OUR proxy (`unix-route-model-denied`, the only denial in its summary) |
+| `example.com`, `host.docker.internal:22`, `host.docker.internal:11434` (the real Ollama's port), `host.docker.internal:<P+1>` | 403 |
+| raw socket to `host.docker.internal:<P>` and to `gateway.docker.internal:<P>`, `CONNECT host:<P>` through the proxy | no data / timeout |
+| `127.0.0.1:<P>` inside the VM | connection refused (the VM's own loopback) |
+| the REAL opencode v2.0.25, as a stage-1 solver session (`solver_argv`, `solver_env_builder`) against the stub | exit 0, the stub's streamed `STUB-DONE`, 2 model requests allowed (`GET /api/tags`, `POST /v1/chat/completions`), 0 denied, about 20 s including the create and the 200 MB copy-in |
+| afterwards | `sbx ls` empty, `sbx policy ls --json` identical to before, nothing of ours left |
+
+Findings that changed the code: the VM's `sh` is dash and has no `ulimit -u` (the session wrapper is `bash`); the policy engine names the host `localhost`, not `host.docker.internal`; HTTP-only rules block the CONNECT tunnel that a plain `host:port` rule would have allowed, so the route is five HTTP rules and no raw tcp rule; the VM's `HTTP_PROXY` is read and must be the gateway (`http://gateway.docker.internal:<port>`) or the session refuses.
+
+**Caveats, stated plainly.**
+
+- **Not the default, and not proven on a real model.** The opt-in route passed against a stub model and the real opencode binary; nothing says how it behaves with a real gemma 12B (latency over the sbx proxy, a long streamed reply, context size). Only the user can run that: `COGNITIVE_HARNESS2_MODEL_SANDBOX=sbx uv run python -m cognitive_harness2.stage1 plan`, then `run --approve`. Docker stays the default until it has.
+- **The Docker preflight still runs.** `stage1 plan` still requires rootless Docker and the proposer image to pass (the sbx route does not use either; a later change can make them optional under sbx).
+- **Isolation is a different shape.** Docker: a read-only root, no capabilities, user 65534, pids and memory cgroups. sbx: a microVM (a stronger boundary) in which the session user `agent` has passwordless sudo and a writable root; `--cpus` and `--memory` are VM-level, `ulimit -u` is advisory, and a session can change anything inside its own VM and in its workspace (as in Docker) but nothing else. `host.docker.internal` reaches the host's loopback ONLY on the rule's one port.
+- **Another process that binds the allowed port can be reached by that sandbox while it runs.** The port is random, the rule exists only for that sandbox and is removed with it, and the proxy that owns the port is started first; a stale rule after a hard kill is removed by the next run's sweep (a leaked sandbox keeps its five rules until then).
+- **A foreign rule scoped to another sandbox is ignored at selection** (it cannot apply to a sandbox this runner creates); the per-sandbox listing is the authoritative check and refuses anything else that applies.
+- **The sbx proxy's HTTP match is coarse** (`/a/`, `//a`, `/%61` all match `/a`): it is a second layer, the exact filter is ours.
+- **Daemon-global effects: none.** Every rule is sandbox-scoped. The global policy was never changed by the spike, the tests or the runner (compared before and after each live run).
 
 ### Selecting it
 
@@ -813,6 +842,7 @@ Subagent definitions (`c5`) and skills (`c6`) carry YAML frontmatter defining ex
 | `COGNITIVE_HARNESS2_ZDR_ENDPOINTS` | unset: comma-separated hosts you attest are zero-retention, for the slice 1 probe path only (the Proposer gate reads the channel profile instead) |
 | `COGNITIVE_HARNESS2_CHANNELS_FILE` | unset: `~/.config/cognitive-engine/harness2-channels.toml`. The channel profile (see **Channel profile**); no file means no channel is declared and everything is denied. Set to a missing file: malformed, refused loudly |
 | `COGNITIVE_HARNESS2_EXPERIENCE_ROOT` | `~/.local/share/cognitive-engine/experiences` |
+| `COGNITIVE_HARNESS2_MODEL_SANDBOX` | unset (rootless Docker). `sbx` opts the stage-1 model sessions into the sbx route (see "sbx model route"); any other value is refused |
 
 The API key is read from `JEV_OPENROUTER_API_KEY` or `OPENROUTER_API_KEY` and is never returned or logged.
 
@@ -829,6 +859,12 @@ The API key is read from `JEV_OPENROUTER_API_KEY` or `OPENROUTER_API_KEY` and is
 
 ```bash
 uv run pytest packages/harness2
+```
+
+The sbx model route has fake-sbx tests in the normal suite (`test_sbx_model_policy.py`, `test_sbx_model_selection.py`, `test_sbx_session.py`, stage-1 runtime tests in `test_stage1.py`; no VM, no Docker) and two opt-in live tests that start throwaway `h2m-*` sandboxes and a stub model on the host. Run them one at a time, under whatever lock your host uses for sbx and Docker:
+
+```bash
+COGNITIVE_HARNESS2_SBX_LIVE=1 uv run pytest -q packages/harness2/tests/test_sbx_session.py -k test_live -s
 ```
 
 The `real_cli` tests (the real opencode binary against a stub model, no Ollama) are skipped unless `~/.opencode/bin/opencode` exists AND `COGNITIVE_HARNESS2_REAL_CLI=1`, so the normal suite is hermetic. Run them on their own:

@@ -631,3 +631,85 @@ def test_the_stage1_solver_environment_is_built_from_the_sbx_runners_logical_end
     job = SolverJob("household/sum-1", "r", "prompt", str(world.ws), "ollama/gemma4:12b", sr.container_cli_path(str(world.cli)))
     env = solver_env_builder(r)(job)
     assert f"http://harness2-proxy.internal:{world.ollama.port}/v1" in env["OPENCODE_CONFIG_CONTENT"]
+
+
+@pytest.mark.requires_sbx_live
+@pytest.mark.skipif(_live_ready() is not None, reason=_live_ready() or "")
+def test_live_the_real_opencode_binary_reaches_the_stub_model_through_the_route(tmp_path):
+    """The REAL opencode v2.0.25 in the VM, as a stage-1 SOLVER session (`stage1.solver_argv`, `solver_env_builder`) against the
+    stub model: it must get through the sbx proxy and our filter, stream the stub's reply and exit 0. No model, no Ollama; the
+    binary runs in the microVM, never on the host. Skipped when the binary is absent."""
+    from real_cli_probe import AGENTS_MD, MODEL_ID, OPENCODE, TASK, StubModel
+
+    if not OPENCODE.is_file():
+        pytest.skip(f"no opencode at {OPENCODE}")
+    from cognitive_harness2 import contained_proposer as cp, sum_signed
+
+    path = shutil.which("sbx")
+    assert path
+    version = sandbox.real_sbx_probes(os.environ).version(path)
+    ls_before = set(subprocess.run([path, "ls", "-q"], capture_output=True, text=True).stdout.split())
+    root = Path(tempfile.mkdtemp(prefix="h2sbxo", dir=str(tmp_path))).resolve()
+    ws = root / "ws"
+    ws.mkdir()
+    task = sum_signed.solver_task(TASK)
+    (ws / "AGENTS.md").write_text(AGENTS_MD)
+    for name, body in task.files.items():
+        (ws / name).write_text(body)
+    (ws / "output").mkdir()
+    with StubModel([]) as stub:
+        profile = stage1.selftest_profile(root, stub.port)
+        ch = profile.channels[stage1.CHANNEL]
+        runner = ss.SbxSessionRunner(path, ch, zdr="strict", classification="restricted", role="solver",
+                                     workspace_roots=profile.workspace_roots, verified=frozenset({version}),
+                                     environ=dict(os.environ), create_timeout_s=900)
+        job = stage1.SolverJob(TASK, "sbx-live", task.prompt, str(ws), ch.model, sr.container_cli_path(str(OPENCODE)))
+        spec = SessionSpec(argv=stage1.solver_argv(job), workspace=str(ws), cli=str(OPENCODE), timeout_s=300,
+                           env=dict(stage1.solver_env_builder(runner)(job)), tmp_exec=stage1.TMP_EXEC["opencode"],
+                           harvest=cp.DEFAULT_HARVEST)
+        try:
+            r = runner.run(spec)
+        finally:
+            for n in sorted(set(subprocess.run([path, "ls", "-q"], capture_output=True, text=True).stdout.split()) - ls_before):
+                if ss.parse_sandbox_name(n):
+                    subprocess.run([path, "rm", "--force", n], capture_output=True)
+    events = []
+    for line in r.stdout.splitlines():
+        try:
+            events.append(json.loads(line))
+        except ValueError:
+            events.append({"_unparsed": line[:200]})
+    print("\nLIVE opencode: exit", r.exit_code, "wall", f"{r.duration_s:.1f}s", "egress", sr.egress_summary(r.egress_log),
+          "\nstub requests", [(x["method"], x["path"]) for x in stub.requests], "\nstderr", r.stderr[-400:])
+    texts = [e["part"]["text"] for e in events if e.get("type") == "text"]
+    assert r.exit_code == 0 and texts == ["STUB-DONE"], (r.exit_code, texts, r.stderr[-500:], r.stdout[-500:])
+    posts = [x for x in stub.requests if x["method"] == "POST"]
+    assert posts and posts[0]["model"] == MODEL_ID and stub.rejected == [], (stub.requests, stub.rejected)
+    assert r.leftovers == () and set(subprocess.run([path, "ls", "-q"], capture_output=True, text=True).stdout.split()) == ls_before
+
+
+def test_the_host_proxy_is_started_so_that_it_dies_with_a_runner_that_is_killed_hard(tmp_path):
+    """No teardown runs after SIGKILL: the proxy must not be left listening for a stale sandbox (`PR_SET_PDEATHSIG`)."""
+    if not sys.platform.startswith("linux"):
+        pytest.skip("PR_SET_PDEATHSIG is Linux only")
+    parent = subprocess.Popen([sys.executable, str(HERE / "fixtures" / "pdeathsig_parent.py")], stdout=subprocess.PIPE, text=True)
+    try:
+        child = int(parent.stdout.readline())              # type: ignore[union-attr]
+        os.kill(child, 0)                                  # alive while its parent is
+        parent.kill()
+        parent.wait()
+        for _ in range(100):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+            try:
+                if os.waitpid(child, os.WNOHANG) != (0, 0):          # not our child: only reached if it was reparented to us
+                    return
+            except ChildProcessError:
+                pass
+        pytest.fail("the sleeper outlived its killed parent")
+    finally:
+        if parent.poll() is None:
+            parent.kill()
