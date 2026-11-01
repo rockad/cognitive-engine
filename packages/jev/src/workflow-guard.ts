@@ -40,8 +40,21 @@
  * - Options of `pipeline`/`parallel`/`phase` helpers are not inspected, only `agent()` and `meta`.
  * - The script is checked as written. It cannot see a file changing between the check and the run,
  *   or what a saved workflow resolves to if Claude Code's lookup differs from `fsResolver`.
- * - Intentional false positives (always ask): any `this`, any variable-key lookup such as `o[k]`
- *   on data, and a local method that happens to be called `agent` or `workflow`.
+ * - Intentional false positives (always ask): `this` outside a class body, a variable-key lookup
+ *   such as `o[k]` unless `k` is a followed `const`, and a local method that happens to be called
+ *   `agent` or `workflow`.
+ *
+ * Values the analysis can prove (see `collectConsts`, `staticString`):
+ * - a `const` with exactly one binding in the whole script, in scope at the reference, initialised
+ *   by a string literal, or by a flat object of string literals that is only ever read, is a known
+ *   string. `model: M`, `model: cfg[key]`, `{model}`, `o[k]`, `{[k]: v}` and `workflow(W)` then
+ *   behave as if the literal were written there: the model is still ranked, a key that spells
+ *   `constructor` or `agent` still asks. `let`, `var`, parameters, destructuring, calls, templates
+ *   with `${}`, concatenation, spreads, and objects that are assigned into, aliased or passed on
+ *   are not followed.
+ * - `this` inside a class body (method, constructor, field initialiser, static block, and
+ *   functions nested there) is strict-mode code and never the global object. A computed key and an
+ *   `extends` clause use the outer `this`, so they still ask.
  */
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -159,6 +172,17 @@ interface Bindings {
   plain: Set<string>;
   /** Every name the script binds anywhere. */
   bound: Set<string>;
+  /** How many bindings each name has in the whole script (a `const` we follow has exactly one). */
+  counts: Map<string, number>;
+  /** `const` bindings whose value is a known string or a flat, read-only object of strings. See `collectConsts`. */
+  consts: Map<string, ConstInfo>;
+}
+
+/** A followed `const`: the scope it is visible in (source offsets) and its value. */
+interface ConstInfo {
+  start: number;
+  end: number;
+  value: string | Map<string, string>;
 }
 
 type Node = any;
@@ -173,11 +197,39 @@ function literalString(n: Node): string | null {
   return null;
 }
 
+/** The value of a followed `const` that this Identifier reference resolves to (it must lie inside the const's scope). */
+function constValue(id: Node, ctx: Bindings): string | Map<string, string> | null {
+  const c = ctx.consts.get(id.name);
+  return c && id.start >= c.start && id.end <= c.end ? c.value : null;
+}
+
+/**
+ * The string an expression provably evaluates to: a string literal, an expression-free template, a
+ * followed `const` string, or a literal member of a followed `const` object (`cfg.a`, `cfg['a']`,
+ * `cfg[key]` with a followed `key`). Everything else, including templates with `${}`,
+ * concatenation and calls, is null.
+ */
+function staticString(n: Node, ctx: Bindings): string | null {
+  const lit = literalString(n);
+  if (lit !== null) return lit;
+  if (n?.type === 'Identifier') {
+    const v = constValue(n, ctx);
+    return typeof v === 'string' ? v : null;
+  }
+  if (n?.type === 'MemberExpression' && !n.optional && n.object?.type === 'Identifier') {
+    const obj = constValue(n.object, ctx);
+    if (!(obj instanceof Map)) return null;
+    const key = n.computed ? staticString(n.property, ctx) : n.property.type === 'Identifier' ? n.property.name : null;
+    return key !== null && obj.has(key) ? (obj.get(key) as string) : null;
+  }
+  return null;
+}
+
 /** The statically known name of a property key, or undefined when it is computed from an expression. */
-function keyName(prop: Node): string | undefined {
+function keyName(prop: Node, ctx: Bindings): string | undefined {
   const k = prop.key;
   if (!prop.computed) return k.type === 'Identifier' ? k.name : typeof k.value === 'string' || typeof k.value === 'number' ? String(k.value) : undefined;
-  return literalString(k) ?? undefined;
+  return staticString(k, ctx) ?? undefined;
 }
 
 /**
@@ -207,7 +259,7 @@ function isNonReference(parent: Node, key: string): boolean {
   }
 }
 
-function analyseOptions(opts: Node, out: Finding[]): void {
+function analyseOptions(opts: Node, out: Finding[], ctx: Bindings): void {
   let modelSeen = false;
   let agentTypeNode: { value: string; node: Node } | null = null;
   for (const prop of opts.properties) {
@@ -215,21 +267,21 @@ function analyseOptions(opts: Node, out: Finding[]): void {
       out.push({ kind: 'unverifiable', reason: 'options use a spread, so `model` cannot be read', ...pos(prop) });
       continue;
     }
-    const name = keyName(prop);
+    const name = keyName(prop, ctx);
     if (name === undefined) {
       out.push({ kind: 'unverifiable', reason: 'options use a computed key, which could be `model`', ...pos(prop) });
       continue;
     }
     if (name === 'model') {
       modelSeen = true;
-      const value = prop.kind === 'init' && !prop.method ? literalString(prop.value) : null;
+      const value = prop.kind === 'init' && !prop.method ? staticString(prop.value, ctx) : null;
       if (value === null) {
         out.push({ kind: 'unverifiable', reason: 'model is not a plain string literal (variable, expression, template with ${} or args)', ...pos(prop) });
       } else {
         out.push({ kind: 'model', model: value, where: 'model', ...pos(prop) });
       }
     } else if (name === 'agentType') {
-      const value = prop.kind === 'init' && !prop.method ? literalString(prop.value) : null;
+      const value = prop.kind === 'init' && !prop.method ? staticString(prop.value, ctx) : null;
       if (value === null) {
         out.push({ kind: 'unverifiable', reason: 'agentType is not a plain string literal, so its model cannot be read', ...pos(prop) });
       } else {
@@ -241,7 +293,7 @@ function analyseOptions(opts: Node, out: Finding[]): void {
   if (agentTypeNode && !modelSeen) out.push({ kind: 'agentType', agentType: agentTypeNode.value, ...pos(agentTypeNode.node) });
 }
 
-function analyseAgentCall(call: Node, out: Finding[]): void {
+function analyseAgentCall(call: Node, out: Finding[], ctx: Bindings): void {
   if (call.optional) {
     out.push({ kind: 'unverifiable', reason: 'optional call of agent()', ...pos(call) });
     return;
@@ -251,21 +303,21 @@ function analyseAgentCall(call: Node, out: Finding[]): void {
     return;
   }
   const [first, second] = call.arguments;
-  if (first?.type === 'ObjectExpression') analyseOptions(first, out);
+  if (first?.type === 'ObjectExpression') analyseOptions(first, out, ctx);
   if (second !== undefined) {
-    if (second.type === 'ObjectExpression') analyseOptions(second, out);
+    if (second.type === 'ObjectExpression') analyseOptions(second, out, ctx);
     else out.push({ kind: 'unverifiable', reason: 'agent() options are not an object literal', ...pos(second) });
   }
 }
 
-function analyseWorkflowCall(call: Node, out: Finding[]): void {
+function analyseWorkflowCall(call: Node, out: Finding[], ctx: Bindings): void {
   const here = pos(call);
   const first = call.arguments[0];
   if (call.optional || call.arguments.some((a: Node) => a.type === 'SpreadElement') || !first) {
     out.push({ kind: 'unverifiable', reason: 'workflow() called in a form the guard cannot read', ...here });
     return;
   }
-  const name = literalString(first);
+  const name = staticString(first, ctx);
   if (name !== null) {
     out.push({ kind: 'nested', ref: { name }, ...here });
     return;
@@ -273,9 +325,9 @@ function analyseWorkflowCall(call: Node, out: Finding[]): void {
   if (first.type === 'ObjectExpression') {
     const ref: { name?: string; scriptPath?: string } = {};
     for (const prop of first.properties) {
-      const k = prop.type === 'SpreadElement' ? undefined : keyName(prop);
+      const k = prop.type === 'SpreadElement' ? undefined : keyName(prop, ctx);
       if (k === 'scriptPath' || k === 'name') {
-        const v = literalString(prop.value);
+        const v = staticString(prop.value, ctx);
         if (v === null) {
           out.push({ kind: 'unverifiable', reason: `workflow() ${k} is not a plain string literal`, ...pos(prop) });
           return;
@@ -295,16 +347,16 @@ function analyseWorkflowCall(call: Node, out: Finding[]): void {
 }
 
 /** `export const meta = {phases: [{model: ...}]}` is metadata, but a phase `model` is checked too. */
-function analyseMeta(decl: Node, out: Finding[]): void {
+function analyseMeta(decl: Node, out: Finding[], ctx: Bindings): void {
   for (const d of decl.declarations ?? []) {
     if (d.id?.type !== 'Identifier' || d.id.name !== 'meta' || d.init?.type !== 'ObjectExpression') continue;
     for (const prop of d.init.properties) {
-      if (prop.type === 'SpreadElement' || keyName(prop) !== 'phases' || prop.value?.type !== 'ArrayExpression') continue;
+      if (prop.type === 'SpreadElement' || keyName(prop, ctx) !== 'phases' || prop.value?.type !== 'ArrayExpression') continue;
       for (const phase of prop.value.elements) {
         if (phase?.type !== 'ObjectExpression') continue;
         for (const p of phase.properties) {
-          if (p.type === 'SpreadElement' || keyName(p) !== 'model') continue;
-          const v = literalString(p.value);
+          if (p.type === 'SpreadElement' || keyName(p, ctx) !== 'model') continue;
+          const v = staticString(p.value, ctx);
           out.push(v === null
             ? { kind: 'unverifiable', reason: 'meta.phases model is not a plain string literal', ...pos(p) }
             : { kind: 'model', model: v, where: 'meta.phases model', ...pos(p) });
@@ -463,22 +515,142 @@ function collectBindings(ast: Node): Bindings {
   for (const [name, list] of byName) {
     if (list.every((f) => f.kind === 'expr' && (f.expr?.type === 'ObjectExpression' || f.expr?.type === 'ArrayExpression'))) plain.add(name);
   }
-  return { numeric, plain, bound };
+  const counts = new Map<string, number>();
+  for (const [name, list] of byName) counts.set(name, list.length);
+  return { numeric, plain, bound, counts, consts: collectConsts(ast, counts) };
+}
+
+const CONST_SCOPES = new Set(['Program', 'BlockStatement', 'StaticBlock', 'SwitchStatement', 'ForStatement']);
+
+/** The positions in which a member expression is written to, deleted, destructured into or called. */
+function isWriteOrCall(member: Node, parent: Node, key: string, grand: Node): boolean {
+  switch (parent?.type) {
+    case 'AssignmentExpression':
+    case 'ForInStatement':
+    case 'ForOfStatement':
+    case 'AssignmentPattern':
+      return key === 'left';
+    case 'UpdateExpression':
+    case 'ArrayPattern':
+    case 'RestElement':
+      return true;
+    case 'UnaryExpression':
+      return parent.operator === 'delete';
+    case 'CallExpression':
+    case 'NewExpression':
+      return key === 'callee';
+    case 'Property':
+      return grand?.type === 'ObjectPattern' && key === 'value';
+    default:
+      return false;
+  }
+}
+
+/**
+ * `const` bindings the analysis may treat as known strings, for `model: M`, `cfg[key]` and the like.
+ * A name qualifies only when ALL of these hold, and anything else keeps asking:
+ * - it has exactly one binding in the whole script (no shadowing, no assignment, no redeclaration);
+ * - it is declared `const` with an Identifier (no destructuring), initialised by a string literal,
+ *   or by a flat object literal whose properties are all plain `key: 'string'` (no spread, computed
+ *   key, method, getter, shorthand, `__proto__`);
+ * - for an object, every reference to it in the script is a read of one of its members (`cfg.a`,
+ *   `cfg[k]`): it is never assigned into, deleted from, destructured, called, aliased, spread or
+ *   passed anywhere, so its contents cannot change;
+ * - a reference counts only inside the const's own scope (block, function body, loop, switch or
+ *   program), so a same-named global outside it is not mistaken for it (see `constValue`).
+ * Template literals with `${}` and concatenation are never followed.
+ */
+function collectConsts(ast: Node, counts: Map<string, number>): Map<string, ConstInfo> {
+  const found = new Map<string, ConstInfo>();
+  const objects = new Set<string>();
+
+  const walk = (n: Node, anc: Node[], key: string, cb: (n: Node, anc: Node[], key: string, keys: string[]) => void, keys: string[] = []): void => {
+    cb(n, anc, key, keys);
+    anc.push(n);
+    keys.push(key);
+    for (const k of Object.keys(n)) {
+      if (SKIP_KEYS.has(k)) continue;
+      const child = n[k];
+      if (Array.isArray(child)) {
+        for (const c of child) if (isNode(c)) walk(c, anc, k, cb, keys);
+      } else if (isNode(child)) {
+        walk(child, anc, k, cb, keys);
+      }
+    }
+    anc.pop();
+    keys.pop();
+  };
+
+  walk(ast, [], '', (n, anc) => {
+    if (n.type !== 'VariableDeclaration' || n.kind !== 'const') return;
+    let scope: Node = null;
+    for (let i = anc.length - 1; i >= 0; i--) {
+      if (anc[i].type === 'ExportNamedDeclaration') continue;
+      if (CONST_SCOPES.has(anc[i].type)) scope = anc[i];
+      break;
+    }
+    if (!scope) return;
+    for (const d of n.declarations) {
+      if (d.id?.type !== 'Identifier' || !d.init || counts.get(d.id.name) !== 1) continue;
+      const str = literalString(d.init);
+      if (str !== null) {
+        found.set(d.id.name, { start: scope.start, end: scope.end, value: str });
+      } else if (d.init.type === 'ObjectExpression') {
+        const props = new Map<string, string>();
+        let flat = true;
+        for (const p of d.init.properties) {
+          const name = p.type === 'Property' && p.kind === 'init' && !p.method && !p.shorthand && !p.computed ? keyNameOf(p) : undefined;
+          const v = p.type === 'Property' ? literalString(p.value) : null;
+          if (name === undefined || name === '__proto__' || v === null) {
+            flat = false;
+            break;
+          }
+          props.set(name, v);
+        }
+        if (flat) {
+          found.set(d.id.name, { start: scope.start, end: scope.end, value: props });
+          objects.add(d.id.name);
+        }
+      }
+    }
+  });
+  if (objects.size === 0) return found;
+
+  walk(ast, [], '', (n, anc, key, keys) => {
+    if (n.type !== 'Identifier' || !objects.has(n.name)) return;
+    const parent = anc[anc.length - 1];
+    if (isNonReference(parent, key)) return;
+    if (parent?.type === 'VariableDeclarator' && key === 'id') return; // the declaration itself
+    const read = parent?.type === 'MemberExpression' && key === 'object' && !parent.optional;
+    const memberParent = anc[anc.length - 2];
+    const memberKey = keys[anc.length - 1] ?? '';
+    if (!read || isWriteOrCall(parent, memberParent, memberKey, anc[anc.length - 3])) {
+      found.delete(n.name);
+      objects.delete(n.name);
+    }
+  });
+  return found;
+}
+
+/** Property name of a non-computed, non-shorthand `Property` key (identifier, string or number). */
+function keyNameOf(p: Node): string | undefined {
+  const k = p.key;
+  return k.type === 'Identifier' ? k.name : typeof k.value === 'string' || typeof k.value === 'number' ? String(k.value) : undefined;
 }
 
 // ── Visitor ────────────────────────────────────────────────────────────────────────────────────
 
 /** Static property name of a member access: a string, null for a private name, undefined when computed from an expression. */
-function memberPropName(m: Node): string | null | undefined {
+function memberPropName(m: Node, ctx: Bindings): string | null | undefined {
   if (!m.computed) return m.property.type === 'Identifier' ? m.property.name : null;
-  return literalString(m.property) ?? undefined;
+  return staticString(m.property, ctx) ?? undefined;
 }
 
 function isFunctionNode(n: Node): boolean {
   return n?.type === 'ArrowFunctionExpression' || n?.type === 'FunctionExpression';
 }
 
-function visit(node: Node, parent: Node, key: string, out: Finding[], ctx: Bindings): void {
+function visit(node: Node, parent: Node, key: string, out: Finding[], ctx: Bindings, strictThis = false): void {
   const ask = (reason: string, at: Node = node) => out.push({ kind: 'unverifiable', reason, ...pos(at) });
   switch (node.type) {
     case 'Identifier': {
@@ -494,13 +666,16 @@ function visit(node: Node, parent: Node, key: string, out: Finding[], ctx: Bindi
       return;
     }
     case 'ThisExpression':
-      ask('`this` can be the global object, which holds agent()');
+      // Class bodies are strict code, where `this` is the instance, a constructor or undefined,
+      // never the global object. Everywhere else (top level, plain functions, object methods) it
+      // could be the global object, which holds agent().
+      if (!strictThis) ask('`this` can be the global object, which holds agent()');
       break;
     case 'MetaProperty':
       if (node.meta?.name === 'import') ask('`import.meta` cannot be inspected');
       break;
     case 'MemberExpression': {
-      const name = memberPropName(node);
+      const name = memberPropName(node, ctx);
       const isCallee = parent?.type === 'CallExpression' && key === 'callee';
       if (name === undefined) {
         const isPlainWrite = parent?.type === 'AssignmentExpression' && key === 'left' && parent.operator === '=' && node.object.type === 'Identifier' && ctx.plain.has(node.object.name);
@@ -517,26 +692,26 @@ function visit(node: Node, parent: Node, key: string, out: Finding[], ctx: Bindi
     }
     case 'Property': {
       if (parent?.type === 'ObjectPattern') {
-        const name = keyName(node);
+        const name = keyName(node, ctx);
         if (name === undefined) {
           if (!isNumeric(node.key, ctx.numeric, ctx.bound)) ask('destructuring with a computed key that is not a literal or a number could pick `agent` or `constructor`');
         } else if (WATCHED.has(name) || MEMBER_ESCAPES.has(name)) {
           ask(`destructuring pulls \`${name}\` out of an object`);
         }
-      } else if (parent?.type === 'ObjectExpression' && keyName(node) === '__proto__') {
+      } else if (parent?.type === 'ObjectExpression' && keyName(node, ctx) === '__proto__') {
         ask('`__proto__` in an object literal changes its prototype');
       }
       break;
     }
     case 'CallExpression': {
       const callee = node.callee;
-      if (callee.type === 'Identifier' && callee.name === 'agent') analyseAgentCall(node, out);
-      else if (callee.type === 'Identifier' && callee.name === 'workflow') analyseWorkflowCall(node, out);
+      if (callee.type === 'Identifier' && callee.name === 'agent') analyseAgentCall(node, out, ctx);
+      else if (callee.type === 'Identifier' && callee.name === 'workflow') analyseWorkflowCall(node, out, ctx);
       else if (callee.type === 'Identifier' && TIMERS.has(callee.name)) {
         const first = node.arguments[0];
         if (!(isFunctionNode(first) || first?.type === 'Identifier')) ask(`${callee.name}() is not given a function, so it may run a string as code`);
       } else if (callee.type === 'MemberExpression') {
-        const prop = memberPropName(callee);
+        const prop = memberPropName(callee, ctx);
         if (typeof prop === 'string' && WATCHED.has(prop)) ask(`\`${prop}\` called through member or computed access`);
       }
       break;
@@ -552,17 +727,23 @@ function visit(node: Node, parent: Node, key: string, out: Finding[], ctx: Bindi
       break;
     case 'ExportNamedDeclaration':
       if (node.source) ask('`export { ... } from` imports a module the guard cannot inspect');
-      if (node.declaration?.type === 'VariableDeclaration') analyseMeta(node.declaration, out);
+      if (node.declaration?.type === 'VariableDeclaration') analyseMeta(node.declaration, out, ctx);
       break;
     default:
   }
   for (const k of Object.keys(node)) {
     if (SKIP_KEYS.has(k)) continue;
     const child = node[k];
+    // Only what runs as a method body, field initialiser or static block is class-body code: a
+    // computed key and an `extends` clause are evaluated with the OUTER `this`.
+    const childStrict =
+      strictThis ||
+      node.type === 'StaticBlock' ||
+      ((node.type === 'MethodDefinition' || node.type === 'PropertyDefinition') && k === 'value');
     if (Array.isArray(child)) {
-      for (const c of child) if (isNode(c)) visit(c, node, k, out, ctx);
+      for (const c of child) if (isNode(c)) visit(c, node, k, out, ctx, childStrict);
     } else if (isNode(child)) {
-      visit(child, node, k, out, ctx);
+      visit(child, node, k, out, ctx, childStrict);
     }
   }
 }

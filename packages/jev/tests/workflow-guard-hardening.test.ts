@@ -134,7 +134,7 @@ table('adversarial battery: the global object and its aliases', [
   ['this in a sloppy function', `const g = (function () { return this })(); await g.agent('p')`, 'ask'],
   ['this in an arrow', `const g = (() => this)()`, 'ask'],
   ['this in an object method', `const o = { m() { return this } }; const m = o.m; m()`, 'ask'],
-  ['this in a class method', `class C { m() { return this } }`, 'ask'],
+  ['this in a class method (strict code: never the global object)', `class C { m() { return this } }`, 'silent'],
   ['arguments object', `const f = function () { return arguments[0] }`, 'ask'],
   ['arguments.callee', `const f = function () { return arguments.callee }`, 'ask'],
   ['fn.caller', `const f = function () { return f.caller }`, 'ask'],
@@ -281,11 +281,12 @@ describe('accepted false positives are asked, not silenced', () => {
   it('a local method called agent asks (fail closed beats a bypass)', () => {
     expect(check(`const client = { agent() { return 1 } }; client.agent()`).length).toBeGreaterThan(0);
   });
-  it('a variable-key lookup asks even on plain data', () => {
+  it('a variable-key lookup asks even on plain data unless the key is a followed const (workflow-guard-literals.test.ts)', () => {
     expect(check(`const o = {}; log(o[args.key])`).length).toBeGreaterThan(0);
   });
-  it('`this` asks even inside a class method', () => {
-    expect(check(`class C { m() { return this.x } }`).length).toBeGreaterThan(0);
+  it('`this` asks outside a class body (it could be the global object)', () => {
+    expect(check(`const t = this`).length).toBeGreaterThan(0);
+    expect(check(`const o = { m() { return this.x } }`).length).toBeGreaterThan(0);
   });
 });
 
@@ -297,7 +298,7 @@ describe('STILL_SLIPS: documented limits of static analysis (these pass today)',
   const slips: Array<[string, string]> = [
     ['setTimeout given a string held in a variable (Node and Bun throw on it; a browser runtime would evaluate it)', `const s = args.code; setTimeout(s, 0)`],
     ['a user-defined map() that passes a string as the index parameter', `const o = { map(f) { return f('a', 'constructor') } }; o.map((x, i) => ({})[i])`],
-    ['a `.length` that is not a number is trusted as a numeric key', `const o = { length: 'constructor' }; const F = ({})[o.length][o.length]`],
+    ['a `.length` that is not a number is trusted as a numeric key (here `o` is data, not a followed const)', `const o = args.o; const F = ({})[o.length][o.length]`],
     ['a member read of the watched names off a plain, unbound name (the sandbox could expose one)', `const f = args.agent`]
   ];
   for (const [name, script] of slips) {
