@@ -58,3 +58,18 @@ Ported from `agentic-hub/plugins/jev` v2.3.0. Of the Claude Code hooks, only the
 ## Subagent guard hook
 
 `bun src/hook.ts claude|antigravity` is a narrow `PreToolUse` guard (`src/guard.ts`). Claude Code asks before a subagent runs on a model above the session's (version-aware ranking, `src/models.ts`); Antigravity asks before any Pro-class subagent. It is the only enforcement point (`jev_dispatch` and its clamp are advice). For a call with no `model`, the model comes from the subagent's definition, looked up from the hook cwd up to the project root (`CLAUDE_PROJECT_DIR`, else the git root), then `~/.claude/agents`, then installed plugins (`plugin:agent` names look only in that plugin); a subagent type that is not a Claude Code built-in (`general-purpose`, `Explore`, `Plan`, `statusline-setup`, `claude-code-guide`) and has no definition found asks, as the Workflow guard does. It is deterministic, makes no network calls, and runs in Jev modes `on` and `on-demand` (not `off`); once active, it asks rather than passing silently when it cannot evaluate a call. A malformed Jev config fails loudly: see Configuration.
+
+### Session model (Claude Code)
+
+The ceiling is the session's model, which Claude Code does not put in any `PreToolUse` payload. The guard builds it from two pieces of evidence and orders them by time (`resolveSessionModel`, `src/session-model.ts`):
+
+- the state file the `PostModelSwitch` recorder writes (`~/.config/jev/claude_sessions/<session_id>.json`, dated by `updatedAt`)
+- the model of the latest assistant turn in the transcript (dated by the entry's `timestamp`, else the file's mtime)
+
+The model can change with no `PostModelSwitch` event: a session resumed with another `--model`, or a switch the recorder missed. So:
+
+- `SessionStart` with `source: resume` writes a resume marker (`<session_id>.resumed.json`). Evidence dated before the last resume is discarded, because it describes a model the session may no longer run on. `startup` and `clear` drop the state and the marker. A marker that cannot be read counts as "resumed just now" (all evidence discarded).
+- When the state file and the transcript turn name different models, the later one wins. If they cannot be ordered (same instant) the model is unknown rather than guessed.
+- With no usable evidence the model is unknown and the guard asks. After a resume this means the first subagent call asks until the first assistant turn of the resumed session lands in the transcript (or a `PostModelSwitch` fires), which is the point where the model is known again.
+
+Limits: this depends on the `SessionStart` recorder being registered (it is, in `adapters/claude/hooks/hooks.json`); without it a resume cannot be seen. The transcript is only read from its last 256 KiB.
