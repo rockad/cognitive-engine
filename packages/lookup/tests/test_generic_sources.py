@@ -345,6 +345,7 @@ class AliasTests(unittest.TestCase):
             f'root = "{self.base}"\ninclude = ["*.md"]\n'
             'extractor = "docs.markdown"\n', encoding="utf-8")
         self._env = dict(os.environ)
+        os.environ.update({"SHARE_USER": "test-user", "SHARE_PASS": "test-pass"})
         self._m = config.MANIFEST
         config.MANIFEST = self.mpath
         self.out = self.base / "override.yml"

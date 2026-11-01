@@ -100,7 +100,7 @@ def clear_sha_cache() -> None:
     _SHA_CACHE.clear()
 
 
-def file_sha256(path: str | Path, cached: bool = True) -> str | None:
+def file_sha256(path: str | Path, cached: bool = True, fs=None) -> str | None:
     """sha256 of a file's bytes, or None if it cannot be read.
 
     None is not an error here: extractors legitimately emit documents whose
@@ -121,7 +121,9 @@ def file_sha256(path: str | Path, cached: bool = True) -> str | None:
     digest: str | None
     try:
         h = hashlib.sha256()
-        with open(key, "rb") as fh:
+        # `fs` is the source's filesystem; the local disk when omitted (the verifier and
+        # every pre-seam caller). The path is the LOGICAL path string either way.
+        with (fs.open_bytes(fs.path(key)) if fs is not None else open(key, "rb")) as fh:
             for chunk in iter(lambda: fh.read(1 << 20), b""):
                 h.update(chunk)
         digest = h.hexdigest()

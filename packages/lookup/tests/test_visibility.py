@@ -101,7 +101,8 @@ class ManifestVisibilityTests(unittest.TestCase):
         from lookup import config
         env = dict(os.environ)
         try:
-            os.environ.update({"LOOKUP_HOME": "/tmp/lookup-home",
+            os.environ.update({"SHARE_USER": "test-user", "SHARE_PASS": "test-pass",
+                               "LOOKUP_HOME": "/tmp/lookup-home",
                                "ARCHIVE_TAKEOUT": "/tmp/t",
                                "ARCHIVE_SOURCES": "/tmp/s",
                                "ARCHIVE_CONVERTED": "/tmp/c",

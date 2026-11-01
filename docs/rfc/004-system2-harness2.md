@@ -30,12 +30,15 @@ flowchart TD
     QuotaCheck -->|Quota OK| Proposer["Harness² Proposer<br/>(Mutates Unprotected Components)"]
     QuotaCheck -->|Constrained| AbortQuota["Skip Probing & Retain Baseline"]
 
-    Proposer --> SbxCheck{"Local sbx Available?"}
-    SbxCheck -->|Yes| SbxProber["Local Docker Sandboxes (sbx)<br/>Parallel Candidate Execution"]
-    SbxCheck -->|No| FailClosed["Fail-Closed Gate<br/>(Abort Code Execution)"]
+    Proposer --> SbxCheck{"sbx on $PATH?"}
+    SbxCheck -->|Yes| SbxProber["Local sbx Sandboxes<br/>Parallel Candidate Execution"]
+    SbxCheck -->|No| DockerCheck{"Rootless Docker Available?"}
+    DockerCheck -->|Yes| DockerProber["Ephemeral Docker Sandbox<br/>(--network none, --read-only)"]
+    DockerCheck -->|No| FailClosed["Fail-Closed Gate<br/>(Abort Code Execution)"]
     FailClosed -.->|Explicit Opt-In| MkdtempDiff["mkdtemp Worktree<br/>(Diff Inspection Only)"]
 
     SbxProber --> Composer["Contrastive Behavioral Composer<br/>(Synthesizes Winning Patches)"]
+    DockerProber --> Composer
     Composer --> HumanGate{"Human Approval Gate"}
     HumanGate -->|Approved| ApplyPatch["Propose to Client Harness"]
     HumanGate -->|Rejected| DiscardPatch["Discard Candidate"]
@@ -49,12 +52,19 @@ flowchart TD
 - Supports mutation across permissible harness dimensions (prompts, tool descriptions, context assembly, decomposition strategies).
 - Integrates with OpenRouter API for candidate generation using calibrated sampling profiles.
 
-### 2.2 Execution Isolation via Local MicroVMs (`packages/harness2/prober/`)
-- **Strict Local MicroVM Sandboxing**:
-  - Probing trajectories execute exclusively inside local Docker Sandboxes managed via the standalone `sbx` CLI.
+### 2.2 Execution Isolation via Dual-Engine Local Sandboxing (`packages/harness2/prober/`)
+Probing trajectories require strict local execution isolation to protect host state:
+- **Primary: Native Local MicroVM Sandboxes (`sbx`)**:
+  - Probing trajectories execute in local sandboxes using native `sbx` when available on `$PATH`.
   - Cloud sandboxing is explicitly prohibited; code, files, and credentials never leave the host machine.
-- **Fail-Closed Sandbox Fallback**:
-  - If the `sbx` runtime is unavailable, the prober fails closed by default and refuses to run candidate code.
+- **Secondary: Ephemeral Rootless Docker Container Fallback**:
+  - If `sbx` is unavailable on `$PATH`, the prober falls back to an ephemeral, rootless Docker container sandbox configured with:
+    - `--network none` (strict network isolation, zero egress)
+    - `--read-only` (read-only root filesystem, scratch in tmpfs only)
+    - Zero off-host credential or environment leakage
+  - Preserves automated candidate execution on developer machines where `sbx` is not yet installed, rather than blocking the optimizer loop.
+- **Fail-Closed Fallback Gate**:
+  - If neither `sbx` nor Docker is available, the prober fails closed by default and refuses to run candidate code.
   - Worktree fallback is an explicit user opt-in (`--allow-worktree-diff`) using `mkdtemp` that **only generates diffs for static inspection and never executes code**.
 
 ### 2.3 Decoupled Probe Triggers
@@ -90,6 +100,16 @@ Probing is completely decoupled from System 1 routing confidence metrics. Probin
 
 The server uses FastMCP and meets the project-wide MCP contract (RFC 001 D29–D30): loopback bind only, `host_origin_protection="auto"` (forged Host and foreign Origin refused), strict argument validation (an unknown, mistyped or missing argument is a tool error), stateless HTTP, and liveness via `tools/list`. The `host_origin_protection` argument is off by default in FastMCP and must be set from the first commit.
 
+### 2.8 Citation Lineage Contract (Google DeepMind Prompt Optimization)
+The `NOTICE` and `README.md` files must formally cite foundational Google DeepMind prompt optimization literature:
+- *Promptbreeder: Self-Referential Self-Improvement Via Prompt Evolution* (Fernando et al., 2023, [arXiv:2309.16797](https://arxiv.org/abs/2309.16797)).
+- *Large Language Models as Tool Makers* (Cai et al., 2023, [arXiv:2305.17126](https://arxiv.org/abs/2305.17126)).
+
+The documentation must explicitly document our clean-room, dual-harness heuristic implementation:
+- Acknowledge the theoretical lineage and algorithmic inspiration from Google DeepMind prompt evolution research.
+- Explicitly state that the code in `packages/harness2` is an independent, clean-room implementation tailored for multi-harness agent architectures (Antigravity, Claude Code, OpenCode).
+- Preserve the Apache-2.0 license boundary for `packages/harness2`.
+
 ---
 
 ## 3. Invariants & Security Protections
@@ -110,13 +130,27 @@ The optimizer is strictly barred from modifying:
 
 ## 4. Acceptance Criteria
 
-- [ ] `packages/harness2` installs and runs cleanly under Python 3.12 with `uv sync`.
-- [ ] FastMCP server initializes and exposes all 4 `harness2_*` tools.
-- [ ] The server passes the MCP conformance runner (RFC 001 D30), including forged Host / foreign Origin refusal and strict arguments.
-- [ ] Probing triggers execute successfully upon simulated `jev_judge` failure and `/probe` command.
-- [ ] Local `sbx` microVM sandbox executes candidate trajectories in complete isolation.
-- [ ] Missing `sbx` runtime triggers clean fail-closed abort without executing code.
-- [ ] `GET /api/v1/key` pre-flight prevents execution when quota limits are reached.
-- [ ] Experience reflections write exclusively to `~/.local/share/cognitive-engine/experiences/`.
-- [ ] Protected invariants are verified immutable by automated mutation rejection tests.
-- [ ] Apache-2.0 license file and Google Research notice attributes applied.
+- [x] `packages/harness2` installs and runs cleanly under Python 3.12 with `uv sync`.
+- [x] FastMCP server initializes and exposes all 4 `harness2_*` tools (plus a read-only `harness2_status`, see §5).
+- [x] The server passes the MCP conformance runner (RFC 001 D30), including forged Host / foreign Origin refusal and strict arguments: 12/12 on the real daemon.
+- [ ] Probing triggers execute successfully upon simulated `jev_judge` failure and `/probe` command. *(The decision logic is done and tested as a pure function; wiring it to `jev_judge` events and a `/probe` command is not built.)*
+- [ ] Option A Dual-Engine sandbox isolation executes candidate trajectories: native local `sbx` microVMs as primary, or ephemeral rootless Docker container (`--network none`, `--read-only`, zero egress) when `sbx` is unavailable.
+- [x] Missing sandbox runtime (neither `sbx` nor Docker available) triggers clean fail-closed abort without executing code.
+- [x] `GET /api/v1/key` pre-flight prevents execution when quota limits are reached. *(Tested against mocked responses; the live field names are unverified.)*
+- [x] Experience reflections write exclusively to `~/.local/share/cognitive-engine/experiences/`. *(Staged lessons are pending until a human approves them through the CLI.)*
+- [x] Protected invariants are verified immutable by automated mutation rejection tests. *(Components are refused and wired; the protected-path rule is tested but not yet used, since this slice mutates components, not files.)*
+- [ ] Apache-2.0 license file and Google DeepMind prompt optimization literature citations (Promptbreeder [arXiv:2309.16797], LLMs as Tool Makers [arXiv:2305.17126]) applied in `NOTICE` and `README.md` with clean-room provenance notice.
+
+---
+
+## 5. Implementation Notes (Track 3 slice 1, 2026-10-28)
+
+Decisions the RFC left open, made explicitly:
+
+1. **Port `8120`.** RFC 004 assigns none; `8120` is clear of 8100/8105/8110/8115 and overridable with `COGNITIVE_HARNESS2_PORT`. Registered with the conformance runner via `tools/probes/harness2.toml`.
+2. **A fifth tool, `harness2_status`.** Read-only and offline: sandbox availability, whether a key is configured (never its value), storage root, the protected set. Track 4's Gate 3 needs a way to ask "is sbx there, is the quota ok" without running a probe, and the conformance runner needs a harmless valid call.
+3. **`dry_run` on `harness2_propose`.** Reports the egress and quota verdict without calling a model, so a caller can see a refusal before committing to a run.
+4. **Only four components are mutable.** RFC 001 says Harness² mutates 8 components; this RFC names four. Anything else, and every unknown name, is refused until someone edits `MUTABLE` deliberately.
+5. **Human sign-off is a CLI step, not a tool.** An agent can stage a lesson with `harness2_reflect` but cannot commit it.
+6. **No upstream package is wrapped.** The RFC names none, so this is an independent baseline of the four stages with a heuristic composer.
+7. **Bug found while testing:** the protected-path check stripped leading `../` and `/` before testing for escapes, so `../../escape` and `/etc/passwd` passed. Fixed, with tests.

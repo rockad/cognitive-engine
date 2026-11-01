@@ -204,28 +204,55 @@ async def test_refresh_index_reports_a_pass(client):
     assert "0 added" in text
 
 
-async def test_unmounted_network_volume_is_reported_loudly(corpus, client):
-    m = corpus["manifest"]
-    original = m.read_text(encoding="utf-8")
-    m.write_text(original + f"""
+SHARE_BLOCK = """
 [[source]]
 name = "share_src"
-description = "A network share the host has not mounted."
-root = "{corpus['base']}/not-mounted"
+description = "A network share."
+root = "{base}/logical-share-root"
 include = ["*.md"]
 extractor = "docs.markdown"
 visibility = "gated"
 [source.volume]
 type = "cifs"
-device = "//fileserver/share"
-""", encoding="utf-8")
+device = "//127.0.0.1/share"
+port = {port}
+username = "{user}"
+password = "{password}"
+"""
+
+
+async def test_an_unreachable_network_share_is_named_and_its_rows_are_kept(corpus, client, monkeypatch):
+    monkeypatch.setenv("SHARE_USER", "u")
+    monkeypatch.setenv("SHARE_PASS", "p")
+    m = corpus["manifest"]
+    original = m.read_text(encoding="utf-8")
+    m.write_text(original + SHARE_BLOCK.format(base=corpus["base"], port=_free_port(),
+                                               user="${SHARE_USER}", password="${SHARE_PASS}"), encoding="utf-8")
     try:
         text = (await client.call_tool("refresh_index", {})).content[0].text
     finally:
         m.write_text(original, encoding="utf-8")
-    assert "share_src" in text
-    assert "does not mount" in text
-    assert "not the same as empty" in text
+    assert "Network share unreachable this pass: share_src" in text
+    assert "rows are KEPT" in text and "not the same as an empty one" in text
+
+
+@pytest.mark.parametrize("user,password,env,message", [
+    ("literal-user", "${SHARE_PASS}", {"SHARE_PASS": "p"}, "never a literal value"),
+    ("${SHARE_USER}", "hunter2", {"SHARE_USER": "u"}, "never a literal value"),
+    ("${SHARE_USER}", "${SHARE_PASS}", {"SHARE_PASS": "p"}, r"\$\{SHARE_USER\} \(for `username`\) is not set"),
+    ("${SHARE_USER}", "${SHARE_PASS}", {"SHARE_USER": "u"}, r"\$\{SHARE_PASS\} \(for `password`\) is not set"),
+])
+def test_bad_credential_declarations_fail_at_load_naming_the_problem(
+        corpus, monkeypatch, user, password, env, message):
+    for k in ("SHARE_USER", "SHARE_PASS"):
+        monkeypatch.delenv(k, raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    p = corpus["base"] / "bad.toml"
+    p.write_text(SHARE_BLOCK.format(base=corpus["base"], port=445, user=user, password=password), encoding="utf-8")
+    with pytest.raises(manifest.ManifestError, match=message) as e:
+        manifest.load(p)
+    assert "hunter2" not in str(e.value), "a credential value must never appear in an error"
 
 
 # ── transport guarantees: a real process ─────────────────────────────────────────

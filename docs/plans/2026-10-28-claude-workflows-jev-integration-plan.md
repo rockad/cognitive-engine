@@ -50,17 +50,58 @@ Claude Objective ──► [Jev Static Decomposer] ──► Hard DAG       Clau
 
 ---
 
-## 3. Recommended Design: The Asynchronous Coprocessor Seam
+## 3. Recommended Design: The Asynchronous Coprocessor Seam & Dual-Hook Guard
 
-To enhance Claude Code's workflows without restricting their emergent dynamics, Jev must operate as an **advisory coprocessor and quality gate**, not a prescriptive gatekeeper:
+To enhance Claude Code's workflows without restricting their emergent dynamics, Jev operates as an **advisory coprocessor and quality gate**, combined with a deterministic safety guard:
 
-### 3.1 Three Integration Touchpoints
+### 3.1 Empirical Finding: Workflow Subagents Bypass `Agent|Task` Hooks
+
+An empirical probe conducted during Track 3 slice 1 uncovered a critical enforcement gap in Claude Code:
+- **The 4-Agent Workflow Probe**: A multi-agent workflow was executed in a Sonnet 5.5 session requesting four agents on `inherit`, `haiku`, `sonnet`, and `opus`.
+- **Bypass Observed**: All four subagents executed. The agent transcript confirmed the `opus` request ran directly on `claude-opus-5-5` without user prompting and without triggering a block.
+- **Log Evidence**: The hook decision log (`~/.config/jev/claude_decisions.jsonl`) recorded **zero** `PreToolUse` entries during the workflow run (108 → 109 lines, with the only addition being a prompt submission), whereas direct `Agent` calls earlier that session triggered hook logging immediately.
+- **Architectural Consequence**: Subagents spawned dynamically from within a `Workflow` script bypass the standard `PreToolUse` `Agent|Task` matcher. RFC 002's assertion that the hook is the single enforcement point holds only for direct subagent calls.
+
+### 3.2 Option A Dual-Hook Specification: Workflow Static AST Inspector
+
+To close the enforcement hole without crippling dynamic workflows, Cognitive Engine implements the **Option A Dual-Hook Strategy**:
+
+```mermaid
+flowchart TD
+    UserTurn["Agent Invocation"] --> ToolCheck{"Tool Type?"}
+    
+    ToolCheck -->|Agent / Task| DirectHook["Primary Hook: PreToolUse (Agent|Task)"]
+    DirectHook --> CheckDirectModel{"Requested Model > Ceiling?"}
+    CheckDirectModel -->|Yes| PromptUserDirect["Interactive 'ask' / Rejection"]
+    CheckDirectModel -->|No| AllowDirect["Allow Subagent Execution"]
+    
+    ToolCheck -->|Workflow| WorkflowHook["Secondary Hook: PreToolUse (Workflow)"]
+    WorkflowHook --> ASTParser["Workflow AST Inspector<br/>(packages/jev/src/workflow-guard.ts)"]
+    
+    ASTParser --> ScanModels{"Model Declarations in Script?"}
+    ScanModels -->|Static Override > Ceiling| PromptUserWF["Interactive 'ask' / Rejection"]
+    ScanModels -->|Dynamic / Unresolvable| FailClosedDynamic["Fail Closed: Interactive 'ask' Prompt"]
+    ScanModels -->|Compliant / Inherit| AllowWF["Execute Workflow Script"]
+```
+
+- **Dual-Hook Registration (`adapters/claude/hooks/hooks.json`)**:
+  - Direct Subagent Seam: `PreToolUse` on `Agent|Task` (existing guard in `packages/jev/src/guard.ts`).
+  - Workflow Seam: `PreToolUse` on `Workflow` pointing to `packages/jev/src/workflow-guard.ts`.
+- **Static AST Inspection (`packages/jev/src/workflow-guard.ts`)**:
+  - Intercepts the workflow script string before execution.
+  - Traverses the AST looking for subagent spawn calls (e.g. `agent()`, `task()`, `Agent()`) and inspects model properties (`opus`, `fable`, `pro`).
+  - Evaluates requested tiers against active session ceiling (`STRONG_RANK` vs active rank).
+- **Fail-Closed Policy on Dynamic Expressions**:
+  - If a model is defined via a dynamic expression (variable reference, runtime parameter, string interpolation, or conditional branch that cannot be statically evaluated), the guard **fails closed**.
+  - Rather than silently allowing potentially runaway model invocations, it emits an interactive `ask` decision prompting the user for approval.
+
+### 3.3 Three Integration Touchpoints
 
 1. **Phase 0: Workflow Inception (Advisory Sizing)**:
    - When a multi-step workflow begins, Claude invokes `jev_dispatch` or `jev_route` to obtain calibrated subagent candidates and recommended model tiers.
    - **Non-blocking**: Jev's output is treated as high-confidence guidance, not a mandatory constraint. Claude retains full authority to override based on fresh context.
 2. **Phase 1: In-Flight Free-Tier Offloading**:
-   - Worker subagents dynamically dispatch mechanical boilerplate, documentation scaffolding, and data transformations to `jev_execute_free` ($0.00 cost, zero Claude Pro quota).
+   - Worker subagents dynamically dispatch mechanical boilerplate, documentation scaffolding, and data transformations to `jev_execute_free` ($0.00 cost, zero Claude Pro quota). Egress and ZDR strict policies apply strictly.
 3. **Phase 2: Milestone Quality Gating (`jev_judge`)**:
    - Upon completion of critical workflow phases, Claude invokes `jev_judge` with the acceptance criteria and code diff.
    - Provides binary quality gating before committing or proceeding to dependent phases.
