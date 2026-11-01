@@ -418,19 +418,21 @@ def test_the_refusal_names_every_offending_variable_and_the_env_u_command_for_al
     assert "OPENCODE_CONFIG" not in text and "HOME" not in text and "/x" not in text            # a value is never shown
     assert "env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_SESSION_ID stage1 run" in text
     assert "plain terminal" in text and "no flag" in text
-    many = {f"CLAUDE_CODE_V{i:02d}": "1" for i in range(40)}
+    many = {f"CODEX_SANDBOX_V{i:02d}": "1" for i in range(40)}
     with pytest.raises(stage1.ApprovalRefused) as ei:
         stage1.refuse_in_agent_environment(many)
     assert "and 28 more" in str(ei.value) and len(str(ei.value)) < 1200                     # bounded
 
 
 def test_the_marker_lists_are_exact_names_and_the_prefixes_the_repo_can_justify():
-    """CLAUDE_CODE_* was observed in a child of Claude Code (CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, CLAUDE_CODE_SESSION_ID, ...); the
+    """The CLAUDE_CODE_ runtime variables were observed in a child of Claude Code (CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, CLAUDE_CODE_SESSION_ID, ...); the
     rest are kept as prefixes only because they cannot be verified here. OPENCODE_* and CODEX_* (config knobs) are not prefixes."""
     assert "CLAUDECODE" in stage1.AGENT_ENV_EXACT and "OPENCODE" in stage1.AGENT_ENV_EXACT
     assert "OPENCODE_" not in stage1.AGENT_ENV_PREFIXES and "OPENCODE" not in stage1.AGENT_ENV_PREFIXES
     assert "CODEX" not in stage1.AGENT_ENV_PREFIXES and "CODEX_" not in stage1.AGENT_ENV_PREFIXES
-    assert "CLAUDE_CODE_" in stage1.AGENT_ENV_PREFIXES
+    assert "CLAUDE_CODE_" not in stage1.AGENT_ENV_PREFIXES and "CLAUDE_CODE_ENTRYPOINT" in stage1.AGENT_ENV_EXACT   # not the namespace of user settings
+    for user_setting in ("CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_BEDROCK"):
+        assert stage1.agent_markers({user_setting: "1", "PATH": "/bin"}) == []              # a person's own setting never refuses a real terminal
 
 
 def test_the_audit_records_what_was_typed_and_which_agent_markers_were_checked_and_found(rig, up, monkeypatch):

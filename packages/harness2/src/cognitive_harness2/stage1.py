@@ -593,8 +593,13 @@ def confirmation_phrase(channel: str, sweep_id: str) -> str:
 #   - ANTIGRAVITY*, GEMINI_CLI*, AGY_*: UNVERIFIED here (those CLIs were not run from this code), kept as prefixes on
 #     purpose: a false refusal is fixed by `env -u NAME`, a false pass lets an agent approve its own sweep. If one of these
 #     is a config variable of yours, the refusal names it; narrow this list when its real child markers are known.
-AGENT_ENV_EXACT = ("CLAUDECODE", "OPENCODE")
-AGENT_ENV_PREFIXES = ("CLAUDE_CODE_", "CODEX_SANDBOX", "ANTIGRAVITY", "GEMINI_CLI", "AGY_")
+# Claude Code: the runtime variables it sets in every session it starts (verified in a child of this code's own session,
+# 2026-11-01). NOT a CLAUDE_CODE_ prefix: that namespace also holds user settings (CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE,
+# CLAUDE_CODE_USE_VERTEX, ...) that a person legitimately exports in their own shell profile, which refused a real terminal.
+AGENT_ENV_EXACT = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_EXECPATH",
+                   "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_MESSAGING_SOCKET",
+                   "CLAUDE_CODE_BRIDGE_SESSION_ID", "OPENCODE")
+AGENT_ENV_PREFIXES = ("CODEX_SANDBOX", "ANTIGRAVITY", "GEMINI_CLI", "AGY_")
 AGENT_ENV_SHOW = 12              # names listed in a refusal (and in its `env -u` command); the rest are counted
 TTY_PATH = "/dev/tty"
 
