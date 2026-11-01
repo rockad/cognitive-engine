@@ -223,7 +223,7 @@ def test_the_session_command_line_and_the_complete_environment(world, monkeypatc
     monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
     world.runner().run(world.spec())
     argv = world.session_argv()
-    assert argv[:2] == ["sh", "-c"] and argv[2].startswith("ulimit -u") and argv[3] == "sh" and argv[4] == "256"
+    assert argv[:2] == ["bash", "-c"] and argv[2].startswith("ulimit -u") and argv[3] == "bash" and argv[4] == "256"
     i = argv.index("env")
     assert argv[-5:] == [sr.container_cli_path(str(world.cli)), "run", "--model", "gemma4:12b", "do the thing"]
     env = world.session_env()
@@ -332,13 +332,15 @@ def test_an_unverified_sbx_version_refuses_before_anything_is_created(world):
     assert "create" not in world.verbs()
 
 
-def test_the_default_verified_set_is_empty_until_live_verification_so_a_plain_runner_refuses(world):
+def test_a_plain_runner_trusts_only_the_versions_the_live_test_passed_on(world):
+    """No `verified` argument: the default set is `VERIFIED_SBX_MODEL_VERSIONS`, which holds a version only after the live
+    test passed on it. The fake reports 9.9.9, which nobody verified."""
+    assert "9.9.9" not in ss.VERIFIED_SBX_MODEL_VERSIONS
     r = ss.SbxSessionRunner(str(FAKE), world.channel, zdr="strict", classification="open", environ=world.env,
                             workspace_roots=(str(world.root),), proposer_decision=sr.upstream_egress.Decision(True, ("ok",)))
-    if ss.VERIFIED_SBX_MODEL_VERSIONS:
-        pytest.skip("a version is verified now")
     with pytest.raises(SessionRefused, match="verified"):
         r.run(world.spec())
+    assert "create" not in world.verbs()
 
 
 # ── lifecycle under failure, interrupt, timeout ───────────────────────────────────
@@ -506,7 +508,81 @@ def test_the_budget_is_reserved_and_released_like_on_docker(world):
     assert len([c for c in world.calls() if c[0] == "create"]) == 1
 
 
-# ── the real thing (opt-in; under flock; needs sbx, a started daemon and a stopped Ollama-free host) ──
+# ── the real sbx, opt-in ──────────────────────────────────────────────────────────
 
-LIVE = os.environ.get("COGNITIVE_HARNESS2_SBX_LIVE") == "1"
-requires_sbx_live = pytest.mark.requires_sbx_live
+def _live_ready() -> str | None:
+    if os.environ.get("COGNITIVE_HARNESS2_SBX_LIVE") != "1":
+        return "set COGNITIVE_HARNESS2_SBX_LIVE=1 to run against a real sbx"
+    path = shutil.which("sbx")
+    if not path:
+        return "sbx is not installed"
+    try:
+        if subprocess.run([path, "ls", "-q"], capture_output=True, timeout=30, stdin=subprocess.DEVNULL).returncode != 0:
+            return "`sbx ls` does not work (daemon down?)"
+    except (OSError, subprocess.TimeoutExpired):
+        return "`sbx ls` does not work"
+    return None
+
+
+def _sbx_json(path: str, *args: str):
+    p = subprocess.run([path, *args], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+    assert p.returncode == 0, p.stderr
+    return json.loads(p.stdout)
+
+
+@pytest.mark.requires_sbx_live
+@pytest.mark.skipif(_live_ready() is not None, reason=_live_ready() or "")
+def test_live_a_vm_reaches_our_proxy_and_nothing_else(tmp_path):
+    """The whole route on a real sbx microVM: a STUB model on the host's loopback behind the real host bridge and egress
+    proxy, a trivial in-VM client (the session's "CLI") that gets 200 on the allowed routes and the stub's answer, 403 on
+    /api/delete, /api/pull, /api/ps, a pinned-out model, example.com, the host's ssh port, the real Ollama's port and the next
+    port, and no data on a raw socket or a CONNECT tunnel. The global policy and `sbx ls` are the same afterwards.
+    Run under the shared lock: `flock .../docker-tests.lock env COGNITIVE_HARNESS2_SBX_LIVE=1 uv run pytest ...`."""
+    from real_cli_probe import MODEL_ID, StubModel
+
+    path = shutil.which("sbx")
+    assert path
+    version = sandbox.real_sbx_probes(os.environ).version(path)
+    assert version
+    policy_before, ls_before = _sbx_json(path, "policy", "ls", "--json"), set(
+        subprocess.run([path, "ls", "-q"], capture_output=True, text=True).stdout.split())
+    root = Path(tempfile.mkdtemp(prefix="h2sbxl", dir=str(tmp_path))).resolve()
+    ws = root / "ws"
+    ws.mkdir()
+    cli = root / "h2probe"
+    cli.write_bytes((HERE / "fixtures" / "sbx_live_client.py").read_bytes())
+    cli.chmod(0o755)
+    with StubModel([]) as stub:
+        profile = stage1.selftest_profile(root, stub.port)
+        runner = ss.SbxSessionRunner(path, profile.channels[stage1.CHANNEL], zdr="strict", classification="restricted", role="solver",
+                                     workspace_roots=profile.workspace_roots, verified=frozenset({version}),
+                                     environ=dict(os.environ), create_timeout_s=900)
+        spec = SessionSpec(argv=(sr.container_cli_path(str(cli)),), workspace=str(ws), cli=str(cli), timeout_s=120,
+                           env={"H2_MODEL_URL": f"http://{sr.PROXY_ALIAS}:{stub.port}/v1", "H2_MODEL": MODEL_ID})
+        try:
+            r = runner.run(spec)
+        finally:
+            leaked = sorted(n for n in set(subprocess.run([path, "ls", "-q"], capture_output=True, text=True).stdout.split()) - ls_before
+                            if ss.parse_sandbox_name(n))
+            for n in leaked:                                       # belt and braces: the runner removes its own
+                subprocess.run([path, "rm", "--force", n], capture_output=True)
+    assert r.exit_code == 0 and r.leftovers == () and not r.timed_out, (r.stdout, r.stderr)
+    got = json.loads(r.stdout.strip().splitlines()[-1])
+    print("\nLIVE in-VM results:", json.dumps(got, sort_keys=True), f"\nsession wall {r.duration_s:.1f}s; egress:", sr.egress_summary(r.egress_log))
+    assert (got["models"], got["tags"], got["chat"]) == (200, 200, 200), got
+    for what in ("chat_other_model", "delete", "pull", "ps", "example_com", "host_ssh_port", "real_ollama_port", "next_port"):
+        assert got[what] == 403, (what, got)
+    assert got["connect_tunnel"] != 200 and got["connect_tunnel"] in (403, "RemoteDisconnected", "ConnectionResetError", "ConnectionError",
+                                                                      "TimeoutError", "timeout", "BrokenPipeError", 502, 400, 405), got
+    assert got["direct_to_model_port"].startswith("NODATA") and got["direct_to_gateway_model_port"].startswith("NODATA"), got
+    assert got["vm_loopback_model_port"] == "refused", got
+    # the stub saw exactly the three allowed requests, with a Host a real Ollama accepts
+    assert [(x["method"], x["path"].split("?")[0]) for x in stub.requests] == [
+        ("GET", "/v1/models"), ("GET", "/api/tags"), ("POST", "/v1/chat/completions")], stub.requests
+    assert stub.rejected == [], stub.rejected
+    summary = sr.egress_summary(r.egress_log)
+    assert summary["model_requests"] == 3 and "unix-route-model-denied" in summary["denied_reasons"], summary
+    # the global policy is what it was and nothing of ours is left
+    assert _sbx_json(path, "policy", "ls", "--json") == policy_before
+    assert set(subprocess.run([path, "ls", "-q"], capture_output=True, text=True).stdout.split()) == ls_before
+    assert not leaked

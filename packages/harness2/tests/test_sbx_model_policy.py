@@ -216,5 +216,7 @@ def test_the_generic_sandbox_setting_does_not_select_the_model_route():
     assert ss.ENV_MODEL_SANDBOX == "COGNITIVE_HARNESS2_MODEL_SANDBOX"
 
 
-def test_no_model_route_is_verified_until_the_live_test_has_passed_on_that_version():
-    assert isinstance(ss.VERIFIED_SBX_MODEL_VERSIONS, frozenset)
+def test_only_a_version_the_live_test_passed_on_is_verified():
+    """Adding a version here is the act of verifying the model route against it: run
+    `COGNITIVE_HARNESS2_SBX_LIVE=1 pytest tests/test_sbx_session.py -k live` on it first."""
+    assert ss.VERIFIED_SBX_MODEL_VERSIONS == frozenset({"0.50.1"})

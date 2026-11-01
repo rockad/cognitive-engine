@@ -91,7 +91,7 @@ case "${1:-}" in
     exists "$n" || { missing "$n"; exit 125; }
     if [ "${1:-}" = printenv ]; then echo "${FAKE_SBX_GATEWAY:-http://gateway.docker.internal:3128}"; exit 0; fi
     if [ "${1:-}" = test ]; then [ -n "${FAKE_SBX_NO_CLI:-}" ] && exit 1; exit 0; fi
-    if [ "${1:-}" = sh ] && [ "${2:-}" = -c ] && case "${3:-}" in ulimit*) true ;; *) false ;; esac; then
+    if [ "${1:-}" = bash ] && [ "${2:-}" = -c ] && case "${3:-}" in ulimit*) true ;; *) false ;; esac; then
       printf '%s\0' "$@" > "$D/session_argv"
       if [ "$stdin" = 1 ]; then cat > "$D/session_stdin"; fi
       [ "${FAKE_SBX_EXEC_HANG:-}" = 1 ] && sleep 60

@@ -38,7 +38,7 @@ RUNTIME_DOCKER, RUNTIME_SBX, RUNTIME_REFUSED = "docker", "sbx", "refused"
 
 # The sbx versions the model route has been verified on by its live test (tests/test_sbx_session.py, COGNITIVE_HARNESS2_SBX_LIVE=1).
 # Separate from `sandbox.VERIFIED_SBX_VERSIONS` (candidate execution): that flow does not use rules, a proxy or the exec of a CLI.
-VERIFIED_SBX_MODEL_VERSIONS: frozenset[str] = frozenset()
+VERIFIED_SBX_MODEL_VERSIONS: frozenset[str] = frozenset({"0.50.1"})
 
 NAME_PREFIX = "h2m"
 _NAME = re.compile(r"^h2m-(?:([0-9a-f]{8,32})|0)-([0-9]{1,10})-([0-9a-f]{12})$")
@@ -588,7 +588,7 @@ class SbxSessionRunner(sr.ProposerSessionRunner):
     def _session_argv(self, name: str, plan: sr.Plan, env: Mapping[str, str]) -> list[str]:
         spec = plan.spec
         return [self.sbx_path, "exec", *(["-i"] if spec.stdin is not None else []), "-w", plan.workspace, "--", name,
-                "sh", "-c", self._session_script(), "sh", str(spec.limits.pids), "env", "-i",
+                "bash", "-c", self._session_script(), "bash", str(spec.limits.pids), "env", "-i",
                 *(f"{k}={v}" for k, v in env.items()), *spec.argv]
 
     def _run_client(self, argv: list[str], plan: sr.Plan, live: _Live) -> tuple[int | None, bytes, bytes, bool, bool]:
