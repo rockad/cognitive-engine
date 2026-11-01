@@ -9,6 +9,7 @@ No Docker, no model, no real sbx."""
 from __future__ import annotations
 
 import _thread
+import contextlib
 import json
 import os
 import shutil
@@ -1098,3 +1099,87 @@ def test_the_launcher_refuses_to_start_on_a_parent_fd_that_is_not_open_or_on_a_b
 def test_the_proxy_source_gained_no_host_only_option():
     """It is baked into the Docker image by content hash: the launcher exists so that changing it was not needed."""
     assert "parent-fd" not in Path(egress_proxy.__file__).read_text()
+
+
+# ── round 3: the sbx teardown shields all three signals in one pass and retries like the Docker runner ──────────────────────
+
+def test_the_sbx_shield_reads_all_three_handlers_before_ignoring_any(monkeypatch):
+    events = []
+    real_get, real_set = signal.getsignal, signal.signal
+    monkeypatch.setattr(sr.signal, "getsignal", lambda s: (events.append(("get", s)), real_get(s))[1])
+    monkeypatch.setattr(sr.signal, "signal", lambda s, h: (events.append(("set", s)), real_set(s, h))[1])
+    sigs = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    olds = {s: real_get(s) for s in sigs}
+    try:
+        with ss._shielded_teardown():
+            assert all(real_get(s) == signal.SIG_IGN for s in sigs)
+        assert all(real_get(s) == olds[s] for s in sigs)
+    finally:
+        for s, h in olds.items():
+            real_set(s, h)
+    kinds = [k for k, _ in events]
+    assert kinds[:3] == ["get"] * 3 and kinds[3:6] == ["set"] * 3 and {s for k, s in events if k == "set"} >= set(sigs)
+
+
+def _counting_shield(monkeypatch):
+    real, entries = ss._shielded_teardown, []
+
+    @contextlib.contextmanager
+    def shield():
+        entries.append(1)
+        with real():
+            yield
+    monkeypatch.setattr(ss, "_shielded_teardown", shield)
+    return entries
+
+
+def _flaky_teardown(monkeypatch, failures, calls=None):
+    real, seen = ss.SbxSessionRunner._teardown_sbx, []
+
+    def teardown(self, *a, **k):
+        seen.append(tuple(signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)))
+        if calls is not None:
+            calls.append((self, a))
+        if failures is None or len(seen) <= failures:
+            raise KeyboardInterrupt(f"teardown call {len(seen)}")
+        return real(self, *a, **k)
+    monkeypatch.setattr(ss.SbxSessionRunner, "_teardown_sbx", teardown)
+    return seen
+
+
+def test_an_interrupted_teardown_is_retried_inside_one_shield_with_all_three_signals_ignored(world, monkeypatch):
+    entries = _counting_shield(monkeypatch)
+    seen = _flaky_teardown(monkeypatch, 2)
+    with pytest.raises(KeyboardInterrupt):
+        world.runner().run(world.spec())
+    assert len(seen) == 3 and len(entries) == 1
+    assert all(h == (signal.SIG_IGN,) * 3 for h in seen)                   # SIGHUP included, on every retry
+    assert world.listed() == [] and world.rules() == [] and world.runtime_leftovers() == []
+
+
+def test_an_interrupt_on_entering_the_shield_does_not_skip_the_teardown(world, monkeypatch):
+    real, left = ss._shielded_teardown, [2]
+
+    @contextlib.contextmanager
+    def shield():
+        if left[0] > 0:
+            left[0] -= 1
+            raise KeyboardInterrupt("second Ctrl-C at the finally entry")
+        with real():
+            yield
+    monkeypatch.setattr(ss, "_shielded_teardown", shield)
+    with pytest.raises(KeyboardInterrupt):
+        world.runner().run(world.spec())
+    assert world.listed() == [] and world.rules() == [] and world.runtime_leftovers() == []
+
+
+def test_a_teardown_that_never_completes_is_a_cleanup_error_with_the_interrupt_as_its_cause(world, monkeypatch):
+    calls: list = []
+    real = ss.SbxSessionRunner._teardown_sbx
+    _flaky_teardown(monkeypatch, None, calls)
+    with pytest.raises(SessionCleanupError) as e:
+        world.runner().run(world.spec())
+    assert isinstance(e.value.__cause__, KeyboardInterrupt) and e.value.leftovers
+    runner, args = calls[-1]                                               # nothing was torn down: do it now, for the fake's sake
+    real(runner, *args[:3], sr._Cleanup())
+    assert world.listed() == [] and world.rules() == [] and world.runtime_leftovers() == []

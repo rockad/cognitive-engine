@@ -433,22 +433,16 @@ def _terminate_as_interrupt():
                 signal.signal(sig, previous)
 
 
+_TEARDOWN_SIGNALS = tuple(s for s in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGHUP", None)) if s is not None)
+
+
 @contextlib.contextmanager
 def _shielded_teardown():
-    """The teardown ignores SIGINT and SIGTERM (`session_runner._shielded_from_interrupts`) and SIGHUP too, so a second signal
-    cannot cut it short. Handlers are restored after."""
-    with sr._shielded_from_interrupts():
-        hup = getattr(signal, "SIGHUP", None)
-        previous = None
-        if hup is not None and threading.current_thread() is threading.main_thread():
-            with contextlib.suppress(ValueError, OSError):
-                previous = signal.signal(hup, signal.SIG_IGN)
-        try:
-            yield
-        finally:
-            if previous is not None:
-                with contextlib.suppress(ValueError, OSError, TypeError):
-                    signal.signal(hup, previous)
+    """The teardown ignores SIGINT, SIGTERM and SIGHUP in ONE pass (`session_runner._shielded_from_interrupts`: every previous
+    handler is read before any is replaced), so a second signal of any of them cannot cut it short, and no signal can land
+    between "SIGINT and SIGTERM ignored" and "SIGHUP ignored". Handlers are restored after."""
+    with sr._shielded_from_interrupts(_TEARDOWN_SIGNALS):
+        yield
 
 
 def _memory_arg(memory: str) -> str:
@@ -832,6 +826,7 @@ class SbxSessionRunner(sr.ProposerSessionRunner):
         raw: tuple[int | None, bytes, bytes, bool, bool] | None = None
         error: BaseException | None = None
         reclaimed: bool | None = None
+        leftovers: tuple[str, ...] = ()
         t0 = time.monotonic()
         self._notify("session_start", session=run_id, timeout_s=spec.timeout_s, tmp_exec=spec.tmp_exec)
         try:
@@ -851,7 +846,9 @@ class SbxSessionRunner(sr.ProposerSessionRunner):
             error = e
         finally:
             cleanup = sr._Cleanup()
-            with _shielded_teardown():
+
+            def steps() -> None:
+                nonlocal leftovers, reclaimed
                 self._teardown_sbx(name, live, stack, cleanup)
                 found = cleanup.run(self._leftovers_sbx, name, live, default=None)      # the proof comes before anything else
                 leftovers = tuple(found or ())
@@ -860,6 +857,11 @@ class SbxSessionRunner(sr.ProposerSessionRunner):
                     # failed, or the listing did) could swap a link under the walk. An unproved teardown leaves the workspace as is.
                     gone = found is not None and not any(x.startswith(f"sandbox {name}") for x in found)
                     reclaimed = cleanup.run(self._reclaim_host, plan.workspace, default=False) if gone else False
+            # The Docker runner's loop: ONE shield (SIGINT, SIGTERM and SIGHUP, all recorded before any is ignored), the steps
+            # retried inside it, the shield entered again when an interrupt lands on its entry or exit, and a teardown that
+            # never completed named in a SessionCleanupError.
+            if not sr._run_teardown(steps, cleanup, _shielded_teardown):
+                leftovers = (*leftovers, sr._TEARDOWN_INCOMPLETE)
         if error is None and cleanup.interrupt is not None:
             error = cleanup.interrupt
         log = sr.access_log_lines(live.log_text)
