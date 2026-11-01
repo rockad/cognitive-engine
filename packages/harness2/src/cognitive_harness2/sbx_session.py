@@ -753,3 +753,46 @@ class SbxSessionRunner(sr.ProposerSessionRunner):
 def egress_proxy_file() -> str:
     from . import egress_proxy
     return egress_proxy.__file__
+
+
+# ═══ choosing the runner, and the sweep's leftover check ═════════════════════════════════════════════════════════════
+
+def make_runner(runtime: ModelRuntime | None, verified: sandbox.VerifiedDocker | None, image: object, channel: sr.channels.Channel,
+                *, environ: Mapping[str, str] | None = None, **kw) -> sr.ProposerSessionRunner:
+    """The session runner for `runtime`: `ProposerSessionRunner` (Docker) for `docker` or None, `SbxSessionRunner` for a usable
+    `sbx`. A runtime that is not usable (`ok` False: sbx asked for and unusable, or an unrecognised setting) is a
+    `SessionRefused` naming every reason: there is no Docker runner to fall back to when sbx was asked for. `kw` is
+    `ProposerSessionRunner`'s; the two Docker-only options (`egress_network`, `_test_allow_cidrs`) are refused on sbx."""
+    if runtime is None or (runtime.kind == RUNTIME_DOCKER and runtime.ok):
+        return sr.ProposerSessionRunner(verified, image, channel, **kw)            # type: ignore[arg-type]
+    if runtime.kind != RUNTIME_SBX or not runtime.ok or not runtime.sbx_path:
+        raise sr.SessionRefused("model sessions cannot run: " + ("; ".join(runtime.reasons) or "the runtime is not usable")
+                                + " (there is no fallback to Docker)")
+    if kw.pop("egress_network", None) is not None or kw.pop("_test_allow_cidrs", ()):
+        raise sr.SessionRefused("egress_network and test_allow_cidrs are Docker options: the sbx route has no egress network")
+    return SbxSessionRunner(runtime.sbx_path, channel, environ=environ, **kw)
+
+
+def leftover_sandboxes(sbx_path: str, session_ids: Sequence[str], *, environ: Mapping[str, str] | None = None) -> list[str]:
+    """`sbx sandbox NAME` for every sandbox of THESE sessions (by session id, in the `h2m-` name) that still exists."""
+    ids = set(session_ids)
+    if not ids:
+        return []
+    env = sandbox._sbx_env(os.environ if environ is None else environ)
+    try:
+        p = subprocess.run([sbx_path, "ls", "-q"], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL, env=env)
+    except (subprocess.TimeoutExpired, OSError):
+        return ["sbx sandboxes: could not be listed"]
+    if p.returncode != 0:
+        return ["sbx sandboxes: could not be listed"]
+    return [f"sbx sandbox {n}" for n in p.stdout.split() if (parsed := parse_sandbox_name(n)) and parsed[2] in ids]
+
+
+def remove_leftover_sandboxes(sbx_path: str, items: Sequence[str], *, environ: Mapping[str, str] | None = None) -> None:
+    """`sbx rm --force` each `sbx sandbox NAME` item (its rules go with it). Best effort; the caller lists again."""
+    env = sandbox._sbx_env(os.environ if environ is None else environ)
+    for item in items:
+        if item.startswith("sbx sandbox ") and parse_sandbox_name(item[len("sbx sandbox "):]):
+            with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                subprocess.run([sbx_path, "rm", "--force", item[len("sbx sandbox "):]], capture_output=True, timeout=60,
+                               stdin=subprocess.DEVNULL, env=env)

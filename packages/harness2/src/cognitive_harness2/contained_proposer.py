@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import channels, trajectory, upstream_egress, workspace_harvest
+from . import channels, sbx_session, trajectory, upstream_egress, workspace_harvest
 from .image import ImageRef
 from .model_gate import GATE, ModelGate
 from .sandbox import VerifiedDocker
@@ -193,6 +193,7 @@ class SessionConfig:
     observer: Callable[[str, Mapping[str, Any]], None] | None = None   # told what happens to each session (audit)
     max_budget_usd: float | None = None    # claude only
     test_allow_cidrs: tuple[str, ...] = ()   # TESTS ONLY: let the proxy reach a throwaway upstream
+    runtime: Any = None                    # `sbx_session.ModelRuntime`; None is Docker (every existing caller)
 
     def __post_init__(self) -> None:
         ch = self.profile.channels.get(self.channel)
@@ -259,7 +260,7 @@ def _build_class(up: Upstream) -> type:
         def _runner(self, decision: upstream_egress.Decision | None) -> ProposerSessionRunner:
             s = self.session
             assert s is not None
-            return ProposerSessionRunner(s.verified, s.image, s.channel_obj, zdr=s.zdr, classification=s.classification,
+            return sbx_session.make_runner(s.runtime, s.verified, s.image, s.channel_obj, zdr=s.zdr, classification=s.classification,
                                          proposer_decision=decision, workspace_roots=s.profile.workspace_roots,
                                          egress_network=s.egress_network, budget=s.budget, observer=s.observer,
                                          _test_allow_cidrs=s.test_allow_cidrs)

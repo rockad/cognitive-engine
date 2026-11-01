@@ -23,7 +23,7 @@ import h2_isolation as iso
 import pytest
 from h2_upstream import isolated_upstream
 
-from cognitive_harness2 import channels, contained_proposer as cp, sandbox, session_runner as sr, stage1, upstream_egress
+from cognitive_harness2 import channels, contained_proposer as cp, sandbox, sbx_session, session_runner as sr, stage1, upstream_egress
 from cognitive_harness2.image import ImageError, ImageRef
 from cognitive_harness2.stage1 import (Approval, Audit, FakeOllama, Probes, Stage1Error, build_parser, clean,
                                        confirm_on_terminal, confirmation_phrase, run_plan, run_run, run_selftest,
@@ -85,14 +85,15 @@ class Rig:
         self.profile.write_text(text)
         self.calls: dict[str, int] = {"gate": 0, "resolve": 0, "ollama": 0}
 
-    def probes(self, *, gate=None, resolve=None, ollama=None) -> Probes:
+    def probes(self, *, gate=None, resolve=None, ollama=None, model_runtime=None, environ=None) -> Probes:
         def count(name, fn):
             def wrapped(*a):
                 self.calls[name] += 1
                 return fn(*a)
             return wrapped
         return Probes(gate=count("gate", gate or (lambda: VERIFIED)), resolve=count("resolve", resolve or (lambda v: IMAGE)),
-                      ollama=count("ollama", ollama or stage1.probe_ollama), environ={}, which=lambda n: None)
+                      ollama=count("ollama", ollama or stage1.probe_ollama), environ=dict(environ or {}), which=lambda n: None,
+                      **({"model_runtime": model_runtime} if model_runtime else {}))
 
     def args(self, *extra: str):
         return build_parser().parse_args(["--profile", str(self.profile), "--opencode", str(self.cli),
@@ -973,3 +974,82 @@ def test_the_audit_event_keeps_denied_requests_keys_whole(tmp_path):
     a.close()
     row = json.loads((tmp_path / "a.jsonl").read_text())
     assert row["denied_requests"] == {key: 3, "GET /api/version": 1}
+
+
+# ══ which runtime model sessions use (docker by default; sbx only when asked for AND usable) ═══════════════════════
+
+SBX_OK = sbx_session.ModelRuntime("sbx", True, "/usr/bin/sbx", "0.50.1")
+SBX_BAD = sbx_session.ModelRuntime("sbx", False, "/usr/bin/sbx", None, ("sbx daemon is not reachable (`sbx daemon start`)",), ("daemon-down",))
+ASK_SBX = {sbx_session.ENV_MODEL_SANDBOX: "sbx"}
+
+
+def test_plan_names_the_runtime_and_it_is_docker_by_default(rig, up):
+    out = io.StringIO()
+    assert run_plan(rig.parse("plan"), environ={}, probes=rig.probes(), out=out) == 0
+    text = out.getvalue()
+    assert "runtime          model sessions run in: rootless Docker (the default" in text
+    assert re.search(r"\[ok\] model_runtime\s+model sessions run in: rootless Docker", text)
+    assert "container        2 GB, 2 CPUs, 256 pids" in text and "no egress network" in text
+
+
+def test_plan_with_sbx_asked_for_and_usable_says_which_runtime_and_describes_a_vm(rig, up):
+    out = io.StringIO()
+    code = run_plan(rig.parse("plan"), environ=ASK_SBX, probes=rig.probes(model_runtime=lambda env: SBX_OK, environ=ASK_SBX), out=out)
+    text = out.getvalue()
+    assert code == 0 and "READY." in text
+    assert "runtime          model sessions run in: sbx microVM 0.50.1 at /usr/bin/sbx" in text
+    assert "microVM          sbx, per session: 2 GB, 2 CPUs" in text and "container        2 GB" not in text
+    assert "one host port (our egress proxy)" in text and "five sandbox-scoped" in text
+    assert re.search(r"\[ok\] model_runtime\s+model sessions run in: sbx microVM", text)
+
+
+def test_plan_with_sbx_asked_for_and_not_usable_is_not_ready_and_never_falls_back_to_docker(rig, up):
+    out = io.StringIO()
+    code = run_plan(rig.parse("plan"), environ=ASK_SBX, probes=rig.probes(model_runtime=lambda env: SBX_BAD, environ=ASK_SBX), out=out)
+    text = out.getvalue()
+    assert code == 2 and "NOT READY" in text and "stage1 run --approve" not in text
+    assert "[FAIL] model_runtime" in text and "sbx daemon is not reachable" in text and "no fallback to Docker" in text
+    assert "rootless Docker (the default" not in text
+
+
+@pytest.mark.parametrize("value", ["auto", "1", "microvm"])
+def test_a_value_that_is_not_docker_or_sbx_is_not_ready(rig, up, value):
+    out = io.StringIO()
+    code = run_plan(rig.parse("plan"), environ={sbx_session.ENV_MODEL_SANDBOX: value}, probes=rig.probes(environ={sbx_session.ENV_MODEL_SANDBOX: value}), out=out)
+    assert code == 2 and "not recognised" in out.getvalue() and "[FAIL] model_runtime" in out.getvalue()
+
+
+def test_the_runtime_check_is_what_the_probe_returns_for_the_environment_it_was_given(rig, up):
+    seen = []
+    run_plan(rig.parse("plan"), environ=ASK_SBX, probes=rig.probes(model_runtime=lambda env: seen.append(dict(env)) or SBX_OK, environ=ASK_SBX), out=io.StringIO())
+    assert seen == [ASK_SBX]
+
+
+def test_a_run_with_sbx_asked_for_and_not_usable_refuses_before_anything_is_created(rig, up, monkeypatch, capsys):
+    Traps(monkeypatch, rig.fake.port)
+    code = run_run(rig.parse("run", "--approve", "local-ollama"), environ=ASK_SBX, probes=rig.probes(model_runtime=lambda env: SBX_BAD, environ=ASK_SBX),
+                   stdin=TTY("approve local-ollama anything\n"), stdout=TTY())
+    err = capsys.readouterr().err
+    assert code == 2 and "model_runtime" in err and "no fallback to Docker" in err and "nothing was started" in err
+    assert not rig.runs.exists() and not any(rig.ws.iterdir())
+
+
+def test_the_sweep_context_defaults_to_docker_and_carries_the_runtime():
+    fields = {f.name: f for f in dataclasses.fields(stage1.SweepContext)}
+    assert "runtime" in fields and fields["runtime"].default_factory().kind == "docker"       # type: ignore[misc]
+
+
+def test_the_sbx_leftover_check_finds_and_removes_this_sweeps_sandboxes_only(tmp_path, monkeypatch):
+    fake = REPO / "tests" / "fixtures" / "fake-sbx-model" / "sbx"
+    state = tmp_path / "fake"
+    state.mkdir()
+    (state / "sandboxes").write_text("\n".join([sbx_session.sandbox_name("00000000000a", pid=os.getpid()),
+                                                sbx_session.sandbox_name("00000000000b", pid=os.getpid()), "somebody-elses"]) + "\n")
+    monkeypatch.setattr(sandbox, "_SBX_ENV_ALLOW_EXTRA", ("FAKE_SBX_",))
+    env = {"PATH": os.environ["PATH"], "FAKE_SBX_DIR": str(state), "FAKE_SBX_POLICY_FILE": str(REPO / "tests" / "fixtures" / "sbx_policy_ls_deny_all.json")}
+    left = sbx_session.leftover_sandboxes(str(fake), ["00000000000a"], environ=env)
+    assert left == [f"sbx sandbox {sbx_session.sandbox_name('00000000000a', pid=os.getpid())}"]
+    sbx_session.remove_leftover_sandboxes(str(fake), left, environ=env)
+    assert sbx_session.leftover_sandboxes(str(fake), ["00000000000a"], environ=env) == []
+    assert set((state / "sandboxes").read_text().split()) == {sbx_session.sandbox_name("00000000000b", pid=os.getpid()), "somebody-elses"}
+    assert sbx_session.leftover_sandboxes(str(fake), [], environ=env) == []

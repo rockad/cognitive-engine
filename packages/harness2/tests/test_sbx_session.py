@@ -586,3 +586,48 @@ def test_live_a_vm_reaches_our_proxy_and_nothing_else(tmp_path):
     assert _sbx_json(path, "policy", "ls", "--json") == policy_before
     assert set(subprocess.run([path, "ls", "-q"], capture_output=True, text=True).stdout.split()) == ls_before
     assert not leaked
+
+
+# ── choosing the runner ───────────────────────────────────────────────────────────
+
+def _docker_args():
+    from cognitive_harness2.image import ImageRef
+    return (sandbox.VerifiedDocker("/usr/bin/docker", "unix:///run/user/1000/docker.sock"),
+            ImageRef("cognitive-harness2-proposer:0123456789ab", "sha256:" + "5" * 64))
+
+
+def test_make_runner_gives_docker_for_docker_or_none_and_sbx_only_for_a_usable_sbx(world):
+    verified, image = _docker_args()
+    kw = dict(zdr="strict", classification="open", workspace_roots=(str(world.root),), role="solver")
+    for rt in (ss.ModelRuntime("docker", True), None):
+        r = ss.make_runner(rt, verified, image, world.channel, **kw)
+        assert type(r) is sr.ProposerSessionRunner and r.verified is verified
+    r = ss.make_runner(ss.ModelRuntime("sbx", True, str(FAKE), "0.50.1"), verified, image, world.channel, environ=world.env, **kw)
+    assert type(r) is ss.SbxSessionRunner and isinstance(r, sr.ProposerSessionRunner) and r.verified is None and r.sbx_path == str(FAKE)
+    assert r.local_endpoint == f"http://harness2-proxy.internal:{world.ollama.port}"          # the logical URL stage 1 builds its config from
+
+
+@pytest.mark.parametrize("rt, match", [
+    (ss.ModelRuntime("sbx", False, "/usr/bin/sbx", None, ("the daemon is down",), ("daemon-down",)), "the daemon is down"),
+    (ss.ModelRuntime("refused", False, reasons=("COGNITIVE_HARNESS2_MODEL_SANDBOX='x' is not recognised",)), "not recognised"),
+])
+def test_make_runner_refuses_a_runtime_that_is_not_usable_and_never_returns_a_docker_runner(world, rt, match):
+    verified, image = _docker_args()
+    with pytest.raises(SessionRefused, match=match):
+        ss.make_runner(rt, verified, image, world.channel, zdr="strict", classification="open", role="solver")
+
+
+@pytest.mark.parametrize("extra", [dict(egress_network="h2-egress"), dict(_test_allow_cidrs=("10.0.0.0/8",))])
+def test_make_runner_refuses_docker_only_options_on_the_sbx_route(world, extra):
+    verified, image = _docker_args()
+    with pytest.raises(SessionRefused, match="Docker"):
+        ss.make_runner(ss.ModelRuntime("sbx", True, str(FAKE), "0.50.1"), verified, image, world.channel, zdr="strict",
+                       classification="open", role="solver", environ=world.env, **extra)
+
+
+def test_the_stage1_solver_environment_is_built_from_the_sbx_runners_logical_endpoint(world):
+    from cognitive_harness2.stage1 import SolverJob, solver_env_builder
+    r = world.runner(role="solver")
+    job = SolverJob("household/sum-1", "r", "prompt", str(world.ws), "ollama/gemma4:12b", sr.container_cli_path(str(world.cli)))
+    env = solver_env_builder(r)(job)
+    assert f"http://harness2-proxy.internal:{world.ollama.port}/v1" in env["OPENCODE_CONFIG_CONTENT"]
