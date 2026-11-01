@@ -5,7 +5,8 @@ import { checkScriptText } from '../src/workflow-guard.ts';
  * Click-through false positives: `this` and variable-key lookups used to ask even when provably
  * harmless. The guard now follows `const` bindings (declared once in the whole script, in scope at
  * the reference, initialised with a string literal or a flat object of string literals that is only
- * ever read) and `this` inside a class body (strict code: never the global object). Everything the
+ * ever read) and `this.member` inside a class body (only as the object of a plain member access:
+ * bare `this` as a value asks, workflow-guard-this.test.ts). Everything the
  * earlier reviews found as a bypass must still ask, including the near-misses of these new rules.
  */
 const SESSION = 'claude-sonnet-5-5';
@@ -29,7 +30,7 @@ describe('provably harmless: silent', () => {
     ['this in a class method', `class C { m() { return this.x } }`],
     ['this in a constructor, field initialiser and static block', `class C { x = this.y; constructor() { this.a = 1 } static { this.z = 1 } }`],
     ['this in an arrow function inside a class method', `class C { m() { return () => this.x } }`],
-    ['this in a plain function nested in a class method (strict code)', `class C { m() { return function () { return this } } }`],
+    ['this.x in a plain function nested in a class method (strict code)', `class C { m() { return function () { return this.x } } }`],
     ['this in a class expression', `const C = class { m() { return this.x } }`]
   ];
   for (const [name, script] of silent) {
