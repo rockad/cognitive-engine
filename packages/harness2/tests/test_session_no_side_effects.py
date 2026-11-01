@@ -197,7 +197,7 @@ def test_post_api_show_is_an_allowed_request_and_the_near_misses_touch_nothing(t
     """`POST /api/show` reaches for the bridge socket like any allowed request; its spelling variants and other methods are
     refused from memory with every door trapped."""
     with pytest.raises(SideEffectAttempted):
-        _serve_routed_once(b'POST /api/show HTTP/1.1\r\nHost: ollama.test:11434\r\nContent-Length: 22\r\n\r\n{"model":"gemma4:e4b"}')
+        _serve_routed_once(b'POST /api/show HTTP/1.1\r\nHost: ollama.test:11434\r\nContent-Type: application/json\r\nContent-Length: 22\r\n\r\n{"model":"gemma4:e4b"}')
     assert any("open_unix_connection" in a for a in traps.attempts)
     traps.attempts.clear()
     for method, path in (("GET", "/api/show"), ("POST", "/api/show/"), ("POST", "/api/show?x=1"), ("POST", "/API/show"),
@@ -284,7 +284,7 @@ def test_a_model_denied_request_is_answered_from_memory_and_touches_nothing(trap
     """The model check happens after the body is read and before any connection to the bridge: with every door trapped, a
     cloud model, an unknown model and a body naming none are refused and nothing is attempted."""
     for body in (b'{"model":"m:cloud"}', b'{"model":"other"}', b"{}", b"not json", b'{"model":"m","model":"m"}'):
-        w, log = _serve_routed_once(b"POST /v1/chat/completions HTTP/1.1\r\nHost: ollama.test:11434\r\nContent-Length: %d\r\n\r\n"
+        w, log = _serve_routed_once(b"POST /v1/chat/completions HTTP/1.1\r\nHost: ollama.test:11434\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n"
                                     % len(body) + body)
         assert w.out.startswith(b"HTTP/1.1 403 ") and b"unix-route-model-denied" in w.out and len(log) == 1, body
     assert traps.attempts == []

@@ -616,11 +616,15 @@ CLOSE = object()          # in a UnixOllama responder's parts: hang up after ans
 
 
 def rq(method: str, target: str, *, host: str | None = f"{ROUTE_HOST}:{ROUTE_PORT}", body: bytes = b"", extra=(),
-       version: str = "HTTP/1.1", close: bool = True, absolute: bool = False, chunks: list[bytes] | None = None) -> bytes:
-    """One request, as bytes. `absolute` writes the proxy form `http://ollama.test:11434<target>`; `chunks` sends the body chunked."""
+       version: str = "HTTP/1.1", close: bool = True, absolute: bool = False, chunks: list[bytes] | None = None,
+       ctype: str | None = "application/json") -> bytes:
+    """One request, as bytes. `absolute` writes the proxy form `http://ollama.test:11434<target>`; `chunks` sends the body chunked.
+    A POST carries `Content-Type: <ctype>` (what a model client sends; the model routes refuse anything else); `ctype=None` omits it."""
     lines = [f"{method} {'http://' + ROUTE_HOST + ':' + str(ROUTE_PORT) if absolute else ''}{target} {version}"]
     if host is not None:
         lines.append(f"Host: {host}")
+    if method == "POST" and ctype is not None:
+        lines.append(f"Content-Type: {ctype}")
     if chunks is not None:
         lines.append("Transfer-Encoding: chunked")
         body = b"".join(f"{len(c):x}\r\n".encode() + c + b"\r\n" for c in chunks) + b"0\r\n\r\n"
@@ -1111,8 +1115,8 @@ BAD_CHUNKED = {
 @pytest.mark.parametrize("name", BAD_CHUNKED)
 async def test_a_malformed_chunked_body_is_refused_before_anything_reaches_ollama(routed, name):
     async with routed(body_timeout_s=1.0) as rt:
-        head = (f"POST /v1/chat/completions HTTP/1.1\r\nHost: {ROUTE_HOST}:{ROUTE_PORT}\r\nTransfer-Encoding: chunked\r\n"
-                "Connection: close\r\n\r\n").encode()
+        head = (f"POST /v1/chat/completions HTTP/1.1\r\nHost: {ROUTE_HOST}:{ROUTE_PORT}\r\nContent-Type: application/json\r\n"
+                "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n").encode()
         out = await talk(rt.port, head + BAD_CHUNKED[name])
         statuses = [s for s, _, _ in responses(out)]
         assert statuses == [400] or statuses == [408], (name, out)
@@ -1170,7 +1174,7 @@ async def test_a_second_request_hidden_after_the_declared_body_is_judged_on_its_
     async with routed() as rt:
         smuggled = b"DELETE /api/delete HTTP/1.1\r\nHost: ollama.test:11434\r\n\r\n"
         body = b'{"model":"m"} '
-        payload = (f"POST /v1/chat/completions HTTP/1.1\r\nHost: {ROUTE_HOST}:{ROUTE_PORT}\r\nContent-Length: {len(body)}\r\n\r\n").encode() + body + smuggled
+        payload = (f"POST /v1/chat/completions HTTP/1.1\r\nHost: {ROUTE_HOST}:{ROUTE_PORT}\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n").encode() + body + smuggled
         out = await talk(rt.port, payload)
         assert [s for s, _, _ in responses(out)] == [200, 403]
         assert [(x["method"], x["target"]) for x in rt.up.requests] == [CHAT]
@@ -1193,13 +1197,13 @@ async def test_post_api_show_has_the_same_strict_framing_and_caps_as_the_other_p
         assert responses(out)[0][0] == 403 and b"unix-route-model-denied" in out and len(rt.up.requests) == 1
         rt.up.requests.clear()
         for extra in (["Expect: 100-continue"], ["Transfer-Encoding: chunked"], ["Upgrade: websocket", "Connection: Upgrade"], ["TE: trailers"]):
-            head = (f"POST /api/show HTTP/1.1\r\nHost: {ROUTE_HOST}:{ROUTE_PORT}\r\nContent-Length: 4\r\n" + "\r\n".join(extra)
+            head = (f"POST /api/show HTTP/1.1\r\nHost: {ROUTE_HOST}:{ROUTE_PORT}\r\nContent-Type: application/json\r\nContent-Length: 4\r\n" + "\r\n".join(extra)
                     + "\r\nConnection: close\r\n\r\nabcd").encode()
             out = await talk(rt.port, head)
             assert [s for s, _, _ in responses(out)][:1] == [400], (extra, out)
         assert rt.up.requests == []                                                       # none of the refused ones was forwarded
         smuggled = b"DELETE /api/delete HTTP/1.1\r\nHost: ollama.test:11434\r\n\r\n"
-        payload = (f"POST /api/show HTTP/1.1\r\nHost: {ROUTE_HOST}:{ROUTE_PORT}\r\nContent-Length: {len(SHOW_BODY)}\r\n\r\n").encode() + SHOW_BODY + smuggled
+        payload = (f"POST /api/show HTTP/1.1\r\nHost: {ROUTE_HOST}:{ROUTE_PORT}\r\nContent-Type: application/json\r\nContent-Length: {len(SHOW_BODY)}\r\n\r\n").encode() + SHOW_BODY + smuggled
         out = await talk(rt.port, payload)
         assert [s for s, _, _ in responses(out)] == [200, 403]
         assert [(x["method"], x["target"]) for x in rt.up.requests] == [SHOW]
@@ -1218,7 +1222,7 @@ async def test_a_get_with_a_body_and_a_missing_post_length_are_handled_strictly(
         out = await talk(rt.port, rq("GET", "/api/tags", extra=["Content-Length: 0"]))        # an empty one is fine
         assert responses(out)[0][0] == 200
         rt.up.requests.clear()
-        out = await talk(rt.port, b"POST /v1/chat/completions HTTP/1.1\r\nHost: ollama.test:11434\r\nConnection: close\r\n\r\n")
+        out = await talk(rt.port, b"POST /v1/chat/completions HTTP/1.1\r\nHost: ollama.test:11434\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n")
         assert responses(out)[0][0] == 403 and b"unix-route-model-denied" in out and rt.up.requests == []      # no body, no model
 
 
@@ -1735,6 +1739,169 @@ def test_check_model_body_is_pure_and_names_the_rule(path):
     with pytest.raises(Refused) as ei:
         ep.check_model_body(path, jb({"model": "x:cloud"}), allowed)
     assert ei.value.code == "unix-route-model-denied" and ei.value.status == 403 and ei.value.detail == "model=x:cloud"
+
+
+# ══ entity headers on the model routes: the body is read as JSON by us, so it must be read as JSON upstream too ═══════════
+# The proxy checks the `model` of the body as strict JSON. Ollama's handlers bind the body as JSON today; if any of them ever
+# bound by Content-Type (a form body, a compressed body) the check would be bypassed. So a model route takes exactly
+# `Content-Type: application/json` (optionally `; charset=utf-8`), never a Content-Encoding or Content-Transfer-Encoding, and the
+# forwarded head carries the proxy's own Content-Type and Content-Length only.
+
+CT_DENIED = b"403 unix-route-content-type-denied\n"
+CE_DENIED = b"403 unix-route-content-encoding-denied\n"
+MODEL_POSTS = [(CHAT_PATH, jb({"model": LOCAL, "messages": []})), (COMP_PATH, jb({"model": LOCAL, "prompt": "x"})),
+               (SHOW_PATH, jb({"model": LOCAL}))]
+
+CT_OK = ["application/json", "Application/JSON", "application/json; charset=utf-8", "application/json;charset=utf-8",
+         "application/json; charset=UTF-8", "APPLICATION/JSON ; CHARSET=Utf-8", "application/json;  charset=utf-8"]
+CT_BAD = ["application/x-www-form-urlencoded", "text/plain", "text/json", "application/jsonx", "application/json-seq", "application/vnd.api+json",
+          "application/x-ndjson", "application/json; charset=utf-16", "application/json; charset=latin-1", "application/json; charset=utf-8; x=1",
+          "application/json; boundary=x", "application/json; charset", "application/json;", "application/json, text/plain",
+          "multipart/form-data; boundary=x", "application/octet-stream", "*/*", "json", "", " ", "application/json charset=utf-8",
+          "application/json; charset=utf-8, application/x-www-form-urlencoded"]
+
+
+def _forwarded(rt):
+    return [r["body"] for r in rt.up.requests]
+
+
+@pytest.mark.parametrize("path,body", MODEL_POSTS, ids=[p for p, _ in MODEL_POSTS])
+@pytest.mark.parametrize("ctype", CT_OK)
+async def test_a_model_route_takes_json_with_an_optional_utf8_charset_and_forwards_a_plain_application_json(routed, path, body, ctype):
+    async with routed(models=LOCAL_MODELS) as rt:
+        out = await talk(rt.port, rq("POST", path, body=body, ctype=ctype, absolute=True))
+        assert responses(out)[0][0] == 200 and _forwarded(rt) == [body]
+        (got,) = rt.up.requests
+        assert [v for k, v in got["headers"] if k.lower() == "content-type"] == ["application/json"]      # the proxy's own, not the client's
+
+
+@pytest.mark.parametrize("path,body", MODEL_POSTS, ids=[p for p, _ in MODEL_POSTS])
+@pytest.mark.parametrize("ctype", CT_BAD + [None])
+async def test_a_model_route_refuses_any_other_or_missing_content_type_before_anything_is_forwarded(routed, path, body, ctype):
+    async with routed(models=LOCAL_MODELS) as rt:
+        out = await talk(rt.port, rq("POST", path, body=body, ctype=ctype, absolute=True))
+        (status, headers, text), = responses(out)
+        assert (status, text) == (403, CT_DENIED) and headers["connection"] == "close", (ctype, status, text)
+        assert rt.up.requests == [] and rt.up.connections == 0
+        assert len(rt.log) == 1 and " reason=unix-route-content-type-denied" in rt.log[0] and "decision=deny" in rt.log[0]
+        assert "SECRET" not in rt.log[0] and "application" not in rt.log[0]                      # the client's value is never logged
+
+
+async def test_the_form_urlencoded_reading_of_a_json_body_is_the_bypass_this_closes(routed):
+    """The review's input: valid JSON naming an allowed model, which a form-urlencoded reader would read as `model=x:cloud`."""
+    async with routed(models=LOCAL_MODELS) as rt:
+        body = jb({"model": LOCAL, "x": "&model=x:cloud&"})
+        out = await talk(rt.port, rq("POST", CHAT_PATH, body=body, ctype="application/x-www-form-urlencoded", absolute=True))
+        assert responses(out)[0][0] == 403 and CT_DENIED in out and rt.up.requests == []
+        out = await talk(rt.port, rq("POST", CHAT_PATH, body=body, absolute=True))                # the same body as JSON is fine
+        assert responses(out)[0][0] == 200 and _forwarded(rt) == [body]
+
+
+async def test_two_content_type_headers_are_refused_whatever_they_say(routed):
+    async with routed(models=LOCAL_MODELS) as rt:
+        for extra in (["Content-Type: application/json"], ["Content-Type: application/x-www-form-urlencoded"], ["content-type: application/json"]):
+            out = await talk(rt.port, rq("POST", CHAT_PATH, body=MODEL_POSTS[0][1], extra=extra, absolute=True))
+            assert responses(out)[0][0] == 403 and CT_DENIED in out
+        assert rt.up.requests == []
+
+
+ENCODING = [["Content-Encoding: gzip"], ["Content-Encoding: identity"], ["Content-Encoding: br"], ["content-encoding: deflate"],
+            ["Content-Encoding:"], ["Content-Transfer-Encoding: base64"], ["Content-Transfer-Encoding: binary"], ["Content-Transfer-Encoding: 7bit"],
+            ["content-transfer-encoding: quoted-printable"], ["Content-Encoding: gzip", "Content-Transfer-Encoding: base64"]]
+
+
+@pytest.mark.parametrize("path,body", MODEL_POSTS, ids=[p for p, _ in MODEL_POSTS])
+@pytest.mark.parametrize("extra", ENCODING, ids=[f"enc{i}" for i in range(len(ENCODING))])
+async def test_a_model_route_refuses_any_content_encoding_or_transfer_encoding_header(routed, path, body, extra):
+    async with routed(models=LOCAL_MODELS) as rt:
+        out = await talk(rt.port, rq("POST", path, body=body, extra=extra, absolute=True))      # with a perfectly good Content-Type
+        (status, headers, text), = responses(out)
+        assert (status, text) == (403, CE_DENIED) and headers["connection"] == "close", (extra, status, text)
+        assert rt.up.requests == [] and rt.up.connections == 0
+        assert len(rt.log) == 1 and " reason=unix-route-content-encoding-denied" in rt.log[0]
+
+
+async def test_a_content_encoding_is_refused_before_the_content_type_is_judged(routed):
+    async with routed(models=LOCAL_MODELS) as rt:
+        out = await talk(rt.port, rq("POST", CHAT_PATH, body=MODEL_POSTS[0][1], ctype="text/plain", extra=["Content-Encoding: gzip"], absolute=True))
+        assert CE_DENIED in out and rt.up.requests == []
+
+
+async def test_the_forwarded_head_has_the_proxys_own_content_type_and_length_and_no_other_entity_header(routed):
+    async with routed(models=LOCAL_MODELS) as rt:
+        entity = ["Content-Language: de", "Content-Location: /x", "Content-MD5: abc", "Content-Disposition: form-data", "Content-Range: bytes 0-1/2",
+                  "Content-Foo: bar", "Digest: sha-256=abc", "Repr-Digest: sha-256=:abc:", "X-Custom: kept", "Accept: application/json"]
+        body = MODEL_POSTS[0][1]
+        out = await talk(rt.port, rq("POST", CHAT_PATH, body=body, ctype="application/json; charset=UTF-8", extra=entity, absolute=True))
+        assert responses(out)[0][0] == 200
+        (got,) = rt.up.requests
+        names = [k.lower() for k, _ in got["headers"]]
+        assert names.count("content-type") == 1 and names.count("content-length") == 1
+        assert got["low"]["content-type"] == "application/json" and got["low"]["content-length"] == str(len(body))
+        assert not [n for n in names if n.startswith("content-") and n not in ("content-type", "content-length")]
+        assert "digest" not in names and "repr-digest" not in names
+        assert got["low"]["x-custom"] == "kept" and got["low"]["accept"] == "application/json"       # everything else still passes
+        assert "transfer-encoding" not in names
+
+
+async def test_a_chunked_body_is_re_sent_with_application_json_and_a_length(routed):
+    async with routed(models=LOCAL_MODELS) as rt:
+        body = MODEL_POSTS[0][1]
+        out = await talk(rt.port, rq("POST", CHAT_PATH, chunks=[body[:7], body[7:]], ctype="application/json; charset=utf-8", absolute=True))
+        assert responses(out)[0][0] == 200
+        (got,) = rt.up.requests
+        assert got["low"]["content-type"] == "application/json" and got["low"]["content-length"] == str(len(body)) and "transfer-encoding" not in got["low"]
+
+
+async def test_the_get_routes_are_not_subject_to_the_content_type_rule(routed):
+    async with routed(models=LOCAL_MODELS) as rt:
+        for path in ("/api/tags", "/v1/models"):
+            assert responses(await talk(rt.port, rq("GET", path, absolute=True)))[0][0] == 200
+
+
+async def test_the_content_type_rule_runs_on_every_request_of_a_keep_alive_connection(routed):
+    async with routed(models=LOCAL_MODELS) as rt:
+        good = MODEL_POSTS[0][1]
+        out = await talk(rt.port, rq("POST", CHAT_PATH, body=good, close=False, absolute=True)
+                         + rq("POST", CHAT_PATH, body=good, ctype="text/plain", absolute=True))
+        rs = responses(out)
+        assert [r[0] for r in rs] == [200, 403] and rs[1][2] == CT_DENIED and _forwarded(rt) == [good]
+
+
+def test_a_model_post_content_type_is_judged_by_a_pure_function():
+    for value in CT_OK:
+        assert ep.model_route_content_type(_req([("Content-Type", value)])) == "application/json"
+    for value in CT_BAD:
+        with pytest.raises(Refused) as ei:
+            ep.model_route_content_type(_req([("Content-Type", value)]))
+        assert (ei.value.code, ei.value.status) == ("unix-route-content-type-denied", 403), value
+    with pytest.raises(Refused) as ei:
+        ep.model_route_content_type(_req([]))
+    assert ei.value.code == "unix-route-content-type-denied"
+    for name in ("Content-Encoding", "content-transfer-encoding"):
+        with pytest.raises(Refused) as ei:
+            ep.model_route_content_type(_req([("Content-Type", "application/json"), (name, "gzip")]))
+        assert (ei.value.code, ei.value.status) == ("unix-route-content-encoding-denied", 403)
+
+
+def _req(headers):
+    return ep.Request("POST", "/v1/chat/completions", "HTTP/1.1", tuple(headers))
+
+
+@pytest.mark.parametrize("entry", [["POST", "/api/generate"], ["POST", "/api/chat"], ["POST", "/api/embed"], ["POST", "/v1/embeddings"],
+                                   ["POST", "/api/pull"], ["POST", "/api/tags"], ["POST", "/v1/models"]])
+def test_a_post_allow_entry_whose_body_is_not_model_checked_is_refused_at_load(entry):
+    """MODEL_CHECKED is fixed in the code and `allow` comes from the config: a POST added to `allow` would be forwarded
+    with no model check, so a route that lists one fails to load."""
+    with pytest.raises(ValueError, match="model-checked"):
+        Policy.build([], [{"host": "ollama.test", "port": 11434, "unix": "/s", "allow": ALLOW + [entry], "allowed_models": ["m"]}])
+    with pytest.raises(ValueError, match="model-checked"):
+        ep.parse_config({"unix_routes": [{"host": "ollama.test", "port": 11434, "unix": "/s", "allow": [entry], "allowed_models": ["m"]}],
+                         "listeners": [{"port": 11434, "unix": "/s"}]})
+
+
+def test_every_post_the_shipped_allow_list_names_is_model_checked():
+    assert {p for p in ep.OLLAMA_ROUTE_ALLOW if p[0] == "POST"} <= ep.MODEL_CHECKED
 
 
 # ══ running counters and the ACCESS-SUMMARY line (F4) ═══════════════════════════════════════════════════════════════════
