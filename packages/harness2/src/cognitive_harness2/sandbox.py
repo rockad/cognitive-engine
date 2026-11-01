@@ -602,10 +602,16 @@ class SbxRunner:
                  verified: frozenset[str] | None = None, cpus: int = 1, memory: str = "512m",
                  create_timeout_s: int = _SBX_CREATE_TIMEOUT_S, control_timeout_s: int = 60,
                  max_output_bytes: int = MAX_OUTPUT_BYTES,
-                 fallback: Callable[[dict], SandboxRunner] | None = None):
+                 fallback: Callable[[dict], SandboxRunner] | None = None,
+                 policy_problem: Callable[[str], str | None] | None = None):
         """`fallback` is for `auto` only: given the reason ({code, detail, loud}), it returns the verified Docker runner
         (or raises `SandboxUnavailable`). It is used only for a failure BEFORE the candidate started (`SandboxNotStarted`);
-        None (the `sbx` setting, and the default) keeps the runner strictly fail-closed."""
+        None (the `sbx` setting, and the default) keeps the runner strictly fail-closed.
+
+        `policy_problem` judges `sbx policy ls --json` in the preflight (default `sbx_network_policy_problem`: deny-all
+        and no allow rule at all). The model-session route (`sbx_session`) passes its own, which also tolerates the
+        per-sandbox rules of its own sessions."""
+        self.policy_problem = policy_problem or sbx_network_policy_problem
         self.fallback = fallback
         self._fell_back: SandboxRunner | None = None
         self.sbx_path = sbx_path
@@ -681,7 +687,7 @@ class SbxRunner:
         if version not in self.verified:
             raise SandboxUnavailable(f"sbx version {version} is not in the verified set "
                                      f"({', '.join(sorted(self.verified)) or 'empty'}) (fail closed)")
-        problem = sbx_network_policy_problem(self._must(self._argv("policy", "ls", "--json"), "policy ls").stdout)
+        problem = self.policy_problem(self._must(self._argv("policy", "ls", "--json"), "policy ls").stdout)
         if problem:
             raise SandboxUnavailable(f"{problem} (fail closed)")
         # Re-read on every run, not trusted from the selection probe's cache: the user can flip them in between.

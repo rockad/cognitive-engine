@@ -10,15 +10,28 @@ means, the sandbox names, and which runtime model sessions use. `SbxSessionRunne
 """
 from __future__ import annotations
 
+import contextlib
 import json
+import math
 import os
 import re
+import secrets
 import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
-from . import sandbox
+from . import run_scope, sandbox
+from . import session_runner as sr
 from .egress_proxy import OLLAMA_ROUTE_ALLOW
+from .host_bridge import HostBridge
 
 ENV_MODEL_SANDBOX = "COGNITIVE_HARNESS2_MODEL_SANDBOX"
 RUNTIME_DOCKER, RUNTIME_SBX, RUNTIME_REFUSED = "docker", "sbx", "refused"
@@ -271,3 +284,472 @@ def choose_model_runtime(environ: Mapping[str, str] | None = None, *, which: Cal
     rep = sandbox.inspect_sbx(which, environ=env, probes=probes if probes is not None else model_probes(env),
                               verified=VERIFIED_SBX_MODEL_VERSIONS if verified is None else verified)
     return ModelRuntime(RUNTIME_SBX, rep.selected, rep.path, rep.version, rep.reasons, tuple(p.code for p in rep.problems))
+
+
+# ═══ the runner ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+
+GATEWAY_PROXY = re.compile(r"^http://gateway\.docker\.internal:[0-9]{2,5}$")
+VM_MODEL_HOST = "host.docker.internal"      # the sbx proxy maps it to the HOST's loopback; the policy engine names it `localhost`
+ROUTE_HOSTS = ("localhost", VM_MODEL_HOST)  # the `Host` names our proxy accepts on its listener (the sbx proxy sends `localhost:<port>`)
+_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+_PROXY_START_ATTEMPTS = 3
+_PROXY_READY_S = 30.0
+_PROXY_STOP_GRACE_S = 3.0
+_MAX_PROXY_LOG_BYTES = 8 * 1024 * 1024
+_SBX_EXEC_FAILURE = sandbox._SBX_EXEC_FAILURE
+_MEM = re.compile(r"^([1-9][0-9]{0,5})([kmg])$")
+_ADDED = re.compile(r"\bAdded rule (\S+)")
+
+
+def _free_ports(n: int, avoid: Sequence[int | None] = ()) -> list[int]:
+    """`n` distinct free loopback TCP ports (all bound at once, then released: another process can still take one before the
+    proxy does, which is why the proxy start is retried)."""
+    socks: list[socket.socket] = []
+    try:
+        while len(socks) < n:
+            s = socket.socket()
+            s.bind(("127.0.0.1", 0))
+            if s.getsockname()[1] in avoid:
+                s.close()
+                continue
+            socks.append(s)
+        return [s.getsockname()[1] for s in socks]
+    finally:
+        for s in socks:
+            s.close()
+
+
+def _die_with_parent() -> None:
+    """In the child, before exec: SIGTERM me when the process that started me dies (Linux `PR_SET_PDEATHSIG`), so a hard kill
+    of the runner cannot leave the host proxy listening for a stale sandbox. Best effort; other platforms get nothing."""
+    try:
+        import ctypes
+        ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OverflowError, ValueError):
+        return True
+    return True
+
+
+def _memory_arg(memory: str) -> str:
+    """`--memory` for sbx: the session limit, but never below sbx's 512 MiB minimum."""
+    m = _MEM.fullmatch(memory)
+    if not m:
+        raise sr.SessionRefused("memory must look like 256m or 2g")
+    mib = int(m.group(1)) * {"k": 1 / 1024, "m": 1, "g": 1024}[m.group(2)]
+    return memory if mib >= 512 else "512m"
+
+
+def _cpus_arg(cpus: str) -> str:
+    return str(max(1, math.ceil(float(cpus))))
+
+
+@dataclass
+class _Live:
+    """What one session has created so far, for the teardown (which must work from any point of failure)."""
+    base: Path | None = None
+    proxy: subprocess.Popen | None = None
+    client: subprocess.Popen | None = None
+    rule_ids: list[str] = field(default_factory=list)
+    log_text: str = ""
+    port: int | None = None
+
+
+class SbxSessionRunner(sr.ProposerSessionRunner):
+    """`ProposerSessionRunner`'s contract on an sbx microVM, for a LOCAL-model channel only.
+
+    Same `authorize`, budget, observer, result and teardown semantics as the Docker runner; different plumbing (README, "sbx model
+    route"). It never touches the global policy and never uses Docker. Every failure before the CLI starts raises
+    `SessionRefused` (preflight) or `SessionError` (after something was created, with the teardown done); a sandbox, rule, process or
+    directory that cannot be removed is a `SessionCleanupError` naming it."""
+
+    def __init__(self, sbx_path: str, channel: sr.channels.Channel, *, zdr: str, classification: str | None,
+                 proposer_decision: sr.upstream_egress.Decision | None = None, workspace_roots: Sequence[str] = (),
+                 role: str = "proposer", budget: sr.SweepBudget | None = None,
+                 observer: Callable[[str, Mapping[str, object]], None] | None = None,
+                 environ: Mapping[str, str] | None = None, verified: frozenset[str] | None = None,
+                 control_timeout_s: int = 60, create_timeout_s: int = 600, python: str | None = None,
+                 proxy_script: str | None = None):
+        if role not in sr.ROLES:
+            raise sr.SessionRefused(f"the session role must be one of {sr.ROLES}")
+        if budget is not None and not isinstance(budget, sr.SweepBudget):
+            raise sr.SessionRefused("budget must be a SweepBudget")
+        if observer is not None and not callable(observer):
+            raise sr.SessionRefused("observer must be a callable (event, fields)")
+        if not isinstance(channel, sr.channels.Channel):
+            raise sr.SessionRefused("the channel must be a declared channels.Channel")
+        self.verified, self.image = None, None                   # no Docker: nothing here may reach for either
+        self.channel, self.zdr, self.classification, self.proposer_decision = channel, zdr, classification, proposer_decision
+        self.workspace_roots, self.egress_network, self._test_allow_cidrs = tuple(workspace_roots), None, ()
+        self.role, self.budget, self.observer, self.observer_errors = role, budget, observer, 0
+        keys = [k for k in channel.endpoint_keys if k[0] in sr.egress.LOOPBACK]
+        self.ollama_port: int | None = keys[0][1] if len(keys) == 1 else None
+        self.environ = dict(os.environ if environ is None else environ)
+        self.sbx_path = sbx_path
+        self.verified_versions = VERIFIED_SBX_MODEL_VERSIONS if verified is None else verified
+        self.control_timeout_s = control_timeout_s
+        self.python = python or sys.executable
+        self.proxy_script = proxy_script or egress_proxy_file()
+        self._sbx = sandbox.SbxRunner(sbx_path, environ=self.environ, verified=self.verified_versions,
+                                      control_timeout_s=control_timeout_s, create_timeout_s=create_timeout_s,
+                                      policy_problem=lambda text: model_policy_problem(text, ollama_port=self.ollama_port))
+
+    # ── authorisation: the Docker runner's, plus what this route cannot serve ────────
+
+    def authorize(self, spec: sr.SessionSpec) -> sr.Plan:
+        plan = super().authorize(spec)
+        if not plan.local:
+            raise sr.SessionRefused("the sbx route serves local-model channels only (a hosted channel needs a route to the internet)")
+        if spec.credential is not None:
+            raise sr.SessionRefused("the sbx route carries no credential file: a local model needs none")
+        if ":" in plan.workspace:
+            raise sr.SessionRefused("the workspace path contains ':' (sbx reads a `:ro` suffix as a mode)")
+        return plan
+
+    def _gate(self) -> None:
+        """The preflight, run for every session (the daemon, policy or settings can change between runs): the same checks
+        `SbxRunner` makes, with this route's reading of the policy. Then the stale sweep (best effort)."""
+        try:
+            self._sbx._preflight()
+        except sandbox.SandboxUnavailable as e:
+            raise sr.SessionRefused(f"sbx cannot be used for a model session: {e}") from None
+        with contextlib.suppress(Exception):
+            self.sweep_stale()
+
+    # ── helpers ───────────────────────────────────────────────────────────────────
+
+    def _ctl(self, *args: str, timeout: int | None = None, what: str | None = None) -> subprocess.CompletedProcess:
+        return self._sbx._ctl(self._sbx._argv(*args), self.control_timeout_s if timeout is None else timeout, what or args[0])
+
+    def _must(self, *args: str, what: str, timeout: int | None = None) -> subprocess.CompletedProcess:
+        try:
+            p = self._ctl(*args, timeout=timeout, what=what)
+        except sandbox.SandboxUnavailable as e:
+            raise sr.SessionError(str(e)) from None
+        if p.returncode != 0:
+            raise sr.SessionError(f"`sbx {what}` failed (exit {p.returncode}): {sandbox._first_line(p.stderr or p.stdout)}")
+        return p
+
+    # ── the stale sweep ───────────────────────────────────────────────────────────
+
+    def sweep_stale(self) -> list[str]:
+        """Remove every `h2m-` sandbox whose owner process is dead (with a run scope set, only that scope's). A sandbox's rules
+        go with it. Never touches a sandbox of a live process, of another scope when scoped, or one that is not ours.
+        Returns what was removed. A listing that fails removes nothing."""
+        try:
+            ls = self._ctl("ls", "-q", what="ls")
+        except sandbox.SandboxUnavailable:
+            return []
+        if ls.returncode != 0:
+            return []
+        scope, removed = run_scope.current(), []
+        for name in ls.stdout.split():
+            parsed = parse_sandbox_name(name)
+            if parsed is None or (scope is not None and parsed[0] != scope) or _pid_alive(parsed[1]):
+                continue
+            with contextlib.suppress(sandbox.SandboxUnavailable):
+                self._ctl("rm", "--force", name, what="rm --force")
+            removed.append(f"sandbox {name}")
+        return removed
+
+    reap_all = sweep_stale
+
+    # ── the host proxy ────────────────────────────────────────────────────────────
+
+    def _proxy_config(self, plan: sr.Plan, bridge: HostBridge, port: int, forward_port: int) -> dict:
+        sock = str(bridge.socket_path)
+        allow = [list(pair) for pair in OLLAMA_ROUTE_ALLOW]
+        models = list(plan.allowed_models)
+        return {"listen_host": "127.0.0.1", "listen_port": forward_port, "allow": [],
+                "unix_routes": [{"host": h, "port": port, "unix": sock, "allow": allow, "allowed_models": models} for h in ROUTE_HOSTS],
+                "listeners": [{"port": port, "unix": sock}]}
+
+    def _start_proxy(self, plan: sr.Plan, base: Path, bridge: HostBridge, live: _Live) -> int:
+        """The SAME `egress_proxy.py` the Docker route runs in a container, as a host process on 127.0.0.1:<port> (a random free
+        port that is never the model server's). Its output goes to a file (no pipe to fill). Retried when another process takes
+        the port first."""
+        last = "no output"
+        for _ in range(_PROXY_START_ATTEMPTS):
+            port, forward = _free_ports(2, avoid=[self.ollama_port])
+            cfg = base / "proxy.json"
+            cfg.write_text(json.dumps(self._proxy_config(plan, bridge, port, forward)))
+            os.chmod(cfg, 0o600)
+            logf = base / "proxy.log"
+            with open(logf, "wb") as out:
+                live.proxy = subprocess.Popen([self.python, "-I", self.proxy_script, "--config", str(cfg)], stdin=subprocess.DEVNULL,
+                                              stdout=out, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True,
+                                              preexec_fn=_die_with_parent, env={"PATH": _PATH, "LANG": "C.UTF-8"})
+            deadline = time.monotonic() + _PROXY_READY_S
+            while time.monotonic() < deadline:
+                text = logf.read_text(errors="replace")
+                if sr.READY_LINE in text:
+                    live.port = port
+                    return port
+                if live.proxy.poll() is not None:
+                    last = sandbox._first_line(text.strip().splitlines()[-1] if text.strip() else "")
+                    break
+                time.sleep(0.05)
+            else:
+                last = "it did not print its ready line in time"
+            self._stop_proxy(live)
+        raise sr.SessionError(f"the host egress proxy did not start: {last}")
+
+    def _stop_proxy(self, live: _Live) -> None:
+        """Stop it gracefully (SIGTERM: it prints its final ACCESS-SUMMARY), else kill the group; then read its log. Idempotent."""
+        proc = live.proxy
+        if proc is not None and proc.poll() is None:
+            for sig, wait in ((signal.SIGTERM, _PROXY_STOP_GRACE_S), (signal.SIGKILL, 5.0)):
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(proc.pid, sig)
+                try:
+                    proc.wait(timeout=wait)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        if live.base is not None:
+            with contextlib.suppress(OSError):
+                with open(live.base / "proxy.log", "rb") as f:
+                    live.log_text = f.read(_MAX_PROXY_LOG_BYTES).decode("utf-8", "replace")
+
+    # ── the sandbox ───────────────────────────────────────────────────────────────
+
+    def _create(self, name: str, plan: sr.Plan, live: _Live, port: int) -> None:
+        lim = plan.spec.limits
+        self._must("create", "shell", "--name", name, "--no-progress", "--cpus", _cpus_arg(lim.cpus), "--memory", _memory_arg(lim.memory),
+                   "--pull", "missing", "--skills", "off", plan.workspace, what="create", timeout=self._sbx.create_timeout_s)
+        if name not in self._must("ls", "-q", what="ls").stdout.split():
+            raise sr.SessionError(f"sandbox {name} is not listed by `sbx ls -q` after create")
+        for method, path in OLLAMA_ROUTE_ALLOW:
+            p = self._must("policy", "allow", "network", "--sandbox", name, f"localhost:{port}", "--method", method, "--path", path,
+                           what="policy allow network")
+            m = _ADDED.search(p.stdout)
+            if not m:
+                raise sr.SessionError("`sbx policy allow network` did not say which rule it added")
+            live.rule_ids.append(m.group(1))
+        listing = self._must("policy", "ls", "--json", name, what="policy ls").stdout
+        problem = sandbox_policy_problem(listing, name, port, ollama_port=self.ollama_port)
+        if problem:
+            raise sr.SessionError(f"the sandbox's policy is not deny-all plus our rules: {problem}")
+        targets = [*sandbox.SBX_DENIED_TARGETS, f"localhost:{self.ollama_port}", f"localhost:{port + 1 if port < 65535 else port - 1}"]
+        for target in targets:
+            p = self._ctl(*self._sbx._check_argv(name, target)[1:], what="policy check network")
+            try:
+                verdict = json.loads(p.stdout)
+            except ValueError:
+                verdict = None
+            if not (isinstance(verdict, dict) and verdict.get("allowed") is False and p.returncode == 1):
+                raise sr.SessionError(f"the sandbox's network policy does not deny {target} "
+                                      f"(exit {p.returncode}: {sandbox._first_line(p.stderr or p.stdout)})")
+
+    def _gateway(self, name: str) -> str:
+        out = self._must("exec", "--", name, "printenv", "HTTP_PROXY", what="exec printenv").stdout.strip()
+        if not GATEWAY_PROXY.fullmatch(out):
+            raise sr.SessionError(f"the sandbox's HTTP_PROXY is {out!r}, not the sbx gateway: its network path is not the one this "
+                                  "route was verified on")
+        return out
+
+    def _install(self, name: str, plan: sr.Plan) -> None:
+        cli = f"{sr.CLI_DIR}/{os.path.basename(plan.cli_host)}"
+        self._must("exec", "-u", "root", "--", name, "mkdir", "-p", sr.CLI_DIR, what="exec mkdir")
+        self._must("cp", plan.cli_host, f"{name}:{sr.CLI_DIR}/", what="cp", timeout=300)
+        self._must("exec", "-u", "root", "--", name, "chmod", "0755", cli, what="exec chmod")
+        if self._ctl("exec", "--", name, "test", "-x", cli, what="exec test").returncode != 0:
+            raise sr.SessionError(f"the CLI is not executable in the sandbox at {cli}")
+        for d in plan.spec.tmpfs_dirs:
+            self._must("exec", "--", name, "mkdir", "-p", d, what="exec mkdir")
+
+    def _vm_env(self, plan: sr.Plan, port: int, gateway: str) -> dict[str, str]:
+        """The COMPLETE environment of the CLI (`env -i`): nothing of the host's, nothing of the VM's own (its `*_API_KEY=proxy-managed`
+        placeholders and `GH_TOKEN` are not passed on). The sbx gateway is its proxy; the VM's own loopback is the only thing not
+        proxied. The logical model URL (the Docker route's `http://harness2-proxy.internal:<port>`) is replaced, in values only, with
+        the origin the sbx proxy maps to the host: `http://host.docker.internal:<port>`."""
+        env = {"HOME": sr.HOME, "TMPDIR": "/tmp", "PATH": _PATH, "TERM": "dumb", "NO_COLOR": "1", "LANG": "C.UTF-8",
+               "HTTP_PROXY": gateway, "HTTPS_PROXY": gateway, "http_proxy": gateway, "https_proxy": gateway,
+               "NO_PROXY": sr.SESSION_NO_PROXY, "no_proxy": sr.SESSION_NO_PROXY, "NODE_USE_ENV_PROXY": "1"}
+        logical = f"http://{sr.PROXY_ALIAS}:{plan.local_port}"
+        real = f"http://{VM_MODEL_HOST}:{port}"
+        env.update({k: v.replace(logical, real) for k, v in plan.spec.env.items()})
+        return env
+
+    @staticmethod
+    def _session_script() -> str:
+        return 'ulimit -u "$1" && ulimit -c 0 && shift && exec "$@"'
+
+    def _session_argv(self, name: str, plan: sr.Plan, env: Mapping[str, str]) -> list[str]:
+        spec = plan.spec
+        return [self.sbx_path, "exec", *(["-i"] if spec.stdin is not None else []), "-w", plan.workspace, "--", name,
+                "sh", "-c", self._session_script(), "sh", str(spec.limits.pids), "env", "-i",
+                *(f"{k}={v}" for k, v in env.items()), *spec.argv]
+
+    def _run_client(self, argv: list[str], plan: sr.Plan, live: _Live) -> tuple[int | None, bytes, bytes, bool, bool]:
+        spec = plan.spec
+        out, err, cut = bytearray(), bytearray(), [False]
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE if spec.stdin is not None else subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=sandbox._sbx_env(self.environ), start_new_session=True)
+        live.client = proc
+        threads = [threading.Thread(target=sandbox._drain, args=(s, spec.limits.max_output_bytes, b, cut), daemon=True)
+                   for s, b in ((proc.stdout, out), (proc.stderr, err))]
+        if spec.stdin is not None:
+            def feed() -> None:
+                with contextlib.suppress(OSError):
+                    proc.stdin.write(spec.stdin)  # type: ignore[union-attr]
+                    proc.stdin.close()            # type: ignore[union-attr]
+            threads.append(threading.Thread(target=feed, daemon=True))
+        for t in threads:
+            t.start()
+        timed_out = False
+        try:
+            code: int | None = proc.wait(timeout=spec.timeout_s)
+        except subprocess.TimeoutExpired:
+            timed_out, code = True, None
+            self._kill_client(live)
+        for t in threads:
+            t.join(timeout=sandbox._PROBE_TIMEOUT_S)
+        return code, bytes(out), bytes(err), timed_out, cut[0]
+
+    def _kill_client(self, live: _Live) -> None:
+        proc = live.client
+        if proc is not None and proc.poll() is None:
+            self._sbx._kill_client(proc)
+
+    # ── teardown ──────────────────────────────────────────────────────────────────
+
+    def _remove_rules(self, name: str, ids: Sequence[str]) -> None:
+        """Remove each rule by id (`--force`: there is no terminal). Best effort: `sbx rm` takes the rest with the sandbox, and
+        the leftover check reports a rule that is still there."""
+        for rule in ids:
+            with contextlib.suppress(sandbox.SandboxUnavailable):
+                self._ctl("policy", "rm", "network", "--sandbox", name, "--id", rule, "--force", what="policy rm network")
+
+    def _remove_sandbox(self, name: str) -> None:
+        with contextlib.suppress(sandbox.SandboxUnavailable):
+            self._sbx._destroy(name)
+
+    def _teardown_sbx(self, name: str, live: _Live, stack: contextlib.ExitStack, cleanup: sr._Cleanup) -> None:
+        """Every step runs whatever happened to the one before it. Order: the client; the rules (the route goes first); the sandbox;
+        the proxy (its final summary is read); the bridge; the private directory."""
+        cleanup.run(self._kill_client, live)
+        cleanup.run(self._remove_rules, name, live.rule_ids)
+        cleanup.run(self._remove_sandbox, name)
+        cleanup.run(self._stop_proxy, live)
+        cleanup.run(sr.ProposerSessionRunner._close_stack, stack)
+        if live.base is not None:
+            cleanup.run(shutil.rmtree, live.base, True)
+
+    def _leftovers_sbx(self, name: str, live: _Live) -> list[str]:
+        left: list[str] = []
+        try:
+            rules = self._ctl("policy", "ls", "--json", what="policy ls")
+            doc = json.loads(rules.stdout) if rules.returncode == 0 else None
+            if doc is None:
+                left.append(f"rules of {name}: could not be listed")
+            else:
+                left += [f"rule {r.get('id')} of sandbox {name}" for r in doc.get("rules", [])
+                         if isinstance(r, dict) and _sandbox_of(r) == name]
+        except (sandbox.SandboxUnavailable, ValueError, AttributeError):
+            left.append(f"rules of {name}: could not be listed")
+        try:
+            ls = self._ctl("ls", "-q", what="ls")
+            if ls.returncode != 0:
+                left.append(f"sandbox {name}: could not be listed")
+            elif name in ls.stdout.split():
+                left.append(f"sandbox {name}")
+        except sandbox.SandboxUnavailable:
+            left.append(f"sandbox {name}: could not be listed")
+        if live.proxy is not None and live.proxy.poll() is None:
+            left.append(f"process {live.proxy.pid} (host egress proxy)")
+        if live.base is not None and live.base.exists():
+            left.append(f"directory {live.base}")
+        return left
+
+    @staticmethod
+    def _reclaim_host(workspace: str) -> bool:
+        """The session's files are the host user's (virtiofs maps them), but a mode the session chose (a directory at 000) can
+        still stop harvest and removal: make every directory u+rwx and every file u+rw, never following a link."""
+        ok, stack = True, [workspace]
+        while stack:
+            d = stack.pop()
+            try:
+                if not os.path.islink(d):
+                    os.chmod(d, os.lstat(d).st_mode | 0o700)
+                with os.scandir(d) as it:
+                    for e in it:
+                        if e.is_symlink():
+                            continue
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        else:
+                            os.chmod(e.path, os.lstat(e.path).st_mode | 0o600)
+            except OSError:
+                ok = False
+        return ok
+
+    # ── a session ─────────────────────────────────────────────────────────────────
+
+    def _execute(self, plan: sr.Plan) -> sr.SessionResult:
+        spec = plan.spec
+        run_id = secrets.token_hex(6)
+        name = sandbox_name(run_id, scope=run_scope.current())
+        live, stack = _Live(), contextlib.ExitStack()
+        raw: tuple[int | None, bytes, bytes, bool, bool] | None = None
+        error: BaseException | None = None
+        reclaimed: bool | None = None
+        t0 = time.monotonic()
+        self._notify("session_start", session=run_id, timeout_s=spec.timeout_s, tmp_exec=spec.tmp_exec)
+        try:
+            live.base = Path(tempfile.mkdtemp(prefix=run_scope.dir_prefix("h2m-"), dir=sr._runtime_base_dir())).resolve()
+            os.chmod(live.base, 0o700)
+            bridge = stack.enter_context(HostBridge(*plan.bridge_target))              # type: ignore[misc]
+            port = self._start_proxy(plan, live.base, bridge, live)
+            self._create(name, plan, live, port)
+            gateway = self._gateway(name)
+            self._install(name, plan)
+            raw = self._run_client(self._session_argv(name, plan, self._vm_env(plan, port, gateway)), plan, live)
+            code, _, err, timed_out, _ = raw
+            if not timed_out and (code == 125 or (code == 255 and _SBX_EXEC_FAILURE.match(err.decode("utf-8", "replace")))):
+                raise sr.SessionError(f"`sbx exec` could not run the session (exit {code}): "
+                                      f"{sandbox._first_line(err.decode('utf-8', 'replace'))}")
+        except BaseException as e:   # noqa: BLE001 - recorded, cleanup runs, then re-raised
+            error = e
+        finally:
+            cleanup = sr._Cleanup()
+            with sr._shielded_from_interrupts():
+                self._teardown_sbx(name, live, stack, cleanup)
+                if spec.reclaim_workspace:
+                    reclaimed = cleanup.run(self._reclaim_host, plan.workspace, default=False)
+                leftovers = tuple(cleanup.run(self._leftovers_sbx, name, live, default=[]))
+        if error is None and cleanup.interrupt is not None:
+            error = cleanup.interrupt
+        log = sr.access_log_lines(live.log_text)
+        code, out, err, timed_out, cut = raw if raw is not None else (None, b"", b"", False, False)
+        self._notify("session_end", session=run_id, exit_code=None if raw is None else code, timed_out=None if raw is None else timed_out,
+                     truncated=None if raw is None else cut, duration_s=round(time.monotonic() - t0, 3), reclaimed=reclaimed,
+                     leftovers=len(leftovers), error=None if error is None else type(error).__name__, **sr.egress_summary(log))
+        if error is not None:
+            if leftovers:
+                raise sr.SessionCleanupError(leftovers) from error
+            raise error
+        note = f"\n[output truncated at {spec.limits.max_output_bytes} bytes]\n" if cut else ""
+        stdout = sr.redact(sr.sanitize_terminal(out.decode("utf-8", "replace")), []) + note
+        stderr = sr.redact(sr.sanitize_terminal(err.decode("utf-8", "replace")), [])
+        report = sr.workspace_harvest.inspect_workspace(plan.workspace, spec.harvest, credentials=[]) if spec.harvest is not None else None
+        result = sr.SessionResult(run_id, code, stdout, "timed out\n" + stderr if timed_out else stderr, timed_out, cut,
+                                  time.monotonic() - t0, log, report, reclaimed, leftovers, self.role)
+        if leftovers:
+            raise sr.SessionCleanupError(leftovers, result)
+        return result
+
+
+def egress_proxy_file() -> str:
+    from . import egress_proxy
+    return egress_proxy.__file__

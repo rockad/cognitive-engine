@@ -332,6 +332,29 @@ def egress_summary(lines: Sequence[str]) -> dict[str, object]:
     return out
 
 
+def access_log_lines(text: str) -> tuple[str, ...]:
+    """The egress log of a session from the proxy's output text: the ACCESS lines (sanitised, cut at
+    `MAX_ACCESS_LOG_BYTES`, then `ACCESS-TRUNCATED`) and the latest VALID `ACCESS-SUMMARY` line (kept past the cap: that is
+    its point). Shared by the Docker route (the proxy container's logs) and the sbx route (the host proxy's output file)."""
+    lines, size, cut = [], 0, False
+    summary: str | None = None
+    for line in text.splitlines():
+        if line.startswith(SUMMARY_PREFIX):
+            if parse_summary(line) is not None:
+                summary = line
+        elif line.startswith("ACCESS ") and not cut:
+            size += len(line)
+            if size > MAX_ACCESS_LOG_BYTES:
+                cut = True
+            else:
+                lines.append(sanitize_terminal(line))
+    if cut:
+        lines.append(TRUNCATED_MARK)
+    if summary is not None:
+        lines.append(summary)
+    return tuple(lines)
+
+
 def _overlap(a: str, b: str) -> bool:
     pa, pb = PurePosixPath(a), PurePosixPath(b)
     return pa == pb or pa in pb.parents or pb in pa.parents
@@ -747,24 +770,7 @@ class ProposerSessionRunner:
             p = self._docker(["logs", names.proxy])
         except (subprocess.TimeoutExpired, OSError):
             return ()
-        lines, size, cut = [], 0, False
-        summary: str | None = None
-        for line in (p.stdout + p.stderr).splitlines():
-            if line.startswith(SUMMARY_PREFIX):
-                # the proxy's running counters: kept past the size cap (that is their point); only a valid one, the latest
-                if parse_summary(line) is not None:
-                    summary = line
-            elif line.startswith("ACCESS ") and not cut:
-                size += len(line)
-                if size > MAX_ACCESS_LOG_BYTES:
-                    cut = True
-                else:
-                    lines.append(sanitize_terminal(line))
-        if cut:
-            lines.append(TRUNCATED_MARK)
-        if summary is not None:
-            lines.append(summary)
-        return tuple(lines)
+        return access_log_lines(p.stdout + p.stderr)
 
     def _finish_proxy(self, names: Names) -> None:
         """Stop the proxy gracefully (SIGTERM, a short grace period) once the session is over, so its final `ACCESS-SUMMARY`
