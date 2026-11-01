@@ -33,8 +33,9 @@ INTRO = ("ENVIRONMENT RULES (added by the runner; they are not part of the task)
 MUTABLE_HEAD = "Mutable (a change here is kept when it passes the check):\n"
 READONLY_HEAD = "Read-only (a change to any of these gets the whole proposal discarded, and the harness stays as it was):\n"
 OUTRO = ("Scripts, plugins and guardrails.md are never edited, whatever they are for. Put what the solver should do into a "
-         "mutable file as plain instructions in words. Do not write the answer to a task into any file, and do not start a "
-         "file with a `---` frontmatter block.\n")
+         "mutable file as plain instructions in words. Do not write the answer to a task into any file. If a file already "
+         "starts with a `---` frontmatter block, keep that block exactly as it is. Never add a frontmatter block to a file "
+         "that has none (a new file has none), and never put a second `---` block or frontmatter keys inside a body.\n")
 BODY_ONLY = " (body only: its leading frontmatter stays byte-identical)"
 
 

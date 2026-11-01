@@ -271,3 +271,48 @@ def test_the_default_is_on_for_the_hard_set_and_off_for_the_easy_one_and_an_expl
     assert stage1.Settings(profile=p, proposer_hint="off").hint_source == "--proposer-hint"
     with pytest.raises(stage1.Stage1Error):
         stage1.Settings(profile=p, proposer_hint="yes")
+
+
+# ══ the frontmatter sentence says what the slot table enforces, and no more ═════════════════════════════════════════════
+# The mutable list says of a skill or agent template "body only: its leading frontmatter stays byte-identical". The closing
+# rule used to say "do not start a file with a `---` frontmatter block", which contradicted it for exactly the files that
+# start with one. The table (`check_mutation`) is: an existing frontmatter block stays byte-identical; a file that has none
+# (a new file included) does not gain one; no second `---` block or frontmatter key inside a body.
+
+SKILL = "skills/demo/SKILL.md"
+FM = "---\nname: demo\ndescription: d\n---\n"
+
+
+def _ok(old, new, path=SKILL):
+    slot = us.classify_path(us.__dict__.get("_DefaultSurface"), path)[0]
+    us.check_mutation(slot, path, old, new)
+
+
+def test_the_slot_table_facts_the_sentence_is_about():
+    _ok(FM + "body\n", FM + "a better body\n")                                   # a file that has frontmatter keeps it, the body changes
+    _ok("", "plain instructions in words\n")                                       # a new file, no frontmatter: fine
+    with pytest.raises(InvariantViolation):
+        _ok("", FM + "body\n")                                                     # a new file may not start with a frontmatter block
+    with pytest.raises(InvariantViolation):
+        _ok(FM + "body\n", FM.replace("demo", "other") + "body\n")                 # an existing block is byte-identical or refused
+    with pytest.raises(InvariantViolation):
+        _ok(FM + "body\n", "body only\n")                                          # ... and is not removed
+    with pytest.raises(InvariantViolation):
+        _ok(FM + "body\n", FM + "body\n---\nname: x\n---\nmore\n")                 # no second block inside the body
+    with pytest.raises(InvariantViolation):
+        _ok("body\n", FM + "body\n")                                               # a file without one does not gain one
+
+
+def test_the_closing_rule_does_not_tell_a_proposer_to_drop_the_frontmatter_the_list_says_to_keep(surface):
+    text = ph.build_hint(surface).text
+    assert "do not start a file with" not in text.lower()                          # the sentence that contradicted the list
+    low = " ".join(text.lower().split())
+    assert "keep" in low and "exactly as it is" in low                              # an existing block stays unchanged
+    assert "never add a frontmatter block to a file that has none" in low           # no new block (a new file has none)
+    assert "second" in low                                                          # no second `---` block in a body
+    # the list and the rule agree: the template lines still say the leading block stays as it is
+    assert low.count("byte-identical") == 2
+
+
+def test_the_block_stays_short_with_the_longer_frontmatter_sentence(surface):
+    assert len(ph.build_hint(surface).text) < 1600
