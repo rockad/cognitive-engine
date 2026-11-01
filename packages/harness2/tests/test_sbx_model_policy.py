@@ -26,6 +26,10 @@ FS = [{"id": "default-fs-read-allow-all", "scope": "global", "resource_type": "f
        "resources": ["**"], "status": "active", "actions": ["fs:mount:read", "fs:mount:write"]}]
 
 
+PORT_FORWARD = {"id": "pf", "scope": "global", "resource_type": "port_forward", "decision": "allow", "resources": ["**"],
+                "status": "active"}
+
+
 def http_rule(sandbox: str, method: str, path: str, *, port: int = PORT, host: str = "localhost", rid: str | None = None,
               status: str = "active") -> dict:
     return {"id": rid or f"{method}-{path}-{sandbox}", "name": "n", "scope": f"sandbox:{sandbox}", "applies_to": f"sandbox:{sandbox}",
@@ -81,6 +85,9 @@ REFUSED_GLOBAL = [
                  id="a global allow of one host:port"),
     pytest.param(doc(DENY_ALL, mutated(http_rule("x", "GET", "/**"), scope="global", applies_to="all")), "global",
                  id="a global http allow"),
+    pytest.param(doc(DENY_ALL, PORT_FORWARD), "unknown resource type", id="an unknown rule type is refused, not skipped"),
+    pytest.param(doc(DENY_ALL, {**PORT_FORWARD, "decision": "deny"}), "unknown resource type", id="an unknown type is refused whatever it decides"),
+    pytest.param(doc(DENY_ALL, {**PORT_FORWARD, "resource_type": "dns"}), "unknown resource type", id="a dns rule type"),
     pytest.param(doc(DENY_ALL, mutated(DENY_ALL, id="odd", decision="maybe")), "decision", id="an unknown decision"),
     pytest.param(doc(DENY_ALL, mutated(DENY_ALL, id="odd", decision="allow", scope="team:acme")), "scope",
                  id="an unknown scope is refused, not ignored"),
@@ -154,6 +161,9 @@ SESSION_REFUSED = [
                  "unexpected", id="a raw tcp allow of our own port (it would let a CONNECT tunnel through)"),
     pytest.param(session_doc(http_rule("someone-else", "GET", "/api/tags")), "another sandbox",
                  id="the listing shows a rule scoped to another sandbox"),
+    pytest.param(session_doc(PORT_FORWARD), "unknown resource type", id="a rule kind that is not on the allow-list"),
+    pytest.param(session_doc({**PORT_FORWARD, "decision": "deny"}), "unknown resource type", id="an unknown kind that denies"),
+    pytest.param(session_doc({"id": "no-type"}), "resource_type", id="a rule with no resource type"),
     pytest.param(session_doc(rules=[]), "missing", id="no rules at all"),
     pytest.param(doc(FS, ours()), "deny-all", id="no deny-all"),
     pytest.param("not json", "JSON", id="garbage"),

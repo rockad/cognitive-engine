@@ -94,8 +94,7 @@ def _rules(policy_json: str) -> tuple[list[dict] | None, str | None]:
 
 
 def _is_net(rule: dict) -> bool:
-    kind = rule.get("resource_type")
-    return isinstance(kind, str) and (kind.startswith("network") or kind == "http")
+    return sandbox.sbx_rule_is_network(rule.get("resource_type"))
 
 
 def _sandbox_of(rule: dict) -> str | None:
@@ -143,9 +142,9 @@ def model_policy_problem(policy_json: str, *, ollama_port: int | None = None) ->
     assert rules is not None
     deny_all = False
     for rule in rules:
-        kind = rule.get("resource_type")
-        if not isinstance(kind, str):
-            return "`sbx policy ls --json` has a rule without a resource_type"
+        type_problem = sandbox.sbx_rule_type_problem(rule)      # a type nobody has observed is foreign: refused, never skipped
+        if type_problem:
+            return type_problem
         if not _is_net(rule):
             continue
         decision = rule.get("decision")
@@ -192,6 +191,9 @@ def sandbox_policy_problem(policy_json: str, name: str, port: int, *, ollama_por
     unexpected: list[str] = []
     foreign: list[str] = []
     for rule in rules:
+        type_problem = sandbox.sbx_rule_type_problem(rule)
+        if type_problem:
+            return type_problem
         if not _is_net(rule):
             continue
         owner, decision = _sandbox_of(rule), rule.get("decision")
