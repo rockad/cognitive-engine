@@ -815,6 +815,101 @@ def test_live_a_vm_reaches_our_proxy_and_nothing_else(tmp_path):
     assert not leaked
 
 
+# ── live: SIGTERM and a hard kill, on a real microVM ──────────────────────────────
+
+def _sbx_names(path: str) -> list[str]:
+    return subprocess.run([path, "ls", "-q"], capture_output=True, text=True, timeout=60).stdout.split()
+
+
+def _children_of(pid: int) -> list[int]:
+    out = []
+    for d in Path("/proc").iterdir():
+        if d.name.isdigit():
+            try:
+                stat = (d / "stat").read_text()
+                if int(stat[stat.rindex(")") + 2:].split()[1]) == pid:
+                    out.append(int(d.name))
+            except (OSError, ValueError, IndexError):
+                pass
+    return out
+
+
+def _start_live_child(tmp_path, path: str):
+    """A real session in its own process, up when its five rules are in place and the CLI (`sleep`) is running in the VM."""
+    root = Path(tempfile.mkdtemp(prefix="h2sbxk", dir=str(tmp_path))).resolve()
+    child = subprocess.Popen([sys.executable, str(HERE / "fixtures" / "sbx_live_session_child.py"), str(root), path],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    name = None
+    for _ in range(600):
+        if child.poll() is not None:
+            pytest.fail(f"the child session ended early: {child.stderr.read()[-800:]}")        # type: ignore[union-attr]
+        mine = [n for n in _sbx_names(path) if (p := ss.parse_sandbox_name(n)) and p[1] == child.pid]
+        if mine:
+            rules = [r for r in _sbx_json(path, "policy", "ls", "--json")["rules"] if r.get("scope") == f"sandbox:{mine[0]}"]
+            if len(rules) == 5:
+                name = mine[0]
+                break
+        time.sleep(0.5)
+    assert name, "the session never got its five rules"
+    time.sleep(8)                                          # the CLI is copied in and `sleep` is running in the VM
+    proxies = [p for p in _children_of(child.pid) if "host_proxy_launcher" in Path(f"/proc/{p}/cmdline").read_text()]
+    assert len(proxies) == 1
+    return child, name, proxies[0]
+
+
+@pytest.mark.requires_sbx_live
+@pytest.mark.skipif(_live_ready() is not None, reason=_live_ready() or "")
+def test_live_sigterm_during_a_real_session_removes_the_sandbox_its_rules_and_the_proxy(tmp_path):
+    path = shutil.which("sbx")
+    assert path
+    ls_before, policy_before = set(_sbx_names(path)), _sbx_json(path, "policy", "ls", "--json")
+    child, name, proxy = _start_live_child(tmp_path, path)
+    try:
+        child.send_signal(signal.SIGTERM)
+        child.wait(timeout=180)
+        assert child.returncode != 0
+        assert name not in _sbx_names(path)
+        assert not [r for r in _sbx_json(path, "policy", "ls", "--json")["rules"] if r.get("scope") == f"sandbox:{name}"]
+        assert not Path(f"/proc/{proxy}").exists() or "host_proxy_launcher" not in Path(f"/proc/{proxy}/cmdline").read_text()
+        assert set(_sbx_names(path)) == ls_before and _sbx_json(path, "policy", "ls", "--json") == policy_before
+    finally:
+        if child.poll() is None:
+            child.kill()
+        for n in set(_sbx_names(path)) - ls_before:
+            if ss.parse_sandbox_name(n):
+                subprocess.run([path, "rm", "--force", n], capture_output=True)
+
+
+@pytest.mark.requires_sbx_live
+@pytest.mark.skipif(_live_ready() is not None, reason=_live_ready() or "")
+def test_live_a_hard_killed_session_leaks_a_sandbox_that_the_next_run_sweeps(tmp_path):
+    """SIGKILL: no teardown. The proxy still dies with its parent (lifeline), the sandbox and its rules stay, and the next run's
+    sweep removes them because the name proves the owner is gone."""
+    path = shutil.which("sbx")
+    assert path
+    ls_before, policy_before = set(_sbx_names(path)), _sbx_json(path, "policy", "ls", "--json")
+    child, name, proxy = _start_live_child(tmp_path, path)
+    try:
+        child.kill()
+        child.wait(timeout=30)
+        for _ in range(100):
+            if not Path(f"/proc/{proxy}").exists():
+                break
+            time.sleep(0.1)
+        assert not Path(f"/proc/{proxy}").exists(), "the host proxy outlived the killed runner"
+        assert name in _sbx_names(path)                    # the leak: a running VM with its five allow rules
+        assert len([r for r in _sbx_json(path, "policy", "ls", "--json")["rules"] if r.get("scope") == f"sandbox:{name}"]) == 5
+        assert ss.sweep_stale_sandboxes(path, dict(os.environ)) == [f"sandbox {name}"]
+        assert name not in _sbx_names(path)
+        assert set(_sbx_names(path)) == ls_before and _sbx_json(path, "policy", "ls", "--json") == policy_before
+    finally:
+        if child.poll() is None:
+            child.kill()
+        for n in set(_sbx_names(path)) - ls_before:
+            if ss.parse_sandbox_name(n):
+                subprocess.run([path, "rm", "--force", n], capture_output=True)
+
+
 # ── choosing the runner ───────────────────────────────────────────────────────────
 
 def _docker_args():
