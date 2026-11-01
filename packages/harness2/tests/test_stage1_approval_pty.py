@@ -50,8 +50,8 @@ def _drive(env: dict[str, str], *, type_back: bool = True, timeout: float = 20.0
 
 
 def _env(**extra: str) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items()
-           if not (k == "CLAUDECODE" or k.startswith(("CLAUDE_CODE_", "ANTIGRAVITY", "GEMINI_CLI", "AGY_", "OPENCODE", "CODEX")))}
+    from cognitive_harness2 import stage1
+    env = {k: v for k, v in os.environ.items() if not stage1.agent_markers({k: v})}
     env["TERM"] = "dumb"
     # the child runs `python -I` (no site, no cwd), so hand it the import path the test run itself uses
     env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)
@@ -67,7 +67,7 @@ def test_a_driven_pty_without_agent_markers_still_approves_which_is_the_document
 
 
 @pytest.mark.parametrize("marker", ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "ANTIGRAVITY_SESSION", "GEMINI_CLI", "AGY_HOME",
-                                    "OPENCODE", "CODEX_HOME"])
+                                    "OPENCODE", "CODEX_SANDBOX"])
 def test_the_same_driven_pty_with_an_agent_marker_in_the_environment_is_refused(marker):
     """Same pty, same driver, same typed-back phrase; one agent-harness marker in the environment is enough to be refused."""
     code, out = _drive(_env(**{marker: "1"}))
@@ -105,3 +105,10 @@ def test_a_child_with_no_controlling_terminal_is_refused_even_if_its_stdin_is_a_
                        capture_output=True, env=_env(), start_new_session=True, timeout=30)
     assert p.returncode == 4 or p.returncode == 3, (p.returncode, p.stdout, p.stderr)
     assert "APPROVED" not in p.stdout.replace("NOT-APPROVED", "")
+
+
+@pytest.mark.parametrize("name", ["CODEX_HOME", "OPENCODE_CONFIG"])
+def test_a_config_variable_exported_in_a_persons_own_shell_does_not_refuse_the_driven_pty(name):
+    """The review's input: a person who exports CODEX_HOME or OPENCODE_CONFIG in their profile must still be able to approve."""
+    code, out = _drive(_env(**{name: "/x"}))
+    assert code == 0 and "APPROVED" in out and "REFUSED" not in out, out

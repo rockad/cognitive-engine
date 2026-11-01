@@ -543,8 +543,10 @@ class Audit:
 class Approval:
     approved_by: str
     mode: str                  # "tty" (a person typed the phrase) | "selftest"
-    phrase: str
+    phrase: str                # the base phrase (channel and sweep id)
     at: str = field(default_factory=now_iso)
+    typed: str = ""            # what was typed and matched: the phrase plus its nonce ("" for the selftest, nothing was typed)
+    agent_env: Mapping[str, Any] = field(default_factory=dict)      # `agent_env_record`: the markers checked and the names found
 
 
 def confirmation_phrase(channel: str, sweep_id: str) -> str:
@@ -552,12 +554,24 @@ def confirmation_phrase(channel: str, sweep_id: str) -> str:
 
 
 # Environment variables that mark a process as running inside an agent harness. The runner refuses to take an approval
-# there and NO flag overrides it. The names are those the harnesses set in the processes they spawn (Claude Code:
-# CLAUDECODE, CLAUDE_CODE_*; Antigravity / Gemini CLI / agy; opencode; codex). Not a security boundary: a process that
-# scrubs its own environment (`env -i`) defeats it. It makes the careless route (an agent running `stage1 run` and
-# approving it itself) fail loudly instead of quietly working.
-AGENT_ENV_EXACT = ("CLAUDECODE",)
-AGENT_ENV_PREFIXES = ("CLAUDE_CODE_", "ANTIGRAVITY", "GEMINI_CLI", "AGY_", "OPENCODE", "CODEX")
+# there and NO flag overrides it. Not a security boundary: a process that scrubs its own environment (`env -i`) defeats it.
+# It makes the careless route (an agent running `stage1 run` and approving it itself) fail loudly instead of quietly working.
+#
+# The list matches what the harnesses SET in the processes they spawn, not what they READ. Reading is what a person's own
+# profile does: `CODEX_HOME`, `OPENCODE_CONFIG`, `OPENCODE_API_KEY` are settings, and refusing them locked such a person out
+# for good (there is no override). So:
+#   - CLAUDECODE and CLAUDE_CODE_* : observed in a child of Claude Code (CLAUDECODE, CLAUDE_CODE_ENTRYPOINT,
+#     CLAUDE_CODE_SESSION_ID, CLAUDE_CODE_EXECPATH, ...). Kept as a prefix: the set grows with the version. The cost is that a
+#     CLAUDE_CODE_* setting exported in a person's profile (CLAUDE_CODE_USE_VERTEX, say) also refuses; unset it for the run.
+#   - OPENCODE (exact): the marker opencode sets in its children. The binary's OPENCODE_* names are config knobs, so no prefix.
+#   - CODEX_SANDBOX*: the markers codex sets in sandboxed commands (CODEX_SANDBOX, CODEX_SANDBOX_NETWORK_DISABLED). Not
+#     CODEX_HOME, its config directory.
+#   - ANTIGRAVITY*, GEMINI_CLI*, AGY_*: UNVERIFIED here (those CLIs were not run from this code), kept as prefixes on
+#     purpose: a false refusal is fixed by `env -u NAME`, a false pass lets an agent approve its own sweep. If one of these
+#     is a config variable of yours, the refusal names it; narrow this list when its real child markers are known.
+AGENT_ENV_EXACT = ("CLAUDECODE", "OPENCODE")
+AGENT_ENV_PREFIXES = ("CLAUDE_CODE_", "CODEX_SANDBOX", "ANTIGRAVITY", "GEMINI_CLI", "AGY_")
+AGENT_ENV_SHOW = 12              # names listed in a refusal (and in its `env -u` command); the rest are counted
 TTY_PATH = "/dev/tty"
 
 NONCE_WORDS = ("amber", "anchor", "birch", "cobalt", "comet", "coral", "crane", "delta", "ember", "fennel", "flint",
@@ -576,13 +590,23 @@ def agent_markers(environ: Mapping[str, str]) -> list[str]:
     return sorted(k for k in environ if k in AGENT_ENV_EXACT or k.startswith(AGENT_ENV_PREFIXES))
 
 
+def agent_env_record(environ: Mapping[str, str]) -> dict[str, Any]:
+    """What the audit keeps of the environment check: the exact names and prefixes that were checked, and the names found
+    (never a value). For a real approval `present` is empty, since a marker refuses; for the selftest it may not be."""
+    return {"checked_exact": list(AGENT_ENV_EXACT), "checked_prefixes": list(AGENT_ENV_PREFIXES), "present": agent_markers(environ)}
+
+
 def refuse_in_agent_environment(environ: Mapping[str, str]) -> None:
     found = agent_markers(environ)
     if found:
+        shown = found[:AGENT_ENV_SHOW]
+        more = f" and {len(found) - len(shown)} more" if len(found) > len(shown) else ""
+        unset = "env " + " ".join(f"-u {n}" for n in shown) + " stage1 run ..."
         raise ApprovalRefused(
-            "refusing to take an approval inside an agent-harness environment (" + ", ".join(found[:6]) +
-            "): the approval must come from a person at their own terminal. There is no flag to override this; "
-            "run it from a plain shell yourself")
+            "refusing to take an approval inside an agent-harness environment (" + ", ".join(shown) + more +
+            "): the approval must come from a person at their own terminal. There is no flag to override this. "
+            "From a plain terminal (one that is not an agent session) it just works; if one of these is your own setting, "
+            f"drop it for the run: {unset}")
 
 
 def new_nonce(words: int = 4) -> str:
@@ -626,10 +650,16 @@ def open_controlling_terminal(path: str = TTY_PATH) -> _Terminal:
     return _Terminal(rfd, wfd)
 
 
-def confirm_on_terminal(phrase: str, *, stdin: TextIO | None = None, stdout: TextIO | None = None,
-                        environ: Mapping[str, str] | None = None, tty: TextIO | None = None,
-                        tty_path: str = TTY_PATH, nonce: str | None = None) -> bool:
-    """True only if the phrase plus a fresh 4-word nonce is typed on the process's CONTROLLING terminal.
+def confirm_on_terminal(phrase: str, **kw: Any) -> bool:
+    """`confirm_typed`, as a bool."""
+    return confirm_typed(phrase, **kw) is not None
+
+
+def confirm_typed(phrase: str, *, stdin: TextIO | None = None, stdout: TextIO | None = None,
+                  environ: Mapping[str, str] | None = None, tty: TextIO | None = None,
+                  tty_path: str = TTY_PATH, nonce: str | None = None) -> str | None:
+    """The string that was typed (the phrase plus its nonce) if it was typed on the process's CONTROLLING terminal, else None.
+    The phrase plus a fresh 4-word nonce must be typed exactly.
 
     What it stops: a pipe, redirected stdin or stdout, a script with no terminal (the confirmation is read from the
     controlling terminal, never from stdin), and anything inside a known agent-harness environment (raises
@@ -639,7 +669,7 @@ def confirm_on_terminal(phrase: str, *, stdin: TextIO | None = None, stdout: Tex
     refuse_in_agent_environment(os.environ if environ is None else environ)
     sin, sout = stdin or sys.stdin, stdout or sys.stdout
     if not (sin.isatty() and sout.isatty()):
-        return False
+        return None
     owned = tty is None
     try:
         term = tty if tty is not None else open_controlling_terminal(tty_path)
@@ -654,8 +684,8 @@ def confirm_on_terminal(phrase: str, *, stdin: TextIO | None = None, stdout: Tex
         try:
             typed = term.readline()
         except (OSError, KeyboardInterrupt):
-            return False
-        return typed.strip() == expected
+            return None
+        return expected if typed.strip() == expected else None
     finally:
         if owned:
             with contextlib.suppress(OSError):
@@ -1380,14 +1410,14 @@ def run_run(args: argparse.Namespace, *, environ: Mapping[str, str], probes: Pro
     out.write(format_plan(s, pre, plan, [], profile_path=None, with_command=False))
     phrase = confirmation_phrase(s.channel, sweep_id)
     try:
-        confirmed = confirm_on_terminal(phrase, stdin=sin, stdout=out, environ=environ, tty=tty)
+        typed = confirm_typed(phrase, stdin=sin, stdout=out, environ=environ, tty=tty)
     except ApprovalRefused as e:
         err(f"{e}; nothing was started")
         return 2
-    if not confirmed:
+    if typed is None:
         err("the confirmation phrase was not typed exactly; nothing was started")
         return 2
-    approval = Approval(approver_name(), "tty", phrase)
+    approval = Approval(approver_name(), "tty", phrase, typed=typed, agent_env=agent_env_record(environ))
     return _approved(s, plan, pre, up, surface, sweep_id, run_dir, approval, real=True, run_task=run_task, out=out)
 
 
@@ -1400,7 +1430,8 @@ def _approved(s: Settings, plan: SweepPlan, pre: Preflight, up: Any, surface: An
     try:
         audit.emit("plan", plan=plan.to_dict(), preflight={c.name: c.ok for c in pre.checks})
         audit.emit("approval", approved_by=approval.approved_by, mode=approval.mode, sweep_id=sweep_id,
-                   channel=s.channel, approved_for_real_model=real)
+                   channel=s.channel, approved_for_real_model=real, phrase=approval.phrase, typed=approval.typed,
+                   agent_env=dict(approval.agent_env))
         g = grant or make_grant(plan, sweep_id=sweep_id, approval=approval, per_session_s=s.per_session_s)
         audit.emit("grant", **g.to_dict())
         assert pre.verified is not None and pre.image is not None and pre.cli is not None
@@ -1616,7 +1647,8 @@ def run_selftest(*, base: Path | None = None, out: TextIO | None = None, probes:
             up = load_upstream(run_dir / "upstream-runs")
             surface = load_surface()
             plan = build_plan(s, pre, surface)
-            approval = Approval(approver_name(), "selftest", confirmation_phrase(s.channel, sweep_id))
+            approval = Approval(approver_name(), "selftest", confirmation_phrase(s.channel, sweep_id),
+                                agent_env=agent_env_record(os.environ))
             grant = make_grant(plan, sweep_id=sweep_id, approval=approval, per_session_s=s.per_session_s)
             if grant_edit is not None:
                 grant = grant_edit(grant)

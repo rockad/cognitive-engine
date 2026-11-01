@@ -339,19 +339,74 @@ def test_the_phrase_without_the_nonce_never_approves_even_when_the_stored_phrase
 
 
 @pytest.mark.parametrize("name", ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "ANTIGRAVITY_AGENT", "GEMINI_CLI",
-                                  "GEMINI_CLI_HOME", "AGY_SESSION", "OPENCODE", "OPENCODE_CONFIG", "CODEX_HOME", "CODEX_SANDBOX"])
+                                  "GEMINI_CLI_HOME", "AGY_SESSION", "OPENCODE", "CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED"])
 def test_an_agent_harness_marker_refuses_the_approval_and_nothing_overrides_it(rig, up, monkeypatch, capsys, name):
     phrase = confirmation_phrase("local-ollama", "stage1-x")
     with pytest.raises(stage1.ApprovalRefused) as ei:
         confirm_on_terminal(phrase, stdin=TTY(), stdout=TTY(), environ={name: "1"}, tty=HumanTTY())
     assert name in str(ei.value) and "no flag" in str(ei.value)
+    assert f"env -u {name} " in str(ei.value)                                   # how to run it from a plain terminal
     Traps(monkeypatch, rig.fake.port)
     term = HumanTTY()
     code = run_run(rig.parse("run", "--approve", "local-ollama"), environ={name: "1"}, probes=rig.probes(),
                    stdin=TTY(), stdout=TTY(), tty=term)
     err = capsys.readouterr().err
     assert code == 2 and name in err and "agent-harness environment" in err and "nothing was started" in err
+    assert f"env -u {name} " in err
     assert term.getvalue() == "" and rig.calls == {"gate": 0, "resolve": 0, "ollama": 0} and not rig.runs.exists()
+
+
+@pytest.mark.parametrize("name", ["OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "OPENCODE_API_KEY", "OPENCODE_DISABLE_AUTOUPDATE", "CODEX_HOME",
+                                  "CODEX_API_KEY", "CLAUDE_CONFIG_DIR", "GEMINI_API_KEY", "AGYX", "ANTIGRAV"])
+def test_a_variable_a_person_sets_in_their_own_profile_is_not_an_agent_marker(name):
+    """The review's input: `CODEX_HOME=~/.codex stage1 run ...` from a plain shell was refused for good. These are settings
+    the tools READ (their config directory, a key, a switch), not markers they SET in the processes they spawn."""
+    assert stage1.agent_markers({name: "1"}) == []
+    phrase = confirmation_phrase("local-ollama", "stage1-x")
+    assert confirm_on_terminal(phrase, stdin=TTY(), stdout=TTY(), environ={name: "1"}, tty=HumanTTY())
+
+
+def test_the_refusal_names_every_offending_variable_and_the_env_u_command_for_all_of_them():
+    env = {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli", "CLAUDE_CODE_SESSION_ID": "s", "HOME": "/h", "OPENCODE_CONFIG": "/x"}
+    with pytest.raises(stage1.ApprovalRefused) as ei:
+        stage1.refuse_in_agent_environment(env)
+    text = str(ei.value)
+    for name in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID"):
+        assert name in text
+    assert "OPENCODE_CONFIG" not in text and "HOME" not in text and "/x" not in text            # a value is never shown
+    assert "env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_SESSION_ID stage1 run" in text
+    assert "plain terminal" in text and "no flag" in text
+    many = {f"CLAUDE_CODE_V{i:02d}": "1" for i in range(40)}
+    with pytest.raises(stage1.ApprovalRefused) as ei:
+        stage1.refuse_in_agent_environment(many)
+    assert "and 28 more" in str(ei.value) and len(str(ei.value)) < 1200                     # bounded
+
+
+def test_the_marker_lists_are_exact_names_and_the_prefixes_the_repo_can_justify():
+    """CLAUDE_CODE_* was observed in a child of Claude Code (CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, CLAUDE_CODE_SESSION_ID, ...); the
+    rest are kept as prefixes only because they cannot be verified here. OPENCODE_* and CODEX_* (config knobs) are not prefixes."""
+    assert "CLAUDECODE" in stage1.AGENT_ENV_EXACT and "OPENCODE" in stage1.AGENT_ENV_EXACT
+    assert "OPENCODE_" not in stage1.AGENT_ENV_PREFIXES and "OPENCODE" not in stage1.AGENT_ENV_PREFIXES
+    assert "CODEX" not in stage1.AGENT_ENV_PREFIXES and "CODEX_" not in stage1.AGENT_ENV_PREFIXES
+    assert "CLAUDE_CODE_" in stage1.AGENT_ENV_PREFIXES
+
+
+def test_the_audit_records_what_was_typed_and_which_agent_markers_were_checked_and_found(rig, up, monkeypatch):
+    sweep = "stage1-20261030T000000Z-bbbb"
+    code, run_dir, _ = approved_run(rig, up, monkeypatch, lambda task, k, **kw: type("R", (), {"status": "ok", "modes": {}, "errors": []})(),
+                                    sweep=sweep)
+    ap = next(e for e in events(run_dir) if e["event"] == "approval")
+    phrase = confirmation_phrase("local-ollama", sweep)
+    assert ap["typed"].startswith(phrase + " ") and len(ap["typed"][len(phrase):].split()) == 4        # the nonce-bearing string
+    assert all(w in stage1.NONCE_WORDS for w in ap["typed"][len(phrase):].split())
+    assert ap["agent_env"] == {"checked_exact": list(stage1.AGENT_ENV_EXACT), "checked_prefixes": list(stage1.AGENT_ENV_PREFIXES),
+                               "present": []}
+
+
+def test_the_agent_env_record_lists_the_names_present_and_never_a_value():
+    rec = stage1.agent_env_record({"CLAUDECODE": "secret-value", "CLAUDE_CODE_SESSION_ID": "x", "PATH": "/bin"})
+    assert rec["present"] == ["CLAUDECODE", "CLAUDE_CODE_SESSION_ID"] and "secret-value" not in json.dumps(rec)
+    assert stage1.agent_env_record({})["present"] == []
 
 
 def test_no_flag_can_override_the_agent_marker_refusal():
