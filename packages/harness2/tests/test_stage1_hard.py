@@ -282,6 +282,121 @@ def test_an_unknown_scenario_or_task_is_a_problem_not_a_pass():
     assert hard_selftest_problems({**golden("format-rules"), "task": "household/sum-1"}) == ["the hard selftest ran an unknown task 'household/sum-1'"]
 
 
+# ── stage 1c: the same verdicts at --rollouts N, and the proposer hint ──
+
+def golden_n(scenario: str, n: int, *, hint: bool = True) -> dict:
+    """`golden`, as a sweep at `--rollouts n` would report it (the base repeats always run; the final's repeats only in the adopt scenario)."""
+    r = golden(scenario)
+    inst = hd.instance(TASK)
+    naive, right = f"Total: {hd.naive_total(inst.input_text)}\n", inst.expected_line + "\n"
+    adopt = scenario == "format-rules"
+    eb = [f"base{i}" for i in range(2, n + 1)]
+    ef = [f"agg1.r{i}" for i in range(2, n + 1)] if adopt else []
+    r["rollouts"] += [{"label": x, "passed": False, "n_passed": 2, "answer_excerpt": naive} for x in eb]
+    r["rollouts"] += [{"label": x, "passed": True, "n_passed": 3, "answer_excerpt": right} for x in ef]
+    r["rollouts_plan"] = {"n": n, "extra_base_run": eb, "extra_final_run": ef, "extra_errors": [],
+                          "extra_skipped": None if adopt or n == 1 else "no edited harness was adopted (the final agg1 is the base): "
+                                                                         f"nothing to compare it with: base2..base{n} run, the final's repeats do not"}
+    r["pass_rates"] = {"final_label": "agg1", "base": {"passed": 0, "n": n}, "final": {"passed": n if adopt else 0, "n": n if adopt else 1}}
+    if adopt and n > 1:
+        r["selection"].update(verdict="higher-rate", fisher_p=stage1.fisher_two_sided(n, n, 0, n))
+    sha = stage1.proposer_hint.digest("ENVIRONMENT RULES x\n")
+    r["proposer_hint"] = {"on": hint, "source": "--proposer-hint", "sha": sha if hint else None}
+    r["_proposer_audit"] = [{"label": f"{x}.a1", "hint": hint, "hint_sha": sha if hint else None, "block_matches_sha": hint,
+                             "system_starts_with_block": hint} for x in ("inv1", "dom1", "agg1")]
+    return r
+
+
+@pytest.mark.parametrize("scenario", stage1.HARD_SCENARIOS)
+@pytest.mark.parametrize("n", [1, 8])
+def test_the_golden_report_of_each_scenario_passes_at_one_and_at_eight_rollouts(scenario, n):
+    assert hard_selftest_problems(golden_n(scenario, n)) == []
+    assert stage1.hint_selftest_problems(golden_n(scenario, n)) == [] and stage1.hint_selftest_problems(golden_n(scenario, n, hint=False)) == []
+
+
+@pytest.mark.parametrize("name,edit,needle", [
+    ("an extra base passes", lambda r: r["rollouts"][4].update(passed=True, n_passed=3), "base2 must fail"),
+    ("an extra final fails", lambda r: r["rollouts"][-1].update(passed=False, n_passed=2), "extra final rollout agg1.r8 should pass"),
+    ("an extra is missing", lambda r: (r["rollouts"].pop(), r["rollouts_plan"]["extra_final_run"].pop()), "expected 7 extra base and 7 extra final"),
+    ("an extra errored", lambda r: r["rollouts_plan"].update(extra_errors=["base3: died"]), "expected 7 extra base and 7 extra final"),
+    ("an unplanned rollout", lambda r: r["rollouts"].append({"label": "base9"}), "unexpected stages"),
+    ("wrong rates", lambda r: r["pass_rates"]["final"].update(passed=7), "pass rates should be base 0/8 and final 8/8"),
+    ("the word improved", lambda r: r["selection"].update(verdict="improved"), "judged higher-rate"),
+    ("no significance", lambda r: r["selection"].update(fisher_p=0.5), "significant rate gap"),
+])
+def test_the_eight_rollout_adopt_scenario_notices_each_way_the_measurement_could_be_wrong(name, edit, needle):
+    r = golden_n("format-rules", 8)
+    edit(r)
+    assert any(needle in p for p in hard_selftest_problems(r)), (name, hard_selftest_problems(r))
+
+
+def test_a_refusal_scenario_at_eight_rollouts_runs_the_base_extras_not_the_finals_and_must_say_why():
+    r = golden_n("forbid-script", 8)
+    assert r["rollouts_plan"]["extra_base_run"] == [f"base{i}" for i in range(2, 9)] and r["rollouts_plan"]["extra_final_run"] == []
+    r["rollouts_plan"]["extra_skipped"] = None
+    assert any("base repeats should run" in p for p in hard_selftest_problems(r))                  # it must say why
+    r = golden_n("forbid-script", 8)
+    r["rollouts_plan"]["extra_final_run"] = ["agg1.r2"]                                             # a repeat of the final ran
+    r["rollouts"].append({"label": "agg1.r2", "passed": False, "n_passed": 2})
+    assert any("base repeats should run" in p for p in hard_selftest_problems(r))
+    r = golden_n("forbid-script", 8)
+    r["rollouts_plan"]["extra_base_run"].pop()                                                      # a base repeat is missing
+    r["rollouts"].pop()
+    assert any("base repeats should run" in p for p in hard_selftest_problems(r))
+    r = golden_n("forbid-script", 8)
+    r["pass_rates"]["base"]["n"] = 1                                                                # measured once, as before
+    assert any("pass rate of the base should be 0/8" in p for p in hard_selftest_problems(r))
+
+
+def test_selftest_problems_counts_the_extra_rollouts_as_sessions_that_must_have_run():
+    base = {"task_set": "easy", "sessions": {"counts": {"proposer": 3, "solver": 18}}, "ledger": {"P": 3, "R": 4}, "rollouts": [{}] * 18,
+            "rollouts_passed": 18, "stages": [{"fell_back": False}] * 3, "teardown": {"scratch_left": False, "docker_leftovers": [], "gate_locked": False},
+            "sessions_summary": {"started": 21, "reached_model": 21},
+            "rollouts_plan": {"n": 8, "extra_base_run": [f"base{i}" for i in range(2, 9)], "extra_final_run": [f"agg1.r{i}" for i in range(2, 9)]}}
+    assert selftest_problems(SweepOutcome(base, 0)) == []
+    short = {**base, "rollouts": [{}] * 17, "sessions": {"counts": {"proposer": 3, "solver": 17}}}
+    problems = selftest_problems(SweepOutcome(short, 0))
+    assert any("17 rollouts ran, expected 18" in p for p in problems) and any("expected 3 and 18" in p for p in problems)
+    assert any("extra rollouts failed" in p for p in selftest_problems(SweepOutcome(
+        {**base, "rollouts_plan": {**base["rollouts_plan"], "extra_errors": ["base2: died"]}}, 0)))
+
+
+@pytest.mark.parametrize("name,edit,needle", [
+    ("hint missing from the audit", lambda r: [a.update(hint=False) for a in r["_proposer_audit"]], "the audit says hint=False but the sweep ran with hint=True"),
+    ("wrong hash", lambda r: r["_proposer_audit"][1].update(hint_sha="0" * 12), "does not hold the block, its hash"),
+    ("block not in the system text", lambda r: r["_proposer_audit"][2].update(system_starts_with_block=False), "does not hold the block, its hash"),
+    ("a stage is missing", lambda r: r["_proposer_audit"].pop(), "expected one session each for inv1, dom1 and agg1"),
+])
+def test_the_hint_check_notices_an_audit_that_does_not_match_the_flag(name, edit, needle):
+    r = golden_n("format-rules", 1)
+    edit(r)
+    assert any(needle in p for p in stage1.hint_selftest_problems(r)), (name, stage1.hint_selftest_problems(r))
+
+
+def test_the_hint_check_notices_a_block_in_an_audit_when_the_hint_was_off():
+    r = golden_n("format-rules", 1, hint=False)
+    r["_proposer_audit"][0].update(hint_sha="abcdef012345")
+    assert any("hint is off but the audit records a block" in p for p in stage1.hint_selftest_problems(r))
+    assert stage1.hint_selftest_problems({"proposer_hint": {"on": True}}) == []        # a report with no audit is not judged here
+
+
+def test_the_selftest_detail_line_says_sessions_hint_and_rates():
+    r = golden_n("format-rules", 8)
+    r["sessions_summary"] = {"started": 21}
+    r["rollouts_plan"]["sessions_planned"] = 21
+    r["pass_rates"] = {"final_label": "agg1", **stage1.arm_rates(r["rollouts"], "agg1")}
+    line = stage1.selftest_detail(r)
+    assert line.startswith("  21 sessions (3 proposer + 18 rollouts; planned 21), proposer hint on, ")
+    assert line.endswith("pass rate base 0/8 (0%), final agg1 8/8 (100%)")
+
+
+def test_the_selftest_profile_gets_exactly_the_session_cap_the_arithmetic_needs(tmp_path):
+    assert stage1.selftest_profile(tmp_path, 1).channels["local-ollama"].caps.sessions == 7
+    assert stage1.selftest_profile(tmp_path, 1, sessions=21).channels["local-ollama"].caps.sessions == 21
+    with pytest.raises(stage1.Stage1Error, match="--rollouts"):
+        run_selftest(rollouts=0)
+
+
 def test_selftest_problems_still_judges_the_easy_set_as_before_and_dispatches_the_hard_one():
     ok = {"sessions": {"counts": {"proposer": 3, "solver": 4}}, "ledger": {"P": 3, "R": 4}, "rollouts": [{}] * 4, "rollouts_passed": 4,
           "stages": [{"fell_back": False}] * 3, "teardown": {"scratch_left": False, "docker_leftovers": [], "gate_locked": False},
@@ -469,6 +584,83 @@ def test_the_selftest_subcommand_runs_the_hard_scenarios_and_says_what_each_prov
     assert code == 0, out
     assert ("selftest[hard/format-rules] passed: rollouts 3/4 correct, selection improved (final agg1, edited harness adopted), "
             "teardown clean: True") in out.out
+
+
+@pytest.mark.requires_rootless_docker
+def test_eight_rollouts_and_the_hint_run_21_sessions_and_report_pass_rates_not_a_win(tmp_path, verified, proposer_image, up):
+    """Stage 1c on the real daemon: 3 proposers + (4 upstream + 7 more base + 7 more final) = 21 sessions, all through the
+    grant and budget; the hint reaches the three proposer audits and no solver; the report holds both pass rates."""
+    base = tmp_path / "st"
+    base.mkdir()
+    base.chmod(0o755)
+    outcome = run_selftest(base=base, out=io.StringIO(), task_set="hard", scenario="format-rules", rollouts=8, proposer_hint="on")
+    r = outcome.report
+    assert outcome.exit_code == 0 and selftest_problems(outcome) == [], r
+    assert (r["ledger"]["P"], r["ledger"]["R"]) == (3, 4) and r["budget_identity"]["ok"]          # upstream's own ledger is unchanged
+    assert r["sessions"]["counts"] == {"proposer": 3, "solver": 18, "total": 21}
+    assert (r["cli_sessions_started"], r["model_sessions_reached"]) == (21, 21)
+    assert r["grant"]["max_proposer_sessions"] == 3 and r["grant"]["max_solver_sessions"] == 18
+    assert r["channel"]["caps"]["sessions"] == 21 and r["teardown"]["docker_leftovers"] == [] and r["teardown"]["scratch_left"] is False
+    plan = r["rollouts_plan"]
+    assert (plan["n"], plan["rollouts_planned"], plan["sessions_planned"]) == (8, 18, 21)
+    assert plan["extra_base_run"] == [f"base{i}" for i in range(2, 9)] and plan["extra_final_run"] == [f"agg1.r{i}" for i in range(2, 9)]
+    assert plan["extra_errors"] == [] and plan["extra_skipped"] is None
+    # per-rollout pass/fail, and the arm each belongs to
+    arms = {x["label"]: x["arm"] for x in r["rollouts"]}
+    assert arms["inv1"] == arms["dom1"] == "other" and arms["base1"] == arms["base8"] == "base" and arms["agg1"] == arms["agg1.r8"] == "final"
+    assert all(x["passed"] is (x["arm"] == "final" or x["label"] in ("inv1", "dom1")) for x in r["rollouts"])
+    # the pass-rate summary and a verdict that is a rate, with the test that says whether to believe it
+    pr = r["pass_rates"]
+    assert (pr["final_label"], pr["base"]["passed"], pr["base"]["n"], pr["final"]["passed"], pr["final"]["n"]) == ("agg1", 0, 8, 8, 8)
+    sel = r["selection"]
+    assert sel["verdict"] == "higher-rate" and sel["base_rate"] == {"passed": 0, "n": 8} and sel["chosen_rate"] == {"passed": 8, "n": 8}
+    assert sel["fisher_p"] == pytest.approx(2 / 12870) and "improved" not in sel["verdict"]
+    assert stage1.pass_rate_line(r) == "pass rate base 0/8 (0%), final agg1 8/8 (100%)\n"
+    assert stage1.selection_line(r).startswith("selection higher-rate: final agg1 (an edited harness was adopted); pass rate base 0/8, agg1 8/8;")
+    # the hint: in the report and in each of the three proposer audits, never the solver's
+    h = r["proposer_hint"]
+    assert h["on"] is True and re.fullmatch(r"[0-9a-f]{12}", h["sha"])
+    assert [(a["hint"], a["hint_sha"], a["block_matches_sha"], a["system_starts_with_block"]) for a in r["_proposer_audit"]] == [
+        (True, h["sha"], True, True)] * 3
+    run_dir = Path(r["_run_dir"])
+    assert all("ENVIRONMENT RULES" not in p.read_text(errors="replace") for p in (run_dir / "results").rglob("*.md"))
+    events = [json.loads(x) for x in (run_dir / "audit.jsonl").read_text().splitlines()]
+    kinds = [e["event"] for e in events]
+    assert kinds.count("session_start") == kinds.count("session_end") == 21 and kinds.count("rollout_verdict") == 18
+    assert kinds.count("extra_rollouts_start") == kinds.count("extra_rollouts_end") == 1 and "session_refused" not in kinds
+    blob = (run_dir / "audit.jsonl").read_text() + (run_dir / "report.json").read_text()
+    assert "ENVIRONMENT RULES" not in blob and "Parentheses mean a negative" not in blob     # the block is in the proposer audit only
+
+
+@pytest.mark.requires_rootless_docker
+def test_with_no_edit_adopted_only_the_base_extras_run_and_a_hint_off_sweep_says_so(tmp_path, verified, proposer_image, up):
+    base = tmp_path / "st"
+    base.mkdir()
+    base.chmod(0o755)
+    outcome = run_selftest(base=base, out=(printed := io.StringIO()), task_set="hard", scenario="forbid-script", rollouts=8,
+                           proposer_hint="off")
+    r = outcome.report
+    assert outcome.exit_code == 0 and selftest_problems(outcome) == [], r
+    assert r["sessions"]["counts"] == {"proposer": 3, "solver": 11, "total": 14}                # 4 + the 7 base repeats: 14 of the 21 the plan allowed
+    assert r["rollouts_plan"]["sessions_planned"] == 21 and "no edited harness was adopted" in r["rollouts_plan"]["extra_skipped"]
+    assert r["proposer_hint"] == {"on": False, "source": "--proposer-hint", "sha": None}
+    assert [a["hint"] for a in r["_proposer_audit"]] == [False] * 3
+    assert r["selection"]["verdict"] == "base-kept" and r["pass_rates"]["base"]["n"] == 8
+    assert r["rollouts_plan"]["extra_base_run"] == [f"base{i}" for i in range(2, 9)] and r["rollouts_plan"]["extra_final_run"] == []
+    assert "extra rollouts: no edited harness was adopted" in printed.getvalue()
+    assert "pass rate base 0/8 (0%); no edited harness adopted" in printed.getvalue()
+    assert "pass rate base 0/1 (0%), final agg1 0/1 (0%)  (one sample each: not a measurement)" in printed.getvalue()
+
+
+@pytest.mark.requires_rootless_docker
+def test_the_selftest_subcommand_takes_rollouts_and_the_hint_and_prints_both(verified, proposer_image, up, capsys):
+    code = stage1.main(["selftest", "--task-set", "hard", "--scenario", "format-rules", "--rollouts", "8", "--proposer-hint", "on"])
+    out = capsys.readouterr()
+    assert code == 0, out
+    assert ("selftest[hard/format-rules] passed: rollouts 10/18 correct, selection higher-rate (final agg1, edited harness adopted), "
+            "teardown clean: True") in out.out
+    assert "21 sessions (3 proposer + 18 rollouts; planned 21), proposer hint on, " in out.out
+    assert "pass rate base 0/8 (0%), final agg1 8/8 (100%)" in out.out
 
 
 def test_the_selftest_subcommand_refuses_an_unknown_scenario_before_starting_anything(capsys):

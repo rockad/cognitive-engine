@@ -339,19 +339,74 @@ def test_the_phrase_without_the_nonce_never_approves_even_when_the_stored_phrase
 
 
 @pytest.mark.parametrize("name", ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "ANTIGRAVITY_AGENT", "GEMINI_CLI",
-                                  "GEMINI_CLI_HOME", "AGY_SESSION", "OPENCODE", "OPENCODE_CONFIG", "CODEX_HOME", "CODEX_SANDBOX"])
+                                  "GEMINI_CLI_HOME", "AGY_SESSION", "OPENCODE", "CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED"])
 def test_an_agent_harness_marker_refuses_the_approval_and_nothing_overrides_it(rig, up, monkeypatch, capsys, name):
     phrase = confirmation_phrase("local-ollama", "stage1-x")
     with pytest.raises(stage1.ApprovalRefused) as ei:
         confirm_on_terminal(phrase, stdin=TTY(), stdout=TTY(), environ={name: "1"}, tty=HumanTTY())
     assert name in str(ei.value) and "no flag" in str(ei.value)
+    assert f"env -u {name} " in str(ei.value)                                   # how to run it from a plain terminal
     Traps(monkeypatch, rig.fake.port)
     term = HumanTTY()
     code = run_run(rig.parse("run", "--approve", "local-ollama"), environ={name: "1"}, probes=rig.probes(),
                    stdin=TTY(), stdout=TTY(), tty=term)
     err = capsys.readouterr().err
     assert code == 2 and name in err and "agent-harness environment" in err and "nothing was started" in err
+    assert f"env -u {name} " in err
     assert term.getvalue() == "" and rig.calls == {"gate": 0, "resolve": 0, "ollama": 0} and not rig.runs.exists()
+
+
+@pytest.mark.parametrize("name", ["OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "OPENCODE_API_KEY", "OPENCODE_DISABLE_AUTOUPDATE", "CODEX_HOME",
+                                  "CODEX_API_KEY", "CLAUDE_CONFIG_DIR", "GEMINI_API_KEY", "AGYX", "ANTIGRAV"])
+def test_a_variable_a_person_sets_in_their_own_profile_is_not_an_agent_marker(name):
+    """The review's input: `CODEX_HOME=~/.codex stage1 run ...` from a plain shell was refused for good. These are settings
+    the tools READ (their config directory, a key, a switch), not markers they SET in the processes they spawn."""
+    assert stage1.agent_markers({name: "1"}) == []
+    phrase = confirmation_phrase("local-ollama", "stage1-x")
+    assert confirm_on_terminal(phrase, stdin=TTY(), stdout=TTY(), environ={name: "1"}, tty=HumanTTY())
+
+
+def test_the_refusal_names_every_offending_variable_and_the_env_u_command_for_all_of_them():
+    env = {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli", "CLAUDE_CODE_SESSION_ID": "s", "HOME": "/h", "OPENCODE_CONFIG": "/x"}
+    with pytest.raises(stage1.ApprovalRefused) as ei:
+        stage1.refuse_in_agent_environment(env)
+    text = str(ei.value)
+    for name in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID"):
+        assert name in text
+    assert "OPENCODE_CONFIG" not in text and "HOME" not in text and "/x" not in text            # a value is never shown
+    assert "env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_SESSION_ID stage1 run" in text
+    assert "plain terminal" in text and "no flag" in text
+    many = {f"CLAUDE_CODE_V{i:02d}": "1" for i in range(40)}
+    with pytest.raises(stage1.ApprovalRefused) as ei:
+        stage1.refuse_in_agent_environment(many)
+    assert "and 28 more" in str(ei.value) and len(str(ei.value)) < 1200                     # bounded
+
+
+def test_the_marker_lists_are_exact_names_and_the_prefixes_the_repo_can_justify():
+    """CLAUDE_CODE_* was observed in a child of Claude Code (CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, CLAUDE_CODE_SESSION_ID, ...); the
+    rest are kept as prefixes only because they cannot be verified here. OPENCODE_* and CODEX_* (config knobs) are not prefixes."""
+    assert "CLAUDECODE" in stage1.AGENT_ENV_EXACT and "OPENCODE" in stage1.AGENT_ENV_EXACT
+    assert "OPENCODE_" not in stage1.AGENT_ENV_PREFIXES and "OPENCODE" not in stage1.AGENT_ENV_PREFIXES
+    assert "CODEX" not in stage1.AGENT_ENV_PREFIXES and "CODEX_" not in stage1.AGENT_ENV_PREFIXES
+    assert "CLAUDE_CODE_" in stage1.AGENT_ENV_PREFIXES
+
+
+def test_the_audit_records_what_was_typed_and_which_agent_markers_were_checked_and_found(rig, up, monkeypatch):
+    sweep = "stage1-20261030T000000Z-bbbb"
+    code, run_dir, _ = approved_run(rig, up, monkeypatch, lambda task, k, **kw: type("R", (), {"status": "ok", "modes": {}, "errors": []})(),
+                                    sweep=sweep)
+    ap = next(e for e in events(run_dir) if e["event"] == "approval")
+    phrase = confirmation_phrase("local-ollama", sweep)
+    assert ap["typed"].startswith(phrase + " ") and len(ap["typed"][len(phrase):].split()) == 4        # the nonce-bearing string
+    assert all(w in stage1.NONCE_WORDS for w in ap["typed"][len(phrase):].split())
+    assert ap["agent_env"] == {"checked_exact": list(stage1.AGENT_ENV_EXACT), "checked_prefixes": list(stage1.AGENT_ENV_PREFIXES),
+                               "present": []}
+
+
+def test_the_agent_env_record_lists_the_names_present_and_never_a_value():
+    rec = stage1.agent_env_record({"CLAUDECODE": "secret-value", "CLAUDE_CODE_SESSION_ID": "x", "PATH": "/bin"})
+    assert rec["present"] == ["CLAUDECODE", "CLAUDE_CODE_SESSION_ID"] and "secret-value" not in json.dumps(rec)
+    assert stage1.agent_env_record({})["present"] == []
 
 
 def test_no_flag_can_override_the_agent_marker_refusal():
@@ -878,7 +933,7 @@ def test_the_hard_plan_shows_the_set_keeps_the_budgets_and_puts_it_in_the_approv
     # nothing else differs: the budgets, caps and checks are the same lines
     only_easy = [x for x in easy.splitlines() if x not in hard.splitlines()]
     only_hard = [x for x in hard.splitlines() if x not in easy.splitlines()]
-    assert all(("task" in x or "classification" in x or "stage1 run --approve" in x) for x in only_easy + only_hard), (only_easy, only_hard)
+    assert all(("task" in x or "classification" in x or "proposer hint" in x or "stage1 run --approve" in x) for x in only_easy + only_hard), (only_easy, only_hard)
 
 
 def test_the_hard_plan_is_as_side_effect_free_as_the_easy_one(rig, up, monkeypatch):
@@ -925,6 +980,50 @@ def test_an_easy_run_records_the_set_too_and_its_adapter_is_the_easy_one(rig, up
             stdin=TTY(), stdout=TTY(), tty=HumanTTY(), run_task=fake_run_task)
     assert seen["task"] == "household/sum-1" and seen["adapter"].ts is stage1.ss.EASY and seen["adapter"].spec.name == "sum-signed"
     assert json.loads((rig.runs / sweep / "report.json").read_text())["task_set"] == "easy"
+
+
+# ── the proposer hint (stage 1c): `--proposer-hint {on,off}` ──
+
+def test_the_plan_shows_the_hint_flag_on_for_hard_off_for_easy_and_the_approve_command_spells_it_only_when_given(rig, up):
+    easy, hard = plan_text(rig), plan_text(rig, "--task-set", "hard")
+    assert "proposer hint    off  (default for the easy set;" in easy and "--proposer-hint on flips it" in easy
+    assert "proposer hint    on  (default for the hard set;" in hard and "--proposer-hint off flips it" in hard
+    for text in (easy, hard):
+        cmd = next(line.strip() for line in text.splitlines() if "stage1 run --approve" in line)
+        assert "--proposer-hint" not in cmd                                   # a default is not spelled out
+    forced = plan_text(rig, "--task-set", "hard", "--proposer-hint", "off")
+    assert "proposer hint    off  (--proposer-hint;" in forced
+    cmd = next(line.strip() for line in forced.splitlines() if "stage1 run --approve" in line)
+    assert build_parser().parse_args(shlex.split(cmd)[5:]).proposer_hint == "off"
+
+
+def hint_run(rig, up, monkeypatch, sweep, *extra):
+    seen = {}
+
+    def fake_run_task(task, k, **kw):
+        seen["prop"], seen["selector"] = kw["prop"], kw["selector_prop"]
+        return type("R", (), {"status": "ok", "modes": {}, "errors": [], "selections": {}})()
+    monkeypatch.setattr(stage1, "new_sweep_id", lambda: sweep)
+    run_run(rig.parse("run", "--approve", "local-ollama", *extra), environ={}, probes=rig.probes(),
+            stdin=TTY(), stdout=TTY(), tty=HumanTTY(), run_task=fake_run_task)
+    run_dir = rig.runs / sweep
+    return seen, json.loads((run_dir / "report.json").read_text()), next(e for e in events(run_dir) if e["event"] == "sweep_start")
+
+
+def test_a_hard_run_gives_the_proposer_the_block_but_not_the_selector_and_records_it(rig, up, monkeypatch):
+    seen, rep, start = hint_run(rig, up, monkeypatch, "stage1-20261030T000000Z-dd01", "--task-set", "hard")
+    assert seen["prop"].hint_block.startswith("ENVIRONMENT RULES") and seen["selector"].hint_block == ""
+    sha = stage1.proposer_hint.digest(seen["prop"].hint_block)
+    assert rep["proposer_hint"] == start["proposer_hint"] == {"on": True, "source": "default for the hard set", "sha": sha}
+
+
+def test_the_easy_run_has_no_block_by_default_and_off_reproduces_run_4_on_the_hard_set(rig, up, monkeypatch):
+    seen, rep, _ = hint_run(rig, up, monkeypatch, "stage1-20261030T000000Z-dd02")
+    assert seen["prop"].hint_block == "" and rep["proposer_hint"] == {"on": False, "source": "default for the easy set", "sha": None}
+    seen, rep, _ = hint_run(rig, up, monkeypatch, "stage1-20261030T000000Z-dd03", "--task-set", "hard", "--proposer-hint", "off")
+    assert seen["prop"].hint_block == "" and rep["proposer_hint"] == {"on": False, "source": "--proposer-hint", "sha": None}
+    seen, rep, _ = hint_run(rig, up, monkeypatch, "stage1-20261030T000000Z-dd04", "--proposer-hint", "on")
+    assert seen["prop"].hint_block and rep["proposer_hint"]["on"] is True and rep["proposer_hint"]["source"] == "--proposer-hint"
 
 
 # ── what the proxy refused by method and path (stage-1b: 5-10 unix-route-path-denied per session, unidentified) ──

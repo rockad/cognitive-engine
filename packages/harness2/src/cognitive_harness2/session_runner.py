@@ -834,6 +834,7 @@ class ProposerSessionRunner:
         created_networks: list[str] = []
         reclaimed: bool | None = None
         stack = contextlib.ExitStack()
+        cleanup = _Cleanup()              # before the `try`: the `finally` below builds nothing before its shield is up
         t0 = time.monotonic()
         self._notify("session_start", session=run_id, timeout_s=spec.timeout_s, tmp_exec=spec.tmp_exec)
         try:
@@ -921,12 +922,24 @@ class ProposerSessionRunner:
             # reclaim, the sleeps) and leak a network or an `h2s-` directory without a SessionCleanupError. SIGINT and
             # SIGTERM are ignored while it runs (main thread only), and an interrupt that still lands is remembered while
             # the next step runs; the first one is re-raised at the end.
-            cleanup = _Cleanup()
-            with _shielded_from_interrupts():
-                self._teardown(names, base, created_networks, stack, cleanup)
-                if spec.reclaim_workspace:
-                    reclaimed = cleanup.run(self._reclaim, plan, names, default=False)
-                leftovers = tuple(cleanup.run(self._leftovers, names, base, default=[]))
+            #
+            # One window cannot be closed by the shield itself: an interrupt that lands after the body has ended and before
+            # the handlers are ignored (the `finally:` entry, the call, the first `signal.signal`). Such an interrupt is
+            # caught here, remembered like any other (`cleanup.interrupt`, re-raised last), and the teardown runs again
+            # under the shield, every step being idempotent. `cleanup` is made before the `try`, so nothing is built here.
+            for attempt in range(_TEARDOWN_ATTEMPTS):
+                try:
+                    with _shielded_from_interrupts():
+                        self._teardown(names, base, created_networks, stack, cleanup)
+                        if spec.reclaim_workspace:
+                            reclaimed = cleanup.run(self._reclaim, plan, names, default=False)
+                        leftovers = tuple(cleanup.run(self._leftovers, names, base, default=[]))
+                    break
+                except KeyboardInterrupt as e:
+                    if cleanup.interrupt is None:
+                        cleanup.interrupt = e
+                    if attempt == _TEARDOWN_ATTEMPTS - 1:
+                        raise
         if error is None and cleanup.interrupt is not None:
             error = cleanup.interrupt
         self._notify("session_end", session=run_id, exit_code=None if result is None else result.exit_code,
@@ -1019,6 +1032,9 @@ class ProposerSessionRunner:
         return removed
 
 
+_TEARDOWN_ATTEMPTS = 5      # interrupts tolerated in the window before the shield is up (in practice at most one or two)
+
+
 class _Cleanup:
     """Runs cleanup steps so that an interrupt in one cannot skip the others. A `KeyboardInterrupt` in a step is remembered
     (the first one), the step is retried once (every step is idempotent: kill, rm, network rm, reclaim), and the next step
@@ -1043,18 +1059,22 @@ class _Cleanup:
 
 @contextlib.contextmanager
 def _shielded_from_interrupts():
-    """Ignore SIGINT and SIGTERM for the duration, restoring the previous handlers after (also if the body raises). Only the
-    main thread can install signal handlers; anywhere else this does nothing."""
+    """Ignore SIGINT and SIGTERM for the duration, restoring the previous handlers after (also if the body raises, and also
+    if an interrupt lands while they are being installed: each previous handler is read before it is replaced). Only the
+    main thread can install signal handlers; anywhere else this does nothing. Processes started inside (docker, the
+    reclaim) inherit SIG_IGN for both signals, which is harmless and intended: the teardown must not be cut short, and
+    each of them is bounded by its own timeout."""
     if threading.current_thread() is not threading.main_thread():
         yield
         return
     saved: dict[int, object] = {}
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            saved[sig] = signal.signal(sig, signal.SIG_IGN)
-        except (ValueError, OSError):
-            pass
     try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                saved[sig] = signal.getsignal(sig)        # recorded first: an interrupt right after the install still restores
+                signal.signal(sig, signal.SIG_IGN)
+            except (ValueError, OSError):
+                pass
         yield
     finally:
         for sig, handler in saved.items():

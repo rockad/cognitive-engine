@@ -10,6 +10,13 @@ reflection session skipped (`run_task(..., libraries=None)`), attempts forced to
 Every session is `opencode` in a rootless Docker container, reaching Ollama on this machine's loopback through the host
 bridge and the allow-list proxy. One model call at a time (the model gate). $0. Nothing leaves the machine.
 
+Stage 1c (two flags, defaults unchanged): `--proposer-hint on|off` puts the runner's ENVIRONMENT RULES block (which harness
+files are kept, which are read-only) in front of each proposer session (`proposer_hint`; on for the hard set by default), and
+`--rollouts N` rolls the base and the delivered final N times each. Upstream fixes R = 4k, so the extra rollouts are made here,
+after `run_task` (`run_extra_rollouts`), and count as sessions: P + R = 3 + (4 + 2 (N - 1)) must fit the profile's caps.sessions
+(the worst case). The N - 1 base repeats always run; the N - 1 repeats of the final run only if an edited harness was adopted, so
+with no edit a sweep uses N - 1 fewer sessions and reports the baseline pass rate alone.
+
 `plan` changes nothing. It reads the profile, asks the policy, runs the pinned read-only `docker info` and
 `docker image inspect`, and sends ONE `GET /api/tags` to the loopback Ollama (no bytes beyond that, no model is loaded).
 It creates no file, directory, container, network or socket, and prints the exact command that approves the sweep.
@@ -32,6 +39,7 @@ import http.client
 import importlib
 import io
 import json
+import math
 import os
 import re
 import secrets
@@ -49,7 +57,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
-from . import channels, egress, image, ollama_guard, run_scope, sandbox, sum_signed as ss, sum_signed_hard as ss_hard, task_sets, upstream_egress, upstream_import
+from . import channels, egress, image, ollama_guard, proposer_hint, run_scope, sandbox, sum_signed as ss, sum_signed_hard as ss_hard, task_sets, upstream_egress, upstream_import
 from . import session_runner as sr
 from .contained_proposer import (OPENCODE_PROMPT, SessionConfig, build_command, make_proposer, make_selector_prop,
                                  session_env, TMP_EXEC)
@@ -73,6 +81,39 @@ OLLAMA_TIMEOUT_S = 3.0
 EXCERPT = 160
 FAKE_CLI = Path(__file__).with_name("selftest_fake_opencode.sh")
 EXPECTED_P, EXPECTED_R = 3, 4                # upstream's budget identity at k=1 (P = 3k, R = 4k)
+HINT_CHOICES = ("on", "off")                 # --proposer-hint
+MAX_ROLLOUTS = 64                            # --rollouts: a sanity ceiling; the profile's caps.sessions is the real bound
+
+
+@dataclass(frozen=True)
+class RolloutPlan:
+    """The session arithmetic of one sweep at `--rollouts n`, from upstream's own plan (P, R) plus what OUR runner adds.
+
+    Upstream rolls base1, inv1, dom1 and agg1 once each (R = 4 at k=1) and has no knob for more: `run_task` builds
+    `labels = [base1..basek]` and `recursion.run_parallel` rolls each candidate once. `n` is the number of rollouts of the
+    base harness and of the delivered final: upstream's own one plus `n - 1` more of each, made after `run_task` by
+    `run_extra_rollouts`. inv1 and dom1 are upstream's evidence for the aggregator and stay at one each.
+
+    `sessions` is the WORST case, and it is what the cap check, the grant and the budget use: sessions = P + R +
+    (n - 1 base extras, always run) + (n - 1 final extras per final, run only if an edited harness was adopted)."""
+    n: int
+    proposer: int               # P: upstream's proposer sessions
+    upstream_rollouts: int      # upstream's R
+    extra_base: int
+    extra_final: int
+
+    @property
+    def rollouts(self) -> int:
+        return self.upstream_rollouts + self.extra_base + self.extra_final
+
+    @property
+    def sessions(self) -> int:
+        return self.proposer + self.rollouts
+
+
+def rollout_plan(n: int, *, upstream_p: int, upstream_r: int, finals: int = K) -> RolloutPlan:
+    """The arithmetic for `n` rollouts per arm: `finals` is the number of delivered finals (k, one per mode here)."""
+    return RolloutPlan(n=n, proposer=upstream_p, upstream_rollouts=upstream_r, extra_base=n - 1, extra_final=(n - 1) * finals)
 HOST_SESSION_WARNINGS = ("the session runs agent tools (shell and file access) on this host", "HOME and any file-based credentials")
 CANDIDATES = (("systemprompt", "systemprompt.md"), ("memory", "LongTermMEMORY.md"),
               ("tool_guidance", "tool_descriptions/tool_guidance.md"))
@@ -110,6 +151,8 @@ class Settings:
     per_session_s: float = PER_SESSION_S
     cli: str | None = None                   # host path of opencode (--opencode / env / ~/.opencode/bin/opencode / PATH)
     runs_dir: Path = field(default_factory=default_runs_dir)   # PARENT of the per-sweep directory
+    proposer_hint: str | None = None         # "on" / "off" (--proposer-hint); None: on for the hard set, off for the easy one
+    rollouts: int = 1                        # --rollouts: rollouts of the base and of the delivered final (1 = upstream's own)
 
     def __post_init__(self) -> None:
         try:
@@ -119,6 +162,20 @@ class Settings:
         except ValueError as e:
             raise Stage1Error(str(e)) from None
         object.__setattr__(self, "task", task)
+        if self.proposer_hint not in (None, *HINT_CHOICES):
+            raise Stage1Error(f"--proposer-hint must be one of: {', '.join(HINT_CHOICES)}")
+        if not (isinstance(self.rollouts, int) and not isinstance(self.rollouts, bool) and 1 <= self.rollouts <= MAX_ROLLOUTS):
+            raise Stage1Error(f"--rollouts must be a whole number from 1 to {MAX_ROLLOUTS}")
+
+    @property
+    def hint_on(self) -> bool:
+        """Does a proposer session get the ENVIRONMENT RULES block? The flag when given, else on for the hard set only
+        (so a command without the flag reproduces run #4 on the easy set, and the hard set gets the hint by default)."""
+        return self.proposer_hint == "on" if self.proposer_hint is not None else self.task_set == "hard"
+
+    @property
+    def hint_source(self) -> str:
+        return "--proposer-hint" if self.proposer_hint is not None else f"default for the {self.task_set} set"
 
     @property
     def ts(self) -> ss.TaskSet:
@@ -343,11 +400,17 @@ def build_plan(s: Settings, pre: Preflight, surface: Any) -> SweepPlan:
         max_sessions=ch.caps.sessions, max_wall_seconds=s.wall_s if s.wall_s is not None else ch.caps.wall_s,
         max_cost_or_tokens=CostCap("usd", 0.01), proposer=proposer_decision(s, root), readiness=pre.readiness(),
         profile=s.profile, channel=s.channel, classification=s.classification, zdr=s.zdr)
-    total = plan.planned_sessions + plan.planned_rollouts
-    if (plan.planned_sessions, plan.planned_rollouts) != (EXPECTED_P, EXPECTED_R) or total > ch.caps.sessions:
-        raise SweepRefused([f"stage 1 expects P={EXPECTED_P} proposer sessions and R={EXPECTED_R} rollouts within the channel's "
-                            f"{ch.caps.sessions} sessions, but upstream plans P={plan.planned_sessions}, R={plan.planned_rollouts}"])
-    return plan
+    if (plan.planned_sessions, plan.planned_rollouts) != (EXPECTED_P, EXPECTED_R):
+        raise SweepRefused([f"stage 1 expects P={EXPECTED_P} proposer sessions and R={EXPECTED_R} rollouts, "
+                            f"but upstream plans P={plan.planned_sessions}, R={plan.planned_rollouts}"])
+    rp = rollout_plan(s.rollouts, upstream_p=plan.planned_sessions, upstream_r=plan.planned_rollouts)
+    if rp.sessions > ch.caps.sessions:
+        raise SweepRefused([
+            f"{rp.sessions} sessions are planned (P={rp.proposer} proposer + R={rp.rollouts} solver rollouts at --rollouts "
+            f"{s.rollouts}) but channel {s.channel!r} allows caps.sessions = {ch.caps.sessions} in {s.profile.source}; "
+            f"raise caps.sessions to at least {rp.sessions} there, or lower --rollouts"])
+    # the extra rollouts are session budget too: the grant, the budget and the run-time checks are all made from this plan
+    return dataclasses.replace(plan, planned_rollouts=rp.rollouts)
 
 
 def approve_command(s: Settings, plan_cli: str | None, profile_path: str | None, wall_s: float | None = None) -> str:
@@ -358,7 +421,11 @@ def approve_command(s: Settings, plan_cli: str | None, profile_path: str | None,
         parts += ["--opencode", plan_cli]
     if s.task_set != task_sets.DEFAULT:                          # the default is not spelled out: an old command means what it did
         parts += ["--task-set", s.task_set]
-    if s.wall_s is not None:                                    # the figure the plan will actually hold to
+    if s.proposer_hint is not None:                              # spelled out only when asked for: the default is in the plan
+        parts += ["--proposer-hint", s.proposer_hint]
+    if s.rollouts != 1:
+        parts += ["--rollouts", str(s.rollouts)]
+    if s.wall_s is not None:                                   # the figure the plan will actually hold to
         parts += ["--wall-s", f"{wall_s if wall_s is not None else s.wall_s:g}"]
     parts += ["--per-session-s", f"{s.per_session_s:g}", "--runs-dir", str(s.runs_dir)]
     return " ".join(shlex.quote(p) for p in parts)
@@ -370,17 +437,30 @@ def format_plan(s: Settings, pre: Preflight, plan: SweepPlan | None, refusals: S
     L: list[str] = ["STAGE 1: local smoke run, k=1  (this is a PLAN: nothing was started)", ""]
     if ch is not None:
         wall = plan.max_wall_seconds if plan else (s.wall_s or ch.caps.wall_s)
-        worst = (EXPECTED_P + EXPECTED_R) * s.per_session_s
+        rp = rollout_plan(s.rollouts, upstream_p=EXPECTED_P, upstream_r=EXPECTED_R)
+        n = s.rollouts
+        worst = rp.sessions * s.per_session_s
         L += [f"channel          {ch.name}  ({ch.kind}, retention {ch.retention}, max classification {ch.max_classification})",
               f"endpoint         {ch.endpoints[0]}{API_PATH}  (loopback; reached from the containers over the host bridge)",
               f"model            {ch.model}",
               f"classification   {s.classification}  (the {s.ts.spec_name} task, the harness and every prompt are synthetic)",
               f"task set         {s.task_set}  ({s.ts.description})",
               f"task             {s.task}, k={K}, modes={','.join(MODES)}, reflection skipped, attempts 1",
-              f"expected         P={EXPECTED_P} proposer sessions (inv1, dom1, agg1) and R={EXPECTED_R} solver rollouts "
-              f"(base1, inv1, dom1, agg1), one model call at a time",
+              f"proposer hint    {'on' if s.hint_on else 'off'}  ({s.hint_source}; the runner's ENVIRONMENT RULES block in front of "
+              f"each proposer session's system text, never a solver's; --proposer-hint {'off' if s.hint_on else 'on'} flips it)",
+              f"expected         P={rp.proposer} proposer sessions (inv1, dom1, agg1) and R={rp.rollouts} solver rollouts "
+              + ("(base1, inv1, dom1, agg1)" if n == 1 else f"(base1..base{n}, inv1, dom1, agg1 and its {n - 1} repeats)")
+              + ", one model call at a time",
+              f"rollouts         {n}  " + ("(upstream's own: base1, inv1, dom1, agg1 once each)" if n == 1 else
+                                          f"(base1..base{n} ({n}), the delivered final agg1 ({n}), and inv1, dom1 once each; "
+                                          f"upstream rolls one base and one final, the other {n - 1} of each are this runner's; the {n - 1} "
+                                          f"base repeats always run, the final's only if an edited harness is adopted)"),
+              f"sessions         {rp.proposer} + {rp.rollouts} = {rp.sessions} sessions (profile cap {ch.caps.sessions})"
+              + ("" if n == 1 else f", the worst case: {(n - 1) * K} fewer if no edited harness is adopted (its {n - 1} repeats of the final do not run)")
+              + ("" if rp.sessions <= ch.caps.sessions else
+                 f": OVER the cap, so this plan is refused; set caps.sessions to at least {rp.sessions}"),
               f"caps             sessions {ch.caps.sessions}, total wall {wall:g} s ({wall / 60:g} min), cost ${ch.caps.cost_usd:g}",
-              f"timeouts         {s.per_session_s:g} s per session; worst case {worst:g} s for {EXPECTED_P + EXPECTED_R} sessions"
+              f"timeouts         {s.per_session_s:g} s per session; worst case {worst:g} s for {rp.sessions} sessions"
               + (f", which is MORE than the {wall:g} s wall: the sweep stops starting sessions at the deadline" if worst > wall else ""),
               f"container        2 GB, 2 CPUs, 256 pids, read-only root, no capabilities, user 65534 (per session)",
               f"leaves machine   nothing: no hosted endpoint, no credential, no egress network",
@@ -470,8 +550,10 @@ class Audit:
 class Approval:
     approved_by: str
     mode: str                  # "tty" (a person typed the phrase) | "selftest"
-    phrase: str
+    phrase: str                # the base phrase (channel and sweep id)
     at: str = field(default_factory=now_iso)
+    typed: str = ""            # what was typed and matched: the phrase plus its nonce ("" for the selftest, nothing was typed)
+    agent_env: Mapping[str, Any] = field(default_factory=dict)      # `agent_env_record`: the markers checked and the names found
 
 
 def confirmation_phrase(channel: str, sweep_id: str) -> str:
@@ -479,12 +561,24 @@ def confirmation_phrase(channel: str, sweep_id: str) -> str:
 
 
 # Environment variables that mark a process as running inside an agent harness. The runner refuses to take an approval
-# there and NO flag overrides it. The names are those the harnesses set in the processes they spawn (Claude Code:
-# CLAUDECODE, CLAUDE_CODE_*; Antigravity / Gemini CLI / agy; opencode; codex). Not a security boundary: a process that
-# scrubs its own environment (`env -i`) defeats it. It makes the careless route (an agent running `stage1 run` and
-# approving it itself) fail loudly instead of quietly working.
-AGENT_ENV_EXACT = ("CLAUDECODE",)
-AGENT_ENV_PREFIXES = ("CLAUDE_CODE_", "ANTIGRAVITY", "GEMINI_CLI", "AGY_", "OPENCODE", "CODEX")
+# there and NO flag overrides it. Not a security boundary: a process that scrubs its own environment (`env -i`) defeats it.
+# It makes the careless route (an agent running `stage1 run` and approving it itself) fail loudly instead of quietly working.
+#
+# The list matches what the harnesses SET in the processes they spawn, not what they READ. Reading is what a person's own
+# profile does: `CODEX_HOME`, `OPENCODE_CONFIG`, `OPENCODE_API_KEY` are settings, and refusing them locked such a person out
+# for good (there is no override). So:
+#   - CLAUDECODE and CLAUDE_CODE_* : observed in a child of Claude Code (CLAUDECODE, CLAUDE_CODE_ENTRYPOINT,
+#     CLAUDE_CODE_SESSION_ID, CLAUDE_CODE_EXECPATH, ...). Kept as a prefix: the set grows with the version. The cost is that a
+#     CLAUDE_CODE_* setting exported in a person's profile (CLAUDE_CODE_USE_VERTEX, say) also refuses; unset it for the run.
+#   - OPENCODE (exact): the marker opencode sets in its children. The binary's OPENCODE_* names are config knobs, so no prefix.
+#   - CODEX_SANDBOX*: the markers codex sets in sandboxed commands (CODEX_SANDBOX, CODEX_SANDBOX_NETWORK_DISABLED). Not
+#     CODEX_HOME, its config directory.
+#   - ANTIGRAVITY*, GEMINI_CLI*, AGY_*: UNVERIFIED here (those CLIs were not run from this code), kept as prefixes on
+#     purpose: a false refusal is fixed by `env -u NAME`, a false pass lets an agent approve its own sweep. If one of these
+#     is a config variable of yours, the refusal names it; narrow this list when its real child markers are known.
+AGENT_ENV_EXACT = ("CLAUDECODE", "OPENCODE")
+AGENT_ENV_PREFIXES = ("CLAUDE_CODE_", "CODEX_SANDBOX", "ANTIGRAVITY", "GEMINI_CLI", "AGY_")
+AGENT_ENV_SHOW = 12              # names listed in a refusal (and in its `env -u` command); the rest are counted
 TTY_PATH = "/dev/tty"
 
 NONCE_WORDS = ("amber", "anchor", "birch", "cobalt", "comet", "coral", "crane", "delta", "ember", "fennel", "flint",
@@ -503,13 +597,23 @@ def agent_markers(environ: Mapping[str, str]) -> list[str]:
     return sorted(k for k in environ if k in AGENT_ENV_EXACT or k.startswith(AGENT_ENV_PREFIXES))
 
 
+def agent_env_record(environ: Mapping[str, str]) -> dict[str, Any]:
+    """What the audit keeps of the environment check: the exact names and prefixes that were checked, and the names found
+    (never a value). For a real approval `present` is empty, since a marker refuses; for the selftest it may not be."""
+    return {"checked_exact": list(AGENT_ENV_EXACT), "checked_prefixes": list(AGENT_ENV_PREFIXES), "present": agent_markers(environ)}
+
+
 def refuse_in_agent_environment(environ: Mapping[str, str]) -> None:
     found = agent_markers(environ)
     if found:
+        shown = found[:AGENT_ENV_SHOW]
+        more = f" and {len(found) - len(shown)} more" if len(found) > len(shown) else ""
+        unset = "env " + " ".join(f"-u {n}" for n in shown) + " stage1 run ..."
         raise ApprovalRefused(
-            "refusing to take an approval inside an agent-harness environment (" + ", ".join(found[:6]) +
-            "): the approval must come from a person at their own terminal. There is no flag to override this; "
-            "run it from a plain shell yourself")
+            "refusing to take an approval inside an agent-harness environment (" + ", ".join(shown) + more +
+            "): the approval must come from a person at their own terminal. There is no flag to override this. "
+            "From a plain terminal (one that is not an agent session) it just works; if one of these is your own setting, "
+            f"drop it for the run: {unset}")
 
 
 def new_nonce(words: int = 4) -> str:
@@ -553,10 +657,16 @@ def open_controlling_terminal(path: str = TTY_PATH) -> _Terminal:
     return _Terminal(rfd, wfd)
 
 
-def confirm_on_terminal(phrase: str, *, stdin: TextIO | None = None, stdout: TextIO | None = None,
-                        environ: Mapping[str, str] | None = None, tty: TextIO | None = None,
-                        tty_path: str = TTY_PATH, nonce: str | None = None) -> bool:
-    """True only if the phrase plus a fresh 4-word nonce is typed on the process's CONTROLLING terminal.
+def confirm_on_terminal(phrase: str, **kw: Any) -> bool:
+    """`confirm_typed`, as a bool."""
+    return confirm_typed(phrase, **kw) is not None
+
+
+def confirm_typed(phrase: str, *, stdin: TextIO | None = None, stdout: TextIO | None = None,
+                  environ: Mapping[str, str] | None = None, tty: TextIO | None = None,
+                  tty_path: str = TTY_PATH, nonce: str | None = None) -> str | None:
+    """The string that was typed (the phrase plus its nonce) if it was typed on the process's CONTROLLING terminal, else None.
+    The phrase plus a fresh 4-word nonce must be typed exactly.
 
     What it stops: a pipe, redirected stdin or stdout, a script with no terminal (the confirmation is read from the
     controlling terminal, never from stdin), and anything inside a known agent-harness environment (raises
@@ -566,7 +676,7 @@ def confirm_on_terminal(phrase: str, *, stdin: TextIO | None = None, stdout: Tex
     refuse_in_agent_environment(os.environ if environ is None else environ)
     sin, sout = stdin or sys.stdin, stdout or sys.stdout
     if not (sin.isatty() and sout.isatty()):
-        return False
+        return None
     owned = tty is None
     try:
         term = tty if tty is not None else open_controlling_terminal(tty_path)
@@ -581,8 +691,8 @@ def confirm_on_terminal(phrase: str, *, stdin: TextIO | None = None, stdout: Tex
         try:
             typed = term.readline()
         except (OSError, KeyboardInterrupt):
-            return False
-        return typed.strip() == expected
+            return None
+        return expected if typed.strip() == expected else None
     finally:
         if owned:
             with contextlib.suppress(OSError):
@@ -778,6 +888,10 @@ def check_grant(ctx: "SweepContext", *, now: float | None = None) -> None:
     if (g.max_proposer_sessions > p.planned_sessions or g.max_solver_sessions > p.planned_rollouts
             or g.max_wall_s > p.max_wall_seconds):
         raise ExecutionRefused("the grant is larger than the approved plan")
+    cap = s.ch.caps.sessions
+    if g.max_sessions > cap:                  # the profile's own cap, even when plan and grant agree with each other
+        raise ExecutionRefused(f"the grant allows {g.max_sessions} sessions but channel {s.channel!r} has "
+                               f"caps.sessions = {cap}; raise it in the profile or lower --rollouts")
 
 
 def _ledger_view(res: Any) -> dict | None:
@@ -793,6 +907,49 @@ def _stage_view(res: Any) -> list[dict]:
             for st in (mode.get("stages") or []) if isinstance(st, dict)]
 
 
+def _natural(label: str) -> list:
+    """Sort key putting `base2` before `base10` and `agg1` before `agg1.r2`."""
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", label)]
+
+
+def arm_of(label: str, final_label: str | None) -> str:
+    """Which arm of the comparison a rollout belongs to: `base` (base1..baseN), `final` (the delivered final's own rollout
+    and its repeats `<final>.r2`..) or `other` (inv1 and dom1, upstream's evidence for the aggregator: not compared)."""
+    if re.fullmatch(r"base\d+", label):
+        return "base"
+    if final_label and (label == final_label or re.fullmatch(re.escape(final_label) + r"\.r\d+", label)):
+        return "final"
+    return "other"
+
+
+def arm_rates(rollouts: Sequence[Mapping[str, Any]], final_label: str | None) -> dict:
+    """Per arm: its labels, n (every rollout of the arm, a dead one included), how many passed, failed, or were unusable (the
+    session died or the judge gave no verdict), and the pass rate over n (None for an empty arm). A dead rollout is NOT
+    dropped from n: it counts as not passed, and `unusable` says how many there were."""
+    out: dict[str, dict] = {}
+    for arm in ("base", "final"):
+        mine = sorted((r for r in rollouts if arm_of(r["label"], final_label) == arm), key=lambda r: _natural(r["label"]))
+        passed = sum(1 for r in mine if r.get("passed") is True)
+        failed = sum(1 for r in mine if r.get("passed") is False)
+        unusable = sum(1 for r in mine if r.get("ok") is False or r.get("passed") is None)
+        out[arm] = {"labels": [r["label"] for r in mine], "n": len(mine), "passed": passed, "failed": failed,
+                    "unusable": unusable, "rate": passed / len(mine) if mine else None}
+    return out
+
+
+def fisher_two_sided(a: int, n1: int, b: int, n2: int) -> float:
+    """Fisher's exact test, two-sided: `a` of `n1` passed in one arm, `b` of `n2` in the other. The probability, under 'the
+    two arms have one pass rate', of a split at least as unlikely as the one seen."""
+    total = a + b
+    lo, hi = max(0, total - n2), min(n1, total)
+
+    def p(x: int) -> float:
+        return math.comb(n1, x) * math.comb(n2, total - x) / math.comb(n1 + n2, total)
+
+    seen = p(a)
+    return min(1.0, sum(p(x) for x in range(lo, hi + 1) if p(x) <= seen * (1 + 1e-9)))
+
+
 def _selection_view(res: Any, rollouts: Sequence[Mapping[str, Any]]) -> dict | None:
     """What upstream's selection did with the one mode, and what our own verdicts say about it.
 
@@ -801,8 +958,12 @@ def _selection_view(res: Any, rollouts: Sequence[Mapping[str, Any]]) -> dict | N
     otherwise delivers it. `chosen_is_base` is therefore always false, and no score is read. So `adopted` here means:
     the delivered final is an `agg` harness that differs from the base (`chosen_tree_is_base` false). Whether that edit
     HELPED is a separate fact, from this runner's own verdicts on the base and chosen rollouts, which selection never sees.
-    `verdict`: improved (base failed, chosen passed), regressed (the reverse), unchanged (same result), base-kept (no
-    accepted edit reached the final), or unknown."""
+
+    `verdict`, from one rollout each (`--rollouts 1`, an anecdote and said so in `evidence`): improved (base failed, chosen
+    passed), regressed (the reverse), unchanged (same result), base-kept (no accepted edit reached the final), or unknown.
+    From more rollouts it is a comparison of RATES and never a win: higher-rate, lower-rate or same-rate (base-kept and
+    unknown as before), with `base_rate` / `chosen_rate` as passed-over-n and `fisher_p`, a two-sided exact test of the
+    two counts, which `evidence` turns into words. A dead rollout counts in n as not passed."""
     sel = (getattr(res, "selections", None) or {}).get("agg")
     if not isinstance(sel, dict):
         return None
@@ -811,20 +972,38 @@ def _selection_view(res: Any, rollouts: Sequence[Mapping[str, Any]]) -> dict | N
     tree_is_base = sel.get("chosen_tree_is_base")
     adopted = bool(sel.get("ok") and chosen and tree_is_base is False)
     base_passed, chosen_passed = by.get("base1"), by.get(chosen) if chosen else None
+    arms = arm_rates(rollouts, chosen)
+    bn, cn = arms["base"], arms["final"]
+    single = bn["n"] <= 1 and cn["n"] <= 1
+    fisher_p: float | None = None
+    evidence = ""
     if not adopted:
         verdict = "base-kept"
-    elif base_passed is False and chosen_passed is True:
-        verdict = "improved"
-    elif base_passed is True and chosen_passed is False:
-        verdict = "regressed"
-    elif base_passed is not None and base_passed == chosen_passed:
-        verdict = "unchanged"
-    else:
+    elif single:
+        evidence = "one sample each: an anecdote, not a measurement"
+        if base_passed is False and chosen_passed is True:
+            verdict = "improved"
+        elif base_passed is True and chosen_passed is False:
+            verdict = "regressed"
+        elif base_passed is not None and base_passed == chosen_passed:
+            verdict = "unchanged"
+        else:
+            verdict = "unknown"
+    elif bn["unusable"] == bn["n"] or cn["unusable"] == cn["n"]:
         verdict = "unknown"
+        evidence = "an arm has no usable rollout"
+    else:
+        fisher_p = fisher_two_sided(cn["passed"], cn["n"], bn["passed"], bn["n"])
+        verdict = ("higher-rate" if cn["rate"] > bn["rate"] else "lower-rate" if cn["rate"] < bn["rate"] else "same-rate")
+        evidence = (f"Fisher exact two-sided p={fisher_p:.3g}: a gap this size is unlikely to be chance; still one task and one "
+                    "proposer draw, so it measures this final harness, not the method" if fisher_p < 0.05 else
+                    f"Fisher exact two-sided p={fisher_p:.2f}: not significant at these sizes; report the rates and claim nothing")
     return {"ok": bool(sel.get("ok")), "trivial": bool(sel.get("trivial")), "chosen_label": chosen,
             "chosen_is_base": bool(sel.get("chosen_is_base")), "chosen_tree_is_base": tree_is_base, "adopted": adopted,
             "n_candidates": sel.get("n_candidates"), "dropped": list(sel.get("dropped") or [])[:10],
             "base_passed": base_passed, "chosen_passed": chosen_passed, "verdict": verdict,
+            "base_rate": {"passed": bn["passed"], "n": bn["n"]}, "chosen_rate": {"passed": cn["passed"], "n": cn["n"]},
+            "fisher_p": fisher_p, "evidence": evidence,
             "harness_fingerprint": sel.get("harness_fingerprint")}
 
 
@@ -833,9 +1012,97 @@ def selection_line(report: Mapping[str, Any]) -> str:
     if not sel:
         return ""
     word = {True: "passed", False: "failed", None: "no verdict"}
-    return (f"selection {sel['verdict']}: final {sel['chosen_label']} "
-            f"({'an edited harness was adopted' if sel['adopted'] else 'the base harness was kept'}); "
-            f"base1 {word[sel['base_passed']]}, {sel['chosen_label']} {word[sel['chosen_passed']]}\n")
+    head = (f"selection {sel['verdict']}: final {sel['chosen_label']} "
+            f"({'an edited harness was adopted' if sel['adopted'] else 'the base harness was kept'}); ")
+    br, cr = sel.get("base_rate") or {}, sel.get("chosen_rate") or {}
+    if not sel["adopted"] and br.get("n", 0) > 1:        # the base measured N times, nothing to compare it with
+        return head + f"pass rate base {br['passed']}/{br['n']}; no edited harness adopted\n"
+    if max(br.get("n", 0), cr.get("n", 0)) > 1:
+        return head + f"pass rate base {br['passed']}/{br['n']}, {sel['chosen_label']} {cr['passed']}/{cr['n']}" + \
+            (f"; {sel['evidence']}" if sel.get("evidence") else "") + "\n"
+    return head + (f"base1 {word[sel['base_passed']]}, {sel['chosen_label']} {word[sel['chosen_passed']]}"
+                   + (f"; {sel['evidence']}" if sel.get("evidence") else "") + "\n")
+
+
+def pass_rate_line(report: Mapping[str, Any]) -> str:
+    """`pass rate base 4/8 (50%), final agg1 7/8 (88%)`: n_passed/n for both arms, from the report's `pass_rates`."""
+    pr = report.get("pass_rates")
+    if not pr:
+        return ""
+
+    def part(name: str, arm: Mapping[str, Any]) -> str:
+        if not arm["n"]:
+            return f"{name} none"
+        extra = f", {arm['unusable']} unusable" if arm["unusable"] else ""
+        return f"{name} {arm['passed']}/{arm['n']} ({arm['rate'] * 100:.0f}%{extra})"
+    sel = report.get("selection")
+    if sel is not None and not sel.get("adopted") and pr["base"]["n"] > 1:
+        # no edited harness reached the final: the final IS the base, so the baseline over N is the whole result
+        return f"pass rate {part('base', pr['base'])}; no edited harness adopted\n"
+    final = f"final {pr['final_label']}" if pr.get("final_label") else "final"
+    one = pr["base"]["n"] <= 1 and pr["final"]["n"] <= 1 and pr["final"]["n"] > 0
+    return f"pass rate {part('base', pr['base'])}, {part(final, pr['final'])}" + \
+        ("  (one sample each: not a measurement)" if one else "") + "\n"
+
+
+def sweep_exhausted(budget: Any) -> bool:
+    """True when no further solver session may start: the wall clock is spent, the sweep's session cap is reached, or the
+    solver role cap is. (It used to look at the wall clock only, so a refusal by session count showed up as one dead
+    rollout after another, counted as unusable in both arms, instead of as a stop.)"""
+    snap = budget.snapshot()
+    cap = (snap.get("role_caps") or {}).get("solver")
+    return bool(snap["remaining_s"] <= 0 or snap["exhausted"] or (cap is not None and snap["counts"]["solver"] >= cap))
+
+
+def run_extra_rollouts(adapter: Any, res: Any, *, up: Any, runs_root: Path, task: str, k: int, n: int, audit: Any,
+                       exhausted: Callable[[], bool]) -> dict:
+    """The rollouts upstream does not make: base2..baseN and `<final>.r2`..`<final>.rN`, after `run_task`, through the same
+    adapter (so each is a real solver session under the grant and the budget, and each is audited and judged like the rest).
+
+    Upstream rolls ONE base and ONE of each candidate; `run_task` takes no count. The extras use upstream's own run-id
+    namespace (`Namespace.run_id`) and, for the final, the harness directory upstream wrote for the delivered final
+    (`<task dir>/harnesses/<final>`), so they are the same harnesses upstream rolled once. They alternate (base2, final.r2,
+    base3, ...) so a drift in the model or the GPU over the run does not fall on one arm. The final's repeats run only
+    when an edited harness was adopted: with no edit the final IS the base and there is nothing to compare. The BASE extras
+    (base2..baseN) always run: the baseline pass rate over N is a result in itself, whatever the proposer did (decided 2026-11-01). A
+    rollout that dies is counted (and is not in the pass count); a spent budget (wall clock or session count, see
+    `sweep_exhausted`) stops the rest. Returns `{base, final, errors, skipped}`: the labels run, one `label: error` per
+    failure, and why the rest did not run (`skipped`: the final's repeats not run for want of an adopted edit, and/or the
+    budget stop)."""
+    out: dict[str, Any] = {"base": [], "final": [], "errors": [], "skipped": None}
+    if n <= 1:
+        return out
+    sel = (getattr(res, "selections", None) or {}).get("agg")
+    chosen = sel.get("chosen_label") if isinstance(sel, dict) else None
+    ns = up.schedule.Namespace(adapter.spec.name, adapter.substrate.name, "agg", k)
+    hdir: Path | None = None
+    why_no_final = None
+    if not (isinstance(sel, dict) and sel.get("ok") and chosen):
+        why_no_final = "upstream's selection gave no usable final"
+    elif sel.get("chosen_tree_is_base") is not False:
+        why_no_final = f"no edited harness was adopted (the final {chosen} is the base): nothing to compare it with"
+    else:
+        hdir = ns.task_dir(runs_root, task) / "harnesses" / chosen
+        if not hdir.is_dir():
+            hdir, why_no_final = None, f"the harness directory of the final {chosen} is not on disk"
+    if why_no_final:
+        out["skipped"] = f"{why_no_final}: base2..base{n} run, the final's repeats do not"
+        audit.emit("extra_rollouts_skipped", n=n, reason=out["skipped"], base_extras_run=True)
+    plan = [(label, None if arm == "base" else hdir) for i in range(2, n + 1)
+            for arm, label in (("base", f"base{i}"), ("final", f"{chosen}.r{i}")) if arm == "base" or hdir is not None]
+    audit.emit("extra_rollouts_start", n=n, chosen=chosen if hdir is not None else None, planned=len(plan))
+    for done, (label, harness_dir) in enumerate(plan):
+        if exhausted():
+            stop = f"the sweep budget ran out: {done} of {len(plan)} extra rollouts ran"
+            out["skipped"] = f"{out['skipped']}; {stop}" if out["skipped"] else stop
+            break
+        try:
+            adapter.execute(task, harness_dir, ns.run_id(task, label))
+        except Exception as e:  # noqa: BLE001 - one dead rollout is a result (an unusable one), not the end of the sweep
+            out["errors"].append(f"{label}: {type(e).__name__}: {sr.sanitize_terminal(str(e))[:200]}")
+        out["base" if harness_dir is None else "final"].append(label)
+    audit.emit("extra_rollouts_end", ran=len(out["base"]) + len(out["final"]), errors=len(out["errors"]), skipped=out["skipped"])
+    return out
 
 
 def sessions_view(starts: Sequence[Mapping[str, Any]], ends: Sequence[Mapping[str, Any]], *,
@@ -936,7 +1203,10 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
     error: BaseException | None = None
     res: Any = None
     adapter: AuditedAdapter | None = None
+    extra: dict[str, Any] = {"base": [], "final": [], "errors": [], "skipped": None}      # the rollouts OUR runner adds (n > 1)
     budget = g.make_budget()
+    hint = proposer_hint.build_hint(ctx.surface) if s.hint_on else None
+    hint_info = {"on": hint is not None, "source": s.hint_source, "sha": hint.sha if hint else None}
 
     def observer(event: str, fields: Mapping[str, Any]) -> None:
         if event in ("session_start", "session_end"):
@@ -948,6 +1218,7 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
 
     audit.emit("sweep_start", sweep_id=g.sweep_id, channel=g.channel, model=ch.model, endpoint=ch.endpoints[0],
                approved_for_real_model=ctx.approved_for_real_model, k=K, modes=list(MODES), task=s.task, task_set=s.task_set,
+               proposer_hint=hint_info,
                caps=ch.caps.to_dict(),
                per_session_s=g.per_session_s, max_wall_s=g.max_wall_s,
                max_proposer_sessions=g.max_proposer_sessions, max_solver_sessions=g.max_solver_sessions)
@@ -976,7 +1247,7 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
             verified=ctx.verified, image=ctx.image, profile=s.profile, channel=s.channel, zdr=s.zdr,
             classification=s.classification, scratch_root=str(proposer_scratch), cli_paths={"opencode": ctx.cli},
             timeout_s=g.per_session_s, api_path=API_PATH, gate_wait_s=g.max_wall_s, budget=budget, observer=observer)
-        prop = make_proposer(ctx.up, session, audit_dir=ctx.run_dir / "proposer-audit", timeout=int(g.per_session_s))
+        prop = make_proposer(ctx.up, session, audit_dir=ctx.run_dir / "proposer-audit", timeout=int(g.per_session_s), hint=hint)
         spec = ctx.up.spec.BenchSpec(**{**ss.spec_fields(adapter_root), "name": s.ts.spec_name},
                                      prompts=ctx.up.spec.BenchPrompts(**s.ts.prompt_fields),
                                      channels={"proposer": prop.spec, "selector": prop.spec})
@@ -988,6 +1259,8 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
         res = run(s.task, K, adapter=adapter, prop=prop, runs_root=runs_root, modes=MODES, libraries=None,
                   selector_prop=make_selector_prop(prop))
         audit.emit("run_task_end", status=getattr(res, "status", None))
+        extra = run_extra_rollouts(adapter, res, up=ctx.up, runs_root=runs_root, task=s.task, k=K, n=s.rollouts, audit=audit,
+                                   exhausted=lambda: sweep_exhausted(budget))
     except BaseException as e:   # noqa: BLE001 - audited, torn down below, reported
         error = e
         audit.emit("error", type=type(e).__name__, message=sr.sanitize_terminal(str(e))[:300])
@@ -1007,8 +1280,11 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
         status = str(getattr(res, "status", "unknown"))
     if dirty:
         status = f"{status}+dirty"
-    rollouts = sorted((adapter.rollouts.values() if adapter else []), key=lambda r: r["label"])
+    rollouts = sorted((adapter.rollouts.values() if adapter else []), key=lambda r: _natural(r["label"]))
     selection = _selection_view(res, rollouts) if res is not None else None
+    final_label = selection["chosen_label"] if selection else None
+    pass_rates = {"final_label": final_label, **arm_rates(rollouts, final_label)}
+    rp = rollout_plan(s.rollouts, upstream_p=EXPECTED_P, upstream_r=EXPECTED_R)
     with ids_lock:
         summary = sessions_view(list(starts), list(ends),
                                 rollout_errors=[x for r in rollouts for x in (r.get("errors") or [])],
@@ -1027,14 +1303,23 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
         "started_at": started_at, "finished_at": now_iso(), "wall_s": round(time.monotonic() - t0, 3),
         "channel": {"name": ch.name, "kind": ch.kind, "model": ch.model, "endpoint": ch.endpoints[0],
                     "retention": ch.retention, "caps": ch.caps.to_dict()},
-        "task": s.task, "task_set": s.task_set, "k": K, "modes": list(MODES), "classification": s.classification,
+        "task": s.task, "task_set": s.task_set, "proposer_hint": hint_info, "k": K, "modes": list(MODES),
+        "classification": s.classification,
         "grant": g.to_dict(),
         "ledger": ledger, "budget_identity": {"expected_P": EXPECTED_P, "expected_R": EXPECTED_R, "ok": identity_ok},
         "stages": stages, "selection": selection,
         "rollouts": [{k: r.get(k) for k in ("label", "run_id", "ok", "passed", "n_passed", "n_criteria", "delivered",
                                               "exit_code", "timed_out", "n_events", "duration_s", "error", "errors",
-                                              "answer_excerpt")}
+                                              "answer_excerpt")} | {"arm": arm_of(r["label"], final_label)}
                      for r in rollouts],
+        # n_passed / n per arm, over every rollout of the arm (a dead one counts as not passed): the measurement `selection`
+        # is judged on. `rollouts_plan` is the session arithmetic and what the extra rollouts did.
+        "pass_rates": pass_rates,
+        "rollouts_plan": {"n": rp.n, "upstream_rollouts": rp.upstream_rollouts, "extra_base_planned": rp.extra_base,
+                          "extra_final_planned": rp.extra_final, "rollouts_planned": rp.rollouts,
+                          "sessions_planned": rp.sessions, "extra_base_run": list(extra["base"]),
+                          "extra_final_run": list(extra["final"]), "extra_errors": list(extra["errors"]),
+                          "extra_skipped": extra["skipped"]},
         "rollouts_passed": sum(1 for r in rollouts if r.get("passed") is True),
         "rollouts_failed": sum(1 for r in rollouts if r.get("passed") is False or not r.get("ok")),
         "sessions": {"counts": snapshot["counts"], "refusals": snapshot["refusals"], "remaining_s": snapshot["remaining_s"],
@@ -1050,7 +1335,7 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
         json.dump(report, fh, indent=2, sort_keys=True)
         fh.write("\n")
     audit.emit("sweep_end", status=status, wall_s=report["wall_s"], ledger=ledger, rollouts_passed=report["rollouts_passed"],
-               rollouts_failed=report["rollouts_failed"], report=str(report_path))
+               rollouts_failed=report["rollouts_failed"], pass_rates=pass_rates, report=str(report_path))
     code = (130 if isinstance(error, KeyboardInterrupt) else 3 if dirty else
             1 if error is not None or res is None or not identity_ok or no_model else 0)
     return SweepOutcome(report, code)
@@ -1083,7 +1368,8 @@ def _settings_from(args: argparse.Namespace, environ: Mapping[str, str]) -> Sett
             raise Stage1Error(f"{name} must be a positive number of seconds")
     return Settings(profile=profile, channel=args.channel or CHANNEL, classification=args.classification, wall_s=wall,
                     per_session_s=float(per), cli=args.opencode, runs_dir=runs,
-                    task_set=getattr(args, "task_set", None) or task_sets.DEFAULT)
+                    task_set=getattr(args, "task_set", None) or task_sets.DEFAULT,
+                    proposer_hint=getattr(args, "proposer_hint", None), rollouts=getattr(args, "rollouts", 1))
 
 
 def run_plan(args: argparse.Namespace, *, environ: Mapping[str, str], probes: Probes | None = None,
@@ -1152,14 +1438,14 @@ def run_run(args: argparse.Namespace, *, environ: Mapping[str, str], probes: Pro
     out.write(format_plan(s, pre, plan, [], profile_path=None, with_command=False))
     phrase = confirmation_phrase(s.channel, sweep_id)
     try:
-        confirmed = confirm_on_terminal(phrase, stdin=sin, stdout=out, environ=environ, tty=tty)
+        typed = confirm_typed(phrase, stdin=sin, stdout=out, environ=environ, tty=tty)
     except ApprovalRefused as e:
         err(f"{e}; nothing was started")
         return 2
-    if not confirmed:
+    if typed is None:
         err("the confirmation phrase was not typed exactly; nothing was started")
         return 2
-    approval = Approval(approver_name(), "tty", phrase)
+    approval = Approval(approver_name(), "tty", phrase, typed=typed, agent_env=agent_env_record(environ))
     return _approved(s, plan, pre, up, surface, sweep_id, run_dir, approval, real=True, run_task=run_task, out=out)
 
 
@@ -1172,7 +1458,8 @@ def _approved(s: Settings, plan: SweepPlan, pre: Preflight, up: Any, surface: An
     try:
         audit.emit("plan", plan=plan.to_dict(), preflight={c.name: c.ok for c in pre.checks})
         audit.emit("approval", approved_by=approval.approved_by, mode=approval.mode, sweep_id=sweep_id,
-                   channel=s.channel, approved_for_real_model=real)
+                   channel=s.channel, approved_for_real_model=real, phrase=approval.phrase, typed=approval.typed,
+                   agent_env=dict(approval.agent_env))
         g = grant or make_grant(plan, sweep_id=sweep_id, approval=approval, per_session_s=s.per_session_s)
         audit.emit("grant", **g.to_dict())
         assert pre.verified is not None and pre.image is not None and pre.cli is not None
@@ -1186,7 +1473,10 @@ def _approved(s: Settings, plan: SweepPlan, pre: Preflight, up: Any, surface: An
     out.write(f"\nstatus {r['status']}  wall {r['wall_s']:g} s  ledger {r['ledger'] and (r['ledger']['P'], r['ledger']['R'])}  "
               f"rollouts passed {r['rollouts_passed']}, failed {r['rollouts_failed']}\n")
     out.writelines(sessions_lines(r))
+    out.write(pass_rate_line(r))
     out.write(selection_line(r))
+    if r.get("rollouts_plan", {}).get("extra_skipped"):
+        out.write(f"extra rollouts: {r['rollouts_plan']['extra_skipped']}\n")
     out.write(f"audit  {audit.path}\nreport {run_dir / 'report.json'}\n")
     return outcome.exit_code
 
@@ -1239,12 +1529,12 @@ class FakeOllama:
         self._thread.join(5)
 
 
-def selftest_profile(root: Path, port: int, *, wall_s: int = 600) -> channels.ChannelProfile:
+def selftest_profile(root: Path, port: int, *, wall_s: int = 600, sessions: int = 7) -> channels.ChannelProfile:
     return channels.validate({
         "workspace_roots": [str(root)],
         "channels": {CHANNEL: {"kind": "opencode", "provider": "ollama", "endpoint": f"http://127.0.0.1:{port}/v1",
                                "model": "ollama/gemma4:12b", "retention": "local", "max_classification": "restricted",
-                               "approval": "per-sweep", "caps": {"sessions": 7, "wall_s": wall_s, "cost_usd": 0}}}},
+                               "approval": "per-sweep", "caps": {"sessions": sessions, "wall_s": wall_s, "cost_usd": 0}}}},
         source="<selftest>")
 
 
@@ -1323,15 +1613,36 @@ def harness_evidence(run_dir: Path, ts: ss.TaskSet, surface: Any) -> dict:
     return ev
 
 
+def proposer_audit_evidence(run_dir: Path) -> list[dict]:
+    """What the proposer audit (`proposer-audit/<label>.<key>.meta.json` and `.system.md`) says about the hint, per stage
+    session: the meta's `hint` flag, its hash, whether the recorded block matches that hash, and whether the system text the
+    session was given starts with the block. Read by the selftest only; nothing here is printed or logged."""
+    out = []
+    for meta_path in sorted((run_dir / "proposer-audit").glob("*.meta.json")):
+        with contextlib.suppress(OSError, ValueError):
+            meta = json.loads(meta_path.read_text())
+            system = meta_path.with_name(meta_path.name.removesuffix(".meta.json") + ".system.md")
+            text = system.read_text(encoding="utf-8") if system.is_file() else ""
+            block = meta.get("hint_block") or ""
+            out.append({"label": meta.get("label"), "hint": meta.get("hint"), "hint_sha": meta.get("hint_sha"),
+                        "block_matches_sha": bool(block) and proposer_hint.digest(block) == meta.get("hint_sha"),
+                        "system_starts_with_block": bool(block) and text.startswith(block)})
+    return out
+
+
 def run_selftest(*, base: Path | None = None, out: TextIO | None = None, probes: Probes | None = None,
-                 wall_s: int = 600, per_session_s: float = 120.0, grant_edit: Callable[[ExecutionGrant], ExecutionGrant] | None = None,
+                 wall_s: int | None = None, per_session_s: float = 120.0,
+                 grant_edit: Callable[[ExecutionGrant], ExecutionGrant] | None = None,
                  cli_text: str | None = None, run_task: Callable[..., Any] | None = None,
-                 task_set: str = task_sets.DEFAULT, scenario: str | None = None) -> SweepOutcome:
+                 task_set: str = task_sets.DEFAULT, scenario: str | None = None, proposer_hint: str | None = None,
+                 rollouts: int = 1) -> SweepOutcome:
     """The WHOLE pipeline, with a fake opencode and a fake endpoint: profile -> preflight -> plan -> grant -> contained
     sessions on the real rootless daemon -> report -> teardown. No model is called and no real CLI runs.
 
     `scenario` is what the fake PROPOSER does (see `SCENARIOS`); the default is the old sign-check line on the easy set and
-    the scripted format-rules edit on the hard set. `cli_text`, when given, replaces the fake CLI whole."""
+    the scripted format-rules edit on the hard set. `cli_text`, when given, replaces the fake CLI whole.
+    `proposer_hint` and `rollouts` are the stage-1 flags of the same names (the fake profile gets exactly the
+    `caps.sessions` the rollout arithmetic needs, and `wall_s` defaults to 600 s plus 60 s per session beyond seven)."""
     out = out or sys.stdout
     if not FAKE_CLI.is_file():
         raise Stage1Error(f"the fake opencode {FAKE_CLI} is missing")
@@ -1349,9 +1660,12 @@ def run_selftest(*, base: Path | None = None, out: TextIO | None = None, probes:
         cli = bindir / "opencode"
         cli.write_text(cli_text if cli_text is not None else selftest_cli_text(scenario))
         cli.chmod(0o755)
+        sane = rollouts if isinstance(rollouts, int) and not isinstance(rollouts, bool) and rollouts >= 1 else 1   # Settings refuses the rest
+        rp = rollout_plan(sane, upstream_p=EXPECTED_P, upstream_r=EXPECTED_R)
+        wall = wall_s if wall_s is not None else 600 + 60 * (rp.sessions - 7)
         with FakeOllama() as fake:
-            s = Settings(profile=selftest_profile(wsroot, fake.port, wall_s=wall_s), per_session_s=per_session_s,
-                         cli=str(cli), runs_dir=root / "runs", task_set=task_set)
+            s = Settings(profile=selftest_profile(wsroot, fake.port, wall_s=wall, sessions=rp.sessions), per_session_s=per_session_s,
+                         cli=str(cli), runs_dir=root / "runs", task_set=task_set, proposer_hint=proposer_hint, rollouts=rollouts)
             pr = probes or Probes(environ={})
             pre = preflight(s, pr)
             if not pre.ok:
@@ -1361,7 +1675,8 @@ def run_selftest(*, base: Path | None = None, out: TextIO | None = None, probes:
             up = load_upstream(run_dir / "upstream-runs")
             surface = load_surface()
             plan = build_plan(s, pre, surface)
-            approval = Approval(approver_name(), "selftest", confirmation_phrase(s.channel, sweep_id))
+            approval = Approval(approver_name(), "selftest", confirmation_phrase(s.channel, sweep_id),
+                                agent_env=agent_env_record(os.environ))
             grant = make_grant(plan, sweep_id=sweep_id, approval=approval, per_session_s=s.per_session_s)
             if grant_edit is not None:
                 grant = grant_edit(grant)
@@ -1371,6 +1686,7 @@ def run_selftest(*, base: Path | None = None, out: TextIO | None = None, probes:
             report["_run_dir"] = str(run_dir)
             report["_scenario"] = scenario
             report["_harness"] = harness_evidence(run_dir, s.ts, surface)
+            report["_proposer_audit"] = proposer_audit_evidence(run_dir)
             report["_fake_endpoint_hits"] = fake.hits
             report["_fake_endpoint_rejected"] = [list(x) for x in fake.rejected]
             return SweepOutcome(report, code)
@@ -1384,19 +1700,23 @@ def selftest_problems(outcome: SweepOutcome) -> list[str]:
     always was (all four rollouts correct, no stage fell back); the hard set by `hard_selftest_problems`."""
     r, bad = outcome.report, []
     hard = r.get("task_set") == "hard"
+    plan = r.get("rollouts_plan") or {}
+    ran_r = EXPECTED_R + len(plan.get("extra_base_run") or []) + len(plan.get("extra_final_run") or [])   # upstream's four + ours
     if outcome.exit_code != 0:
         bad.append(f"exit code {outcome.exit_code}, status {r.get('status')}")
     led = r.get("ledger") or {}
     if (led.get("P"), led.get("R")) != (EXPECTED_P, EXPECTED_R):
         bad.append(f"ledger P={led.get('P')} R={led.get('R')}, expected P={EXPECTED_P} R={EXPECTED_R}")
     counts = r["sessions"]["counts"]
-    if (counts.get("proposer"), counts.get("solver")) != (EXPECTED_P, EXPECTED_R):
-        bad.append(f"sessions run: proposer {counts.get('proposer')}, solver {counts.get('solver')}")
-    if len(r["rollouts"]) != EXPECTED_R:
-        bad.append(f"{len(r['rollouts'])} rollouts ran, expected {EXPECTED_R}")
+    if (counts.get("proposer"), counts.get("solver")) != (EXPECTED_P, ran_r):
+        bad.append(f"sessions run: proposer {counts.get('proposer')}, solver {counts.get('solver')}, expected {EXPECTED_P} and {ran_r}")
+    if len(r["rollouts"]) != ran_r:
+        bad.append(f"{len(r['rollouts'])} rollouts ran, expected {ran_r}")
+    if plan.get("extra_errors"):
+        bad.append(f"extra rollouts failed: {plan['extra_errors']}")
     if not hard:
-        if r["rollouts_passed"] != EXPECTED_R:
-            bad.append(f"rollouts: {r['rollouts_passed']} of {len(r['rollouts'])} passed, expected {EXPECTED_R} of {EXPECTED_R}")
+        if r["rollouts_passed"] != ran_r:
+            bad.append(f"rollouts: {r['rollouts_passed']} of {len(r['rollouts'])} passed, expected {ran_r} of {ran_r}")
         if any(st.get("fell_back") for st in r["stages"]):
             bad.append("a proposer stage fell back")
     t = r["teardown"]
@@ -1407,11 +1727,31 @@ def selftest_problems(outcome: SweepOutcome) -> list[str]:
     for status, host in r.get("_fake_endpoint_rejected") or []:
         bad.append(f"the fake model endpoint refused a request with HTTP {status} as a real Ollama would: Host {host!r}")
     sv = r.get("sessions_summary") or {}
-    if sv.get("started") != EXPECTED_P + EXPECTED_R or sv.get("reached_model") != sv.get("started"):
+    if sv.get("started") != EXPECTED_P + ran_r or sv.get("reached_model") != sv.get("started"):
         bad.append(f"the fake model endpoint was reached by {sv.get('reached_model')} of {sv.get('started')} sessions, "
-                   f"expected all {EXPECTED_P + EXPECTED_R}")
+                   f"expected all {EXPECTED_P + ran_r}")
     if hard:
         bad += hard_selftest_problems(r)
+    return bad + hint_selftest_problems(r)
+
+
+def hint_selftest_problems(r: Mapping[str, Any]) -> list[str]:
+    """What the selftest asserts about the proposer hint: the report says what the flag was, and the proposer audit of each
+    of the three stage sessions agrees (hint true with the block, its matching hash and the block in front of the system
+    text the session was given, or hint false with none of them). Nothing to check when a report carries neither."""
+    info, audit = r.get("proposer_hint"), r.get("_proposer_audit")
+    if info is None or audit is None:
+        return []
+    bad: list[str] = []
+    if sorted(str(a.get("label", "")).split(".")[0] for a in audit) != ["agg1", "dom1", "inv1"]:
+        bad.append(f"the proposer audit holds {[a.get('label') for a in audit]}, expected one session each for inv1, dom1 and agg1")
+    for a in audit:
+        if a.get("hint") is not info.get("on"):
+            bad.append(f"{a.get('label')}: the audit says hint={a.get('hint')} but the sweep ran with hint={info.get('on')}")
+        elif info.get("on") and not (a.get("hint_sha") == info.get("sha") and a.get("block_matches_sha") and a.get("system_starts_with_block")):
+            bad.append(f"{a.get('label')}: the audit does not hold the block, its hash and the system text that carries it")
+        elif not info.get("on") and (a.get("hint_sha") or a.get("system_starts_with_block")):
+            bad.append(f"{a.get('label')}: hint is off but the audit records a block")
     return bad
 
 
@@ -1443,13 +1783,17 @@ def hard_selftest_problems(r: Mapping[str, Any]) -> list[str]:
     sel = r.get("selection") or {}
     ev = r.get("_harness") or {}
     mchecks = ev.get("mutation_checks") or []
-    if sorted(stages) != ["agg1", "dom1", "inv1"] or sorted(rollouts) != ["agg1", "base1", "dom1", "inv1"]:
+    plan = r.get("rollouts_plan") or {}
+    n = plan.get("n", 1)
+    extra_base, extra_final = list(plan.get("extra_base_run") or []), list(plan.get("extra_final_run") or [])
+    if sorted(stages) != ["agg1", "dom1", "inv1"] or sorted(rollouts) != sorted(["agg1", "base1", "dom1", "inv1", *extra_base, *extra_final]):
         return bad + [f"unexpected stages {sorted(stages)} or rollouts {sorted(rollouts)}"]
     naive_line = f"Total: {ss_hard.naive_total(inst.input_text)}"
-    base = rollouts["base1"]
-    if base.get("passed") is not False or base.get("n_passed") != 2 or (base.get("answer_excerpt") or "").strip() != naive_line:
-        bad.append(f"base1 must fail on the total alone, with the weak reader's answer {naive_line!r}: "
-                   f"passed={base.get('passed')} n_passed={base.get('n_passed')} answer={base.get('answer_excerpt')!r}")
+    for label in ["base1", *extra_base]:                    # every base rollout, upstream's and ours, is the weak reader's
+        base = rollouts[label]
+        if base.get("passed") is not False or base.get("n_passed") != 2 or (base.get("answer_excerpt") or "").strip() != naive_line:
+            bad.append(f"{label} must fail on the total alone, with the weak reader's answer {naive_line!r}: "
+                       f"passed={base.get('passed')} n_passed={base.get('n_passed')} answer={base.get('answer_excerpt')!r}")
     if "error" in ev:
         bad.append(ev["error"])
     if scenario == "format-rules":
@@ -1472,9 +1816,23 @@ def hard_selftest_problems(r: Mapping[str, Any]) -> list[str]:
                                     or c.get("slots") != {"systemprompt.md": "c1"} for c in mchecks):
             bad.append(f"expected three accepted mutation_check events on systemprompt.md (c1), got {mchecks}")
         want = dict(ok=True, trivial=True, chosen_label="agg1", chosen_is_base=False, chosen_tree_is_base=False,
-                    adopted=True, verdict="improved", base_passed=False, chosen_passed=True)
+                    adopted=True, verdict="improved" if n == 1 else "higher-rate", base_passed=False, chosen_passed=True)
         if {k: sel.get(k) for k in want} != want:
-            bad.append(f"selection should adopt the edited agg1 and be judged improved: {sel}")
+            bad.append(f"selection should adopt the edited agg1 and be judged {want['verdict']}: {sel}")
+        if n > 1:                                            # the rollouts of ours: all there, all as expected, reported as rates
+            if len(extra_base) != n - 1 or len(extra_final) != n - 1 or plan.get("extra_skipped") or plan.get("extra_errors"):
+                bad.append(f"expected {n - 1} extra base and {n - 1} extra final rollouts, run without error: {plan}")
+            for label in extra_final:
+                ro = rollouts[label]
+                if ro.get("passed") is not True or (ro.get("answer_excerpt") or "").strip() != inst.expected_line:
+                    bad.append(f"extra final rollout {label} should pass with {inst.expected_line!r}: passed={ro.get('passed')} "
+                               f"answer={ro.get('answer_excerpt')!r}")
+            pr = r.get("pass_rates") or {}
+            if (pr.get("base") or {}).get("passed") != 0 or (pr.get("base") or {}).get("n") != n \
+                    or (pr.get("final") or {}).get("passed") != n or (pr.get("final") or {}).get("n") != n:
+                bad.append(f"pass rates should be base 0/{n} and final {n}/{n}: {pr}")
+            if not (isinstance(sel.get("fisher_p"), float) and sel["fisher_p"] < 0.05) or "improved" in str(sel.get("verdict")):
+                bad.append(f"{n} rollouts of each should give a significant rate gap and never the word improved: {sel}")
     elif scenario in REFUSED_BY:
         for label in ("inv1", "dom1", "agg1"):
             st, ro = stages[label], rollouts[label]
@@ -1492,6 +1850,14 @@ def hard_selftest_problems(r: Mapping[str, Any]) -> list[str]:
                     adopted=False, verdict="base-kept", base_passed=False, chosen_passed=False)
         if {k: sel.get(k) for k in want} != want:
             bad.append(f"selection should deliver a base-equal agg1 and the runner say base-kept: {sel}")
+        if n > 1:                                            # the baseline is measured N times whatever the proposer did
+            if len(extra_base) != n - 1 or extra_final or plan.get("extra_errors") \
+                    or "no edited harness was adopted" not in str(plan.get("extra_skipped")):
+                bad.append(f"with no edit adopted the {n - 1} base repeats should run, no repeat of the final should, and the plan "
+                           f"should say why: {plan}")
+            pr = r.get("pass_rates") or {}
+            if (pr.get("base") or {}).get("passed") != 0 or (pr.get("base") or {}).get("n") != n:
+                bad.append(f"the pass rate of the base should be 0/{n}: {pr}")
     else:
         bad.append(f"the hard selftest has no expectations for scenario {scenario!r}")
     return bad
@@ -1513,6 +1879,14 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--task-set", default=task_sets.DEFAULT, choices=task_sets.NAMES,
                         help="easy: sum-signed, 5 clean amounts, the base harness already passes it (default); "
                              "hard: sum-signed-hard, 12 amounts in mixed notations the base harness does not explain")
+    common.add_argument("--proposer-hint", choices=HINT_CHOICES, default=None,
+                        help="on: put the runner's ENVIRONMENT RULES (which harness files are mutable and which are "
+                             "read-only) in front of each proposer session's system text; off: do not (run #4's behaviour). "
+                             "Default: on for --task-set hard, off for easy")
+    common.add_argument("--rollouts", type=int, default=1, metavar="N",
+                        help=f"rollouts of the base harness AND of the delivered final, each (default 1 = upstream's own single "
+                             f"one; 1..{MAX_ROLLOUTS}). Upstream rolls one of each, so the other N-1 are made by this runner "
+                             "after it; sessions = 3 proposers + (4 + 2*(N-1)) rollouts must fit the profile's caps.sessions")
     sub.add_parser("plan", parents=[common], help="read-only: validate, preflight, print the plan and the approve command")
     run = sub.add_parser("run", parents=[common], help="approve and run the sweep (the only place a real model is called)")
     run.add_argument("--approve", metavar="CHANNEL", help="the channel you approve; a phrase must also be typed on a terminal")
@@ -1522,8 +1896,22 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--task-set", default=task_sets.DEFAULT, choices=task_sets.NAMES,
                     help="hard: also prove the improvement loop (an edit is harvested, checked, run as a candidate and adopted; "
                          "forbidden edits are refused), one sweep per scenario")
+    st.add_argument("--proposer-hint", choices=HINT_CHOICES, default=None,
+                    help="as for plan and run (default: on for --task-set hard, off for easy)")
+    st.add_argument("--rollouts", type=int, default=1, metavar="N",
+                    help="as for plan and run: N rollouts of the base and of the delivered final (the fake profile gets "
+                         "caps.sessions = 3 + 4 + 2*(N-1) to match)")
     st.add_argument("--scenario", choices=SCENARIOS, help="run only this fake-proposer scenario (default: all of the task set's)")
     return p
+
+
+def selftest_detail(report: Mapping[str, Any]) -> str:
+    """The second line of a selftest's summary: the sessions that ran, the hint and the pass rates (the first line is pinned)."""
+    sv, plan = report.get("sessions_summary") or {}, report.get("rollouts_plan") or {}
+    hint = report.get("proposer_hint") or {}
+    return (f"  {sv.get('started')} sessions (3 proposer + {sv.get('started', 0) - 3} rollouts; planned {plan.get('sessions_planned')}), "
+            f"proposer hint {'on, ' + str(hint.get('sha')) if hint.get('on') else 'off'}; "
+            + (pass_rate_line(report).strip() or "no pass rate"))
 
 
 HARD_SCENARIOS = ("format-rules", "forbid-guardrails", "forbid-executable", "forbid-frontmatter", "forbid-script")
@@ -1539,7 +1927,8 @@ def run_hard_selftests(args: argparse.Namespace) -> int:
         if args.keep_in:
             base = Path(args.keep_in).resolve() / scenario
             base.mkdir(parents=True, exist_ok=True)
-        outcome = run_selftest(base=base, task_set=args.task_set, scenario=scenario, out=io.StringIO())
+        outcome = run_selftest(base=base, task_set=args.task_set, scenario=scenario, out=io.StringIO(),
+                               proposer_hint=args.proposer_hint, rollouts=args.rollouts)
         problems = selftest_problems(outcome)
         for p in problems:
             print(f"selftest[{args.task_set}/{scenario}] FAILED: {p}", file=sys.stderr)
@@ -1549,6 +1938,7 @@ def run_hard_selftests(args: argparse.Namespace) -> int:
               f"selection {sel.get('verdict')} (final {sel.get('chosen_label')}, "
               f"{'edited harness adopted' if sel.get('adopted') else 'base harness kept'}), "
               f"teardown clean: {not outcome.report['teardown']['docker_leftovers'] and not outcome.report['teardown']['scratch_left']}")
+        print(selftest_detail(outcome.report))
         failed += bool(problems)
     return 1 if failed else 0
 
@@ -1567,7 +1957,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.cmd == "selftest" and args.task_set != task_sets.DEFAULT:
             return run_hard_selftests(args)
         if args.cmd == "selftest":
-            outcome = run_selftest(base=Path(args.keep_in).resolve() if args.keep_in else None)
+            outcome = run_selftest(base=Path(args.keep_in).resolve() if args.keep_in else None, proposer_hint=args.proposer_hint,
+                                 rollouts=args.rollouts)
             problems = selftest_problems(outcome)
             for p in problems:
                 print(f"selftest FAILED: {p}", file=sys.stderr)
@@ -1576,6 +1967,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                   f"R={outcome.report['ledger'] and outcome.report['ledger']['R']}, "
                   f"rollouts {outcome.report['rollouts_passed']}/{len(outcome.report['rollouts'])} correct, "
                   f"teardown clean: {not outcome.report['teardown']['docker_leftovers'] and not outcome.report['teardown']['scratch_left']}")
+            print(selftest_detail(outcome.report))
             return 1 if problems else 0
         parser.print_help()
         return 2

@@ -28,7 +28,8 @@ Policy, all of it enforced before a single byte reaches an upstream:
     that names the route) are parsed ONE BY ONE on the keep-alive stream, and only the (method, exact path)
     pairs in the route's `allow` list are forwarded (see `OLLAMA_ROUTE_ALLOW`); everything else is a logged
     403 `unix-route-path-denied` and the connection is closed. A forwarded request is rebuilt from parsed
-    parts (the allow-listed literal path, a pinned `Host`, `Content-Length` framing only), its body is read
+    parts (the allow-listed literal path, a pinned `Host`, `Content-Length` framing only, and on a model POST the proxy's
+    own `Content-Type: application/json` in place of every client `Content-*` header), its body is read
     and bounded first, and the response is relayed as it arrives (SSE streams unchanged) while its framing is
     followed so the next request on the connection can be told apart;
   * caps: request line 8 KiB, header block 32 KiB, 100 headers, a total deadline for the request head
@@ -109,6 +110,14 @@ OLLAMA_ROUTE_ALLOW: tuple[tuple[str, str], ...] = (
 # large local model could be picked. Its value must be one of the route's `allowed_models` (the channel's approved model).
 MODEL_CHECKED: frozenset[tuple[str, str]] = frozenset({("POST", "/v1/chat/completions"), ("POST", "/v1/completions"),
                                                        ("POST", "/api/show")})
+# The proxy reads the body of a MODEL_CHECKED POST as strict JSON, so upstream must read it as JSON too. The client's
+# entity headers are forwarded unchanged on every other route, but here a different Content-Type (form-urlencoded: a JSON
+# body can carry a second `model` under that reading) or a Content-Encoding / Content-Transfer-Encoding (the bytes we
+# checked are not the bytes upstream decodes) would let the pinned model be bypassed if any handler ever bound by them.
+# So a model POST takes exactly one `Content-Type: application/json` (optionally `; charset=utf-8`) and no encoding header,
+# and the forwarded head carries the proxy's own `Content-Type: application/json` and `Content-Length` only.
+_JSON_CONTENT_TYPE = re.compile(r"application/json(?:[ \t]*;[ \t]*charset=utf-8)?", re.IGNORECASE)
+_ENCODING_HEADERS = frozenset({"content-encoding", "content-transfer-encoding"})
 _MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")      # an ollama model name: no space, slash, wildcard, non-ASCII
 MAX_ALLOWED_MODELS = 32
 LOG_MODEL_MAX = 64
@@ -391,6 +400,10 @@ def _route_allow(raw: object) -> frozenset[tuple[str, str]]:
         if not _ROUTE_PATH.fullmatch(path) or "//" in path or any(seg in (".", "..") for seg in path.split("/")):
             raise ValueError(f"unix route allow entry {item!r}: the path must be an exact, normalised path (no wildcard, "
                              "query, percent-encoding, double slash or dot segment)")
+        if method == "POST" and (method, path) not in MODEL_CHECKED:
+            # the model of a body is only pinned on MODEL_CHECKED: a POST added to `allow` would be forwarded unchecked
+            raise ValueError(f"unix route allow entry {item!r}: a POST must be one whose body is model-checked "
+                             f"({sorted(p for m, p in MODEL_CHECKED)})")
         out.add((method, path))
     return frozenset(out)
 
@@ -662,17 +675,38 @@ def request_framing(req: Request) -> tuple[str, int, bool]:
     return kind, length, close
 
 
-def rewrite_routed(req: Request, host: str, port: int, path: str, body_len: int | None, close: bool) -> bytes:
+def model_route_content_type(req: Request) -> str:
+    """The `Content-Type` to forward on a model POST (always `application/json`), or a refusal. A Content-Encoding or
+    Content-Transfer-Encoding header of any value is refused first (`unix-route-content-encoding-denied`, 403); then the
+    request must carry exactly one Content-Type that is `application/json`, optionally with `; charset=utf-8`, any case
+    (`unix-route-content-type-denied`, 403: missing, repeated or anything else). Neither refusal logs the client's value."""
+    if any(n.lower() in _ENCODING_HEADERS for n, _ in req.headers):
+        raise Refused("unix-route-content-encoding-denied", 403)
+    values = [v for n, v in req.headers if n.lower() == "content-type"]
+    if len(values) != 1 or not _JSON_CONTENT_TYPE.fullmatch(values[0].strip(" \t")):
+        raise Refused("unix-route-content-type-denied", 403)
+    return "application/json"
+
+
+def _is_entity_header(low: str) -> bool:
+    return low.startswith("content-") or low in ("digest", "repr-digest", "want-digest", "want-repr-digest")
+
+
+def rewrite_routed(req: Request, host: str, port: int, path: str, body_len: int | None, close: bool,
+                   content_type: str | None = None) -> bytes:
     """The request sent over a unix route, built from parsed parts: the (allow-listed, literal) path, a `Host` pinned
-    to the route's own name, every other header but the hop-by-hop and framing ones, and `Content-Length` framing of
-    the body the proxy already read (a chunked client body is re-sent as a length: upstream sees one framing only)."""
+    to the route's own name, every other header but the hop-by-hop, framing and entity ones (`Content-*`, `Digest`: the
+    client's description of a body the proxy has already read), and the proxy's own `Content-Type` (when given) and
+    `Content-Length` framing of the body (a chunked client body is re-sent as a length: upstream sees one framing only)."""
     shown = f"[{host}]" if ":" in host else host
     lines = [f"{req.method} {path} {req.version}", f"Host: {shown}:{port}"]
     for name, value in req.headers:
         low = name.lower()
-        if low == "host" or low in _HOP_BY_HOP or low in ("content-length", "transfer-encoding"):
+        if low == "host" or low in _HOP_BY_HOP or low == "transfer-encoding" or _is_entity_header(low):
             continue
         lines.append(f"{name}: {value}")
+    if content_type is not None:
+        lines.append(f"Content-Type: {content_type}")
     if body_len is not None:
         lines.append(f"Content-Length: {body_len}")
     if close:
@@ -1184,6 +1218,7 @@ class Proxy:
                         kind, length, close = request_framing(req)
                         if kind == "length" and length > lim.route_max_request_bytes:
                             raise Refused("unix-route-body-too-large", 413)
+                        content_type = model_route_content_type(req) if (req.method, path) in MODEL_CHECKED else None
                         body, buf = await self._read_body(reader, buf, kind, length)
                         if (req.method, path) in MODEL_CHECKED:
                             check_model_body(path, body, policy.route_models[(host, port)])
@@ -1199,7 +1234,8 @@ class Proxy:
                         self.route_requests += 1
                         last = close or self.route_requests >= lim.route_max_requests
                         self._log("allow", *(allow_line or (host, port, "unix-route")))
-                        data = rewrite_routed(req, host, port, path, len(body) if req.method == "POST" else None, last) + body
+                        data = rewrite_routed(req, host, port, path, len(body) if req.method == "POST" else None, last,
+                                              content_type) + body
                         moved[0] += len(data)
                         uw.write(data)
                         await uw.drain()

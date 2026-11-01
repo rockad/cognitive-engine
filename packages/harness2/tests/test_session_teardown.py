@@ -258,3 +258,81 @@ def test_teardown_called_on_its_own_reraises_the_first_interrupt_after_finishing
     with pytest.raises(KeyboardInterrupt):
         r._teardown(names, base, ["n1", "n2"], contextlib.ExitStack())
     assert r.count("kill") == 3 and r.count("network rm") == 2 and not base.exists()       # the interrupted kill was retried
+
+
+# ══ the window between entering `finally:` and the shield being in place ═════════════════════════════════════════════════
+# An interrupt that lands after the body has ended but before SIGINT and SIGTERM are ignored (the `finally:` entry, the
+# `_shielded_from_interrupts()` call, the first `signal.signal`) used to skip the whole teardown with no SessionCleanupError.
+# The teardown now resumes: the interrupt is remembered (re-raised last, like any other) and the teardown runs again, shielded.
+
+
+def _interrupt_entering_the_shield(how, times=1):
+    """A replacement for `_shielded_from_interrupts` whose first `times` entries are interrupted before the real shield is up."""
+    real = sr._shielded_from_interrupts
+    left = [times]
+
+    @__import__("contextlib").contextmanager
+    def shield():
+        if left[0] > 0:
+            left[0] -= 1
+            how()
+        with real():
+            yield
+    return shield
+
+
+def _raise_ki():
+    raise KeyboardInterrupt("in the window")
+
+
+def _deliver_sigint():
+    os.kill(os.getpid(), signal.SIGINT)
+    for _ in range(3):                      # the handler runs between bytecodes of this thread
+        pass
+
+
+@pytest.mark.parametrize("how", [_raise_ki, _deliver_sigint], ids=["raised", "real-sigint"])
+@pytest.mark.parametrize("times", [1, 2, 3])
+def test_an_interrupt_before_the_shield_is_up_does_not_skip_the_teardown(world, monkeypatch, how, times):
+    r, plan = make(world)
+    monkeypatch.setattr(sr, "_shielded_from_interrupts", _interrupt_entering_the_shield(how, times))
+    with pytest.raises(KeyboardInterrupt):
+        r._execute(plan)                                   # the interrupt is not swallowed ...
+    assert_fully_cleaned(r, world)                         # ... and the whole teardown, reclaim and leftover check still ran
+
+
+def test_the_interrupt_in_the_window_is_the_one_reraised_and_no_cleanup_error_is_raised(world, monkeypatch):
+    first = KeyboardInterrupt("first")
+    r, plan = make(world)
+
+    def how():
+        raise first
+    monkeypatch.setattr(sr, "_shielded_from_interrupts", _interrupt_entering_the_shield(how))
+    with pytest.raises(KeyboardInterrupt) as ei:
+        r._execute(plan)
+    assert ei.value is first and not isinstance(ei.value, sr.SessionCleanupError)
+
+
+def test_an_interrupt_between_the_two_handler_installs_leaves_the_old_handlers_in_place(world, monkeypatch):
+    sentinel_int, sentinel_term = (lambda *a: None), (lambda *a: None)
+    old_int, old_term = signal.signal(signal.SIGINT, sentinel_int), signal.signal(signal.SIGTERM, sentinel_term)
+    try:
+        real = signal.signal
+        seen = []
+
+        def flaky(sig, handler):
+            seen.append((sig, handler))
+            out = real(sig, handler)
+            if len(seen) == 1 and handler == signal.SIG_IGN:
+                raise KeyboardInterrupt("right after the first install")       # SIGINT is already ignored, SIGTERM not yet
+            return out
+        monkeypatch.setattr(sr.signal, "signal", flaky)
+        r, plan = make(world)
+        with pytest.raises(KeyboardInterrupt):
+            r._execute(plan)
+        assert signal.getsignal(signal.SIGINT) is sentinel_int and signal.getsignal(signal.SIGTERM) is sentinel_term
+        assert_fully_cleaned(r, world)
+    finally:
+        signal.signal(signal.SIGINT, old_int)
+        signal.signal(signal.SIGTERM, old_term)
+

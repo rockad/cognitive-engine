@@ -147,6 +147,30 @@ def _present(spec: Any) -> dict[str, str]:
     return present
 
 
+@dataclass(frozen=True)
+class SurfaceEntry:
+    """One place on a surface: the slot it belongs to and its path (`where`), or a `<name>` template for a family."""
+    slot: str
+    where: str
+
+    @property
+    def is_template(self) -> bool:
+        return "<" in self.where
+
+
+def layout(spec: Any) -> tuple[tuple[SurfaceEntry, ...], tuple[SurfaceEntry, ...]]:
+    """(mutable, read-only) entries of `spec`, in slot order: the same partition `check_surface` makes, as data a prompt
+    can be written from. A slot is mutable only if its component is in `invariants.MUTABLE` right now; every other slot
+    present on the surface (guardrails, scripts, plugins, a composite AGENTS.md, an unknown file) is read-only.
+    Raises InvariantViolation for a spec shape it does not recognise."""
+    _require_spec(spec)
+    mutable: list[SurfaceEntry] = []
+    readonly: list[SurfaceEntry] = []
+    for slot, where in _present(spec).items():
+        (mutable if _component_if_mutable(slot) is not None else readonly).append(SurfaceEntry(slot, where))
+    return tuple(mutable), tuple(readonly)
+
+
 def _denial(slot: str, where: str) -> str:
     if slot.startswith("unknown:"):
         return f"{where}: not a slot this module recognises (unknown slot, denied by default)"
