@@ -30,7 +30,7 @@ flowchart TD
     QuotaCheck -->|Quota OK| Proposer["Harness² Proposer<br/>(Mutates Unprotected Components)"]
     QuotaCheck -->|Constrained| AbortQuota["Skip Probing & Retain Baseline"]
 
-    Proposer --> SbxCheck{"sbx on $PATH?"}
+    Proposer --> SbxCheck{"sbx verified and runner AUTO?"}
     SbxCheck -->|Yes| SbxProber["Local sbx Sandboxes<br/>Parallel Candidate Execution"]
     SbxCheck -->|No| DockerCheck{"Rootless Docker Available?"}
     DockerCheck -->|Yes| DockerProber["Ephemeral Docker Sandbox<br/>(--network none, --read-only)"]
@@ -57,11 +57,11 @@ flowchart TD
 ### 2.2 Execution Isolation via Dual-Engine Local Sandboxing (`sandbox.py`)
 Probing trajectories require strict local execution isolation to protect host state:
 - **Primary: Native Local MicroVM Sandboxes (`sbx`)**:
-  - Probing trajectories execute in local sandboxes using native `sbx` when available on `$PATH`.
+  - Probing trajectories execute in local sandboxes using native `sbx`. `sbx` is the AUTO default for model-free untrusted execution (see section 9.7 for the full selection matrix).
   - Cloud sandboxing is explicitly prohibited; code, files, and credentials never leave the host machine.
-  - *Status*: `SbxRunner` is implemented but unverified against a real binary because standalone `sbx` is not installed on this host.
+  - *Status*: `sbx` v0.50.1 is **verified live** (2026-10-31) and is in `VERIFIED_SBX_VERSIONS`.
 - **Secondary: Ephemeral Rootless Docker Container Fallback (`DockerRunner`)**:
-  - If `sbx` is unavailable on `$PATH`, the prober falls back to an ephemeral, rootless Docker container sandbox configured with:
+  - If `sbx` is unavailable or its version is not verified, the prober falls back, loudly, to an ephemeral, rootless Docker container sandbox configured with:
     - `--network none` (strict network isolation, zero egress)
     - `--read-only` (read-only root filesystem, scratch in tmpfs only)
     - Pinned unix socket execution, dropped capabilities (`--cap-drop ALL`), `no-new-privileges`, unprivileged user (`65534:65534`), and candidate staged read-only at `/candidate`
@@ -144,7 +144,7 @@ The optimizer is strictly barred from modifying:
 - [x] FastMCP server initializes and exposes all tools (`harness2_{propose,probe,compose,reflect,trigger,status}`).
 - [x] The server passes the MCP conformance runner (RFC 001 D30), including forged Host / foreign Origin refusal and strict arguments: 12/12 on the real daemon.
 - [x] Probing triggers execute successfully: advisory push via hook script (`packages/harness2/hooks/harness2-advise.sh`) plus read-only pull tool (`harness2_trigger` with `advise`/`ready` semantics). Pure logic and hook smoke-tested.
-- [x] Option A Dual-Engine sandbox isolation executes candidate trajectories: ephemeral rootless Docker container (`--network none`, `--read-only`, zero egress) verified against live daemon (`unix:///run/user/1000/docker.sock`; 21 real-daemon integration tests pass unskipped). Native local `sbx` microVMs supported via `SbxRunner` (unverified on host; `sbx` not installed).
+- [x] Option A Dual-Engine sandbox isolation executes candidate trajectories: ephemeral rootless Docker container (`--network none`, `--read-only`, zero egress) verified against live daemon (`unix:///run/user/1000/docker.sock`; 21 real-daemon integration tests pass unskipped). Native local `sbx` microVMs (`SbxRunner`, v0.50.1) verified live and selected by default for model-free untrusted execution, with a loud Docker fallback (section 9.7).
 - [x] Missing sandbox runtime (neither `sbx` nor Docker available) triggers clean fail-closed abort without executing code.
 - [x] `GET /api/v1/key` pre-flight prevents execution when quota limits are reached. *(Tested against mocked responses; the live field names are unverified.)*
 - [x] Experience reflections write exclusively to `~/.local/share/cognitive-engine/experiences/`. *(Staged lessons are pending until a human approves them through the CLI.)*
@@ -159,7 +159,7 @@ The optimizer is strictly barred from modifying:
 2. **Read-only tools.** `harness2_status` (offline readiness report) and `harness2_trigger` (read-only advisory pull check with `advise`/`ready` semantics).
 3. **`dry_run` on `harness2_propose`.** Reports policy verdict without calling a model.
 4. **Only four components are mutable.** `prompt`, `tool_description`, `context_assembly`, `decomposition_strategy`. All others refused.
-5. **Human sign-off is a CLI step.** An agent stages lessons with `harness2_reflect`; only a human approves them with `cognitive-harness2 experience approve`.
+5. **Human sign-off is a CLI step.** An agent stages lessons with `harness2_reflect`; a human approves them with `cognitive-harness2 experience approve`. The gate raises the bar for agents and scripts but has a stated residual limit (section 9.6).
 6. **Upstream consumption.** Pinned git dependency at `1cfe254e` (extra `upstream`).
 7. **Slice 3 Two Gated Steps**:
    - **Slice 3a (Safety Seams)**: Wire `MUTABLE` <-> upstream `SurfaceSpec` default-deny, egress gate on Proposer endpoint, `Substrate.preflight` -> `require_rootless_docker`, quota/ledger pre-flight. Zero model calls, zero execution. Subject to independent review and user gate.
@@ -346,7 +346,7 @@ Slice 3b executes through three strictly sequential, user-gated stages:
 
 ### Slice 3b Stage 1: Local Smoke (Gated on User Go)
 - [x] Glibc-based rootless container image (`ubuntu:26.04`) built and verified on local daemon (run #4, 2026-10-31).
-- [x] Host unix-socket bridge and forward proxy container route container traffic to loopback Ollama only (7/7 sessions reached the model). Caveat: the ollama management API is still reachable through the unix route (route filter in progress, section 9.4).
+- [x] Host unix-socket bridge and forward proxy container route container traffic to loopback Ollama only (7/7 sessions reached the model). The ollama management API is no longer reachable: the route allow-list closes it (section 9.5).
 - [x] Containerized `opencode` session launched and output captured (7 sessions exit 0).
 - [x] Frontmatter freeze validator covered by slice 3a / WS-D tests. **Not exercised by a live accepted edit**: no proposer edit was accepted in run #4.
 - [x] Smoke sweep (P=3 proposer sessions, R=4 solver rollouts) completed in 127 s, $0, clean teardown. Resource caps were not stressed.
@@ -369,9 +369,9 @@ The following architectural assumptions are tracked and verified across slice sp
 3. **Rootless Docker Host-Loopback Egress**: **DISPROVEN & REDESIGNED**. Direct container-to-host loopback via TCP is impossible under rootlesskit `gvisor-tap-vsock`. Replaced with host unix-socket bridge + forward proxy container architecture. **The replacement is VERIFIED by run #4 (2026-10-31)**: 7/7 sessions in the contained `opencode` reached the model through egress proxy, host bridge and ollama.
 4. **Containerized opencode end to end**: **VERIFIED by run #4 (2026-10-31)**. opencode v2.0.25 in the contained session, `--standalone`, exit 0 in 7/7 sessions, JSON event stream captured, teardown clean (nothing left behind daemon-wide). Required fixes are in section 6.2 item 3 (NO_PROXY, network alias, provider block).
 5. **Local model viability**: **VERIFIED by run #4 and the benchmark (section 9.2)** for `gemma4:e4b` 16k with thinking ON. `gemma4:12b` is **DISPROVEN** on this host (8 GB GPU shared with the desktop).
-6. **Native `sbx` MicroVMs**: **STILL UNVERIFIED**. `sbx` (Docker Sandboxes v0.50.1) is now installed. The real command flow is `create` / `cp` / `exec` / `rm --force`, and its daemon needs the `kvm` gid (started via `sg kvm`). Live verification is in progress and `VERIFIED_SBX_VERSIONS` is still empty. The default runner no longer selects `sbx` merely because it is on `PATH`. Ephemeral rootless Docker remains the verified sandbox.
+6. **Native `sbx` MicroVMs**: **VERIFIED live (2026-10-31, v0.50.1)**. The real command flow is `create` / `cp` / `exec` / `rm --force`, and its daemon needs the `kvm` gid (started via `sg kvm`). `sbx` is now the AUTO default for model-free untrusted execution, with a loud Docker fallback; model sessions stay on Docker (section 9.7).
 7. **Live OpenRouter Quota Response Schema**: **STILL UNVERIFIED**. Field names for `GET /api/v1/key` are verified against mock schemas but pending validation against live endpoint responses (Stage 2).
-8. **Accepted proposer edit applied and re-scored**: **STILL UNVERIFIED**. No proposer edit has been accepted yet (section 9.3).
+8. **Accepted proposer edit applied and re-scored**: **STILL UNVERIFIED**. No proposer edit has been accepted in run #4 or in the three stage 1b runs (sections 9.3 and 9.4).
 9. **`claude_cli` token delivery (value vs file)**: **STILL UNVERIFIED / unsolved** (Stage 3).
 
 ---
@@ -405,16 +405,73 @@ Proven by run #4:
 
 **Not proven:**
 - **No accepted proposer edit has been exercised.** All three proposer stages kept the base harness because the base already passes the task. The edit-apply, frontmatter-freeze-on-live-edit and re-score path has therefore never run on a real candidate.
-- The stage-1 task is too easy to discriminate harnesses; the inv1 2/3 result is noise, not signal.
+- The stage-1 task is too easy to discriminate harnesses; the inv1 2/3 result is noise, not signal. Stage 1b (section 9.4) did not change this.
 - Nothing about stages 2 and 3 (OpenRouter, subscription channels).
 
-### 9.4 Known gaps and open items
+### 9.4 Stage 1b results (hard task set, 2026-10-31)
 
-- **Route filter**: the ollama management API is reachable through the unix route; hardening is in progress.
-- **Stage 1b**: a harder task set so that a proposer edit can be accepted; in progress.
-- **Test isolation**: real-daemon tests assert "nothing left behind" daemon-wide on a shared rootless Docker daemon, so concurrent agents must serialize Docker-backed runs; isolation work is open.
-- **sbx verification**: in progress (assumption 6).
+Stage 1b added a harder task set so that a proposer edit could be accepted and re-scored: the `sum-signed-hard` task, a deliberately weak base harness, and a `--task-set {easy,hard}` selector.
+
+| Run | Model | Outcome |
+|---|---|---|
+| 1b-1 | gemma4:e4b (16k) | No proposer edit accepted. The INV proposer edited a `c7` script and the slot table refused it. |
+| 1b-2 | gemma4:e4b (16k) | No proposer edit accepted. The INV proposer edited a `c7` script again and the slot table refused it. |
+| 1b-3 | qwen3-4b-16k | No proposer edit accepted. The qwen proposers made no edit. |
+
+Honest reading:
+- **The loop is unproven.** No run produced an accepted edit, so apply, frontmatter freeze on a live edit, and re-score have still never run on a real candidate.
+- The base harness passes about half the time at k=1, so a pass/fail difference between harnesses is noise, not signal.
+- The two refusals are evidence that the slot table works against a real proposer (it stopped a `c7` edit), not evidence that the optimizer improves anything.
+- Next step: improve the proposer's signal by telling it which files are mutable. Check first that the upstream rules allow this.
+
+### 9.5 Route filter and model pinning
+
+The forward proxy admits only an allow-list of method and path pairs on the unix route to ollama:
+- `GET /api/tags`
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- `POST /v1/completions`
+- `POST /api/show`
+
+Everything else is refused, which closes the ollama management API that run #4 left reachable (the earlier "route filter in progress" note is closed). The denial log records the method and path of each refused request. The proxy also pins the model: a request that names any model other than the approved one is refused, so a contained session cannot switch to a larger or different model through the allowed endpoints. The `ACCESS-SUMMARY` counters now cover the proxy traffic of a run.
+
+### 9.6 Approval gate: the true guarantee and the residual limit
+
+The `experience approve` gate is a human-in-the-loop control. What it guarantees:
+- An agent or script that has no controlling terminal, pipes its input, or passes a flag or marker supplied in-band cannot approve. Marker-style approval is refused.
+- Confirmation is read from `/dev/tty` and must include a per-invocation nonce that the human reads from the prompt and types back, so a prewritten answer does not work.
+
+What it does not guarantee: a process running as the same user can allocate and drive a pty, and can therefore imitate a human at a terminal. The gate stops accidental and naive automated approval; it is not a defence against a hostile same-user process. The containment of model sessions (section 6.2 item 3) does not rely on this gate; the gate only guards the step where a human accepts staged output.
+
+### 9.7 Sandbox selection: sbx default and fallback matrix
+
+`sbx` v0.50.1 was verified live on 2026-10-31 and is the AUTO default for **model-free** untrusted execution. Selection is explicit and loud:
+
+| Runner setting | Work | Result |
+|---|---|---|
+| AUTO (default) | Model-free untrusted execution, `sbx` verified | `sbx` |
+| AUTO | Model-free untrusted execution, `sbx` missing or version not verified | Docker, with a loud warning that names the reason |
+| `docker` | Any | Docker is forced; `sbx` is never tried |
+| `sbx` | Any model-free | `sbx`, or fail closed if it is unavailable (no Docker fallback) |
+| any | Model sessions (proposer channels) | Docker only; model sessions stay on Docker |
+| any | Neither runtime available | Fail closed; no code runs |
+
+Precondition for `sbx`: both host-reach settings must be off, otherwise the runner refuses to start. Earlier text in this RFC that described `sbx` as "unverified", "not installed" or only selected on explicit opt-in is superseded by this section.
+
+### 9.8 Slot table enforced on every task set
+
+The slot table (section 6.2 item 5) is now enforced on every task set, easy and hard, not only on the original smoke task. A proposer edit to a denied component (`c2`, `c7`, `c8`) or to a frozen frontmatter key is refused whichever `--task-set` is selected. Stage 1b exercised this for real: the INV proposer's `c7` edits were refused in both gemma runs.
+
+### 9.9 Known gaps and open items
+
+- **Proposer signal**: no accepted proposer edit yet (section 9.4); hint the proposer which files are mutable once the upstream rules are confirmed to allow it.
+- **Test isolation**: done. Leak checks use per-run ids rather than daemon-wide counts, so a concurrent agent's containers no longer break the "nothing left behind" assertions.
 - **`claude_cli` token delivery** (value vs file): unsolved.
-- **Stages 2 and 3**: user-gated, not started.
+- **Stages 2 and 3**: user-gated, not started. Stage 2 (OpenRouter, zdr strict, dollar cap) and Stage 3 (Claude and Antigravity channels, zdr off, open content only) each need a separate user go.
+- **Jev guard backlog** (tracked in the Track 1 PR stack): click-through false positives on `this` and variable keys, the resume model gap, and project configs.
 - **Locks**: `mkdir`-based locks are NOT exclusive under rapid create/remove cycling on this host. The hook uses a lock-free line-number position; `flock` works.
 - **`agy` headless feasibility** (single endpoint `daily-cloudcode-pa.googleapis.com:443`) remains a spike result only.
+
+### 9.10 Final verification (Fable 5.1)
+
+A final verification pass found no critical issue and no smuggling path out of a contained session. It led to these fixes in the same body of work: the Jev Agent-guard unknown-agent hole (HIGH), approval gate hardening (section 9.6), model pinning in the proxy (section 9.5), `ACCESS-SUMMARY` counters, non-interruptible teardown, the slot table on every task set (section 9.8), and lower-severity items.

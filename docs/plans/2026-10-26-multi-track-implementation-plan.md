@@ -186,8 +186,8 @@ Full list with evidence in [RFC 003 §4](../rfc/003-memory-lookup.md). The ones 
     - Proposes candidate prompt/tool/context mutations across allowed dimensions without ground truth.
     - Behavioral contrast composer synthesizes candidate outputs into human-reviewable proposals.
   - **Dual-Engine Execution Isolation**:
-    - Primary: Parallel candidate execution runs inside local Docker Sandboxes via standalone `sbx` CLI. (Implemented via `SbxRunner`, unverified on host as `sbx` is not installed).
-    - Fallback: Ephemeral rootless Docker container sandbox (`--network none`, `--read-only`, zero off-host egress) when `sbx` is not installed.
+    - Primary: Parallel candidate execution runs inside local Docker Sandboxes via standalone `sbx` CLI (`SbxRunner`, v0.50.1 verified live 2026-10-31; AUTO default for model-free untrusted execution).
+    - Fallback: Ephemeral rootless Docker container sandbox (`--network none`, `--read-only`, zero off-host egress), used loudly when `sbx` is unavailable and always for model sessions.
     - Host prerequisite: Rootless Docker is **installed and verified on host** (`unix:///run/user/1000/docker.sock`, `docker info` reports `name=rootless`). 21 real-daemon integration tests pass unskipped.
   - **Fail-Closed Sandbox Fallback**:
     - If neither `sbx` nor Docker is available, candidate probing fails closed immediately.
