@@ -13,7 +13,7 @@
  * Everything else Jev does for a turn (advice, dispatch, telemetry) is advice from the MCP tools.
  */
 import { modelTierRank } from './core/governance.js';
-import { describeAgentLookup, readAgentDefinition } from './agent-definitions.js';
+import { describeAgentLookup, missingAgentDetail, readAgentDefinition } from './agent-definitions.js';
 import { assessModelRequest } from './models.js';
 import { evaluateWorkflowInput } from './workflow-guard.js';
 import { resolveSessionModel, sessionModelFromTranscript, type SessionModelSource } from './session-model.js';
@@ -85,8 +85,8 @@ function unknownAgentVerdict(call: AgentCall, cwd: string | undefined): Verdict 
   return {
     decision: 'ask',
     reason:
-      `[jev] The subagent type ${label} is not a built-in agent and no definition for it could be found, so the model it will run on cannot be checked against the session ceiling. ` +
-      `Looked in ${describeAgentLookup(cwd)}. Approve only if that agent is trusted to run on the session model or a cheaper one, or deny and re-run with an explicit model.`,
+      `[jev] The subagent type ${label} is not a built-in agent and ${missingAgentDetail(describeAgentLookup(cwd))} ` +
+      'Approve only if that agent is trusted to run on the session model or a cheaper one, or deny and re-run with an explicit model.',
     audit: { kind: 'unknown-agent', subagent_type: typeof type === 'string' ? type : null }
   };
 }

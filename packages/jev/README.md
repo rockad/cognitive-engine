@@ -59,6 +59,12 @@ Ported from `agentic-hub/plugins/jev` v2.3.0. Of the Claude Code hooks, only the
 
 `bun src/hook.ts claude|antigravity` is a narrow `PreToolUse` guard (`src/guard.ts`). Claude Code asks before a subagent runs on a model above the session's (version-aware ranking, `src/models.ts`); Antigravity asks before any Pro-class subagent. It is the only enforcement point (`jev_dispatch` and its clamp are advice). For a call with no `model`, the model comes from the subagent's definition, looked up from the hook cwd up to the project root (`CLAUDE_PROJECT_DIR`, else the git root), then `~/.claude/agents`, then installed plugins (`plugin:agent` names look only in that plugin); a subagent type that is not a Claude Code built-in (`general-purpose`, `Explore`, `Plan`, `statusline-setup`, `claude-code-guide`) and has no definition found asks, as the Workflow guard does. It is deterministic, makes no network calls, and runs in Jev modes `on` and `on-demand` (not `off`); once active, it asks rather than passing silently when it cannot evaluate a call. A malformed Jev config fails loudly: see Configuration.
 
+### Agent definition lookup
+
+Both guards (the Agent/Task guard and the Workflow guard's `agentType`) read a subagent's `model:` from its definition file, nearest first: project `.claude/agents` from the hook cwd up to the project root, `~/.claude/agents`, then installed plugins. Plugins are searched in this order: those enabled per `enabledPlugins` (`~/.claude/settings.json`, then the project's `.claude/settings.json` and `settings.local.json`, later layers winning, only a literal `true` enables), then every other installed plugin, each group in manifest order. This only orders the search: a disabled or unlisted plugin's definition is still found, so a lookup never finds fewer definitions than a plain search of all. Unreadable settings leave the manifest order.
+
+When no definition is found both guards ask, in the same words: the agent is named, with the sentence "no definition for it could be found, so the model it will run on cannot be checked against the session ceiling" and every location searched. A Workflow `agentType` that names a Claude Code built-in (`Explore`, `Plan`, ...) still asks, since the Workflow guard has no built-in list; the Agent/Task guard passes built-ins.
+
 ### Session model (Claude Code)
 
 The ceiling is the session's model, which Claude Code does not put in any `PreToolUse` payload. The guard builds it from two pieces of evidence and orders them by time (`resolveSessionModel`, `src/session-model.ts`):
