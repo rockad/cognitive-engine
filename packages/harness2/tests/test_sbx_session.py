@@ -12,6 +12,7 @@ import _thread
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -368,6 +369,57 @@ def test_an_interrupt_in_the_middle_of_a_session_still_removes_rules_sandbox_pro
     assert world.listed() == [] and world.rules() == [] and world.runtime_leftovers() == []
     verbs = world.verbs()
     assert verbs[-4:] == ["rm", "ls", "policy ls", "ls"] or "rm" in verbs
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP])
+def test_a_terminate_signal_in_the_middle_of_a_session_runs_the_same_teardown_as_ctrl_c(world, sig):
+    """A plain `kill`, a systemd stop, `timeout` or a closed terminal must not skip the `finally`: the microVM would keep
+    running the CLI with the workspace mounted read-write and its allow rules in place."""
+    seen: list[int] = []
+    sentinel = lambda signum, frame: seen.append(signum)       # noqa: E731 - what the process had before the session
+    old = signal.signal(sig, sentinel)
+    during: list[object] = []
+
+    def deliver_when_running():
+        for _ in range(200):
+            if (world.fake / "session_argv").exists():
+                during.append(signal.getsignal(sig))
+                os.kill(os.getpid(), sig)
+                return
+            time.sleep(0.05)
+
+    t = threading.Thread(target=deliver_when_running, daemon=True)
+    t.start()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            world.runner(env={"FAKE_SBX_EXEC_HANG": "1"}).run(world.spec(timeout_s=60))
+        t.join()
+        assert seen == [] and during and during[0] is not sentinel         # the session had its own handler, not the old one
+        assert signal.getsignal(sig) is sentinel                           # and the previous one is back afterwards
+    finally:
+        signal.signal(sig, old)
+    assert world.listed() == [] and world.rules() == [] and world.runtime_leftovers() == []
+    verbs = world.verbs()
+    assert verbs[-4:] == ["rm", "ls", "policy ls", "ls"]                   # the whole teardown ran, with its proof
+
+
+def test_the_previous_handlers_are_restored_after_a_normal_session_too(world):
+    before = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+    world.runner().run(world.spec())
+    assert {s: signal.getsignal(s) for s in before} == before
+
+
+def test_the_terminate_handler_is_not_installed_outside_the_main_thread():
+    out: list[object] = []
+
+    def body():
+        before = signal.getsignal(signal.SIGTERM)
+        with ss._terminate_as_interrupt():
+            out.append(signal.getsignal(signal.SIGTERM) is before)
+    t = threading.Thread(target=body)
+    t.start()
+    t.join()
+    assert out == [True]                                                   # nothing to install there, and nothing raised
 
 
 def test_an_interrupt_inside_one_teardown_step_does_not_skip_the_others(world, monkeypatch):

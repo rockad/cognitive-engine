@@ -331,6 +331,51 @@ def _die_with_parent() -> None:
         pass
 
 
+_TERMINATE_SIGNALS = tuple(s for s in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)) if s is not None)
+
+
+@contextlib.contextmanager
+def _terminate_as_interrupt():
+    """SIGTERM and SIGHUP raise `KeyboardInterrupt` for the duration, so they take the path Ctrl-C takes (the `finally`, the
+    shielded teardown). Previous handlers are restored after, also if the body raises. Only the main thread can install a signal
+    handler; anywhere else this does nothing (and a kill there is a hard kill, which the next run's sweep cleans up)."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def handler(signum, frame):  # noqa: ARG001
+        raise KeyboardInterrupt(f"terminated by {signal.Signals(signum).name}")
+
+    saved: dict[int, object] = {}
+    for sig in _TERMINATE_SIGNALS:
+        with contextlib.suppress(ValueError, OSError):
+            saved[sig] = signal.signal(sig, handler)
+    try:
+        yield
+    finally:
+        for sig, previous in saved.items():
+            with contextlib.suppress(ValueError, OSError, TypeError):
+                signal.signal(sig, previous)
+
+
+@contextlib.contextmanager
+def _shielded_teardown():
+    """The teardown ignores SIGINT and SIGTERM (`session_runner._shielded_from_interrupts`) and SIGHUP too, so a second signal
+    cannot cut it short. Handlers are restored after."""
+    with sr._shielded_from_interrupts():
+        hup = getattr(signal, "SIGHUP", None)
+        previous = None
+        if hup is not None and threading.current_thread() is threading.main_thread():
+            with contextlib.suppress(ValueError, OSError):
+                previous = signal.signal(hup, signal.SIG_IGN)
+        try:
+            yield
+        finally:
+            if previous is not None:
+                with contextlib.suppress(ValueError, OSError, TypeError):
+                    signal.signal(hup, previous)
+
+
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -699,6 +744,13 @@ class SbxSessionRunner(sr.ProposerSessionRunner):
     # ── a session ─────────────────────────────────────────────────────────────────
 
     def _execute(self, plan: sr.Plan) -> sr.SessionResult:
+        """One session. For its whole length (main thread) SIGTERM and SIGHUP raise `KeyboardInterrupt`, like Ctrl-C, so a plain
+        `kill`, a systemd stop, `timeout` or a closed terminal runs the same shielded teardown instead of leaving the microVM (with
+        the workspace mounted read-write and its allow rules) behind. The previous handlers are restored afterwards."""
+        with _terminate_as_interrupt():
+            return self._execute_session(plan)
+
+    def _execute_session(self, plan: sr.Plan) -> sr.SessionResult:
         spec = plan.spec
         run_id = secrets.token_hex(6)
         name = sandbox_name(run_id, scope=run_scope.current())
@@ -725,7 +777,7 @@ class SbxSessionRunner(sr.ProposerSessionRunner):
             error = e
         finally:
             cleanup = sr._Cleanup()
-            with sr._shielded_from_interrupts():
+            with _shielded_teardown():
                 self._teardown_sbx(name, live, stack, cleanup)
                 if spec.reclaim_workspace:
                     reclaimed = cleanup.run(self._reclaim_host, plan.workspace, default=False)
