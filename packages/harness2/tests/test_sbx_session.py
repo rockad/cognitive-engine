@@ -355,7 +355,7 @@ def test_a_wall_clock_timeout_kills_the_client_and_removes_everything(world):
 
 def test_an_interrupt_in_the_middle_of_a_session_still_removes_rules_sandbox_proxy_and_files(world):
     def interrupt_when_running():
-        for _ in range(200):
+        for _ in range(1200):                         # up to 60 s: the proxy start and the create are slow on a loaded host
             if (world.fake / "session_argv").exists():
                 _thread.interrupt_main()
                 return
@@ -381,7 +381,7 @@ def test_a_terminate_signal_in_the_middle_of_a_session_runs_the_same_teardown_as
     during: list[object] = []
 
     def deliver_when_running():
-        for _ in range(200):
+        for _ in range(1200):                         # up to 60 s: the proxy start and the create are slow on a loaded host
             if (world.fake / "session_argv").exists():
                 during.append(signal.getsignal(sig))
                 os.kill(os.getpid(), sig)
