@@ -76,7 +76,6 @@ describe('frontmatter shapes that name a model above the session model ask', () 
     ['CR-only line endings', fm('name: q\nmodel: opus', '\r')],
     ['opening delimiter with trailing spaces', `---  \nmodel: opus\n---\nbody\n`],
     ['model after a multi-line block scalar that mentions another model', fm('description: |\n  model: haiku\n  more\nmodel: opus')],
-    ['model after a multi-line quoted description', fm('description: "line one\nmodel: haiku"\nmodel: opus')],
     ['model after a description containing a colon', fm('description: Use this: when needed\nmodel: opus')]
   ];
   for (const [name, text] of asks) {
@@ -117,7 +116,11 @@ describe('frontmatter whose model cannot be established asks', () => {
     ['blank line before the opening delimiter', `\n${fm('model: opus')}`],
     ['space before the opening delimiter', ` ${fm('model: opus')}`],
     ['Unicode line separator in the block', fm('name: q\u2028model: opus')],
-    ['a model Jev cannot rank', fm('model: nonexistent-model')]
+    ['a model Jev cannot rank', fm('model: nonexistent-model')],
+    // a multi-line quoted value is read differently by Claude Code's fallback parser (see agent-frontmatter-differential.test.ts)
+    ['model after a multi-line quoted description', fm('description: "line one\nmodel: haiku"\nmodel: opus')],
+    // Claude Code only sees a block closed by `---`, so it reads no frontmatter at all here
+    ['a document end marker closing the block', `---\nmodel: haiku\n...\nbody\n`]
   ];
   for (const [name, text] of asks) {
     it(`asks: ${name}`, () => {
@@ -151,8 +154,7 @@ describe('frontmatter that is read exactly allows what it should', () => {
     ['a nested model key', fm('tools:\n  model: opus\nname: q')],
     ['a model mentioned in a block scalar only', fm('description: |\n  model: opus\nname: q')],
     ['a model mentioned in a comment only', fm('# model: opus\nname: q')],
-    ['a model mentioned in the body only', `---\nname: q\n---\nmodel: opus\n`],
-    ['a document end marker closing the block', `---\nmodel: haiku\n...\nbody\n`]
+    ['a model mentioned in the body only', `---\nname: q\n---\nmodel: opus\n`]
   ];
   for (const [name, text] of allows) {
     it(`allows: ${name}`, () => {
