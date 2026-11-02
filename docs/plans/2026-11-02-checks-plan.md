@@ -79,6 +79,20 @@ The dry runs cannot predict what happens after a conflict is resolved by hand. A
 
 Every PR gets the same envelope before and after (rows M-x.1 to M-x.3), then its own rows.
 
+**The order is also in the PR list.** Every open PR title starts with `[merge N/9 · after #X]` and every description starts with a banner (between `<!-- merge-order:start -->` and `<!-- merge-order:end -->`) holding the full nine-row table, so a reviewer can read the order from the PR list alone. Claude regenerates the banner and titles whenever the order changes or a PR merges or is retargeted (check M-N.3).
+
+| Title prefix | PR | Branch | Base now |
+| --- | --- | --- | --- |
+| `[merge 1/9]` | #3 | `feat/track1-jev-adapters` | `main` |
+| `[merge 2/9 · after #3]` | #4 | `fix/agent-guard-unknown-agents` | #3's branch |
+| `[merge 3/9 · after #4]` | #8 | `feat/track2-memory-lookup` | `main` |
+| `[merge 4/9 · after #8]` | #9 | `feat/mcp-conformance` | #8's branch |
+| `[merge 5/9 · after #9]` | #5 | `feat/stage1-integration` | `main` |
+| `[merge 6/9 · after #5]` | #6 | `feat/model-bench` | #5's branch |
+| `[merge 7/9 · after #6]` | #10 | `feat/lookup-smb-sources` | #8's branch |
+| `[merge 8/9 · after #10 · LAST]` | #7 | `docs/stage1-findings` | `main` |
+| `[merge 9/9 · after #7]` | this docs PR | `docs/future-plans` | #7's branch |
+
 **Envelope, for every PR N.**
 
 | Id | When | What | Command or evidence | Owner | Blocked by | Status |
