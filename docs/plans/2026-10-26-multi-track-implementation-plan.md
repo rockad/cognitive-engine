@@ -688,7 +688,8 @@ Command, run on `docs/future-plans` after the corrections:
 
 `rg -n -i "clean-room|No upstream package is wrapped|DeepMind|no custom session hooks|fail-open shell wrapper|HANDOFF.md|docs/handoffs|about half|half the time|Fable 5.1" docs README.md`
 
-- `clean-room`, `No upstream package is wrapped`, `DeepMind`, `no custom session hooks`, `fail-open shell wrapper`, `half the time`: no hit anywhere.
+- `clean-room`, `No upstream package is wrapped`, `DeepMind`, `no custom session hooks`, `fail-open shell wrapper`: no hit except the search command itself, written in this appendix and in Checks plan C-4. Intentional (self-references).
+- `half the time` (RFC 004 section 9.4, Checks plan M-5.j and R-8): the quoted PR #5 body sentence and the note that it is superseded by the measured 0 of 8. Intentional historical notes.
 - `Fable 5.1` (RFC 004 section 9.10, this plan section 3.3.3, Checks plan, RFC 006): every hit is the correction note that the first review was requested on Fable 5.1 and served by Sonnet 5.5. Intentional.
 - `about half` (RFC 004 section 9.4 and 9.11, this plan section 3.3.3, Checks plan M-5.j and R-8, Experiments plan section 8): every hit says the estimate was superseded by the measured 0 of 8, or names the PR #5 body sentence that still has to be edited. Intentional historical notes.
 - `HANDOFF.md` and `docs/handoffs` (Checks plan sections 2, 3.7 to 3.9, and this plan section 6.1): rules for resolving the merge conflicts with the removed files and the statement that `origin/main` still carries them until #7 merges. Intentional.
