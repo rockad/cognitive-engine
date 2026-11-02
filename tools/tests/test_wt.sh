@@ -28,8 +28,6 @@ chmod +x "$HUB_DIR/tools/wt" "$HUB_DIR/.githooks/pre-commit"
 
 # Initial commit
 echo "# Test Repo" > README.md
-mkdir -p docs/handoffs
-echo "initial bridge text" > docs/handoffs/antigravity-claude-bridge.md
 git add .
 git commit -m "initial commit" --quiet
 
@@ -67,13 +65,13 @@ git reset --hard HEAD --quiet
 rm -f dirty.txt
 
 # 6. Test: tools/wt new strictly refuses dirty hub with zero exceptions
-echo "channel update" >> docs/handoffs/antigravity-claude-bridge.md
+echo "uncommitted edit" >> README.md
 if "$HUB_DIR/tools/wt" new branch-one 2>/dev/null; then
-  echo "FAIL: tools/wt new did not refuse dirty hub (bridge file uncommitted)" >&2
+  echo "FAIL: tools/wt new did not refuse dirty hub (uncommitted edit)" >&2
   exit 1
 fi
 echo "PASS: tools/wt new strictly refuses dirty hub with zero exceptions"
-git checkout -- docs/handoffs/antigravity-claude-bridge.md 2>/dev/null || git restore docs/handoffs/antigravity-claude-bridge.md
+git checkout -- README.md 2>/dev/null || git restore README.md
 "$HUB_DIR/tools/wt" new branch-one
 if [ ! -d "$TMP_DIR/cognitive-engine-branch-one" ]; then
   echo "FAIL: tools/wt new failed to create worktree on clean hub" >&2
