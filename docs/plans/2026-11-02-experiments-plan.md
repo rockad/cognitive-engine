@@ -15,7 +15,7 @@
 
 An experiment here tests a hypothesis that can come out either way. Pass or fail engineering checks (merges, tickets, acceptance tests) are in the [Checks plan](2026-11-02-checks-plan.md).
 
-**Background.** Stage 1 proved the plumbing with local models (RFC 004 section 9). The improvement loop is UNPROVEN: no proposer edit has been adopted in any of 5 real hard-set runs (gemma4-e4b-16k and qwen3-4b-16k; one interrupted run, `a81f`, had a slot-table-legal `systemprompt.md` edit whose candidate rollout failed, with no final or selection: RFC 004 section 9.11); the 4B proposers write the answer into a script (slot `c7`) and the slot table refuses the whole proposal; the measured baseline on `household/hard-1` is 0 of 8. **User decision (2026-11-01): stop loop experiments on local models; test later with a smarter proposer.** This plan is the "later", and it does not start anything.
+**Background.** Stage 1 proved the plumbing with local models (RFC 004 section 9). The improvement loop is UNPROVEN: one legal edit was accepted by the gates (run `a81f`, aborted by the user, one rollout sample, unmeasured: a slot-table-legal `systemprompt.md` edit whose candidate rollout failed, with no final or selection), but no edit was ADOPTED by selection in the four completed hard-set runs (`1493`, `82cd`, `5ead`, `d08d`; `base-kept` every time; gemma4-e4b-16k and qwen3-4b-16k; a second aborted run, `72a1`, made no edit: RFC 004 section 9.11); the 4B proposers write the answer into a script (slot `c7`) and the slot table refuses the whole proposal; the measured baseline on `household/hard-1` is 0 of 8. **User decision (2026-11-01): stop loop experiments on local models; test later with a smarter proposer.** This plan is the "later", and it does not start anything.
 
 **Experiments in this plan.**
 
@@ -69,7 +69,7 @@ With alpha corrected for up to 3 adopted sweeps (0.05 / 3 = 0.0167): from a 0 of
 | Run | Sessions | Wall | Solver median | Proposer median | Model requests per session | Notes |
 | --- | --- | --- | --- | --- | --- | --- |
 | `58c3` (run #4, easy set) | 7 | 127.7 s | 11.2 s | 20.5 s | not summarised here | `base1` met 3 of 3 criteria (one rollout); `inv1` 2 of 3; all stages kept the base |
-| `82cd` (1b, hard) | 7 | 246.5 s | 23.0 s | 36.4 s | not summarised here | no accepted edit |
+| `82cd` (1b, hard) | 7 | 246.5 s | 23.0 s | 36.4 s | not summarised here | no edit adopted (`base-kept`) |
 | `d08d` (1c, hard, 8 rollouts) | 14 | 440.9 s | 27.6 s (max 46.2) | 38.4 s (max 49.0) | solver 6 to 10 (mean 7.4); proposer 9 to 16 (mean 13) | base 0 of 8; 2 `mutation_check` refused, 1 `ok` with no change |
 
 The solver median varies 2.5 times between runs on the same route (11.2 s versus 27.6 s). Any latency comparison therefore needs a same-day control (EXP-3).
@@ -125,7 +125,7 @@ The model id is chosen by the user from the OpenRouter catalogue at the time of 
 - **Tool calling works** through the OpenAI-compatible `/v1/chat/completions` that `opencode` v2.0.25 uses via `@ai-sdk/openai-compatible`. This is verified first with the existing stub probe pattern (`tests/real_cli_probe.py`, no hosted call) and then by the first sweep itself.
 - **Context of at least 32k tokens** and a documented price, with the central cost of one sweep at or below half the per-sweep cap.
 - **Reasoning behaviour that can be bounded**: a model that bills unbounded reasoning is excluded unless the profile can limit it.
-- **Exact id pinned in the proxy.** The route pins the model name; the name sent by `opencode` must equal the approved name (see the R-1 finding about model-denied requests in the Checks plan: on the local route every session had denied requests, cause UNVERIFIED, and a naming mismatch must be understood before a hosted run).
+- **Exact id pinned in the proxy.** The route pins the model name; the name sent by `opencode` must equal the approved name (see the R-1 finding, RESOLVED 2026-11-02, in the Checks plan: on the local route every session had model-denied requests because `opencode` calls `POST /api/show` for every model that `GET /api/tags` lists and the pin allows only the approved one, which is the pin working as designed; the sessions are unaffected. A hosted run must still send exactly the approved id).
 - Not the same family as the solver, to avoid self-preference. Not required, but recorded.
 - Fable is not available on the user's subscription; this does not restrict OpenRouter models.
 
@@ -161,7 +161,7 @@ The model id is chosen by the user from the OpenRouter catalogue at the time of 
 - **Selection rule at k=1** (section 3): adoption does not mean improvement.
 - **Rollouts are not independent draws of tasks.** They are repeats on one instance; Fisher treats them as independent Bernoulli trials.
 - **Hint effect.** The `ENVIRONMENT RULES` hint is on, as in stage 1c; a hint-off arm is not run.
-- **Model denial anomaly (R-1).** Eight denied requests per session on the local route are unexplained; a hosted route could behave differently and fail for a naming reason.
+- **Model denials on the local route (R-1, RESOLVED 2026-11-02).** Four or eight denied requests per session on the local route are `POST /api/show` calls for the other installed models, refused by the model pin as designed; they do not fail a session. The run summary does not count model denials (Checks plan R-18), so the denial check in the table below must read the per-session `egress_denied` in `audit.jsonl` and the model names in the `egress` log lines, not `denied_requests`. A hosted route could still fail for a naming reason, so the approved id is checked first.
 - **Multiple looks.** Up to 3 sweeps; handled by the corrected alpha. The N=16 extension is a second look and is flagged as such if used.
 - **Non-stationarity.** Hosted models change; the model id, date and provider route are recorded per sweep (names and hashes, not content).
 - **Cost uncertainty.** The estimate may be wrong by a factor of 5 in either direction.

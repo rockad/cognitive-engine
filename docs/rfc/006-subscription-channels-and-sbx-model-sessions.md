@@ -18,7 +18,7 @@
 
 ## 1. Summary & Motivation
 
-Stage 1 proved the plumbing with a local model: contained sessions, the allow-list egress proxy with route filter and model pinning, the host unix-socket bridge, the approval gate, the slot table, harvest, teardown and audit (RFC 004 section 9). It did not prove the improvement loop: no proposer edit has been adopted in any of 5 real hard-set runs (one interrupted run accepted a legal edit that was scored once and never selected), and the baseline is 0 of 8 (RFC 004 section 9.11). On 2026-11-01 the user stopped loop experiments on local models and asked for a smarter proposer later.
+Stage 1 proved the plumbing with a local model: contained sessions, the allow-list egress proxy with route filter and model pinning, the host unix-socket bridge, the approval gate, the slot table, harvest, teardown and audit (RFC 004 section 9). It did not prove the improvement loop: one legal edit was accepted by the gates (run `a81f`, aborted, one rollout sample, unmeasured), but no edit was adopted by selection in the four completed hard-set runs (`1493`, `82cd`, `5ead`, `d08d`; verdict `base-kept` every time; two more hard-set runs, `a81f` and `72a1`, were aborted), and the baseline is 0 of 8 (RFC 004 section 9.11). On 2026-11-01 the user stopped loop experiments on local models and asked for a smarter proposer later.
 
 This RFC covers the two pieces of "item 4" that sit on that path:
 
