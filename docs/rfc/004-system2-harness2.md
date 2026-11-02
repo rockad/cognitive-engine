@@ -6,9 +6,10 @@
 - **Runtime**: Python 3.12 / uv
 - **License**: Apache-2.0
 - **Target Subsystem**: `packages/harness2/`
-- **Target Branch**: `feat/track3-harness2`
+- **Target Branch**: `feat/track3-harness2` (the PR is `feat/stage1-integration`, PR #5, which contains it; PR #6 `feat/model-bench` is stacked on #5)
 - **Parent Blueprint**: [RFC 001: Cognitive Engine Architecture](001-harness2-jev-unified-cognitive-substrate.md)
 - **Implementation Plan**: [Multi-Track Implementation Plan](../plans/2026-10-26-multi-track-implementation-plan.md)
+- **Follow-up**: [RFC 006: Subscription Proposer Channels (Stage 3) and sbx for Model Sessions](006-subscription-channels-and-sbx-model-sessions.md) (Stage 3 design, credential delivery, sbx default criteria)
 
 ---
 
@@ -354,10 +355,12 @@ Slice 3b executes through three strictly sequential, user-gated stages:
 ### Slice 3b Stage 2: OpenRouter Integration (Gated)
 - [ ] OpenRouter channel profile validates against schema with strict ZDR enforcement.
 - [ ] Dollar budget cap enforced fail-closed by ledger pre-flight.
+- Prerequisites found 2026-11-02 (PR #5 head `9f12381`): `stage1.py` pins `ZDR = "strict"` and its preflight accepts only an `opencode` channel with `retention = "local"` on a loopback endpoint, and the solver runner refuses a non-local channel, so the stage-1 runner must be generalised first; the key cannot be passed in the environment (RFC 006 section 2.3, decision D9). Experiment design: [Experiments plan](../plans/2026-11-02-experiments-plan.md) EXP-1.
 
 ### Slice 3b Stage 3: Subscription Channels (Gated)
 - [ ] Subscription channel profiles validate with `retention: unknown` and clamp sweep classification to `open`.
 - [ ] Containerized `claude_cli` and `agy_cli` sessions execute without leaking credentials outside container.
+- Design: [RFC 006](006-subscription-channels-and-sbx-model-sessions.md) (Proposed, not accepted). It proposes to strengthen the second box to "the long-lived credential is never present in the session container" (a credential route in the egress proxy for `claude_cli`; `agy_cli` keeps a file credential until the proxy has HTTP/2). The box text here is unchanged until RFC 006 is accepted.
 
 ---
 
@@ -371,8 +374,8 @@ The following architectural assumptions are tracked and verified across slice sp
 5. **Local model viability**: **VERIFIED by run #4 and the benchmark (section 9.2)** for `gemma4:e4b` 16k with thinking ON. `gemma4:12b` is **DISPROVEN** on this host (8 GB GPU shared with the desktop).
 6. **Native `sbx` MicroVMs**: **VERIFIED live (2026-10-31, v0.50.1)**. The real command flow is `create` / `cp` / `exec` / `rm --force`, and its daemon needs the `kvm` gid (started via `sg kvm`). `sbx` is now the AUTO default for model-free untrusted execution, with a loud Docker fallback; model sessions stay on Docker (section 9.7).
 7. **Live OpenRouter Quota Response Schema**: **STILL UNVERIFIED**. Field names for `GET /api/v1/key` are verified against mock schemas but pending validation against live endpoint responses (Stage 2).
-8. **Accepted proposer edit applied and re-scored**: **STILL UNVERIFIED**. No proposer edit has been accepted in run #4, the three stage 1b runs or stage 1c (sections 9.3, 9.4 and 9.11).
-9. **`claude_cli` token delivery (value vs file)**: **STILL UNVERIFIED / unsolved** (Stage 3).
+8. **Accepted proposer edit applied and re-scored**: **STILL UNVERIFIED**. No proposer edit has been accepted in run #4, the three stage 1b runs or stage 1c (sections 9.3, 9.4 and 9.11). One qualification: the interrupted run `a81f` accepted a legal `systemprompt.md` edit and scored its candidate rollout, but has no composed final or selection (section 9.11).
+9. **`claude_cli` token delivery (value vs file)**: **STILL UNVERIFIED / unsolved** (Stage 3). [RFC 006](006-subscription-channels-and-sbx-model-sessions.md) proposes a delivery design (credential route in the proxy); the Claude CLI's behaviour with a custom base URL is untested (RFC 006 spike A-11).
 
 ---
 
@@ -440,7 +443,7 @@ Everything else is refused, which closes the ollama management API that run #4 l
 The approval of a real-model sweep (`stage1 run --approve <channel>`, `confirm_on_terminal`) is a human-in-the-loop control. What it does (hardened 2026-10-31 after an independent adversarial review, section 9.10):
 - The process must have a controlling terminal: the confirmation is read from `/dev/tty`, never from stdin, so pipes, redirected stdin and scripts without a tty are refused.
 - The typed text is the approval phrase plus a fresh four-word nonce shown on the terminal, so a prewritten answer does not work.
-- The command refuses to run, with no flag to override it, when the environment carries a known agent-harness marker (`CLAUDECODE`, the Claude Code runtime variables `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_EXECPATH`, `CLAUDE_CODE_CHILD_SESSION`, `CLAUDE_CODE_SESSION_ATTENDED`, `CLAUDE_CODE_MESSAGING_SOCKET` and `CLAUDE_CODE_BRIDGE_SESSION_ID`, `OPENCODE`, `CODEX_SANDBOX*`, `ANTIGRAVITY*`, `GEMINI_CLI*`, `AGY_*`; the Antigravity, Gemini and `AGY_` names are prefix guesses, not names the repo has observed; the `CLAUDE_CODE_*` settings a person exports, such as `CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE`, are NOT markers).
+- The command refuses to run, with no flag to override it, when the environment carries a known agent-harness marker (`CLAUDECODE`, the Claude Code runtime variables `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_EXECPATH`, `CLAUDE_CODE_CHILD_SESSION`, `CLAUDE_CODE_SESSION_ATTENDED`, `CLAUDE_CODE_MESSAGING_SOCKET` and `CLAUDE_CODE_BRIDGE_SESSION_ID`; the code at PR #5's head also lists `CLAUDE_PID` and `CLAUDE_JOB_DIR`, an ASSUMPTION that Claude Code sets them only in its own sessions and the user's own terminal does not, UNVERIFIED until the user checks it; `OPENCODE`, `CODEX_SANDBOX*`, `ANTIGRAVITY*`, `GEMINI_CLI*`, `AGY_*`; the Antigravity, Gemini and `AGY_` names are prefix guesses, not names the repo has observed; the `CLAUDE_CODE_*` settings a person exports, such as `CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE`, are NOT markers).
 
 What it does not guarantee: a process running as the same user can allocate and drive a pty (`pty.fork`, `script`, `expect`, `tmux send-keys`), read the nonce and type it back, and it can scrub the environment markers. The gate stops pipes, scripts and anything running inside a known agent harness; it is not a defence against a determined same-user process, and the human remains the control. `tests/test_stage1_approval_pty.py` asserts both sides (a pty driver without markers is still approved; with markers it is refused). The containment of model sessions (section 6.2 item 3) does not rely on this gate.
 
@@ -490,7 +493,7 @@ Stage 1c asked two things: does telling the proposer which files are mutable sto
 | Run id | `stage1-20261101T185011Z-d08d` |
 | Flags | `--task-set hard --rollouts 8 --proposer-hint on`; profile `caps.sessions=21` |
 | Sessions | 14 of 21 planned ran (3 proposers plus 11 solver rollouts), 441 s |
-| Health | All exit 0, no timeouts, no denied requests, teardown clean |
+| Health | All exit 0, no timeouts, teardown clean. Correction (2026-11-02): the earlier text said "no denied requests"; `report.json` and `audit.jsonl` show every one of the 14 sessions logged denied requests (20 over the 3 proposer sessions, 56 over the 11 solver sessions), all reason `unix-route-model-denied` on `harness2-proxy.internal:11434`. They failed no session. What the denied requests were is UNVERIFIED (the proxy refuses a request whose body names a model other than the pinned one) |
 | Verdict | `base-kept` |
 
 Baseline (rollouts `base1`..`base8`): **0 of 8 passed**. Answers: -302.27, -1292.27, -1191.31, -292.27, 10572.61, -291.27, -291.27, 7729.49; the correct answer is -1291.27. The baseline on the hard task is a measurement now. The "about half" in section 9.4 was an earlier estimate and is superseded. The unedited starting harness rolled in `dom1` and `agg1` (passed) and `inv1` (failed): 2 of 3, not separable from luck.
@@ -504,7 +507,8 @@ Proposer hint: the runner's `ENVIRONMENT RULES` block, derived from the slot tab
 No edited harness was adopted, so the 7 extra final rollouts did not run (extras for the base always run, decision 2026-11-01).
 
 Honest reading:
-- No proposer edit has been accepted in any real run: 5 real hard-set runs across gemma and qwen. The loop is unproven; this run does not change that.
+- No proposer edit has been adopted in any real run: 5 real hard-set runs that started proposer sessions, across gemma and qwen. The loop is unproven; this run does not change that.
+- Qualification (2026-11-02, from `audit.jsonl`, names and counts only): in the interrupted run `stage1-20261031T183543Z-a81f` (status `aborted`) one proposer's `mutation_check` is `ok: true` with `changed: ["systemprompt.md"]` (slot `c1`), so a slot-table-legal edit was accepted by the check and its candidate rollout `dom1` ran and failed, while the unedited `inv1` passed. That run has no composed final and no selection, so it shows neither an improvement nor a regression. The edit's content was not read.
 - The 4B local proposers' habit is to write the answer into a script, which the slot table refuses.
 - The slot table again worked against a real proposer.
 
