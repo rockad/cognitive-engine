@@ -549,3 +549,148 @@ To guarantee zero race conditions between Antigravity and Claude Code:
 When using dynamic multi-agent workflows in Claude Code, Jev participates in the workflow loop to judge subagent suitability, recommend model tiers, and gate quality.
 - **Overshadowing Analysis & Seam Design**: Dedicated follow-up architecture plan established in [docs/plans/2026-10-28-claude-workflows-jev-integration-plan.md](2026-10-28-claude-workflows-jev-integration-plan.md).
 - **Guiding Invariant**: Jev operates as an **asynchronous advisory coprocessor** (providing probabilistic sizing, free-tier offloading, and milestone `jev_judge` gates) rather than a rigid synchronous execution interceptor, preserving Claude Code's emergent workflow adaptation and avoiding latency amplification or context pollution.
+
+---
+
+## Appendix A: Reconciliation 2026-11-02
+
+Every status claim, workstream row, checkbox, PR or branch name, test count, model or version claim and open item in this plan was checked against the repository and the run records on 2026-11-02, and the three companion documents ([RFC 006](../rfc/006-subscription-channels-and-sbx-model-sessions.md), [Checks plan](2026-11-02-checks-plan.md), [Experiments plan](2026-11-02-experiments-plan.md)) were checked against this plan and each other.
+
+**Method and limits.**
+
+- Read-only. `git fetch origin`, then `git`, `gh pr view` and `gh pr list` for #3 to #10, `rg` and `git show origin/<branch>:<path>` for code at `origin/feat/stage1-integration` (`9f12381`), `origin/fix/agent-guard-unknown-agents` (`fb9fb8d`), `origin/feat/track1-jev-adapters` (`61fd4a3`), `origin/feat/lookup-smb-sources` (`205a332`) and `origin/docs/stage1-findings` (`19de968`); `jq` over `report.json` and `audit.jsonl` of the stage-1 run directories (counts, labels and file names only; no prompt or model text was read); the tracker `~/.agents/cognitive-engine-tasklist.md` and the design note were read only.
+- No test suite, daemon, container, sbx sandbox or model was run. Test counts are therefore quoted from commit messages and PR bodies and marked as such.
+- A claim is `confirmed` when a command or file named in the evidence column shows it, `corrected` when it was false, stale or incomplete and the text changed, and `unverified` when it could not be checked from here (the evidence column says why).
+
+### A.1 Claim table
+
+| # | Claim | Where | Verdict | Evidence | What changed |
+|---|---|---|---|---|---|
+| 1 | Child RFC list is RFCs 002 to 005 | Header | corrected | `ls docs/rfc` shows 006 | Added RFC 006, the companion plans and the reconciliation date |
+| 2 | Baseline is `v0.1-baseline` on `main` | Header | confirmed | `git tag -l` | none |
+| 3 | Four track branches, each created from `main` | Section 1 | corrected | `git branch -r`: no `feat/track4-egress-retirement`; `feat/track3-harness2` is an ancestor of `feat/stage1-integration` | Section 1 states the real PR branches |
+| 4 | Tracks merge to `main` via discrete PRs | Section 1 | corrected | `gh pr view 3..10`: eight PRs, three stacked on others | Section 2.1 table and merge order |
+| 5 | Bun workspace manages `packages/jev`, `adapters`, `cli` | Section 1 | corrected | `package.json` `workspaces` = `packages/jev`, `adapters/*`; no `cli/` in any ref | `cli/` marked planned, not built |
+| 6 | uv workspace manages memory, lookup, harness2 | Section 1 | confirmed | `pyproject.toml` `[tool.uv.workspace]` at `9f12381` | none |
+| 7 | Compiled `bin/engine` / Makefile with `engine up` etc. | Section 1 | corrected | `git ls-tree` on `main`, #3, #4, #5, #7: no `cli/`, `bin/`, `Makefile` | Marked not built |
+| 8 | Phase 2 builds Track 3 on the validated Track 1 judge | Section 1 | corrected | `git merge-base --is-ancestor`: #8 and #9 heads are in #5; `git diff --name-only origin/main...origin/feat/stage1-integration` has no `packages/jev` or `adapters` file | Phase 2 bullet says Track 3 sits on Track 2 |
+| 9 | DAG node lists `engine install-adapters` and Lookup on `:8100` | Section 2 | corrected | `adapters/antigravity/README.md` at #3: "no installer yet"; `lookup/cli.py` default 8100, plan port policy stages on 8101 | Diagram nodes edited |
+| 10 | Jev stdio default, Streamable HTTP on `127.0.0.1:8115/mcp` | 3.1 | confirmed | `packages/jev/README.md` and `src/index.ts` at #3 | none |
+| 11 | Claude plugin manifest, MCP registration and hooks file | 3.1 | confirmed | `adapters/claude/.claude-plugin/plugin.json`, `.mcp.json`, `hooks/hooks.json` at #3 | none |
+| 12 | OpenCode V2 plugin is a deliverable | 3.1 | corrected | `adapters/opencode/` exists at #3; RFC 002 and #3's plan text say deferred, unverified | Marked committed but deferred |
+| 13 | `engine install-adapters` is a deliverable | 3.1 | corrected | `adapters/antigravity/README.md` at #3; `rg install-adapters` finds only docs and README text | Marked deferred |
+| 14 | Subagent guard asks on any escalation above the session model | 3.1 | confirmed | `packages/jev/README.md` at #4 ("asks before a subagent runs on a model above the session's") | none |
+| 15 | Aliases `opus` and `sonnet` map to 5.5, `fable` to 5.1 | 3.1.3 | confirmed | `packages/jev/src/models.ts` at #4 `ALIASES` | none |
+| 16 | `Agent\|Task` and `Workflow` `PreToolUse` hooks, `onFailure: "block"` | 3.1.3 | confirmed | `jq` of `adapters/claude/hooks/hooks.json` at #4 (both PreToolUse entries `block`; PostToolUse, SessionStart, PostModelSwitch have none). At #3 only the `PreToolUse` key exists | none |
+| 17 | `onFailure` needs Claude Code >= 2.1.295 | 3.1.3 | unverified | `adapters/claude/README.md` at #4 states it; the CLI release notes were not read | Source named in the text |
+| 18 | A unit test kills the hook process to assert a block | 3.1.3 | corrected | `adapters/claude/tests/hooks.test.ts` checks the manifest; `packages/jev/tests/hook-entrypoint.test.ts` checks a crashed process exits non-zero with no allow; neither starts Claude Code | Text names the real tests |
+| 19 | Session model tracked via `PostModelSwitch` with a transcript fallback | 3.1.3 | corrected | `packages/jev/tests/fixtures/payloads/README.md` at #4: the event "never fired in `-p`" | Added the fixtures finding |
+| 20 | Built-in agentTypes ask (no allow-list) | 3.1.3 | corrected | `packages/jev/README.md` line on built-ins: the Workflow guard asks, the Agent/Task guard passes `Explore` etc. | Text names which guard |
+| 21 | Claude Code owns hooks/guard files, Antigravity owns agent definitions and path quoting | 3.1.3 | unverified | An organisational claim; no git evidence either way | none |
+| 22 | The earlier subagent model rule was temporary, not encoded as permanent | 3.1 | unverified | Depends on user decisions 6 and 7 in the bridge; the guard code matches the "asks above session model" behaviour (row 14) | none |
+| 23 | `packages/memory` is a launcher over pinned upstream basic-memory on `:8105` | 3.2 | confirmed | `packages/memory/pyproject.toml` description and `settings.py` `PORT = 8105` at #5 | none |
+| 24 | Reranker bounds, 2 to 3 GB RAM bound, out-of-range refused not clamped | 3.2, 3.2.1 | unverified | Not measured or run here | none |
+| 25 | Lookup has 4 tools: `search_archive`, `get_document`, `refresh_index`, `archive_stats` | 3.2 | confirmed | `rg 'def (search_archive\|get_document\|refresh_index\|archive_stats)'` in `lookup/mcp.py` at #5 | none |
+| 26 | Lookup runs on `:8100`; stages on `:8101` until cutover | 3.2, 3.2.1 | corrected | Code default 8100 (`cli.py`, `mcp.py`); staging is `--port 8101`; RFC 001 D31 and RFC 003 agree | Clarified in 3.2 |
+| 27 | SMB branch `feat/lookup-smb-sources` S1-S5 "not yet run against production `core` share" and, 6 lines later, real-Samba check DONE 2026-10-29 | 3.2.1 | corrected | Same bullet contradicted itself; RFC 005 Phase 1 box is ticked | First sentence aligned; PR #10 named; parity gate stays open |
+| 28 | `smb.py`, `vfs.py` exist | 3.2.1 | confirmed | `git ls-tree` of `origin/feat/lookup-smb-sources`; not in #5 (`--is-ancestor` fails) | none |
+| 29 | SMB tests: 24 against a real server, 197 Lookup tests unedited, 271 repo-wide | 3.2.1 | unverified | Historical counts from 2026-10-28; no suite run | Marked as not re-run |
+| 30 | Real-Samba check on host `core` passed 2026-10-29 (7 live tests) | 3.2.1 | unverified | Needs host `core`; recorded in RFC 005 and the tracker; not re-run | Marked not re-run |
+| 31 | Track 2 is independent of Track 3 | 3.2 / Section 1 | corrected | `git merge-base --is-ancestor`: #8 and #9 heads are in #5 | Track 2 status line |
+| 32 | Track 3 branch is `feat/track3-harness2` | 3.3 | corrected | PR #5 head is `feat/stage1-integration` | Target branch note and status |
+| 33 | `sbx` v0.50.1 is the AUTO default for model-free untrusted execution; Docker fallback loud | 3.3, 3.3.3 | confirmed | README "What stays on Docker" at #5; `VERIFIED_SBX_MODEL_VERSIONS = {"0.50.1"}` in `sbx_session.py`; RFC 004 9.7 | none |
+| 34 | Docker is used "always for model sessions" | 3.3 | corrected | README "sbx model route" at #5: opt-in route exists | Text says "by default" |
+| 35 | 21 real-daemon integration tests pass unskipped | 3.3 | corrected | 21 at slice 2; `rg -c '^def test_\|^async def test_'` gives 25 in `test_docker_integration.py` at #5 | Both numbers given; no run |
+| 36 | Slice 1: FastMCP on `:8120`, 12/12 conformance, 129 tests | 3.3.1, matrix WS3 | unverified | `settings.py` `PORT = 8120` confirmed; 12/12 and 129 are historical, not re-run | none |
+| 37 | Upstream pinned at `1cfe254e8d25b15f37048c3730134686abe60335` | 3.3.1 | confirmed | `packages/harness2/pyproject.toml` at #5 | none |
+| 38 | WS-D on `feat/3b-slot-table` at `1e5d591` | 3.3.2 | confirmed | `git rev-parse origin/feat/3b-slot-table`; is an ancestor of #5 | none |
+| 39 | WS-A, WS-B, WS-C listed without a completion state | 3.3.2, matrix | corrected | `channels.py`, `egress_proxy.py`, `host_bridge.py`, `session_runner.py`, `contained_proposer.py` exist at #5; stage-1 runs used them | Marked complete (local channel) |
+| 40 | `agy_cli` adapter is part of WS-C | 3.3.2 | corrected | `contained_proposer.py` builds `agy_cli` and `claude_cli` command lines; `rg 'Credential('` finds no construction; no real run | Marked built, never run |
+| 41 | Run #4: 7 sessions exit 0, 127 s, P=3 and R=4 | 3.3.3 | confirmed | `report.json` and `audit.jsonl` of `58c3`: exit codes `{"0":7}`, `sweep_end.wall_s` 127.687, 3 proposers and 4 solvers | none |
+| 42 | Stage 1c: 14 of 21 sessions, 441 s, all exit 0, verdict `base-kept` | 3.3.3 | confirmed | `d08d`: 14 `session_end`, `wall_s` 440.924, exit codes `{"0":14}`, `selection.verdict` `base-kept` | none |
+| 43 | Stage 1c had "no denied requests" | 3.3.3, RFC 004 9.11 | corrected | `d08d` `sessions_summary.denied_reasons` = `["unix-route-model-denied"]`; per-session `egress_denied` 4 or 8; proposers 20, solvers 56 | Both texts corrected; cause UNVERIFIED |
+| 44 | Baseline `base1..base8` passed 0 of 8 | 3.3.3 | confirmed | `d08d` `pass_rates.base`: passed 0, n 8 | none |
+| 45 | Unedited harness rolled 2 of 3 in proposer-stage rollouts (dom1, agg1 pass; inv1 fails) | 3.3.3 | confirmed | `d08d` `rollout_verdict` events | none |
+| 46 | The INV and DOM proposers edited `c7` scripts, both refused; AGG made no change | 3.3.3 | confirmed | `d08d` three `mutation_check` events: `ok:false` with `scripts/ledger_sum.py` (`c7`); `ok:false` with `scripts/calculate_total.py` (`c7`); `ok:true`, `changed: []` | none |
+| 47 | No proposer edit has been accepted in any of 5 real hard-set runs | 3.3.3 | corrected | Run `a81f` (aborted): a `mutation_check` `ok:true` with `["systemprompt.md"]` (`c1`); the `dom1` rollout failed, `inv1` passed. Runs `1493`, `82cd`, `5ead`, `d08d` show none accepted | Reworded to "adopted" with the qualification (Checks plan R-12) |
+| 48 | Route filter allows exactly five method-and-path pairs; model pinned | 3.3.3 | confirmed | `egress_proxy.py` lines 101-105 and `MODEL_CHECKED` at #5 | none |
+| 49 | Approval markers are "the exact runtime variables" (RFC 004 lists seven) | 3.3.3 | corrected | `stage1.py` line 609 lists nine; `CLAUDE_PID`, `CLAUDE_JOB_DIR` marked ASSUMED | Count and label added here and in RFC 004 9.6 |
+| 50 | `sbx` model route is opt-in via `COGNITIVE_HARNESS2_MODEL_SANDBOX=sbx`; no fallback to Docker; `auto` does not exist | 3.3.3 | confirmed | harness2 README "Selecting it" at #5; `choose_model_runtime` in `sbx_session.py` | Details added |
+| 51 | First "Fable 5.1" pass was actually served by Sonnet 5.5; two later passes ran on Opus 5.5 | 3.3.3 | unverified | Stated in RFC 004 9.10 and the task facts; the reviewer transcripts were not re-opened (Checks plan C-6) | none (kept as the model-attribution reference case, R-9) |
+| 52 | PR stack: #3 to #6 and "Docs PR -> main after #5" | 3.3.3 | corrected | `gh pr view 3..10`: eight open PRs, titles `[merge N/9]` | Rewritten; merge order added |
+| 53 | Open items list (stages 2 and 3, `claude_cli` token delivery, guard backlog, Track 4) | 3.3.3 | corrected | RFC 006, Experiments plan, Checks plan now exist; `stage1.py` prerequisites for Stage 2 | Pointers and prerequisites added |
+| 54 | Stage 2 / 3 "user-gated, not started" | Matrix | corrected | Incomplete: `stage1.py` line 73 `ZDR = "strict"`, preflight needs `opencode` + `local`, line 766 refuses non-local solver | Row rewritten; WS-S1..S6, WS-M1..M2, WS-X added |
+| 55 | Track 4 deliverables and gates (RFC 005) | 3.4 | confirmed | RFC 005 section 3 matches; only the real-Samba box is ticked | Status line added; branch marked not created |
+| 56 | WS6: 307 tests pass, "needs a push to update the PR" | 3.5 | corrected | `3dd8b8d` is in #3's history and its message says 245 -> 307; #3's body still says 245 | Push done; PR body stale (Checks plan R-16) |
+| 57 | WS5 conformance runner "12/12 verified across all daemons" | 3.5, matrix | corrected | #8 and #9 bodies: 12/12 on Memory and Lookup; Harness² at slice 1; no Jev run recorded; `tools/probes/jev.toml` exists | Wording narrowed |
+| 58 | WS1..WS10 branches and states | Matrix | corrected | See rows 3, 5, 12, 13, 31, 39; WS7 branch is contained in `fix/agent-guard-unknown-agents`; WS10 branch is in no PR (`--is-ancestor` fails for #5 and #3) | PR numbers and states added |
+| 59 | Matrix rows WS-1b, WS-1c, WS-RF, WS-TI, WS-SBX are complete | Matrix | confirmed | Run records (rows 41-47), `egress_proxy.py` (row 48), `sbx_session.py` (row 33) | none |
+| 60 | Stacked-delivery list in section 5 (`feat/track3-harness2` on `feat/mcp-conformance`) | 5.1 | corrected | `--is-ancestor feat/track3-harness2 feat/mcp-conformance` fails; #5 is the Track 3 PR | List rewritten |
+| 61 | `feat/worktree-protocol` implemented, 11/11 `test_wt.sh` | 5.2 | corrected | Branch exists (`d7f4e93`, 1 commit; `tools/wt`, `.githooks/pre-commit`, `AGENTS.md`, `tools/tests/test_wt.sh`); 11/11 not re-run; in none of #3 to #10 | Text says no PR |
+| 62 | `bun run test:egress` and `uv run pytest tests/test_egress.py` | 5.4 | corrected | Root `package.json` scripts are `test`, `build`, `lint`; no `tests/test_egress.py` | Marked Track 4 deliverable; real tests named |
+| 63 | `bun test` and `uv run pytest` are the gates | 5.4 | confirmed | `package.json` `test`; `pyproject.toml` `testpaths` | none |
+| 64 | Model tiers and names in section 6 (Sonnet 5.5, Opus 5.5, Gemini 3.8 Flash) | 6.1 | unverified | Sonnet 5.5 is this session's model; Opus 5.5 from RFC 004 9.10; Gemini names not checkable | none |
+| 65 | Antigravity worktree `/home/rockad/projects/cognitive-engine-track1` | 6.2 | confirmed | `git worktree list`: exists at `61fd4a3` (#3's head) | none |
+| 66 | Mode A: Claude Code implements WS7 and WS8; Antigravity WS9 | 6.3 | corrected | All three are complete (#4, inside #5, #3) | Past tense and PR names |
+| 67 | Live channel `~/.agents/antigravity-claude-bridge-cognitive-engine.md`; repo carries no handoff file | 6.1, 6.2 | corrected | File exists; `origin/main` still has `HANDOFF.md` and `docs/handoffs/`; #7 removes them | Qualified |
+| 68 | "Both harnesses operate directly on `~/projects/cognitive-engine`" | 6.3 | corrected | Contradicts 6.2 and the worktree rule; `git worktree list` shows each agent in its own worktree | Reworded; heading renumbered (duplicate 6.3) |
+| 69 | Follow-up workflows plan exists | 6.4 | confirmed | `docs/plans/2026-10-28-claude-workflows-jev-integration-plan.md` | Heading renumbered to 6.5 |
+| 70 | Cross-harness note `session-handoff:cognitive-engine` in Recall | 6.4 | unverified | Recall server not queried | none |
+| 71 | README: "Unified SQLite Memory", no Lookup, no RFC list | README | corrected | `packages/memory/pyproject.toml` description; `packages/lookup` exists at #5 | README rewritten (layout, RFC and plan index) |
+| 72 | RFC 001 Track Status Matrix shows Track 3 "Proposed", Track 1/2 without PRs | RFC 001 section 6 | corrected | `gh pr view` | Rows updated; RFC 006 row and mermaid node added |
+| 73 | RFC 005 file paths `packages/jev/src/egress.ts`, `packages/harness2/core/egress.py` | RFC 005 2.1 | corrected | `git ls-tree`: `packages/jev/src/core/egress.ts`; `packages/harness2/src/cognitive_harness2/egress.py` | Paths fixed |
+| 74 | RFC 006 section 2.3 table (ZDR pin, preflight, solver refusal, `Credential` 0444, secret prefixes, 0444 file) | RFC 006 | confirmed | `stage1.py` lines 73, 314, 766; `session_runner.py` `Credential`, `0o444`; `upstream_egress.py` `_SECRET_PREFIXES` | none |
+| 75 | RFC 006 section 4.1: #5 contains #8 and #9, not #10; #6 is 69 commits behind and 23 files; stage1.py 2049 lines | RFC 006 | confirmed | `--is-ancestor`; `git rev-list --count origin/feat/model-bench..origin/feat/stage1-integration` = 69; `git diff --stat` 23 files; `wc -l` 2049 | none |
+| 76 | RFC 006 section 3.2: `stage1 plan` requires Docker and the image regardless of runtime | RFC 006 | confirmed | `stage1.py` preflight: `docker` and `image` checks are unconditional, `model_runtime` is separate | none |
+| 77 | Claude CLI accepts a custom base URL with OAuth | RFC 006 | unverified | Needs the real binary against a stub (spike A-11, user go D2) | none |
+| 78 | RFC 006 D1 to D8 equal the design note's eight decisions | RFC 006 | confirmed | `~/.agents/cognitive-engine-stage3-credential-delivery-design.md` section 8 | none |
+| 79 | Checks plan PR snapshot (heads, bases) | Checks plan 2 | confirmed | `gh pr view` heads `61fd4a3`, `fb9fb8d`, `9f12381`, `888a4d4`, `19de968`, `1e7ff7a`, `d7c4f2e`, `205a332` | #5 and #6 mergeability updated from UNKNOWN to MERGEABLE |
+| 80 | Checks plan dry-run results (#3 alone against #5 and #7 conflicts only in the plan and RFC 002) | Checks plan 2 | confirmed | `git merge-tree --write-tree --name-only` re-run for those two pairs | none (other pairs not re-run) |
+| 81 | Checks plan: 5446 passed / 7 skipped; 1204 pass for #4 | Checks plan K-1, K-8 | unverified | #4's body says 1203 pass and 1 skip; 5446 is a user fact; no suite run | Discrepancy already noted in K-1 |
+| 82 | Checks plan R-1 counts (20 proposer, 56 solver denied) | Checks plan 6 | confirmed | `jq` over `d08d/audit.jsonl` `session_end` | Status updated |
+| 83 | Checks plan R-5 (nine markers) | Checks plan 6 | confirmed | `stage1.py` line 609, `test_stage1.py` lines 392 and 444 | RFC 004 9.6 fixed |
+| 84 | Checks plan G-6 "plugin lookup ignores `enabledPlugins`" | Checks plan 4.1 | corrected | README at #4 describes an `enabledPlugins`-ordered search that still finds disabled plugins; #4's body says "ignores" | G-6 rewritten |
+| 85 | Checks plan: 11 run directories under `~/.local/state/cognitive-engine/harness2-stage1` | Checks plan 4.5 | confirmed | `ls` lists 11 names equal to the list in the plan | none |
+| 86 | Checks plan C-4 stale-phrase pattern | Checks plan 5 | corrected | Pattern lacked five phrases of the standing list | Pattern replaced |
+| 87 | Experiments plan reference data (walls, medians, maxima, sessions) | Experiments plan 3 | confirmed | `jq` over `58c3`, `82cd`, `d08d` `audit.jsonl`: 127.7 / 246.5 / 440.9 s; solver medians 11.2 / 23.0 / 27.6; proposer medians 20.5 / 36.4 / 38.4 | none |
+| 88 | Experiments plan: "no proposer edit accepted in 5 runs" | Experiments plan 1 | corrected | Row 47 | Qualified |
+| 89 | Experiments plan: six of nine hard instances use CRLF; token sizes; Fisher table | Experiments plan 3, 8 | unverified | Content and instance files were not read; the Fisher table is arithmetic stated as hand-checked | none |
+| 90 | Merge order #3, #4, #8, #9, #5, #6, #10, #7 and PR titles `[merge N/9]` | All | confirmed | `gh pr view` titles and bodies of #3 to #10 carry the same table | none |
+| 91 | Handoff location (`~/.agents` only) | Checks plan 3.9 | confirmed | `ls ~/.agents`; `git ls-tree origin/docs/stage1-findings` has no `HANDOFF.md` | none |
+| 92 | Jev guard backlog items G-1 to G-5 and the unclear `jev_judge` `PostToolUse` payload | Checks plan 4.1 | unverified | The code exists on #4; whether each item is still open needs the tests it names | Tracked as G-1 to G-5, status in the Checks plan |
+
+### A.2 Tally and what remains unverified
+
+Counts are over the table rows in A.1.
+
+- Claims checked: 92 rows (some rows bundle several closely related statements from the same sentence or table).
+- Confirmed: 37.
+- Corrected: 41.
+- Unverified: 14 (rows 17, 21, 22, 24, 29, 30, 36, 51, 64, 70, 77, 81, 89, 92).
+
+The unverified items, with what would settle each:
+
+- Row 17: Claude Code release that introduced `onFailure` (read the release notes).
+- Rows 21 and 22: ownership split and the "temporary rule" statement (the user's records).
+- Row 24: reranker bounds and the RAM bound (run the Memory suite and a sustained query load).
+- Rows 29, 30, 36, 81: test counts and the real-Samba check (run the suites under the shared lock; needs host `core`).
+- Row 51: model attribution of the review passes (open the reviewer transcripts, Checks plan C-6).
+- Row 64: Gemini model names (Antigravity's records).
+- Row 70: the `session-handoff:cognitive-engine` Recall note (query Recall).
+- Row 77: the Claude CLI with a custom base URL (RFC 006 spike A-11, the user's go).
+- Row 89: CRLF count, token sizes, Fisher table (read instance files, recompute with the runner's `fisher_two_sided`).
+- Row 92: whether each guard-backlog item is still open (Checks plan G-1 to G-5).
+- The cause of the denied requests in row 43 (what the 76 denied requests were) and the attribution of the `a81f` edit to the DOM proposer (row 47) are inside corrected rows and remain UNVERIFIED.
+
+### A.3 Stale-phrase check result
+
+Command, run on `docs/future-plans` after the corrections:
+
+`rg -n -i "clean-room|No upstream package is wrapped|DeepMind|no custom session hooks|fail-open shell wrapper|HANDOFF.md|docs/handoffs|about half|half the time|Fable 5.1" docs README.md`
+
+- `clean-room`, `No upstream package is wrapped`, `DeepMind`, `no custom session hooks`, `fail-open shell wrapper`, `half the time`: no hit anywhere.
+- `Fable 5.1` (RFC 004 section 9.10, this plan section 3.3.3, Checks plan, RFC 006): every hit is the correction note that the first review was requested on Fable 5.1 and served by Sonnet 5.5. Intentional.
+- `about half` (RFC 004 section 9.4 and 9.11, this plan section 3.3.3, Checks plan M-5.j and R-8, Experiments plan section 8): every hit says the estimate was superseded by the measured 0 of 8, or names the PR #5 body sentence that still has to be edited. Intentional historical notes.
+- `HANDOFF.md` and `docs/handoffs` (Checks plan sections 2, 3.7 to 3.9, and this plan section 6.1): rules for resolving the merge conflicts with the removed files and the statement that `origin/main` still carries them until #7 merges. Intentional.
+
+[RFC 001 section 6](../rfc/001-harness2-jev-unified-cognitive-substrate.md) and the [README](../../README.md) now list RFC 006 and the plans, so no RFC index lacks it.
