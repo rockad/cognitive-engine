@@ -91,7 +91,7 @@ Every PR gets the same envelope before and after (rows M-x.1 to M-x.3), then its
 | `[merge 6/9 · after #5]` | #6 | `feat/model-bench` | #5's branch |
 | `[merge 7/9 · after #6]` | #10 | `feat/lookup-smb-sources` | #8's branch |
 | `[merge 8/9 · after #10 · LAST]` | #7 | `docs/stage1-findings` | `main` |
-| `[merge 9/9 · after #7]` | this docs PR | `docs/future-plans` | #7's branch |
+| `[merge 9/9 · after #7]` | #11 (this docs PR) | `docs/future-plans` | #7's branch |
 
 **Envelope, for every PR N.**
 
