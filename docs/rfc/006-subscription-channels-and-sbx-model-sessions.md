@@ -225,7 +225,7 @@ The default changes only if all of these hold, measured on the user's host and r
 
 - [ ] **B-1** A real stage-1 sweep on the hard task set completes on the sbx route with `status ok`, all sessions exit 0, and no session hits the 600 s timeout.
 - [ ] **B-2** Teardown is clean: `sbx ls -q` lists no `h2m-` sandbox, `sbx policy ls --json` is identical to its pre-run snapshot, no host proxy process and no `h2s-*` or `h2bridge-*` directory remain, and the report's `teardown` block is empty.
-- [ ] **B-3** The median session wall time is at most 2.0 times the Docker median from the reference runs (proposal; the user confirms the factor). Reference values from run `d08d`: about 29.5 s per solver session and 38 s per proposer session.
+- [ ] **B-3** The median session wall time is at most 2.0 times the median of a same-day Docker control run with the same flags (proposal; the user confirms the factor before the run). The control is needed because the Docker solver median alone varied 2.5 times between recorded runs (11.2 s in run `58c3`, 27.6 s in run `d08d`; proposer median 38.4 s in `d08d`).
 - [ ] **B-4** No session ends with an error event caused by stream truncation, EOF or a proxy timeout; the longest streamed reply completes.
 - [ ] **B-5** Every denied request is of a pre-registered kind (Experiments plan EXP-3 table); none comes from the sbx layer for an allowed path.
 - [ ] **B-6** The `stage1 plan` preflight no longer requires Docker or the proposer image when sbx is selected, or the dual requirement is accepted in writing.
