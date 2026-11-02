@@ -85,17 +85,20 @@ flowchart TD
     - Binary quality gatekeeping and diff acceptance (`jev_judge`).
     - Free-tier offloading coprocessor (`jev_execute_free`, `jev_agent_free`) saving Gemini/Claude quota.
     - Model tier ceiling governance (clamping subagents to parent tier; strict user gate for Pro tier).
+    - Next-gen model tier governance: Full support for Gemini 4 Argon and Claude Fable 5.1 as Tier 3 (`pro`) with `gemini-argon-wtu-weekly` quota mapping (see [§7](#7-2026-10-29-antigravity--gemini-4-argon-hardening-specifications)).
   - **Dual-Mode Transport**:
     - Default: FastMCP stdio transport for zero-latency direct integration with CLI harnesses.
     - Supervised Daemon: Streamable HTTP transport on `127.0.0.1:8115/mcp` managed via `engine up`.
   - **Multi-Harness Adapters (`adapters/`)**:
     - Google Antigravity sidecar integration and MCP registration (`~/.gemini/config/mcp_config.json`).
+    - Production-hardened Antigravity integration: Real `ANTIGRAVITY_*` env detection, live `PreInvocation` pre-flight dispatch, and fail-soft non-blocking hooks (see [§7](#7-2026-10-29-antigravity--gemini-4-argon-hardening-specifications)).
     - Claude Code native plugin package (`.claude-plugin/plugin.json`) and MCP registration (no custom session hooks, aligning with the 2026-10-27 settings consolidation).
     - OpenCode V2 plugin bundle and event interceptors.
     - Turnkey installer command: `engine install-adapters`.
 - **Invariants & Gates**:
   - Blocks `openrouter/free` offloading when handling private workspaces or under `zdr: strict`.
   - Enforces `@Doc-Cr` alias routing.
+  - Incorporates the 2026-10-29 Antigravity & Gemini 4 Argon hardening fixes (see [§7](#7-2026-10-29-antigravity--gemini-4-argon-hardening-specifications)).
 
 ---
 
@@ -263,3 +266,143 @@ To maximize development velocity and conserve Gemini Pro quota, implementation l
 - **Shared Repository Disk State**: Both harnesses operate directly on `~/projects/cognitive-engine`.
 - **Clipboard-Ready Prompt Templates**: Antigravity formats self-contained markdown prompts with embedded schemas so Claude Code has complete context upon session start.
 - **Cross-Harness Memory**: Both harnesses query `session-handoff:cognitive-engine` and search indexed session logs via `lookup` on `127.0.0.1:8100`.
+
+---
+
+## 7. 2026-10-29 Antigravity & Gemini 4 Argon Hardening Specifications
+
+During production validation on 2026-10-29, four critical edge cases were identified and hardened across the live Jev coprocessor and Antigravity hook architecture. These hardening requirements must be ported directly into `packages/jev/` and `adapters/antigravity/` during Track 1 implementation.
+
+### 7.1 Fix 1: `PreInvocation` Hook SSE Socket / Event-Loop Hang (`adapters/antigravity/` & Pre-Flight Runner)
+
+- **Affected Subsystems**:
+  - `adapters/antigravity/`
+  - `packages/jev/src/pre-invocation.ts`
+  - `adapters/antigravity/src/hook.ts`
+- **Root Cause**:
+  - Calling HTTP daemons such as `fetch('http://127.0.0.1:8110/mcp')` (or port `:8105/mcp` in Track 2) using `Promise.race` without an explicit `AbortController` leaves Server-Sent Events (SSE) HTTP stream sockets open in Bun's event loop.
+  - Even after `console.log` emits the hook response payload, Bun keeps the runtime process active waiting for open socket handles to close.
+  - Antigravity's hook supervisor (`prehooks.go:43`) waits up to its 5-second hard timeout and then terminates the hook process via `SIGKILL`.
+  - The `SIGKILL` abruptly drops buffered stdout before Antigravity can ingest it, silently losing pre-flight recommendations while introducing an unacceptable 5-second stall on every agent turn.
+- **Requirements for `cognitive-engine`**:
+  - **Explicit Abort Binding**:
+    - Every outbound HTTP fetch to local daemon endpoints must bind an `AbortController`.
+    - The controller must be aborted inside a `finally` block immediately after response processing.
+  - **Explicit Process Termination**:
+    - Call `process.exit(0)` explicitly on all hook completion and error recovery paths to guarantee the runtime event loop terminates cleanly.
+  - **Fail-Soft Shell Guard**:
+    - In `adapters/antigravity/`, wrap the pre-flight invocation command with a 3.5-second timeout shell guard:
+      ```bash
+      timeout 3.5 bun run /path/to/hook.ts || exit 0
+      ```
+    - This ensures any hung subprocess fails soft with exit code 0 well before Antigravity's 5.0-second hard kill ceiling.
+
+### 7.2 Fix 2: Live `PreInvocation` Pre-Flight Dispatch & Telemetry Parity with Claude Code (`adapters/antigravity/`)
+
+- **Affected Subsystems**:
+  - `adapters/antigravity/`
+  - `packages/jev/src/telemetry.ts`
+  - Hook runners
+- **Root Cause**:
+  - Unlike Claude Code's `UserPromptSubmit` hook (`onUserPromptSubmit`), which dynamically inspects the user prompt, runs a 1500ms `callJev` dispatch, records telemetry, and injects tier guidance, Antigravity's `PreInvocation` script previously only printed a static reminder string.
+  - The script did not read `stdin` (`lastUserInput`, `invocationNum`, `conversationId`) and never invoked `callJev`.
+  - Because no dispatch telemetry was recorded in `jev_telemetry.jsonl`, subsequent multi-file edits in Antigravity tripped the `PreToolUse` write guard (`jev-pre-tool.sh`), which blocks consecutive edits without a preceding dispatch event.
+- **Requirements for `cognitive-engine`**:
+  - **Non-Blocking `stdin` Reader**:
+    - Implement a non-blocking `stdin` stream reader with a 50ms timeout to safely handle empty streams or interactive TTY invocations without blocking.
+  - **Protocol Tag Sanitization**:
+    - Strip Antigravity protocol wrapper tags such as `<USER_REQUEST>` and `<ADDITIONAL_METADATA>` before evaluating the prompt.
+  - **Turn-1 Dispatch Evaluation**:
+    - Trigger a 1500ms-bounded `callJev` dispatch specifically when `invocationNum === 1` (the initial turn of a user request).
+  - **Telemetry Logging**:
+    - Record the pre-flight dispatch event to `jev_telemetry.jsonl` with:
+      - `tool: "jev_dispatch"`
+      - `toolOrHook: "PreInvocation"`
+      - Recommended execution tier and calibrated confidence score.
+    - This satisfies the `PreToolUse` consecutive edit guard.
+  - **Direct Step Injection**:
+    - Inject the calibrated cost-tiered recommendation (`[JEV PRE-FLIGHT] ...`) directly into the hook's `injectSteps` array in stdout JSON.
+
+### 7.3 Fix 3: Next-Gen Model Tier Ceiling & Quota Bucket Mapping (`packages/jev/src/core/governance.ts`)
+
+- **Affected Subsystems**:
+  - `packages/jev/src/core/governance.ts`
+  - `packages/jev/src/core/config.ts`
+  - Quota view resolution
+- **Root Cause**:
+  - `modelTierRank()` only checked for string occurrences of `pro`, `opus`, and `expensive`, defaulting any unrecognized model to rank `2` (`flash`).
+  - Next-generation frontier models—specifically `"Gemini 4 Argon (Medium)"`, `"Gemini 4 Argon (High)"`, and `"Claude Fable 5.1"`—erroneously evaluated to rank `2`.
+  - When running inside a Gemini 4 Argon session, `clampTierToSessionCeiling()` assigned `ceilingRank = 2` (`ceilingTier: 'flash'`), which caused subagents recommended for `pro` to be clamped down to `flash`.
+  - Furthermore, Gemini 4 Argon tracks quota via a dedicated weekly bucket (`gemini-argon-wtu-weekly`) in `quota-state.json` rather than the legacy `gemini-weekly` bucket.
+- **Requirements for `cognitive-engine`**:
+  - **Frontier Model Tier 3 Ranking**:
+    - Update `modelTierRank()` in `governance.ts` so `argon`, `fable`, and `deep` return rank `3`:
+      ```typescript
+      if (
+        t.includes('pro') ||
+        t.includes('argon') ||
+        t.includes('opus') ||
+        t.includes('fable') ||
+        t.includes('expensive') ||
+        t === 'deep'
+      ) {
+        return 3;
+      }
+      ```
+  - **Tier Normalization**:
+    - Update `normalizeTier()` in `config.ts` to map `argon` and `fable` variants to `'deep'`.
+  - **Explicit Pro Override Expansion**:
+    - In `clampTierToSessionCeiling()`, expand `explicitProOverride` to include:
+      - `argon`
+      - `gemini argon`
+      - `fable`
+      - `claude fable`
+  - **Argon Quota Bucket Resolution**:
+    - In `readQuotaView()`, check whether `active_model` contains `argon`.
+    - When active, resolve weekly remaining quota from `gemini-argon-wtu-weekly` to ensure correct derivation of quota strategy (`normal`, `conserve`, `free_only`).
+
+### 7.4 Fix 4: Antigravity Environment Detection & Concrete Model Resolution (`packages/jev/src/core/config.ts`)
+
+- **Affected Subsystems**:
+  - `packages/jev/src/core/config.ts`
+  - `adapters/antigravity/`
+- **Root Cause**:
+  - `detectActiveHarness()` checked only `ANTIGRAVITY_CLI`, `GEMINI_CLI`, and `CORTEX_SESSION`.
+  - Google Antigravity actually exports the following runtime environment variables:
+    - `ANTIGRAVITY_AGENT=1`
+    - `ANTIGRAVITY_APP_DATA_DIR`
+    - `ANTIGRAVITY_LS_ADDRESS`
+    - `ANTIGRAVITY_LS_VERSION`
+    - `ANTIGRAVITY_CONVERSATION_ID`
+    - `ANTIGRAVITY_PROJECT_ID`
+  - Because none of these matched, `detectActiveHarness()` fell back to `'cli'`.
+  - As a result, `getHarnessModels()` resolved the generic CLI model mapping (`concreteModel: "typesafe/jev-router"`).
+  - Passing `"typesafe/jev-router"` to Antigravity's `invoke_subagent` caused the `PreToolUse` hook (`jev-pre-tool.sh`) to reject the call, as `"typesafe/jev-router"` is not a valid Antigravity `Model` enum (`inherit`, `flash_lite`, `flash`, `pro`).
+- **Requirements for `cognitive-engine`**:
+  - **Comprehensive Environment Variable Inspection**:
+    - Update `detectActiveHarness()` in `config.ts` to inspect all genuine Antigravity variables:
+      - `process.env.ANTIGRAVITY_AGENT`
+      - `process.env.ANTIGRAVITY_APP_DATA_DIR`
+      - `process.env.ANTIGRAVITY_LS_ADDRESS`
+      - `process.env.ANTIGRAVITY_LS_VERSION`
+      - `process.env.ANTIGRAVITY_CONVERSATION_ID`
+      - `process.env.ANTIGRAVITY_PROJECT_ID`
+      - `process.env.ANTIGRAVITY_CLI`
+      - `process.env.GEMINI_CLI`
+      - `process.env.CORTEX_SESSION`
+  - **Entrypoint Fallback Detection**:
+    - When executed as an MCP server without inherited environment variables, inspect `process.argv` for the MCP server script and verify recent mtime on `~/.gemini/antigravity-cli/quota-state.json`.
+  - **Explicit Harness Registration**:
+    - In `engine install-adapters`, configure `mcpServers.jev.env` in `~/.gemini/config/mcp_config.json` with an explicit environment override:
+      ```json
+      "env": {
+        "JEV_HARNESS": "antigravity"
+      }
+      ```
+  - **Strict Model Enum Mapping**:
+    - Ensure `getHarnessModels('antigravity')` strictly returns valid Antigravity model identifiers:
+      - `free`: `'openrouter/free'`
+      - `cheap`: `'flash_lite'`
+      - `standard`: `'flash'`
+      - `deep`: `'pro'`
+
