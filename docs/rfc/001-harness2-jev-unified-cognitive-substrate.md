@@ -250,23 +250,26 @@ cognitive-engine/
 
 ## 6. Implementation Roadmap & Track Status Matrix
 
-RFC 001 establishes the approved **Umbrella Architecture Baseline**. Detailed implementation specifications and parallel workstreams are partitioned into 4 modular child RFC tracks:
+RFC 001 establishes the approved **Umbrella Architecture Baseline**. Detailed implementation specifications and parallel workstreams are partitioned into 4 modular child RFC tracks, plus one follow-up RFC under Track 3 (status as of 2026-11-02; all PRs are open, none merged):
 
 | Track | Specification | Subsystem / Scope | Runtime & License | Status | Target Branch / PR |
 |---|---|---|---|---|---|
 | **Umbrella** | **RFC 001** | **Cognitive Engine Architecture** | Polyglot (Bun + uv) | **Approved Baseline** | `main` (PR #1) |
-| **Track 1** | **[RFC 002](002-system1-jev.md)** | **System 1: TypeSafe Jev & Adapters** | TypeScript / Bun *(MIT)* | In review (PR #3) | `feat/track1-jev-adapters` |
-| **Track 2** | **[RFC 003](003-memory-lookup.md)** | **Memory & Lookup Substrates** | Python 3.12 / uv *(AGPL + MIT)* | Implemented, pending review | `feat/track2-memory-lookup` |
-| **Track 3** | **[RFC 004](004-system2-harness2.md)** | **System 2: Google Harness² Optimizer** | Python 3.12 / uv *(Apache-2.0)* | Proposed | `feat/track3-harness2` |
-| **Track 4** | **[RFC 005](005-egress-retirement.md)** | **Egress Gates & Retirement Protocol** | Cross-Runtime | Proposed | `feat/track4-egress-retirement` |
+| **Track 1** | **[RFC 002](002-system1-jev.md)** | **System 1: TypeSafe Jev & Adapters** | TypeScript / Bun *(MIT)* | In review (PR #3; guard PR #4 stacked on it) | `feat/track1-jev-adapters`, `fix/agent-guard-unknown-agents` |
+| **Track 2** | **[RFC 003](003-memory-lookup.md)** | **Memory & Lookup Substrates** | Python 3.12 / uv *(AGPL + MIT)* | Implemented, in review (PR #8; conformance runner PR #9 and SMB reads PR #10 stacked on it) | `feat/track2-memory-lookup`, `feat/mcp-conformance`, `feat/lookup-smb-sources` |
+| **Track 3** | **[RFC 004](004-system2-harness2.md)** | **System 2: Google Harness² Optimizer** | Python 3.12 / uv *(Apache-2.0)* | Stage 1 built and run locally, improvement loop unproven; in review (PR #5; model benchmark PR #6 stacked on it) | `feat/stage1-integration` (contains `feat/track3-harness2`), `feat/model-bench` |
+| **Track 3 follow-up** | **[RFC 006](006-subscription-channels-and-sbx-model-sessions.md)** | **Subscription Proposer Channels (Stage 3) and sbx for Model Sessions** | Python 3.12 / uv *(Apache-2.0)* | Proposed, design only | `feat/stage3-credential-route`, `feat/sbx-model-default` (proposed, not created) |
+| **Track 4** | **[RFC 005](005-egress-retirement.md)** | **Egress Gates & Retirement Protocol** | Cross-Runtime | Proposed, not started | `feat/track4-egress-retirement` (not created) |
 
 - **Multi-Track Implementation Plan**: [2026-10-26-multi-track-implementation-plan.md](../plans/2026-10-26-multi-track-implementation-plan.md)
+- **Companion plans**: [Checks plan](../plans/2026-11-02-checks-plan.md), [Experiments plan](../plans/2026-11-02-experiments-plan.md)
 
 ```mermaid
 flowchart LR
     RFC001["RFC 001: Umbrella Baseline (main)"] --> Track1["RFC 002: Track 1 (Jev & Adapters)"]
     RFC001 --> Track2["RFC 003: Track 2 (Memory & Lookup)"]
     RFC001 --> Track3["RFC 004: Track 3 (Harness² Optimizer)"]
+    Track3 --> RFC006["RFC 006: Track 3 follow-up (Stage 3 channels, sbx model sessions)"]
     Track1 & Track2 & Track3 --> Track4["RFC 005: Track 4 (Egress & Retirement)"]
 ```
 
