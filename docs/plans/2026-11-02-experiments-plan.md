@@ -15,7 +15,7 @@
 
 An experiment here tests a hypothesis that can come out either way. Pass or fail engineering checks (merges, tickets, acceptance tests) are in the [Checks plan](2026-11-02-checks-plan.md).
 
-**Background.** Stage 1 proved the plumbing with local models (RFC 004 section 9). The improvement loop is UNPROVEN: no proposer edit has been accepted in any of 5 real hard-set runs (gemma4-e4b-16k and qwen3-4b-16k); the 4B proposers write the answer into a script (slot `c7`) and the slot table refuses the whole proposal; the measured baseline on `household/hard-1` is 0 of 8. **User decision (2026-11-01): stop loop experiments on local models; test later with a smarter proposer.** This plan is the "later", and it does not start anything.
+**Background.** Stage 1 proved the plumbing with local models (RFC 004 section 9). The improvement loop is UNPROVEN: no proposer edit has been adopted in any of 5 real hard-set runs (gemma4-e4b-16k and qwen3-4b-16k; one interrupted run, `a81f`, had a slot-table-legal `systemprompt.md` edit whose candidate rollout failed, with no final or selection: RFC 004 section 9.11); the 4B proposers write the answer into a script (slot `c7`) and the slot table refuses the whole proposal; the measured baseline on `household/hard-1` is 0 of 8. **User decision (2026-11-01): stop loop experiments on local models; test later with a smarter proposer.** This plan is the "later", and it does not start anything.
 
 **Experiments in this plan.**
 

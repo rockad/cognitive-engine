@@ -18,7 +18,7 @@
 
 ## 1. Summary & Motivation
 
-Stage 1 proved the plumbing with a local model: contained sessions, the allow-list egress proxy with route filter and model pinning, the host unix-socket bridge, the approval gate, the slot table, harvest, teardown and audit (RFC 004 section 9). It did not prove the improvement loop: no proposer edit has been accepted in any of 5 real hard-set runs, and the baseline is 0 of 8 (RFC 004 section 9.11). On 2026-11-01 the user stopped loop experiments on local models and asked for a smarter proposer later.
+Stage 1 proved the plumbing with a local model: contained sessions, the allow-list egress proxy with route filter and model pinning, the host unix-socket bridge, the approval gate, the slot table, harvest, teardown and audit (RFC 004 section 9). It did not prove the improvement loop: no proposer edit has been adopted in any of 5 real hard-set runs (one interrupted run accepted a legal edit that was scored once and never selected), and the baseline is 0 of 8 (RFC 004 section 9.11). On 2026-11-01 the user stopped loop experiments on local models and asked for a smarter proposer later.
 
 This RFC covers the two pieces of "item 4" that sit on that path:
 
@@ -275,7 +275,7 @@ If B-1 to B-9 hold, the change is a small commit that makes sbx the default for 
 
 - **Part B can start today.** The code is in PR #5; the only thing missing is the user's real run. It needs no merge.
 - **Part A can start today up to and including the stub spike and the proxy credential route.** A4 (stage-1 generalisation) can be written on a branch stacked on #5, but it will conflict with any further change to `stage1.py` on #5, so it should be the last piece and be rebased onto merged #5.
-- **Nothing in this RFC can merge before #5.** And #5 cannot merge before #8 and #9 under the agreed order, because it carries their commits (merge commits keep stacked branches valid, so a branch stacked on #5 survives its parents merging).
+- **Nothing in this RFC can merge before #5.** And #5 cannot merge before #3, #4, #8 and #9 under the agreed order (#3 and #4 by order only; #8 and #9 also because #5 carries their commits). Merge commits keep stacked branches valid, so a branch stacked on #5 survives its parents merging.
 - **#3 and #4 do not block any code in this RFC.** They block only the documentation merge order (the shared two-file conflict) and Track 1 consumers.
 - **#10 and #6 do not block anything here.** #10 is Lookup/SMB; #6 is `tools/bench`.
 - **#7 (docs, last in the order) blocks the repository text of RFC 004 section 9.** This RFC and its companions are stacked on #7, so their cross-references to RFC 004 section 9 resolve only after #7 merges.

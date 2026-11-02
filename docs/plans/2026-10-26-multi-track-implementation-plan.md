@@ -96,7 +96,7 @@ Verified with `gh pr view` and `git merge-base --is-ancestor` on 2026-11-02. All
 #### 2.1.1 What blocks items 4 and 6 (summary; detail in RFC 006 section 4 and the Checks plan)
 
 - **Item 4a, Stage 2 and Stage 3 proposer channels (RFC 006 Part A, EXP-1, EXP-2):**
-  - Preparation can start now on a branch stacked on `feat/stage1-integration`; it cannot merge before #3, #4, #8, #9 and #5 (agreed order), because it edits files that exist only in #5.
+  - Preparation can start now on a branch stacked on `feat/stage1-integration`; it cannot merge before #5, because it edits files that exist only in #5, and by the agreed order #5 comes after #3, #4, #8 and #9 (#3 and #4 are an ordering constraint, not a code dependency).
   - It is not blocked by #6, #10 or #7, nor by Track 4.
   - It IS blocked by user decisions (RFC 006 D1 to D10), by the user's typed approval of each real run, by a dollar cap for Stage 2, and by the unverified behaviour of the Claude CLI with a custom base URL (spike A-11).
   - The stage-1 runner must first be generalised (RFC 006 phase A4): at the PR #5 head `stage1.py` pins `ZDR = "strict"` and accepts only a local `opencode` channel.
