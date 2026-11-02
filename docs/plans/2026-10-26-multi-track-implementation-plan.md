@@ -10,6 +10,9 @@
   - Track 2: [RFC 003: Memory & Lookup Substrates](../rfc/003-memory-lookup.md)
   - Track 3: [RFC 004: System 2 — Google Harness² Recursive Reasoning Optimizer](../rfc/004-system2-harness2.md)
   - Track 4: [RFC 005: Cross-Runtime Egress Gates & agentic-hub Retirement Protocol](../rfc/005-egress-retirement.md)
+  - Track 3 follow-up: [RFC 006: Subscription Proposer Channels (Stage 3) and sbx for Model Sessions](../rfc/006-subscription-channels-and-sbx-model-sessions.md)
+- **Companion Plans (2026-11-02)**: [Checks plan](2026-11-02-checks-plan.md) (merge checklist, item-6 leftovers, recurring checks), [Experiments plan](2026-11-02-experiments-plan.md) (pre-registered experiments EXP-1 to EXP-5)
+- **Reconciled against the repository**: 2026-11-02 (see [Appendix A](#appendix-a-reconciliation-2026-11-02))
 
 ---
 
@@ -23,19 +26,20 @@ Following the formal `/clarify` architectural review and incorporated feedback f
   - Decouples large, complex subsystem designs into focused, reviewable specifications.
   - Centralizes shared invariants, licensing boundaries, and monorepo topology in [RFC 001](../rfc/001-harness2-jev-unified-cognitive-substrate.md).
 - **Independent Feature Branching Model**:
-  - Each track develops on an independent feature branch created directly from `main`:
+  - Each track was planned on an independent feature branch created directly from `main`:
     - `feat/track1-jev-adapters`
     - `feat/track2-memory-lookup`
     - `feat/track3-harness2`
     - `feat/track4-egress-retirement`
   - Merges directly back to `main` via discrete Pull Requests with automated test verification.
+  - **What happened (verified 2026-11-02):** Track 3 was built on top of Track 2, so the Track 3 PR is `feat/stage1-integration` (PR #5, base `main`) and `feat/track3-harness2` is one of the branches contained in it. Track 2 and its follow-ups have their own PRs (#8, #9, #10); the guard is PR #4 stacked on #3. `feat/track4-egress-retirement` does not exist (Track 4 is not started). The real stack is in [section 2.1](#21-actual-state-of-the-dag-2026-11-02).
 - **Root CLI Multiplexer & Polyglot Workspaces**:
-  - Bun workspace (`package.json`) manages TypeScript packages (`packages/jev/`, `adapters/`, `cli/`).
+  - Bun workspace (`package.json`) manages TypeScript packages: `workspaces` is `packages/jev` and `adapters/*`. A `cli/` package was planned and does not exist in any branch.
   - Python `uv` workspace (`pyproject.toml`) manages Python 3.12 packages (`packages/memory/`, `packages/lookup/`, `packages/harness2/`).
-  - Standalone compiled executable binary (`bin/engine` / Makefile) provides high-level orchestration (`engine up`, `engine status`, `engine memory`, `engine jev`).
+  - Standalone compiled executable binary (`bin/engine` / Makefile) providing high-level orchestration (`engine up`, `engine status`, `engine memory`, `engine jev`) is **not built**: no `bin/`, `cli/` or `Makefile` exists in any branch. The `engine ...` commands named in this plan and the RFCs are the planned CLI work (also named in Track 1 as the reason the installer is deferred).
 - **Substrate-First Parallel Execution DAG**:
   - Phase 1: Tracks 1 and 2 execute concurrently in parallel to lay the foundational System 1 coprocessor and native memory/lookup daemons.
-  - Phase 2: Track 3 implements System 2 (Harness² recursive optimizer) on top of the validated System 1 judge and sandbox substrate.
+  - Phase 2: Track 3 implements System 2 (Harness² recursive optimizer) on top of the validated System 1 judge and sandbox substrate. In practice Track 3 was built on top of Track 2 (its PR #5 carries the Track 2 commits until #8 and #9 merge) and does not touch `packages/jev`, so it did not wait for Track 1 to merge.
   - Phase 3: Track 4 executes cross-runtime egress testing, privacy audits, consumer rebinding, and gated retirement of legacy `agentic-hub` plugins.
 
 ---
@@ -48,8 +52,8 @@ flowchart TD
 
     subgraph Phase1 ["Phase 1: Substrate Foundations (Parallel Execution)"]
         direction LR
-        Track1["Track 1 (RFC 002)<br/>Branch: feat/track1-jev-adapters<br/>- packages/jev/<br/>- adapters/<br/>- engine install-adapters"]
-        Track2["Track 2 (RFC 003)<br/>Branch: feat/track2-memory-lookup<br/>- packages/memory/ (:8105)<br/>- packages/lookup/ (:8100)<br/>- docs.visibility & RAM tuning"]
+        Track1["Track 1 (RFC 002)<br/>Branch: feat/track1-jev-adapters (PR #3, guard PR #4)<br/>- packages/jev/<br/>- adapters/ (Claude + Antigravity; installer deferred)"]
+        Track2["Track 2 (RFC 003)<br/>Branch: feat/track2-memory-lookup (PR #8; #9 conformance, #10 SMB)<br/>- packages/memory/ (:8105)<br/>- packages/lookup/ (:8101 staging, :8100 after cutover)<br/>- docs.visibility & RAM tuning"]
     end
 
     Phase1 --> Merge1["Merge Track 1 & Track 2 PRs to main"]
@@ -69,6 +73,43 @@ flowchart TD
     Phase3 --> FinalProd["Production Substrate Active (v0.2.0)"]
 ```
 
+### 2.1 Actual state of the DAG (2026-11-02)
+
+Verified with `gh pr view` and `git merge-base --is-ancestor` on 2026-11-02. All eight PRs are open and nothing has merged. The planned phases above did not run as drawn: Track 3 was built on Track 2 and carries it.
+
+| PR | Branch | Base | Head | Track and content | Merge order |
+|---|---|---|---|---|---|
+| #3 | `feat/track1-jev-adapters` | `main` | `61fd4a3` | Track 1: Jev core, Claude and Antigravity adapters, strict tools (WS1, WS6, WS9) | 1 |
+| #4 | `fix/agent-guard-unknown-agents` | #3's branch | `fb9fb8d` | Track 1: workflow and agent guard, guard backlog (WS7); contains `feat/jev-workflow-guard` and `feat/guard-backlog` | 2 |
+| #8 | `feat/track2-memory-lookup` | `main` | `1e7ff7a` | Track 2: native Memory launcher and Lookup (WS2) | 3 |
+| #9 | `feat/mcp-conformance` | #8's branch | `d7c4f2e` | Cross-cutting: MCP conformance runner (WS5) | 4 |
+| #5 | `feat/stage1-integration` | `main` | `9f12381` | Track 3: Harness² stage-1 pipeline, route filter, sbx, hint and rollouts. Contains the heads of #8 and #9 (so Track 2 and the runner show in its diff until those merge), not #10, not #3, not #4 | 5 |
+| #6 | `feat/model-bench` | #5's branch | `888a4d4` | `tools/bench` model benchmark (23 files) | 6 |
+| #10 | `feat/lookup-smb-sources` | #8's branch | `205a332` | Track 2 follow-up: SMB reads in userspace (S1-S5) | 7 |
+| #7 | `docs/stage1-findings` | `main` | `19de968` | Docs; contains #10's head, so it is docs-only only after #10 lands | 8 |
+| (open later) | `docs/future-plans` | #7's branch | this branch | RFC 006, checks plan, experiments plan, this reconciliation | 9 |
+
+- **Order (agreed by the user):** #3, #4, #8, #9, #5, #6, #10, #7, then the `docs/future-plans` PR. Merge commits only, never squash. Children are retargeted to `main` after their parent merges.
+- **Code does not conflict between the PRs.** #3 and #4 touch `packages/jev`, `adapters/`, docs, the root `package.json`, `bun.lock`, `README.md` and `LICENSE`, and (#4 only) `tools/probes/hook-canary`; #5, #6, #8, #9, #10 and #7 touch none of `packages/jev` and `adapters/` (checked with `git diff --name-only origin/main...origin/<branch>`). The dry-run merges in the Checks plan (section 2) report conflicts only in docs files. The shared conflict is documentation: this plan and RFC 002 (and RFC 003, RFC 004, the removed handoff files for the later ones). Resolution rules are in the [Checks plan](2026-11-02-checks-plan.md), section 3.9.
+- **Not in any PR:** `feat/worktree-protocol` (`tools/wt`, `.githooks/pre-commit`, `AGENTS.md`; one commit, `d7f4e93`). It needs a decision whether it gets a PR (Checks plan L-e4).
+
+#### 2.1.1 What blocks items 4 and 6 (summary; detail in RFC 006 section 4 and the Checks plan)
+
+- **Item 4a, Stage 2 and Stage 3 proposer channels (RFC 006 Part A, EXP-1, EXP-2):**
+  - Preparation can start now on a branch stacked on `feat/stage1-integration`; it cannot merge before #3, #4, #8, #9 and #5 (agreed order), because it edits files that exist only in #5.
+  - It is not blocked by #6, #10 or #7, nor by Track 4.
+  - It IS blocked by user decisions (RFC 006 D1 to D10), by the user's typed approval of each real run, by a dollar cap for Stage 2, and by the unverified behaviour of the Claude CLI with a custom base URL (spike A-11).
+  - The stage-1 runner must first be generalised (RFC 006 phase A4): at the PR #5 head `stage1.py` pins `ZDR = "strict"` and accepts only a local `opencode` channel.
+- **Item 4b, sbx for model sessions (RFC 006 Part B, EXP-3):**
+  - The code is in #5, so the real run needs no merge: the user runs it from a checkout of `feat/stage1-integration`.
+  - Making sbx the default needs the run's result, the user's acceptance of the isolation shape, and one more read-only review of the fixes after round 3.
+- **Item 6, small leftovers (Checks plan, section 4):**
+  - Guard backlog tickets (G-1 to G-6) need #3 and #4 merged first, because the code is in #4.
+  - Antigravity's optional review of `374b790..9f12381` is blocked by Antigravity quota (out, no date), not by a PR.
+  - Run-directory cleanup and the marker-assumption check (`CLAUDE_PID`, `CLAUDE_JOB_DIR` absent from the user's own terminal) are the user's.
+  - Branch cleanup and retargets happen after the merges they follow.
+- **Track 4 (RFC 005):** blocked by the merges above plus the user and the real corpus; it is neither blocked by nor blocking RFC 006.
+
 ---
 
 ## 3. Detailed Breakdown by Track
@@ -78,7 +119,8 @@ flowchart TD
 - **Target Branch**: `feat/track1-jev-adapters`
 - **Specification**: [RFC 002: System 1 Coprocessor](../rfc/002-system1-jev.md)
 - **Runtime & License**: TypeScript / Bun | MIT
-- **Target Directories**: `packages/jev/`, `adapters/`, `cli/`
+- **Target Directories**: `packages/jev/`, `adapters/` (`cli/` was planned and does not exist; see section 1)
+- **Status (2026-11-02)**: PR #3 (core, adapters, strict tools) and PR #4 (workflow and agent guard, stacked on #3) are open; neither is merged.
 - **Key Deliverables**:
   - **TypeSafe Jev Core (`packages/jev`)**:
     - Sub-second probabilistic model tier dispatch (`jev_dispatch`, `jev_route`).
@@ -91,8 +133,8 @@ flowchart TD
   - **Multi-Harness Adapters (`adapters/`)**:
     - Google Antigravity sidecar integration and MCP registration (`~/.gemini/config/mcp_config.json`).
     - Claude Code native plugin package (`.claude-plugin/plugin.json`), MCP registration, and lifecycle hooks (`hooks/hooks.json`).
-    - OpenCode V2 plugin bundle and event interceptors.
-    - Turnkey installer command: `engine install-adapters`.
+    - OpenCode V2 plugin bundle and event interceptors: committed in `adapters/opencode` but deferred (unverified against a live OpenCode; RFC 002 and PR #3 say it is expected to need an overhaul).
+    - Turnkey installer command `engine install-adapters`: **deferred** to the `engine` CLI work (PR #3's adapter READMEs and RFC 002 say so; no installer code exists). The adapter READMEs document the manual steps.
 - **Invariants & Gates**:
   - Blocks `openrouter/free` offloading when handling private workspaces or under `zdr: strict`.
   - Enforces `@Doc-Cr` alias routing.
@@ -105,7 +147,7 @@ Empirical testing confirmed that Claude Code workflow-spawned subagents bypass t
   - Secondary Workflow Hook: `PreToolUse` on `Workflow` in `adapters/claude/hooks/hooks.json` intercepts workflow script execution.
 - **Version-Aware Ranking & Model Tracking**:
   - Models ranked by `(family, version)` tuple. Aliases resolved deterministically (`opus` -> 5.5, `sonnet` -> 5.5, `fable` -> 5.1).
-  - Session model tracked via `PostModelSwitch` state file with transcript-tail fallback.
+  - Session model tracked via `PostModelSwitch` state file with transcript-tail fallback. The fixtures README of PR #4 records that `PreModelSwitch` and `PostModelSwitch` never fired in headless (`-p`) runs, including `--resume --model`; the event schema is taken from the binary, not from a capture, so the transcript-tail fallback is what has been exercised.
   - Unknown models prompt (`ask`). Every `ask` and safety fallback is audited in `~/.config/jev/claude_decisions.jsonl`.
   - Never block Claude Code's "switch models when a message is flagged" safety fallbacks.
 - **Workflow AST Parser (`packages/jev/src/workflow-guard.ts`)**:
@@ -117,19 +159,20 @@ Empirical testing confirmed that Claude Code workflow-spawned subagents bypass t
   - Capture live payloads (`PreToolUse[Workflow]`, `PostModelSwitch`, `SubagentStart`) with a log-only canary hook.
   - Commit real payloads as test fixtures before implementing production logic.
 - **Native Hook Failure Policy**:
-  - Guard hooks use native `"onFailure": "block"` (Claude Code >= 2.1.295). Verified in headless runs: crashing hook with `onFailure: "block"` blocks tool execution. Log-only hooks stay fail-open.
-  - Unit test kills the hook process to assert a block.
+  - Guard hooks use native `"onFailure": "block"` (Claude Code >= 2.1.295, as stated in `adapters/claude/README.md`; the version number itself is UNVERIFIED here). Headless-run verification that a crashing hook with `onFailure: "block"` blocks tool execution is recorded in the fixtures README of PR #4 (not re-run). Log-only hooks stay fail-open.
+  - Tests at PR #4's head: `adapters/claude/tests/hooks.test.ts` asserts every `PreToolUse` guard entry has `onFailure: "block"` and no other event carries it; `packages/jev/tests/hook-entrypoint.test.ts` asserts a crashed hook process exits non-zero with no allow on stdout. No test starts Claude Code itself.
 - **Implementation Ownership Division & Operational Rules**:
   - Claude Code owns: `hooks.json`, `guard.ts` (fail-closed, version-aware model ranking, active in `on` and `on-demand` for both harnesses), `packages/jev/src/workflow-guard.ts`, and `packages/jev/src/core/config.ts` (`validateJevConfig`, `inspectJevConfigFile`).
   - Antigravity owns: plugin agent definitions (`agentDefinitionModel`) and Antigravity hook path quoting (`adapters/antigravity/src/index.ts`).
   - Config Rule (User Decision): Do nothing when Jev is explicitly `off`; when config is malformed fail loudly (ask on every guarded call, stderr line, `config_malformed` audit event). Missing file or `{}` = unset = default `off`.
-  - Known Limits: Built-in agentTypes ask (no static allow-list yet), resume gap (after `--resume --model X` transcript tail can show previous model until switch event), static analysis cannot prove dynamic runtime indirection.
+  - Known Limits: the Workflow guard asks for built-in agentTypes such as `Explore` (it has no static allow-list yet; the Agent/Task guard already allows built-ins, so the two guards differ; Checks plan G-1), resume gap (after `--resume --model X` transcript tail can show previous model until switch event), static analysis cannot prove dynamic runtime indirection.
 
 ---
 
 ### 3.2 Track 2 (RFC 003): Memory & Lookup Substrates
 
 - **Target Branch**: `feat/track2-memory-lookup`
+- **Status (2026-11-02)**: PR #8 (Memory launcher and Lookup, base `main`), PR #9 (conformance runner, stacked on #8) and PR #10 (SMB reads, stacked on #8) are open, unmerged, and have their own reviews. Track 2 is not independent of Track 3 in git: PR #5 carries the heads of #8 and #9 until they merge.
 - **Specification**: [RFC 003: Memory & Lookup Substrates](../rfc/003-memory-lookup.md)
 - **Runtime & License**: Python 3.12 / uv | AGPL-3.0 (`packages/memory`) + MIT (`packages/lookup`)
 - **Target Directories**: `packages/memory/`, `packages/lookup/`
@@ -144,7 +187,7 @@ Empirical testing confirmed that Claude Code workflow-spawned subagents bypass t
       - Bounded resident memory strictly under **2–3 GB RAM** while maintaining 9/10 context accuracy.
     - Out-of-tree persistent storage at `~/.local/share/cognitive-engine/memory/`.
   - **`packages/lookup` (Companion Archive & Transcript Search, MIT)**:
-    - Runs natively on `127.0.0.1:8100/mcp`.
+    - Runs natively on `127.0.0.1:8100/mcp` once the legacy container is retired. The code default is `:8100` (`lookup/cli.py`); until the Track 4 cutover it is started with `--port 8101` (port policy below).
     - Preserves the 4 standard Lookup tools (`search_archive`, `get_document`, `refresh_index`, `archive_stats`).
     - Full-text SQLite FTS5 search indexing session transcripts and external knowledge archives.
     - Enforces `docs.visibility` classification (`open`, `gated`, `unstated`, `mixed`) for strict classification inheritance.
@@ -157,7 +200,7 @@ Full list with evidence in [RFC 003 §4](../rfc/003-memory-lookup.md). The ones 
 
 - **`packages/memory` is a launcher, not a fork.** It validates settings and `exec`s the pinned upstream `basic-memory mcp`. The reranker is off by default upstream, so the tuned configuration only exists because the launcher forces it; out-of-range bounds are refused, not clamped.
 - **`packages/lookup` is a port of the Docker-era Lookup**, with the transport replaced by FastMCP and the Docker-only SMB mounting removed. Python 3.12 required replacing a 3.13+ stdlib call.
-- **Decided follow-up — shares declared in the manifest** (branch `feat/lookup-smb-sources`, cut from `feat/track2-memory-lookup`; **S1–S5 done**, see the status lines below; not yet run against the production `core` share). Native Lookup cannot mount network shares, so a manifest `[source.volume]` is indexed through a userspace SMB client with no host mount, root or FUSE. Decisions:
+- **Follow-up built — shares declared in the manifest** (branch `feat/lookup-smb-sources`, cut from `feat/track2-memory-lookup`, **PR #10**; **S1–S5 done**, see the status lines below; the real-Samba check on host `core` passed on 2026-10-29, not re-run by this reconciliation; per-source document-count parity against the legacy container is still open and is a Track 4 gate). Native Lookup cannot mount network shares, so a manifest `[source.volume]` is indexed through a userspace SMB client with no host mount, root or FUSE. Decisions:
   - **Access layer:** a full filesystem seam (`walk`, `stat`, `open`) with `LocalFS` and `SmbFS` backends; manifest, pipeline, hashing and every extractor call it. The engine's `Path` becomes a small `VPath` that carries its filesystem, replacing `type(path)(d["path"])` with a lexical `src.contains_logical()`. The file digest comes from the same read the extractor performs.
   - **Path model:** `root` stays the *logical* mount path that is stored and shown (hits are marked `REMOTE`); an optional `subpath` selects a directory inside the share. Existing manifests and any migrated index keep working.
   - **Dependency:** `smbprotocol` (MIT, pure Python) is a core dependency of `cognitive-lookup`, imported lazily. **NTLM only**: Kerberos needs system krb5 libraries, which is the host setup this feature removes.
