@@ -6,7 +6,8 @@
 - **Runtime**: Polyglot (TypeScript / Bun + Python 3.12 / uv + Shell)
 - **License**: MIT
 - **Target Subsystem**: Cross-runtime egress guards, client configs, and migration cutover tooling
-- **Target Branch**: `feat/track4-egress-retirement`
+- **Target Branch**: `feat/track4-egress-retirement` (not created; Track 4 is not started)
+- **Related**: [RFC 006](006-subscription-channels-and-sbx-model-sessions.md) uses the channel retention levels of section 2.5 and does not change them; it neither blocks nor is blocked by this track
 - **Parent Blueprint**: [RFC 001: Cognitive Engine Architecture](001-harness2-jev-unified-cognitive-substrate.md)
 - **Implementation Plan**: [Multi-Track Implementation Plan](../plans/2026-10-26-multi-track-implementation-plan.md)
 
@@ -66,10 +67,10 @@ flowchart TD
 
 ### 2.1 Cross-Runtime Outbound Egress Firewall
 Outbound egress rules must be enforced symmetrically across both runtimes:
-- **TypeScript Runtime (`packages/jev/src/egress.ts`)**:
+- **TypeScript Runtime (`packages/jev/src/core/egress.ts`; the path was written as `src/egress.ts` before the files existed)**:
   - Enforces workspace boundaries and URL endpoint whitelisting before any LLM API call.
   - Intercepts free-tier offloading requests (`jev_execute_free`).
-- **Python Runtime (`packages/harness2/core/egress.py`, `packages/lookup/`)**:
+- **Python Runtime (`packages/harness2/src/cognitive_harness2/egress.py`, `egress_proxy.py` and `upstream_egress.py` at PR #5's head; `packages/lookup/`)**:
   - Validates model endpoints during candidate generation and reflection.
   - Ensures local microVM sandboxes (`sbx`) maintain network isolation.
 
