@@ -265,6 +265,7 @@ def test_requests_reach_our_proxy_and_the_route_filter_and_model_pinning_apply(w
     summary = sr.egress_summary(r.egress_log)
     assert summary["model_requests"] == 1 and summary["egress_denied"] == 4
     assert summary["denied_requests"] == {"POST /api/delete": 1, "POST /api/pull": 1, "GET /api/ps": 1}
+    assert summary["denied_models"] == {"some-other-model": 1}
     assert "unix-route-model-denied" in summary["denied_reasons"] and "unix-route-path-denied" in summary["denied_reasons"]
     assert world.ollama.hits == 1 and world.ollama.rejected == []          # the pinned Host is one a real Ollama accepts
     assert any(line.startswith("ACCESS-SUMMARY ") and '"final":true' in line for line in r.egress_log)

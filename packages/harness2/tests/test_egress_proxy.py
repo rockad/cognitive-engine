@@ -1970,6 +1970,37 @@ def test_a_denied_requests_detail_that_is_not_exactly_method_and_path_is_not_cou
     assert s["egress_denied"] == 5 and "denied_requests" not in s
 
 
+def test_the_proxy_counts_denied_models_by_exact_token_and_merges_repeats():
+    px, log = _proxy(summary_every=10 ** 9)
+    px._log("deny", "h", 1, "unix-route-model-denied", "model=qwen3:4b")
+    px._log("deny", "h", 1, "unix-route-model-denied", "model=qwen3:4b")
+    px._log("deny", "h", 1, "unix-route-model-denied", "model=nemotron-3-nano:4b")
+    px._log("deny", "h", 1, "unix-route-model-denied", "model=(missing)")
+    px.emit_summary(final=True)
+    s = _last_summary(log)
+    assert s["denied_models"] == {"qwen3:4b": 2, "nemotron-3-nano:4b": 1, "(missing)": 1}
+    assert s["egress_denied"] == 4 and s["denied_reasons"] == ["unix-route-model-denied"]
+
+
+def test_the_summary_is_bounded_in_denied_models_too():
+    px, log = _proxy(summary_every=10 ** 9)
+    for i in range(60):
+        px._log("deny", "h", 1, "unix-route-model-denied", f"model=m{i}")
+    px.emit_summary(final=True)
+    s = _last_summary(log)
+    d = s["denied_models"]
+    assert len(d) == 21 and d["other"] == 40 and sum(d.values()) == 60
+
+
+def test_a_denied_models_detail_that_is_not_exactly_model_equals_token_is_not_counted():
+    px, log = _proxy(summary_every=10 ** 9)
+    for detail in ("method=GET path=/x", "model=", "model with a space", ""):
+        px._log("deny", "h", 1, "unix-route-model-denied", detail)
+    px.emit_summary()
+    s = _last_summary(log)
+    assert s["egress_denied"] == 4 and "denied_models" not in s
+
+
 async def test_serve_prints_a_final_summary_at_graceful_exit():
     log: list[str] = []
     stop, up = asyncio.Event(), asyncio.Event()

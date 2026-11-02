@@ -130,8 +130,10 @@ SUMMARY_EVERY = 100
 SUMMARY_MAX_HOSTS = 10
 SUMMARY_MAX_REASONS = 10
 SUMMARY_MAX_REQUESTS = 20            # distinct `METHOD path` keys; the rest are summed under `other`
+SUMMARY_MAX_MODELS = 20              # distinct model names refused by `check_model_body`; the rest are summed under `other`
 _MODEL_REASONS = frozenset({"unix-route", "unix-listener"})
 _PATH_DETAIL = re.compile(r"method=([A-Z?]{1,16}) path=(\S+)")
+_MODEL_DETAIL = re.compile(r"model=(\S+)")
 
 
 def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
@@ -851,6 +853,7 @@ class Proxy:
         self._denied_hosts: list[str] = []
         self._denied_reasons: list[str] = []
         self._denied_requests: dict[str, int] = {}
+        self._denied_models: dict[str, int] = {}
 
     def _log(self, decision: str, host: str, port: int, reason: str, detail: str = "") -> None:
         self.log(f"ACCESS decision={decision} host={host} port={port} reason={reason}" + (f" {detail}" if detail else ""))
@@ -873,6 +876,12 @@ class Proxy:
                 if key not in self._denied_requests and len(self._denied_requests) >= SUMMARY_MAX_REQUESTS:
                     key = "other"
                 self._denied_requests[key] = self._denied_requests.get(key, 0) + 1
+            mm = _MODEL_DETAIL.fullmatch(detail) if reason == "unix-route-model-denied" else None
+            if mm:
+                key = mm[1]
+                if key not in self._denied_models and len(self._denied_models) >= SUMMARY_MAX_MODELS:
+                    key = "other"
+                self._denied_models[key] = self._denied_models.get(key, 0) + 1
         total = self.allowed + self.denied
         if self.summary_every > 0 and total % self.summary_every == 0:
             self.emit_summary()
@@ -883,6 +892,8 @@ class Proxy:
                      "denied_reasons": sorted(self._denied_reasons)}
         if self._denied_requests:
             out["denied_requests"] = dict(self._denied_requests)
+        if self._denied_models:
+            out["denied_models"] = dict(self._denied_models)
         return out
 
     def emit_summary(self, *, final: bool = False) -> None:

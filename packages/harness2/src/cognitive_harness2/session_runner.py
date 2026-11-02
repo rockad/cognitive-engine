@@ -218,9 +218,10 @@ def redact(text: str, secrets_: Sequence[str]) -> str:
 
 # the optional tail is the proxy's `method=<M> path=<P>` on a route path denial (older logs have none), or `model=<token>` on a
 # model denial; every value is a single token, so no text of a request can end the line or open another field
-_ACCESS_LINE = re.compile(r"ACCESS decision=(allow|deny) host=(\S+) port=(\d+) reason=([a-z-]+)(?: method=([A-Z?]{1,16}) path=(\S+)| model=\S+)?")
+_ACCESS_LINE = re.compile(r"ACCESS decision=(allow|deny) host=(\S+) port=(\d+) reason=([a-z-]+)(?: method=([A-Z?]{1,16}) path=(\S+)| model=(\S+))?")
 _MODEL_ROUTES = frozenset({"unix-route", "unix-listener"})      # the proxy's two ways to the host bridge (the local model)
 DENIED_REQUESTS_MAX = 20                                        # distinct `METHOD path` keys kept; the rest are summed in `other`
+DENIED_MODELS_MAX = 20                                          # distinct model names kept; the rest are summed in `other`
 
 
 def _summary_from_lines(lines: Sequence[str]) -> dict[str, object]:
@@ -233,16 +234,21 @@ def _summary_from_lines(lines: Sequence[str]) -> dict[str, object]:
 
     `denied_requests` (present only when a `unix-route-path-denied` line carried `method=` and `path=`; older logs have
     neither) maps `"METHOD path"` (the path as the proxy sanitised it: escaped, query reduced to `?<length>`) to a count,
-    first-seen order, at most `DENIED_REQUESTS_MAX` keys, the rest summed under `other`."""
+    first-seen order, at most `DENIED_REQUESTS_MAX` keys, the rest summed under `other`.
+
+    `denied_models` (present only when a `unix-route-model-denied` line carried `model=`) maps the model token (the model
+    name as the proxy sanitised and logged it, or a fixed word such as `(missing)`) to a count, first-seen order, at most
+    `DENIED_MODELS_MAX` keys, the rest summed under `other`."""
     model = allowed = denied = 0
     hosts: list[str] = []
     reasons: list[str] = []
     requests: dict[str, int] = {}
+    models: dict[str, int] = {}
     for line in lines:
         m = _ACCESS_LINE.fullmatch(line.strip())
         if not m:
             continue
-        decision, host, port, reason, method, path = m.groups()      # a `model=<token>` tail (unix-route-model-denied) is matched, not kept
+        decision, host, port, reason, method, path, model_token = m.groups()
         if decision == "allow":
             allowed += 1
             model += reason in _MODEL_ROUTES
@@ -257,10 +263,17 @@ def _summary_from_lines(lines: Sequence[str]) -> dict[str, object]:
             if key not in requests and len(requests) >= DENIED_REQUESTS_MAX:
                 key = "other"
             requests[key] = requests.get(key, 0) + 1
+        if reason == "unix-route-model-denied" and model_token:
+            key = model_token
+            if key not in models and len(models) >= DENIED_MODELS_MAX:
+                key = "other"
+            models[key] = models.get(key, 0) + 1
     out: dict[str, object] = {"model_requests": model, "egress_allowed": allowed, "egress_denied": denied,
                               "denied_hosts": hosts, "denied_reasons": sorted(reasons)}
     if requests:
         out["denied_requests"] = requests
+    if models:
+        out["denied_models"] = models
     return out
 
 
@@ -268,10 +281,12 @@ SUMMARY_PREFIX = "ACCESS-SUMMARY "          # the proxy's running counters (egre
 TRUNCATED_MARK = "ACCESS-TRUNCATED"         # added by `_access_log` when it cut the ACCESS lines at MAX_ACCESS_LOG_BYTES
 _SUMMARY_MAX_LINE = 8 * 1024
 _SUMMARY_COUNTS = ("egress_allowed", "egress_denied", "model_requests")
-_SUMMARY_KEYS = frozenset({"v", "final", *_SUMMARY_COUNTS, "denied_hosts", "denied_reasons", "denied_requests"})
+_SUMMARY_KEYS = frozenset({"v", "final", *_SUMMARY_COUNTS, "denied_hosts", "denied_reasons", "denied_requests",
+                            "denied_models"})
 _SUMMARY_HOST = re.compile(r"[^\s]{1,255}:[0-9]{1,5}")
 _SUMMARY_REASON = re.compile(r"[a-z0-9-]{1,64}")
 _SUMMARY_REQUEST = re.compile(r"(?:[A-Z?]{1,16} \S{1,200}|other)")
+_SUMMARY_MODEL = re.compile(r"[\x21-\x7e]{1,80}")
 _SUMMARY_MAX_COUNT = 10 ** 9
 
 
@@ -300,6 +315,10 @@ def parse_summary(line: str) -> dict | None:
     if not (isinstance(reqs, dict) and len(reqs) <= DENIED_REQUESTS_MAX + 1
             and all(isinstance(k, str) and _SUMMARY_REQUEST.fullmatch(k) and _count_ok(v) for k, v in reqs.items())):
         return None
+    models = d.get("denied_models", {})
+    if not (isinstance(models, dict) and len(models) <= DENIED_MODELS_MAX + 1
+            and all(isinstance(k, str) and _SUMMARY_MODEL.fullmatch(k) and _count_ok(v) for k, v in models.items())):
+        return None
     return d
 
 
@@ -323,6 +342,8 @@ def egress_summary(lines: Sequence[str]) -> dict[str, object]:
                                   "denied_reasons": sorted(summary["denied_reasons"])}
         if summary.get("denied_requests"):
             out["denied_requests"] = dict(summary["denied_requests"])
+        if summary.get("denied_models"):
+            out["denied_models"] = dict(summary["denied_models"])
         if cut and not summary["final"]:
             out["truncated"] = True
         return out

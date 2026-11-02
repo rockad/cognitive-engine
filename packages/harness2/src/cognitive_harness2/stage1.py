@@ -1167,6 +1167,7 @@ def sessions_view(starts: Sequence[Mapping[str, Any]], ends: Sequence[Mapping[st
     denied: dict[str, int] = {}
     reasons: set[str] = set()
     requests: dict[str, int] = {}
+    models: dict[str, int] = {}
     reached = timed_out = 0
     for e in ends:
         key = "none" if e.get("exit_code") is None else str(e["exit_code"])
@@ -1181,6 +1182,11 @@ def sessions_view(starts: Sequence[Mapping[str, Any]], ends: Sequence[Mapping[st
             for k, n in dr.items():
                 if isinstance(k, str) and isinstance(n, int) and not isinstance(n, bool) and n > 0 and (k == "other" or " " in k):
                     requests[k] = requests.get(k, 0) + n
+        dm = e.get("denied_models")
+        if isinstance(dm, Mapping):
+            for k, n in dm.items():
+                if isinstance(k, str) and isinstance(n, int) and not isinstance(n, bool) and n > 0 and " " not in k:
+                    models[k] = models.get(k, 0) + n
     first = next((sr.sanitize_terminal(x)[:160] for x in (*rollout_errors, *stage_errors) if x), None)
     # the status of a provider HTTP error in the CLI's own words ("... failed with HTTP 403"), to tell a refusal by the model
     # endpoint from a denial by the proxy (which has its own `denied_hosts`)
@@ -1196,6 +1202,13 @@ def sessions_view(starts: Sequence[Mapping[str, Any]], ends: Sequence[Mapping[st
         kept, rest = named[:sr.DENIED_REQUESTS_MAX], named[sr.DENIED_REQUESTS_MAX:]
         other = requests.get("other", 0) + sum(n for _, n in rest)
         view["denied_requests"] = dict(kept) | ({"other": other} if other else {})
+    if models:
+        # what check_model_body refused, by model name (the proxy's sanitised form, exact string, no case fold): most
+        # frequent first, at most DENIED_MODELS_MAX keys, the remainder (and any per-session `other`) summed in a last `other`
+        named = sorted(((k, n) for k, n in models.items() if k != "other"), key=lambda kv: (-kv[1], kv[0]))
+        kept, rest = named[:sr.DENIED_MODELS_MAX], named[sr.DENIED_MODELS_MAX:]
+        other = models.get("other", 0) + sum(n for _, n in rest)
+        view["denied_models"] = dict(kept) | ({"other": other} if other else {})
     return view
 
 
@@ -1225,6 +1238,10 @@ def sessions_lines(report: Mapping[str, Any], *, max_hosts: int = 5) -> list[str
             reqs = list(v["denied_requests"].items())
             left = len(reqs) - max_hosts
             parts.append("denied requests: " + ", ".join(f"{k} x{n}" for k, n in reqs[:max_hosts]) + (f", +{left} more" if left > 0 else ""))
+        if v.get("denied_models"):
+            dmods = list(v["denied_models"].items())
+            left = len(dmods) - max_hosts
+            parts.append("denied models: " + ", ".join(f"{k} x{n}" for k, n in dmods[:max_hosts]) + (f", +{left} more" if left > 0 else ""))
     elif v.get("first_error_http") in (401, 403) and reached:
         # the second real run: every session reached ollama, the proxy denied nothing, ollama itself answered 403
         parts.append(f"the proxy denied nothing, the model endpoint itself refused (HTTP {v['first_error_http']}); "

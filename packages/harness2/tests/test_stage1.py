@@ -1146,6 +1146,53 @@ def test_the_audit_event_keeps_denied_requests_keys_whole(tmp_path):
     assert row["denied_requests"] == {key: 3, "GET /api/version": 1}
 
 
+# ── what the proxy refused by model (stage-1c run d08d: opencode's POST /api/show probing every installed model, R-18) ──
+
+def _end_dm(denied_models, **kw):
+    e = _end(1, 0, ["harness2-proxy.internal:11434"], ["unix-route-model-denied"], **kw)
+    e["denied_models"] = dict(denied_models)
+    return e
+
+
+def test_sessions_view_adds_denied_models_summed_over_sessions_and_omits_it_when_no_session_has_any():
+    ends = [_end_dm({"qwen3:4b": 5, "nemotron-3-nano:4b": 1}), _end_dm({"qwen3:4b": 7}), _end(1, 0)]
+    v = stage1.sessions_view([{"event": "session_start"}] * 3, ends, rollout_errors=[], stage_errors=[])
+    assert v["denied_models"] == {"qwen3:4b": 12, "nemotron-3-nano:4b": 1}
+    assert list(v["denied_models"]) == ["qwen3:4b", "nemotron-3-nano:4b"]                       # most frequent first
+    old = stage1.sessions_view([{"event": "session_start"}] * 2, FIRST_RUN_ENDS[:2], rollout_errors=[], stage_errors=[])
+    assert "denied_models" not in old
+    junk = stage1.sessions_view([{"event": "session_start"}], [{**_end(1, 0), "denied_models": "x"},
+                                                                {**_end(1, 0), "denied_models": {"has a space": "z"}}],
+                                rollout_errors=[], stage_errors=[])
+    assert "denied_models" not in junk
+
+
+def test_sessions_view_keeps_at_most_20_denied_model_keys_and_sums_the_rest_into_other():
+    ends = [_end_dm({f"m{i}": 1 for i in range(15)}), _end_dm({f"n{i}": 2 for i in range(15)} | {"other": 4})]
+    d = stage1.sessions_view([{"event": "session_start"}] * 2, ends, rollout_errors=[], stage_errors=[])["denied_models"]
+    assert len(d) == 21 and sum(d.values()) == 15 + 30 + 4
+    assert set(list(d)[:15]) == {f"n{i}" for i in range(15)} and list(d)[-1] == "other"
+    assert d["other"] == 4 + 10                                                           # 10 singles beyond the 20th key
+    assert all(" " not in k for k in d if k != "other")
+
+
+def test_the_summary_prints_the_most_frequent_denied_models_and_how_many_more():
+    ends = [_end_dm({"qwen3:4b": 9, "nemotron-3-nano:4b": 2, **{f"m{i}": 1 for i in range(6)}})]
+    v = stage1.sessions_view([{"event": "session_start"}], ends, rollout_errors=[], stage_errors=[])
+    text = "\n".join(stage1.sessions_lines({"sessions_summary": v}))
+    assert "denied models: qwen3:4b x9, nemotron-3-nano:4b x2, m0 x1, m1 x1, m2 x1, +3 more" in text
+    assert "denied models" not in "\n".join(stage1.sessions_lines({"sessions_summary": stage1.sessions_view(
+        [{"event": "session_start"}], FIRST_RUN_ENDS[:1], rollout_errors=[], stage_errors=[])}))
+
+
+def test_the_audit_event_keeps_denied_models_keys_whole(tmp_path):
+    a = stage1.Audit(tmp_path / "a.jsonl")
+    a.emit("session_end", denied_models={"qwen3-4b-16k:latest": 3, "gemma4:e4b": 1})
+    a.close()
+    row = json.loads((tmp_path / "a.jsonl").read_text())
+    assert row["denied_models"] == {"qwen3-4b-16k:latest": 3, "gemma4:e4b": 1}
+
+
 # ══ which runtime model sessions use (docker by default; sbx only when asked for AND usable) ═══════════════════════
 
 SBX_OK = sbx_session.ModelRuntime("sbx", True, "/usr/bin/sbx", "0.50.1")

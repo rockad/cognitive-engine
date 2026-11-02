@@ -921,13 +921,23 @@ def test_the_local_plan_carries_the_allowed_models_into_every_unix_route_and_a_h
     assert pol.route_models[("127.0.0.1", 11434)] == frozenset({"gemma4:12b"})
 
 
-def test_the_egress_summary_counts_a_model_denied_line_as_a_denied_request_and_keeps_its_reason():
+def test_the_egress_summary_counts_a_model_denied_line_into_denied_models_and_keeps_its_reason():
     lines = ["ACCESS decision=deny host=harness2-proxy.internal port=11434 reason=unix-route-model-denied model=x:cloud",
              "ACCESS decision=deny host=harness2-proxy.internal port=11434 reason=unix-route-model-denied model=(missing)",
              "ACCESS decision=allow host=harness2-proxy.internal port=11434 reason=unix-route"]
     s = sr.egress_summary(lines)
     assert s["egress_denied"] == 2 and s["egress_allowed"] == 1 and s["model_requests"] == 1
     assert s["denied_reasons"] == ["unix-route-model-denied"]
+    assert s["denied_models"] == {"x:cloud": 1, "(missing)": 1} and "denied_requests" not in s
+
+
+def test_denied_models_are_capped_at_20_distinct_keys_and_the_rest_go_to_other():
+    base = "ACCESS decision=deny host=harness2-proxy.internal port=11434 reason=unix-route-model-denied model="
+    lines = [f"{base}m{i}" for i in range(35)] + [f"{base}m0"] * 2 + [f"{base}m34"]
+    s = sr.egress_summary(lines)
+    d = s["denied_models"]
+    assert len(d) == 21 and list(d)[:20] == [f"m{i}" for i in range(20)] and d["m0"] == 3
+    assert d["other"] == 16 and sum(d.values()) == s["egress_denied"] == 38
 
 
 # ── the proxy's running counters beat a log cut at the cap (F4) ──────────────────────────────────────────────────────
@@ -963,6 +973,12 @@ def test_the_summary_line_beats_the_lines_when_it_is_final():
     assert "truncated" not in s
 
 
+def test_the_summary_line_with_denied_models_beats_the_lines_when_it_is_final():
+    lines = [DENY_LINE] * 5 + [_summary_line(denied_models={"x:cloud": 9})]
+    s = sr.egress_summary(lines)
+    assert s["denied_models"] == {"x:cloud": 9} and s["denied_requests"] == {"GET /api/version": 3000}
+
+
 def test_the_latest_of_several_summaries_is_the_one_used():
     lines = [_summary_line(final=False, egress_denied=100), DENY_LINE, _summary_line(final=True, egress_denied=250)]
     assert sr.egress_summary(lines)["egress_denied"] == 250
@@ -994,6 +1010,8 @@ def test_a_cut_log_without_a_summary_counts_the_lines_it_has_and_says_truncated(
     _summary_line(denied_hosts=["h:1"] * 11), _summary_line(denied_hosts=["has space:1"]), _summary_line(denied_reasons=[5]),
     _summary_line(denied_requests={"GET /x": -1}), _summary_line(denied_requests={f"GET /p{i}": 1 for i in range(22)}),
     _summary_line(denied_requests={"GET /a b": 1}), _summary_line(final="yes"),
+    _summary_line(denied_models={"x:cloud": -1}), _summary_line(denied_models={f"m{i}": 1 for i in range(22)}),
+    _summary_line(denied_models={"has a space": 1}), _summary_line(denied_models="x:cloud"),
     SUM + _json.dumps({"v": 1, "final": True, "egress_allowed": 0, "egress_denied": 0, "model_requests": 0, "denied_hosts": [],
                        "denied_reasons": []}) + " trailing",
     " " + _summary_line(), "x" + _summary_line(), SUM + "{" * 100000,
