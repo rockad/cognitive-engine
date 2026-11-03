@@ -85,6 +85,20 @@ describe('antigravity adapter', () => {
 describe('antigravity hook entry', () => {
   const entry = jevHooksEntry('/opt/cognitive-engine') as any;
 
+  it('registers PreInvocation with timeout 3.5 shell guard', () => {
+    expect(entry.PreInvocation).toHaveLength(1);
+    expect(entry.PreInvocation[0].type).toBe('command');
+    expect(entry.PreInvocation[0].timeout).toBe(5);
+    expect(entry.PreInvocation[0].command).toBe(
+      'timeout 3.5 bun "/opt/cognitive-engine/packages/jev/src/pre-invocation.ts" antigravity || exit 0'
+    );
+
+    const spaced = jevHooksEntry('/path with spaces/cognitive-engine') as any;
+    expect(spaced.PreInvocation[0].command).toBe(
+      'timeout 3.5 bun "/path with spaces/cognitive-engine/packages/jev/src/pre-invocation.ts" antigravity || exit 0'
+    );
+  });
+
   it('guards only invoke_subagent with the shared hook script and quotes the path', () => {
     expect(entry.PreToolUse).toHaveLength(1);
     expect(entry.PreToolUse[0].matcher).toBe('invoke_subagent');
@@ -94,8 +108,8 @@ describe('antigravity hook entry', () => {
     expect(spaced.PreToolUse[0].hooks[0].command).toBe('bun "/path with spaces/cognitive-engine/packages/jev/src/hook.ts" antigravity');
   });
 
-  it('registers no other hook events', () => {
-    expect(Object.keys(entry).sort()).toEqual(['PreToolUse', 'enabled']);
+  it('registers PreInvocation and PreToolUse hook events', () => {
+    expect(Object.keys(entry).sort()).toEqual(['PreInvocation', 'PreToolUse', 'enabled']);
   });
 
   it('merges into a workspace hooks config without touching other groups', () => {

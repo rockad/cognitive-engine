@@ -4,3 +4,4 @@
  * Maintained for backward compatibility with existing tests, hooks, and external callers.
  */
 export * from './core/index.js';
+export * from './pre-invocation.js';
