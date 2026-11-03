@@ -107,7 +107,7 @@ Every PR gets the same envelope before and after (rows M-x.1 to M-x.3), then its
 
 | Id | When | What | Command or evidence | Owner | Blocked by | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| M-3.a | before | Jev suite green on the head | K-1, K-2 | Claude Code | none | open |
+| M-3.a | before | Jev suite green on the head | K-1, K-2 | Claude Code | none | done (2026-11-03): #3 61fd4a3 bun test 306 passed / 1 skipped (macOS gate) / 0 failed, lint clean; Antigravity AG-1 and Claude Code re-run agree |
 | M-3.b | before | Adapter packaging: Claude plugin manifest, hooks file and manifest test present. The turnkey `engine install-adapters` is NOT in #3 (deferred to the `engine` CLI work, per #3's README and plan text); see R-11 | `git ls-tree -r --name-only origin/feat/track1-jev-adapters adapters/claude` lists `.claude-plugin/plugin.json`, `hooks/hooks.json`, `tests/manifest.test.ts` | Claude Code | none | open |
 | M-3.c | after | #4 retargeted to `main` | `gh pr edit 4 --base main`, then K-10 shows `baseRefName` = `main` | Claude Code | M-3.4 | open |
 | M-3.d | after | #4's diff now shows only guard commits | `gh pr diff 4 --name-only \| wc -l` is smaller than before the merge | Claude Code | M-3.c | open |
@@ -117,7 +117,7 @@ Every PR gets the same envelope before and after (rows M-x.1 to M-x.3), then its
 
 | Id | When | What | Command or evidence | Owner | Blocked by | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| M-4.a | before | Jev suite on the head: all pass, 0 fail, `tsc` clean | K-1, K-2 | Claude Code | M-3.5 | open |
+| M-4.a | before | Jev suite on the head: all pass, 0 fail, `tsc` clean | K-1, K-2 | Claude Code | M-3.5 | done (2026-11-03): #4 fb9fb8d bun test 1238 passed / 1 skipped / 0 failed, lint clean (Antigravity AG-1, gemini-2.5-flash; not re-run by Claude Code) |
 | M-4.b | before | Backlog items G-1 to G-5 (section 4.1) are either closed or recorded as tickets | read PR #4 body, "Known limits" | Claude Code | none | open |
 | M-4.c | before | The guard refuses an unknown agent (the HIGH finding fixed in `3e37ce7`) | run the named test in `packages/jev/tests` for unknown agents and read its result | Claude Code | none | open |
 | M-4.d | after | Jev suite on `main`; hooks file still has `onFailure: "block"` on the guard hooks | K-1; `jq '.' adapters/claude/hooks/hooks.json` and read the guard entries | Claude Code | M-4.5 | open |
@@ -127,7 +127,7 @@ Every PR gets the same envelope before and after (rows M-x.1 to M-x.3), then its
 
 | Id | When | What | Command or evidence | Owner | Blocked by | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| M-8.a | before | Memory and Lookup tests | `uv run pytest packages/memory packages/lookup` | Claude Code | none | open |
+| M-8.a | before | Memory and Lookup tests | `uv run pytest packages/memory packages/lookup` | Claude Code | none | done (2026-11-03): #8 1e7ff7a packages/memory + packages/lookup 233 passed (Antigravity AG-1) |
 | M-8.b | before | Docs conflict list equals {plan, RFC 002} after #3 and #4 | K-9 | Claude Code | M-4.5 | open |
 | M-8.c | merge | Resolve the docs conflict by ownership (section 3.9, rule table) | read both sides; apply the rule; K-9 then reports clean | Claude Code (resolves) with User (approves) | M-8.b | open |
 | M-8.d | after | #9 and #10 retargeted to `main` | `gh pr edit 9 --base main`; `gh pr edit 10 --base main`; K-10 on both | Claude Code | M-8.5 | open |
@@ -137,7 +137,7 @@ Every PR gets the same envelope before and after (rows M-x.1 to M-x.3), then its
 
 | Id | When | What | Command or evidence | Owner | Blocked by | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| M-9.a | before | Runner tests | `uv run pytest tools/tests` | Claude Code | M-8.5 | open |
+| M-9.a | before | Runner tests | `uv run pytest tools/tests` | Claude Code | M-8.5 | done (2026-11-03): #9 d7c4f2e tools/tests 15 passed / 1 skipped (JEV checkout opt-in gate) (Antigravity AG-1) |
 | M-9.b | before | Conformance 12/12 on Memory and Lookup daemons | K-7 with `tools/probes/memory.toml`, `tools/probes/lookup.toml` (start each daemon on a free port) | Claude Code | M-8.5 | open |
 | M-9.c | after | Jev probe is a required check from now on | K-7 with `tools/probes/jev.toml` against `bun run start:http` | Claude Code | M-9.5 | open |
 
@@ -146,15 +146,15 @@ Every PR gets the same envelope before and after (rows M-x.1 to M-x.3), then its
 | Id | When | What | Command or evidence | Owner | Blocked by | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | M-5.a | before | #5's diff no longer shows Track 2 | `gh pr diff 5 --name-only \| rg '^packages/(memory\|lookup)/'` prints nothing | Claude Code | M-9.5 | open |
-| M-5.b | before | Full suite on the head under the lock | K-4 with K-3; record passed/skipped counts; expected 5446 passed / 7 skipped (user fact, to be re-measured) | Claude Code | M-5.a | open |
-| M-5.c | before | The skip list is the expected seven and no `requires_rootless_docker` test skipped | K-8 | Claude Code | M-5.b | open |
-| M-5.d | before | Real-opencode stub probes | K-5 | Claude Code | M-5.b | open |
-| M-5.e | before | Selftest rehearsal with fakes on the real daemon | `uv run python -m cognitive_harness2.stage1 selftest` under K-4 | Claude Code | M-5.b | open |
-| M-5.f | before | Proposer image resolves by id and the tag matches the source | `uv run python -m cognitive_harness2.image status` | Claude Code | none | open |
+| M-5.b | before | Full suite on the head under the lock | K-4 with K-3; record passed/skipped counts; expected 5446 passed / 7 skipped (user fact, to be re-measured) | Claude Code | M-5.a | done (2026-11-03): b479f3e 5444 passed / 22 skipped / 0 failed; 0fe0d19 5448 passed / 22 skipped (both under the lock, no leftovers). The expected 5446/7 is superseded |
+| M-5.c | before | The skip list is the expected seven and no `requires_rootless_docker` test skipped | K-8 | Claude Code | M-5.b | done (2026-11-03): the 22 skips are all opt-in gates, no requires_rootless_docker test skipped: 15 real-opencode (REAL_CLI=1), 6 sbx-live (SBX_LIVE=1), 1 JEV checkout |
+| M-5.d | before | Real-opencode stub probes | K-5 | Claude Code | M-5.b | done (2026-11-03): K-5 15 passed, 0 skipped, 58 s on b479f3e |
+| M-5.e | before | Selftest rehearsal with fakes on the real daemon | `uv run python -m cognitive_harness2.stage1 selftest` under K-4 | Claude Code | M-5.b | done (2026-11-03): stage1 selftest status ok, 16.4 s, 7 sessions rc=0, 4/4 rollouts, teardown clean on b479f3e |
+| M-5.f | before | Proposer image resolves by id and the tag matches the source | `uv run python -m cognitive_harness2.image status` | Claude Code | none | done (2026-11-03): image tag cognitive-harness2-proposer:f713740e878c matches source, resolves by id |
 | M-5.g | before | `stage1 plan` is READY on the host (read-only) | `uv run python -m cognitive_harness2.stage1 plan --opencode ~/.opencode/bin/opencode` | User | none | open |
 | M-5.h | before | sbx live tests, if sbx is to be trusted at merge | K-6 | Claude Code | host settings off | open |
 | M-5.i | before | The independent look on post-round-3 fixes has been decided (L-b3) | decision recorded | User | none | open |
-| M-5.j | before | PR #5 body corrected: "the base harness passes about half the time at k=1" is superseded by the measured 0 of 8 (R-1) | `gh pr view 5 --json body --jq .body \| rg 'about half'` prints nothing | Claude Code | none | open |
+| M-5.j | before | PR #5 body corrected: "the base harness passes about half the time at k=1" is superseded by the measured 0 of 8 (R-1) | `gh pr view 5 --json body --jq .body \| rg 'about half'` prints nothing | Claude Code | none | done (2026-11-03): PR #5 body no longer contains the half-the-time claim (rg finds nothing) |
 | M-5.k | after | #6 retargeted to `main` | `gh pr edit 6 --base main`; K-10 | Claude Code | M-5.5 | open |
 | M-5.l | after | Suite and `stage1 plan` on `main` | K-3 under K-4; `stage1 plan` | Claude Code | M-5.5 | open |
 | M-5.m | after | Conformance on the Harness2 daemon (`:8120`) | K-7 with `tools/probes/harness2.toml` | Claude Code | M-5.5 | open |
@@ -163,7 +163,7 @@ Every PR gets the same envelope before and after (rows M-x.1 to M-x.3), then its
 
 | Id | When | What | Command or evidence | Owner | Blocked by | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| M-6.a | before | Bench tests (not in `testpaths`) | `uv run pytest tools/bench/tests` | Claude Code | M-5.5 | open |
+| M-6.a | before | Bench tests (not in `testpaths`) | `uv run pytest tools/bench/tests` | Claude Code | M-5.5 | done (2026-11-03): #6 888a4d4 tools/bench/tests 109 passed (Antigravity AG-1) |
 | M-6.b | before | The bench imports exist at `main` (`cognitive_harness2.sum_signed`) | `rg -n 'sum_signed' tools/bench packages/harness2/src` | Claude Code | M-5.5 | open |
 | M-6.c | before | #6 is 69 commits behind #5's old head; after #5 merges it must merge cleanly | K-9 | Claude Code | M-5.5 | open |
 | M-6.d | before | `tools/bench/PREREGISTRATION.md` is committed before any benchmark result in the same PR | `git log --follow --format='%h %ad' --date=short -- tools/bench/PREREGISTRATION.md` precedes the first report commit; the file text says so | Claude Code | none | open |
@@ -172,10 +172,10 @@ Every PR gets the same envelope before and after (rows M-x.1 to M-x.3), then its
 
 | Id | When | What | Command or evidence | Owner | Blocked by | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| M-10.a | before | Lookup tests incl. SMB (fake client plus in-process server) | `uv run pytest packages/lookup` | Claude Code | M-6.5 | open |
+| M-10.a | before | Lookup tests incl. SMB (fake client plus in-process server) | `uv run pytest packages/lookup` | Claude Code | M-6.5 | done (2026-11-03): #10 205a332 packages/lookup 235 passed (Antigravity AG-1) |
 | M-10.b | before | Docs conflict list: `docs/handoffs/antigravity-claude-bridge.md` and `docs/rfc/003-memory-lookup.md` (observed in the dry run); resolve the handoff by deletion, as PR #5's body states | K-9 | Claude Code | M-6.5 | open |
 | M-10.c | before | Real-Samba share check on `core` still passes (7 live tests passed on 2026-10-29) | the SMB live test suite against `//core/knowledge-archive` | User | host `core` reachable | open |
-| M-10.d | before | No credential in any log or error string | `rg -n -i 'password\|NTLM' packages/lookup/src` read for literal values; tests that pin the redaction run in M-10.a | Claude Code | none | open |
+| M-10.d | before | No credential in any log or error string | `rg -n -i 'password\|NTLM' packages/lookup/src` read for literal values; tests that pin the redaction run in M-10.a | Claude Code | none | done (2026-11-03): no literal credential in packages/lookup/src at 205a332; smb.py enforces VAR references (Antigravity AG-4) |
 | M-10.e | after | Share-source parity gate for Track 4 is still open (it is not closed by merging) | RFC 005 Phase 1 box stays unticked until per-source document counts match | User | Track 4 | blocked |
 
 ### 3.8 PR #7 — Docs (→ `main`, last)
@@ -218,15 +218,15 @@ PR #4's body lists the open backlog as: click-through false positives on `this` 
 | G-1 | Workflow guard asks for a built-in `agentType` (`Explore`, `Plan`, ...) while the Agent guard allows built-ins (verified in `packages/jev/README.md`) | A Workflow call with `agentType: "Explore"` and no `model` is allowed; an unknown or plugin agent without a definition still asks; the Agent and Workflow guards give the same verdict for the same built-in | Claude Code | #3, #4 merged | open |
 | G-2 | `PostToolUse` payload for `jev_judge` was unclear and got no code. The harness2 push hook counts tool failures only and cannot see a `jev_judge` verdict (README, "What is not done") | Step 1: capture a real payload with a log-only canary and commit it as a fixture under `packages/jev/tests/fixtures/payloads/`. Step 2, only if the verdict is readable: a hook test that a `FAIL` or a score under 0.50 advises. If it is not readable: document the limit in RFC 004 section 2.3 | Claude Code | #4 merged; canary run needs the user's go | open |
 | G-3 | Resume model gap: after `--resume --model X` the first subagent call asks until the first assistant turn lands (documented in `packages/jev/README.md`) | Decide: accepted limit (close with the documentation) or reduce false asks. If reduce: a test that a resumed session with a readable transcript tail does not ask | User decides; Claude Code | #4 merged | open |
-| G-4 | Click-through false positives on `this` and variable keys | Read `workflow-guard-this.test.ts`; list the forms that still ask and decide per form: keep (fail closed) or allow with a test. Close the ticket when the list is empty or each remaining form is documented | Claude Code | #4 merged | UNVERIFIED |
-| G-5 | Project-level configs | Tests `ceiling-inherit.test.ts` and the project-ceiling tests in #4 pass; the README states that a project config can tighten but never loosen | Claude Code | #4 merged | UNVERIFIED |
-| G-6 | Plugin lookup and `enabledPlugins`: PR #4's body ("Known limits") says lookup ignores `enabledPlugins` and errs toward asking; the README at #4's head says the search is ORDERED by `enabledPlugins` (settings layers, a literal `true` enables) and still finds a disabled or unlisted plugin's definition, so it never finds fewer definitions than a plain search | Make the PR body and the README say the same thing (the README is the more detailed text). No guard change needed | Claude Code | none | open (found 2026-11-02) |
+| G-4 | Click-through false positives on `this` and variable keys | Read `workflow-guard-this.test.ts`; list the forms that still ask and decide per form: keep (fail closed) or allow with a test. Close the ticket when the list is empty or each remaining form is documented | Claude Code | #4 merged | partly done (2026-11-03): forms listed by Antigravity AG-2 on fb9fb8d (workflow-guard-this.test.ts, 61 passed: 14 silent member accesses, 40 ask on bare this in a class body, 7 ask on this outside a class body); the keep-or-allow decision per form is still open |
+| G-5 | Project-level configs | Tests `ceiling-inherit.test.ts` and the project-ceiling tests in #4 pass; the README states that a project config can tighten but never loosen | Claude Code | #4 merged | done (2026-11-03): ceiling-inherit.test.ts 64 passed at fb9fb8d, README lines 62-65 say a project config tightens only (Antigravity AG-2) |
+| G-6 | Plugin lookup and `enabledPlugins`: PR #4's body ("Known limits") says lookup ignores `enabledPlugins` and errs toward asking; the README at #4's head says the search is ORDERED by `enabledPlugins` (settings layers, a literal `true` enables) and still finds a disabled or unlisted plugin's definition, so it never finds fewer definitions than a plain search | Make the PR body and the README say the same thing (the README is the more detailed text). No guard change needed | Claude Code | none | done (2026-11-03): PR #4 body aligned with the README |
 
 ### 4.2 Antigravity's optional review
 
 | Id | What | Scope | Evidence | Owner | Blocked by | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| L-b1 | Independent review of `374b790..9f12381` on `feat/stage1-integration` | Read-only. Files: `session_runner.py`, `egress_proxy.py`, `sbx_session.py`, `stage1.py`, `substrate.py`; the approval gate; the route filter; teardown. Output: findings with file and line, severity, and the failing scenario | A review note in `~/.agents` with the head SHA reviewed (`git rev-parse` of the reviewed commit) | Antigravity | Antigravity quota (out, no date) | blocked |
+| L-b1 | Independent review of `374b790..9f12381` on `feat/stage1-integration` | Read-only. Files: `session_runner.py`, `egress_proxy.py`, `sbx_session.py`, `stage1.py`, `substrate.py`; the approval gate; the route filter; teardown. Output: findings with file and line, severity, and the failing scenario | A review note in `~/.agents` with the head SHA reviewed (`git rev-parse` of the reviewed commit) | Antigravity | Antigravity quota (out, no date) | done (2026-11-03): Antigravity message 19, PASS 0 blockers, 2 LOW; reviewed 374b790..9f12381 but SERVED BY gemini-2.5-flash, not a stronger model (model attribution C-6 applies). Its R-18 re-read (AG-6, 9f12381..b479f3e) also PASS, served by Gemini 3.8 Flash |
 
 ### 4.3 The earlier "independent look" and the post-round-3 options
 
@@ -236,7 +236,7 @@ Facts to keep straight (RFC 004 section 9.10): the first review was requested on
 | --- | --- | --- | --- | --- | --- | --- |
 | L-b2 | One more read-only Opus 5.5 pass on the diff after the last Opus pass | `git diff <last-reviewed-sha>..9f12381 --stat` to size it; the pass writes findings with file and line | Subscription quota (shared with interactive use) | User decides; Claude Code runs | none | open |
 | L-b3 | Accept the residual and record it as an accepted limit in the PR #5 body | PR body line naming the head SHA and what was not re-reviewed | none | User | none | open |
-| L-b4 | Wait for Antigravity (L-b1) and treat it as the independent look | L-b1 evidence | Antigravity quota | Antigravity | quota | blocked |
+| L-b4 | Wait for Antigravity (L-b1) and treat it as the independent look | L-b1 evidence | Antigravity quota | Antigravity | quota | answered (2026-11-03): the review exists but ran on a flash-class model; whether it counts as the independent look is the user decision L-b3 |
 
 ### 4.4 Marker assumption check
 
@@ -297,7 +297,7 @@ Found while writing this plan and RFC 006, then worked through in the reconcilia
 | R-5 | RFC 004 section 9.6 | Lists seven Claude Code runtime variables as approval markers | The harness2 README at #5 lists nine: it adds `CLAUDE_PID` and `CLAUDE_JOB_DIR`, marked as an ASSUMPTION | Add the two names with the same ASSUMPTION label, or remove them from the code; tie to L-c1 | done in the text (2026-11-02): RFC 004 section 9.6 now names the two with the ASSUMPTION label; L-c1 (the user's check) stays open |
 | R-6 | RFC 004 section 7 (stage 3 acceptance) | "execute without leaking credentials outside container" | Design note and RFC 006: the credential must never be inside the session container | Reword after RFC 006 is accepted | blocked by RFC 006 acceptance |
 | R-7 | RFC 004 section 6.2 stage 2; plan "Stage 2 / 3" row | Stage 2 is "user-gated, not started" | Also true but incomplete: at #5's head `stage1.py` pins `ZDR = "strict"` and its preflight accepts only an `opencode` channel with `retention = "local"` on a loopback endpoint; the solver runner refuses a non-local channel. Stage 2 therefore needs code (RFC 006 section 2.3, phase A4) and a key-delivery decision (D9) before the user's go can be used | Add the code prerequisites to the Stage 2 row | done (2026-11-02): plan matrix Stage 2 / 3 row and RFC 004 section 7 |
-| R-8 | PR #5 body | "On the hard task the base harness passes about half the time at k=1" | Superseded by the measured 0 of 8 (RFC 004 section 9.11) | Edit the PR body (M-5.j) | open |
+| R-8 | PR #5 body | "On the hard task the base harness passes about half the time at k=1" | Superseded by the measured 0 of 8 (RFC 004 section 9.11) | Edit the PR body (M-5.j) | done (2026-11-03): see M-5.j |
 | R-9 | Plan 3.3.3, "Independent read-only verification" | Says the pass was "requested as Fable 5.1, actually served by Sonnet 5.5" | Matches RFC 004 section 9.10 and the transcript (C-6) | No change; keep as the model-attribution reference case | done |
 | R-11 | Plan section 3.1 (on the docs base) | Lists "Turnkey installer command: `engine install-adapters`" as a Track 1 deliverable | PR #3's own plan and RFC 002 text say the installer is deferred to the `engine` CLI work and no code for it exists on #3's branch | Resolved by the section 3.9 rule (Track 1 text is owned by #3); re-check after the merge | done on this branch (2026-11-02): plan 3.1, the matrix and section 1 now say the installer is deferred; the merge-time conflict still resolves to #3's text |
 | R-10 | RFC 004 section 4 acceptance, `GET /api/v1/key` | Ticked, "tested against mocked responses; the live field names are unverified" | Still unverified; Stage 2 needs it live | Keep the caveat; EXP-1 prerequisite in the Experiments plan | open |
@@ -305,7 +305,7 @@ Found while writing this plan and RFC 006, then worked through in the reconcilia
 | R-13 | Plan section 5.4 | "Egress test suite: `bun run test:egress` and `uv run pytest tests/test_egress.py`" | Neither exists at any head: the root `package.json` has `test`, `build`, `lint` only and there is no `tests/test_egress.py`. Existing egress tests: `packages/harness2/tests/test_egress_proxy.py`, `test_upstream_egress.py`, `packages/jev/tests/egress.test.ts` | Plan text now says the cross-runtime suites are a Track 4 deliverable | done (2026-11-02) |
 | R-14 | Plan sections 1, 3.1, 4 (WS1) | `cli/` workspace, `bin/engine` and a Makefile, `engine up` | No `cli/`, `bin/` or `Makefile` in `main`, #3, #4, #5 or #7 | Plan text now says they are not built | done (2026-11-02) |
 | R-15 | Plan section 3.4, RFC 001 section 6, RFC 005 header | Track 4 branch `feat/track4-egress-retirement` | The branch does not exist (`git branch -r`) | Marked "not created, not started" | done (2026-11-02) |
-| R-16 | PR #3 body | "Bun Test Suite: 245 passed, 1 skipped" | Commit `3dd8b8d` in #3's history says tests went 245 to 307; PR #4 reports 1203 pass. The PR body is stale | Edit the PR #3 body (the plan only records it) | open |
+| R-16 | PR #3 body | "Bun Test Suite: 245 passed, 1 skipped" | Commit `3dd8b8d` in #3's history says tests went 245 to 307; PR #4 reports 1203 pass. The PR body is stale | Edit the PR #3 body (the plan only records it) | done (2026-11-03): PR #3 body now 306 passed / 1 skipped at 61fd4a3 |
 | R-17 | Plan section 3.3 and RFC 004 section 2.2 | "21 real-daemon integration tests pass unskipped" | True at slice 2 (2026-10-29); `test_docker_integration.py` has 25 test functions at PR #5's head (`rg`, parametrisation not counted) | Plan text gives both numbers; re-measure with K-4 before quoting a count | done in the plan; RFC 004 line unchanged (historical) |
 | R-18 | Run summary (`report.json` `sessions_summary`), `egress_summary` and the stage-1 report | `sessions_summary.denied_requests` shows no denials for run `d08d` | It counts path denials only; the 76 model denials (`unix-route-model-denied`) appear only in `denied_reasons`, in `denied_hosts` and in each session's `egress_denied` and `egress` log lines. This is why stage 1c was first reported as "no denied requests" (R-1) | `egress_summary` and the report now count model-denied requests by exact model name (per model: count), mirroring the existing path-denial diagnostics: a new `denied_models` map at the proxy layer (`egress_proxy.py`), threaded through `session_runner.egress_summary()`, and merged across sessions in `stage1.py` with the same cap-and-bucket pattern as `denied_requests`. `feat/stage1-integration` @ `b479f3e`; full suite 5444 passed, 22 skipped, 0 leftover containers | done (2026-11-02) |
 
@@ -340,7 +340,7 @@ The rows below are the RFC 006 acceptance criteria as checks, so they appear in 
 | B-3 | Median session wall time within the agreed factor of the Docker reference | `jq` over `audit.jsonl` `session_end` events | Claude Code | B-1 | blocked |
 | B-4 | No stream truncation, EOF or proxy-timeout errors | `report.json` `errors` and per-rollout `metrics.json` `errors` | Claude Code | B-1 | blocked |
 | B-5 | Every denial is of a pre-registered kind | `sessions_summary` and `egress_denied` counts | Claude Code | B-1 | blocked |
-| B-6 | Preflight no longer requires Docker under sbx, or the dual requirement is accepted in writing | Code diff, or a decision note | Claude Code, User | none | open |
+| B-6 | Preflight no longer requires Docker under sbx, or the dual requirement is accepted in writing | Code diff, or a decision note | Claude Code, User | none | done (2026-11-03): feat/stage1-integration 0fe0d19 (docker and image checks not required under sbx; default unchanged; fallback and open-only flip are a later gated change) |
 | B-7 | One review pass on the code changed since the last Opus pass, no open HIGH finding | L-b2 or L-b3 outcome | User | none | open |
 | B-8 | The user accepts the isolation shape (RFC 006 section 3.3) | A written decision | User | none | open |
 | B-9 | Both host-reach settings off at run time; restart-pending heuristic passes | `sbx settings ls` read; `stage1 plan` shows the `model_runtime` check ok | User | none | open |
