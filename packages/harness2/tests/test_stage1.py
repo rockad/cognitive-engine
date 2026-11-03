@@ -1229,6 +1229,40 @@ def test_plan_with_sbx_asked_for_and_not_usable_is_not_ready_and_never_falls_bac
     assert "rootless Docker (the default" not in text
 
 
+def test_with_sbx_selected_docker_and_the_image_are_not_required_and_never_consulted(rig, up):
+    out = io.StringIO()
+    code = run_plan(rig.parse("plan"), environ=ASK_SBX, probes=rig.probes(model_runtime=lambda env: SBX_OK, environ=ASK_SBX), out=out)
+    text = out.getvalue()
+    assert code == 0 and "READY." in text
+    assert re.search(r"\[ok\] docker\s+not required: model sessions run on sbx", text)
+    assert re.search(r"\[ok\] image\s+not required: model sessions run on sbx", text)
+    assert rig.calls["gate"] == 0 and rig.calls["resolve"] == 0
+
+
+def test_with_sbx_selected_the_plan_is_ready_although_rootless_docker_is_not_usable(rig, up):
+    def no_docker():
+        raise sandbox.SandboxUnavailable("rootless Docker is not running")
+    pre = stage1.preflight(stage1._settings_from(rig.parse("plan"), {}), rig.probes(gate=no_docker, model_runtime=lambda env: SBX_OK, environ=ASK_SBX))
+    assert pre.ok and pre.verified is None and pre.image is None
+    assert {c.name: c.ok for c in pre.checks} == {"profile": True, "policy": True, "workspace_roots": True, "docker": True, "image": True,
+                                                  "model_runtime": True, "cli": True, "ollama": True}
+
+
+def test_with_sbx_asked_for_and_not_usable_docker_is_still_not_required_and_the_failure_is_the_runtime(rig, up):
+    out = io.StringIO()
+    code = run_plan(rig.parse("plan"), environ=ASK_SBX, probes=rig.probes(model_runtime=lambda env: SBX_BAD, environ=ASK_SBX), out=out)
+    text = out.getvalue()
+    assert code == 2 and "[FAIL] model_runtime" in text and "[FAIL] docker" not in text and "[FAIL] image" not in text
+    assert rig.calls["gate"] == 0 and rig.calls["resolve"] == 0
+
+
+def test_with_the_default_runtime_docker_and_the_image_are_still_required_and_consulted(rig, up):
+    pre = stage1.preflight(stage1._settings_from(rig.parse("plan"), {}), rig.probes())
+    assert pre.ok and pre.verified is not None and pre.image is not None and rig.calls["gate"] == 1 and rig.calls["resolve"] == 1
+    bad = stage1.preflight(stage1._settings_from(rig.parse("plan"), {}), rig.probes(gate=lambda: (_ for _ in ()).throw(sandbox.SandboxUnavailable("no docker"))))
+    assert not bad.ok and [c.name for c in bad.failing()] == ["docker", "image"]
+
+
 @pytest.mark.parametrize("value", ["auto", "1", "microvm"])
 def test_a_value_that_is_not_docker_or_sbx_is_not_ready(rig, up, value):
     out = io.StringIO()

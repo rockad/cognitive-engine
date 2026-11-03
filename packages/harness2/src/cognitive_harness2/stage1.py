@@ -337,22 +337,28 @@ def preflight(s: Settings, probes: Probes | None = None) -> Preflight:
         return True, f"{root} exists and is writable"
     out.checks.append(_guard("workspace_roots", roots_ok))
 
+    def runtime_ok() -> tuple[bool, str]:
+        out.runtime = pr.model_runtime(pr.environ)
+        return out.runtime.ok, out.runtime.line
+    runtime_check = _guard("model_runtime", runtime_ok)      # first: it decides whether Docker is needed at all
+    docker_needed = out.runtime.kind != sbx_session.RUNTIME_SBX
+
     def docker_ok() -> tuple[bool, str]:
+        if not docker_needed:
+            return True, "not required: model sessions run on sbx (no container, no proposer image)"
         out.verified = pr.gate()
         return True, f"rootless Docker verified at {out.verified.host}"
     out.checks.append(_guard("docker", docker_ok))
 
     def image_ok() -> tuple[bool, str]:
+        if not docker_needed:
+            return True, "not required: model sessions run on sbx"
         if out.verified is None:
             return False, "not checked: Docker is not usable"
         out.image = pr.resolve(out.verified)
         return True, f"{out.image.tag} present locally (never built or pulled by a run)"
     out.checks.append(_guard("image", image_ok))
-
-    def runtime_ok() -> tuple[bool, str]:
-        out.runtime = pr.model_runtime(pr.environ)
-        return out.runtime.ok, out.runtime.line
-    out.checks.append(_guard("model_runtime", runtime_ok))
+    out.checks.append(runtime_check)
 
     def cli_ok() -> tuple[bool, str]:
         cli = find_cli(s.cli, pr.environ, pr.which)
@@ -895,8 +901,8 @@ class SweepContext:
     plan: SweepPlan
     grant: ExecutionGrant
     approval: Approval
-    verified: sandbox.VerifiedDocker
-    image: image.ImageRef
+    verified: sandbox.VerifiedDocker | None       # None only when model sessions run on sbx (preflight's `docker` check: not required)
+    image: image.ImageRef | None
     cli: str
     up: upstream_import.Upstream
     surface: Any
@@ -1545,7 +1551,8 @@ def _approved(s: Settings, plan: SweepPlan, pre: Preflight, up: Any, surface: An
                    agent_env=dict(approval.agent_env))
         g = grant or make_grant(plan, sweep_id=sweep_id, approval=approval, per_session_s=s.per_session_s)
         audit.emit("grant", **g.to_dict())
-        assert pre.verified is not None and pre.image is not None and pre.cli is not None
+        assert pre.cli is not None
+        assert pre.runtime.kind == sbx_session.RUNTIME_SBX or (pre.verified is not None and pre.image is not None)
         ctx = SweepContext(settings=s, plan=plan, grant=g, approval=approval, verified=pre.verified, image=pre.image,
                            cli=pre.cli, up=up, surface=surface, run_dir=run_dir, audit=audit, approved_for_real_model=real,
                            run_task=run_task, runtime=pre.runtime)

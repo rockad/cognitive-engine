@@ -173,8 +173,8 @@ def apply_overrides(up: Upstream, *, stage_attempts: int = 1, transport_attempts
 
 @dataclass(frozen=True)
 class SessionConfig:
-    verified: VerifiedDocker
-    image: ImageRef
+    verified: VerifiedDocker | None        # None only when `runtime` is sbx, which uses neither Docker nor the image
+    image: ImageRef | None
     profile: channels.ChannelProfile
     channel: str                           # the name in the profile
     zdr: str
