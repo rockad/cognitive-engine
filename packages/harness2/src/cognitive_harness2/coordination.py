@@ -47,6 +47,7 @@ import asyncio
 import contextlib
 import fcntl
 import json
+import math
 import os
 import re
 import socket
@@ -60,7 +61,7 @@ from typing import Protocol, runtime_checkable
 
 from .model_gate import _wait_seconds
 
-__all__ = ["BuildSlot", "FlockBuildSlot", "HolderInfo", "SlotTimeout", "marker_name", "DEFAULT_PATHS"]
+__all__ = ["DEFAULT_PATHS", "BuildSlot", "FlockBuildSlot", "HolderInfo", "SlotTimeout", "marker_name"]
 
 MARKER_PREFIX = "CE_BUILDSLOT_HELD_"
 _NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
@@ -131,7 +132,7 @@ def _clean(text: object, limit: int) -> str | None:
 
 
 def _number(value: object, *, positive: bool) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value or value in (float("inf"), float("-inf")):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         return None
     return float(value) if (value > 0 if positive else value >= 0) else None
 

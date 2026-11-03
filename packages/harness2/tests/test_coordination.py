@@ -14,11 +14,17 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
-
 from cognitive_harness2 import coordination
-from cognitive_harness2.coordination import BuildSlot, FlockBuildSlot, HolderInfo, SlotTimeout, marker_name
+from cognitive_harness2.coordination import (
+    BuildSlot,
+    FlockBuildSlot,
+    HolderInfo,
+    SlotTimeout,
+    marker_name,
+)
 from cognitive_harness2.model_gate import GATE
 
 SLOT = "rootless-docker"
@@ -107,9 +113,8 @@ def test_a_free_slot_is_taken_and_given_back(rig):
 
 def test_two_processes_exclude_each_other(rig):
     child = rig.start_holder()
-    with pytest.raises(SlotTimeout):
-        with rig.slots.hold(SLOT, timeout=0.3):
-            pytest.fail("entered a slot another process holds")
+    with pytest.raises(SlotTimeout), rig.slots.hold(SLOT, timeout=0.3):
+        pytest.fail("entered a slot another process holds")
     child.release()
     with rig.slots.hold(SLOT, timeout=5):
         pass
@@ -134,9 +139,8 @@ def test_timeout_and_deadline_the_earlier_wins(rig):
 
 def test_the_timeout_names_the_holder_when_it_is_known(rig):
     rig.start_holder(label="suite:full")
-    with pytest.raises(SlotTimeout) as ei:
-        with rig.slots.hold(SLOT, timeout=0.2):
-            pass
+    with pytest.raises(SlotTimeout) as ei, rig.slots.hold(SLOT, timeout=0.2):
+        pass
     assert ei.value.slot == SLOT and isinstance(ei.value, TimeoutError)
     assert ei.value.holder is not None and ei.value.holder.label == "suite:full" and ei.value.holder.pid
     assert "suite:full" in str(ei.value)
@@ -147,9 +151,8 @@ def test_the_slot_is_released_on_normal_exit_on_exception_and_on_sigkill(rig):
         pass
     with rig.slots.hold(SLOT, timeout=1):          # normal exit released it
         pass
-    with pytest.raises(RuntimeError):
-        with rig.slots.hold(SLOT, timeout=1):
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError), rig.slots.hold(SLOT, timeout=1):
+        raise RuntimeError("boom")
     with rig.slots.hold(SLOT, timeout=1):          # an exception released it
         pass
     child = rig.start_holder()
@@ -159,10 +162,9 @@ def test_the_slot_is_released_on_normal_exit_on_exception_and_on_sigkill(rig):
 
 
 def test_the_slot_is_not_reentrant(rig):
-    with rig.slots.hold(SLOT, timeout=1):
-        with pytest.raises(SlotTimeout):
-            with rig.slots.hold(SLOT, timeout=0.2):
-                pytest.fail("a thread entered a slot it already holds")
+    with rig.slots.hold(SLOT, timeout=1), pytest.raises(SlotTimeout):
+        with rig.slots.hold(SLOT, timeout=0.2):
+            pytest.fail("a thread entered a slot it already holds")
 
 
 def test_different_slots_do_not_exclude_each_other(rig):
@@ -250,18 +252,16 @@ async def test_a_cancelled_ahold_does_not_leak_the_slot(rig):
 
 async def test_ahold_takes_and_releases_the_slot(rig):
     async with rig.slots.ahold(SLOT, timeout=1, label="async"):
-        with pytest.raises(SlotTimeout):
-            with rig.slots.hold(SLOT, timeout=0.1):
-                pass
+        with pytest.raises(SlotTimeout), rig.slots.hold(SLOT, timeout=0.1):
+            pass
     with rig.slots.hold(SLOT, timeout=1):
         pass
 
 
 @pytest.mark.parametrize("bad", ["", "A", "../x", "a/b", "a b", "-a", "x" * 65, ".a"])
 def test_a_bad_slot_name_is_refused_before_anything_is_touched(rig, bad):
-    with pytest.raises(ValueError):
-        with rig.slots.hold(bad, timeout=0.1):
-            pass
+    with pytest.raises(ValueError), rig.slots.hold(bad, timeout=0.1):
+        pass
     with pytest.raises(ValueError):
         rig.slots.holder(bad)
 
@@ -269,9 +269,8 @@ def test_a_bad_slot_name_is_refused_before_anything_is_touched(rig, bad):
 @pytest.mark.parametrize("kw,exc", [({"timeout": -1}, ValueError), ({"timeout": "5"}, TypeError), ({"timeout": True}, TypeError),
                                     ({"deadline": "x"}, TypeError), ({"timeout": float("nan")}, ValueError)])
 def test_a_bad_timeout_or_deadline_is_refused(rig, kw, exc):
-    with pytest.raises(exc):
-        with rig.slots.hold(SLOT, **kw):
-            pass
+    with pytest.raises(exc), rig.slots.hold(SLOT, **kw):
+        pass
 
 
 # ══ FLOCK: what is specific to this implementation ══════════════════════════════════════════════════════════════════
@@ -288,7 +287,7 @@ def sidecar(rig: FlockRig):
 
 
 def test_the_kernel_call_is_fcntl_flock_never_lockf():
-    src = open(coordination.__file__, encoding="utf-8").read()
+    src = Path(coordination.__file__).read_text(encoding="utf-8")
     assert "fcntl.flock(" in src and "fcntl.lockf(" not in src
 
 
@@ -306,7 +305,7 @@ def test_it_excludes_against_flock_1_in_both_directions(flock_rig):
         outer.kill()
         outer.wait()
     with flock_rig.slots.hold(SLOT, timeout=2):
-        rc = subprocess.run(["flock", "-n", str(flock_rig.lock), "true"]).returncode
+        rc = subprocess.run(["flock", "-n", str(flock_rig.lock), "true"], check=False).returncode
         assert rc == 1                                      # flock(1) cannot take what Python holds
 
 
@@ -343,9 +342,8 @@ def test_an_unreadable_or_oversized_sidecar_is_ignored(flock_rig, text):
     flock_rig.start_holder()
     sidecar(flock_rig).write_text(text)
     assert flock_rig.slots.holder(SLOT) is None
-    with pytest.raises(SlotTimeout) as ei:
-        with flock_rig.slots.hold(SLOT, timeout=0.2):
-            pass
+    with pytest.raises(SlotTimeout) as ei, flock_rig.slots.hold(SLOT, timeout=0.2):
+        pass
     assert ei.value.holder is None
 
 
@@ -356,9 +354,8 @@ def test_a_forged_sidecar_cannot_inject_control_characters_or_huge_text(flock_ri
     info = flock_rig.slots.holder(SLOT)
     assert info is not None and "\n" not in (info.label or "") and "\x1b" not in (info.label or "") and len(info.label or "") <= 120
     assert info.pid is None and info.acquired_at is None and info.ttl_hint_s is None and "\n" not in (info.host or "")
-    with pytest.raises(SlotTimeout) as ei:
-        with flock_rig.slots.hold(SLOT, timeout=0.2):
-            pass
+    with pytest.raises(SlotTimeout) as ei, flock_rig.slots.hold(SLOT, timeout=0.2):
+        pass
     assert "\n" not in str(ei.value) and "\x1b" not in str(ei.value)
 
 
@@ -406,18 +403,16 @@ def test_a_marker_for_another_slot_does_not_bypass_the_lock(flock_rig, monkeypat
     flock_rig.start_holder()
     monkeypatch.setenv("CE_BUILDSLOT_HELD_OTHER", "1")
     monkeypatch.setenv("CE_BUILDSLOT_HELD_GPU_MODEL", "1")
-    with pytest.raises(SlotTimeout):
-        with flock_rig.slots.hold(SLOT, timeout=0.2):
-            pass
+    with pytest.raises(SlotTimeout), flock_rig.slots.hold(SLOT, timeout=0.2):
+        pass
 
 
 @pytest.mark.parametrize("value", ["", "0", "true", "yes", "11", " 1", "1 "])
 def test_only_the_exact_value_1_counts_as_the_marker(flock_rig, monkeypatch, value):
     flock_rig.start_holder()
     monkeypatch.setenv("CE_BUILDSLOT_HELD_ROOTLESS_DOCKER", value)
-    with pytest.raises(SlotTimeout):
-        with flock_rig.slots.hold(SLOT, timeout=0.2):
-            pass
+    with pytest.raises(SlotTimeout), flock_rig.slots.hold(SLOT, timeout=0.2):
+        pass
 
 
 def test_a_child_started_under_the_wrapper_marker_does_not_deadlock_against_its_parent(flock_rig):
@@ -427,12 +422,12 @@ def test_a_child_started_under_the_wrapper_marker_does_not_deadlock_against_its_
     code = ("import sys\nfrom cognitive_harness2.coordination import FlockBuildSlot\n"
             "with FlockBuildSlot({'rootless-docker': sys.argv[1]}).hold('rootless-docker', timeout=2):\n    print('INSIDE')\n")
     env = {**os.environ, "CE_BUILDSLOT_HELD_ROOTLESS_DOCKER": "1"}
-    out = subprocess.run(["flock", str(flock_rig.lock), sys.executable, "-c", code, str(flock_rig.lock)], env=env, capture_output=True,
+    out = subprocess.run(["flock", str(flock_rig.lock), sys.executable, "-c", code, str(flock_rig.lock)], env=env, check=False, capture_output=True,
                          text=True, timeout=20)
     assert out.returncode == 0 and out.stdout.strip() == "INSIDE", out.stderr
     env.pop("CE_BUILDSLOT_HELD_ROOTLESS_DOCKER")             # without the marker the same nesting is the self-deadlock the marker exists for
     out = subprocess.run(["flock", str(flock_rig.lock), sys.executable, "-c", code.replace("timeout=2", "timeout=0.5"), str(flock_rig.lock)],
-                         env=env, capture_output=True, text=True, timeout=20)
+                         env=env, check=False, capture_output=True, text=True, timeout=20)
     assert out.returncode != 0 and "SlotTimeout" in out.stderr
 
 
