@@ -64,7 +64,7 @@ from .model_gate import _wait_seconds
 __all__ = ["DEFAULT_PATHS", "BuildSlot", "FlockBuildSlot", "HolderInfo", "SlotTimeout", "marker_name"]
 
 MARKER_PREFIX = "CE_BUILDSLOT_HELD_"
-_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 _SIDECAR_MAX_BYTES = 4096
 _LABEL_MAX = 120
 _HOST_MAX = 255
@@ -112,14 +112,16 @@ class BuildSlot(Protocol):
 
 def marker_name(slot: str) -> str:
     """The environment variable a wrapper exports to say "this process tree already holds `slot`": the slot name
-    upper-cased with every non-alphanumeric character replaced by `_` (`rootless-docker` gives
-    `CE_BUILDSLOT_HELD_ROOTLESS_DOCKER`). Two names that differ only in such characters share one marker."""
+    upper-cased with every `-` replaced by `_` (`rootless-docker` gives
+    `CE_BUILDSLOT_HELD_ROOTLESS_DOCKER`). A slot name may contain only lower-case letters, digits and `-`, so no two names share a
+    marker or a lock file (names with `_` or `.` were refused for exactly that reason: `a-b` and `a_b` would have had two lock
+    files and one marker, and a wrapper holding one would have made `hold()` of the other skip a lock someone else can take)."""
     return MARKER_PREFIX + re.sub(r"[^A-Za-z0-9]", "_", _checked(slot)).upper()
 
 
 def _checked(name: str) -> str:
     if not isinstance(name, str) or not _NAME.fullmatch(name):
-        raise ValueError("a slot name is 1 to 64 characters: lower-case letters, digits, '.', '_' and '-', starting with a letter or digit")
+        raise ValueError("a slot name is 1 to 64 characters: lower-case letters, digits and '-', starting with a letter or digit")
     return name
 
 

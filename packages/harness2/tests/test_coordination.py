@@ -62,6 +62,7 @@ class FlockRig:
     def __init__(self, tmp_path):
         self.tmp = tmp_path
         self.lock = tmp_path / "slot.lock"
+        (tmp_path / "state").mkdir()
         self.slots: BuildSlot = FlockBuildSlot({SLOT: self.lock}, state_dir=tmp_path / "state", poll_s=0.02)
         self.children: list[Holder] = []
 
@@ -258,7 +259,7 @@ async def test_ahold_takes_and_releases_the_slot(rig):
         pass
 
 
-@pytest.mark.parametrize("bad", ["", "A", "../x", "a/b", "a b", "-a", "x" * 65, ".a"])
+@pytest.mark.parametrize("bad", ["", "A", "../x", "a/b", "a b", "-a", "x" * 65, ".a", "a_b", "a.b", "_a"])
 def test_a_bad_slot_name_is_refused_before_anything_is_touched(rig, bad):
     with pytest.raises(ValueError), rig.slots.hold(bad, timeout=0.1):
         pass
@@ -378,7 +379,7 @@ def test_a_failed_sidecar_write_does_not_fail_the_hold(flock_rig, monkeypatch):
 
 def test_the_marker_name_maps_the_slot_name():
     assert marker_name("rootless-docker") == "CE_BUILDSLOT_HELD_ROOTLESS_DOCKER"
-    assert marker_name("gpu.model_2") == "CE_BUILDSLOT_HELD_GPU_MODEL_2"
+    assert marker_name("gpu-model-2") == "CE_BUILDSLOT_HELD_GPU_MODEL_2"
     with pytest.raises(ValueError):
         marker_name("Bad Name")
 
@@ -444,3 +445,33 @@ def test_a_bad_poll_interval_is_refused(tmp_path, poll):
     with pytest.raises(ValueError):
         FlockBuildSlot(state_dir=tmp_path, poll_s=poll)
 
+
+
+# ── a slot name maps to ONE lock file and ONE marker, and no two names share either ───────────────────────────────
+
+def test_no_two_valid_names_share_a_marker_or_a_lock_file(tmp_path):
+    """The review finding: 'a-b' and 'a_b' used to have two lock files but one marker, so a wrapper holding 'a-b' made
+    hold('a_b') skip a lock that another process could take. Names are now restricted so that cannot be constructed."""
+    import itertools
+    slots = FlockBuildSlot(state_dir=tmp_path)
+    names = [a + b for a in "a-1" for b in ("", *"a-1")] + ["".join(p) for p in itertools.product("a-", repeat=3)]
+    valid = sorted({n for n in names if n[0] != "-"})
+    markers = [marker_name(n) for n in valid]
+    files = [slots.lock_path(n) for n in valid]
+    assert len(set(markers)) == len(valid) and len(set(files)) == len(valid)
+    for pair in ("a_b", "a.b", "a-b_c"):
+        with pytest.raises(ValueError):
+            marker_name(pair)
+        with pytest.raises(ValueError):
+            slots.lock_path(pair)
+
+
+def test_a_marker_for_one_slot_bypasses_only_that_slot_never_a_look_alike(flock_rig, monkeypatch):
+    other = flock_rig.start_holder(name="a-c")
+    flock_rig.start_holder(name="a-b")
+    monkeypatch.setenv(marker_name("a-b"), "1")
+    with flock_rig.slots.hold("a-b", timeout=0.2):                # the marked slot: skipped
+        pass
+    with pytest.raises(SlotTimeout), flock_rig.slots.hold("a-c", timeout=0.2):      # a different slot, held by someone: not skipped
+        pass
+    other.release()
