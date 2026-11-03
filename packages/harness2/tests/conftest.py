@@ -77,3 +77,19 @@ def _fresh_sandbox_selection_state():
     yield
     sandbox.clear_sbx_cache()
     sandbox._reset_warnings()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _private_slots_dir(tmp_path_factory):
+    """Every cross-process slot a test takes without naming a directory (`FlockBuildSlot()` in a real-sweep gate) lives in a
+    directory private to this pytest process, so two test processes never wait for each other's GPU slot, and no test
+    touches the user's real `~/.local/state/cognitive-engine/slots`. The `rootless-docker` slot keeps its fixed path
+    (it is the shell wrapper's lock file): tests that exercise it pass their own paths."""
+    from cognitive_harness2 import coordination
+    previous = os.environ.get(coordination.SLOTS_DIR_ENV)
+    os.environ[coordination.SLOTS_DIR_ENV] = str(tmp_path_factory.mktemp("slots"))
+    yield
+    if previous is None:
+        os.environ.pop(coordination.SLOTS_DIR_ENV, None)
+    else:
+        os.environ[coordination.SLOTS_DIR_ENV] = previous

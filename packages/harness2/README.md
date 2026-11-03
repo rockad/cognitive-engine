@@ -486,7 +486,7 @@ Upstream's `Proposer` is the object `run_task` and `run_sweep` call to start eve
 | --- | --- | --- |
 | verified import | `upstream_import.py` | `import_upstream(runs_dir=...)` imports `config`, `core.{spec,proposer,recursion,schedule,tree}` with the current directory switched to a private **empty** directory and `os.environ` scrubbed of `HARNESS2_*`, `GOOGLE_CLOUD_*` and Vertex variables (plus `HARNESS2_RUNS_DIR` under your directory and a placeholder `HARNESS2_IMPROVER_MODEL`), so `config.py` cannot read a stray `.env` or freeze your Vertex project. Then it **verifies**: the installed distribution is `PINNED_COMMIT` (a git install via `direct_url.json`'s `commit_id`; an editable install must be a git checkout at that HEAD with unmodified tracked files and no `.env` beside the package); the package Python found is the one that distribution installed (no shadowing on `sys.path`) and `config.__file__` is inside it; `os.environ` gained, lost or changed nothing but the controlled variables and upstream's one `setdefault` (`GOOGLE_CLOUD_LOCATION`); `harness2.benchmarks` and `harness2.cli` are not loaded. The environment and directory are restored in a `finally`; any surprise raises `UpstreamImportError` and removes the half-imported modules. Here upstream is installed from git into `site-packages` (`direct_url.json` carries the commit); a module imported by someone else first is refused, because it cannot be shown to have read nothing. |
 | command shapes | `upstream_egress.py` | `COMMAND_SHAPES` is the allow-list of exactly the argv this package runs: `opencode run --standalone --auto --format json --model M PROMPT` (opencode v2.0.25; the v1 `bun ... --dir --variant` shape is gone), `claude -p --output-format json --permission-mode ... --no-session-persistence --model M --effort E --append-system-prompt S [--max-budget-usd N]` (prompt on stdin), and `agy --print=PROMPT --dangerously-skip-permissions --model=M [--effort=low]` (joined flags). `agy_cli` is a checked kind (`CHECKED_KINDS`), with `googleapis.com` as its own endpoint rather than a Vertex route. |
-| model gate | `model_gate.py` | `GATE`: one slot, `hold(timeout=, deadline=)` and `async with ahold(...)`. A single GPU serves one model call at a time; the solver sessions (WS-E) take the same gate. Deadline-aware: a wait past it raises `GateTimeout` naming the holder. Not re-entrant. |
+| model gate | `model_gate.py` | `GATE`: one slot, `hold(timeout=, deadline=)` and `async with ahold(...)`. A single GPU serves one model call at a time (a real sweep adds a cross-process slot behind it: see **Cross-process slots**); the solver sessions (WS-E) take the same gate. Deadline-aware: a wait past it raises `GateTimeout` naming the holder. Not re-entrant. |
 | contained proposer | `contained_proposer.py` | `contained_proposer_class(up)` builds `ContainedProposer(Proposer)`; `make_proposer(up, SessionConfig(...))` builds one; `make_selector_prop(prop)` builds the selector's, to pass as `selector_prop=` (otherwise upstream's `_selector_for` builds a plain host `Proposer`). |
 | drift pins | `tests/test_upstream_compat.py` | Pins every private or fragile upstream name the binding relies on. A failure says what drifted and the pinned commit. |
 
@@ -923,6 +923,23 @@ Subagent definitions (`c5`) and skills (`c6`) carry YAML frontmatter defining ex
 3. **Body Hygiene**: The body must not introduce a secondary frontmatter-looking block or stray frontmatter keys (`model:`, `tools:`, `permissions:`, etc.) following a `---` fence outside fenced code blocks.
 4. **Encoding & Size Hygiene**: Files must be valid UTF-8, strictly capped at 512 KiB, free of NUL characters (`\x00`), and free of disallowed Unicode control or invisible characters (BOM `\ufeff`, zero-width spaces, bidi overrides, ANSI escapes).
 
+## Cross-process slots (BuildSlot)
+
+`model_gate.GATE` serialises one process; a second process on the same machine is not seen by it. `coordination.py` adds a named exclusive slot that is (`BuildSlot`: `hold`, `ahold`, `holder`; `FlockBuildSlot` on `fcntl.flock`, never `lockf`, so it also excludes against `flock(1)`). What it promises and what it does not (TTL, fairness, forced release, heartbeat, cross-host are out of scope) is in the module docstring. A slot name is lower-case letters, digits and `-`, so no two names share a lock file or a nesting marker.
+
+Where it is used:
+
+- **The GPU, in a real sweep.** `stage1 run` (a real, approved sweep) gives every proposer and solver session `SlottedGate`: the in-process `GATE` first, then the cross-process `gpu-model` slot, released in reverse. A second process on the same GPU waits as a second thread would; the wait is one budget for both; a slot that is not free in time raises the `GateTimeout` every caller already handles, naming the holder. The teardown records `gpu_slot_holder` (who else holds the slot afterwards; informational, never makes a run dirty). `COGNITIVE_HARNESS2_GPU_SLOT=off` (also `0`, `false`, `no`) keeps the in-process gate alone, as before; any other value, a typo included, leaves the slot on. The selftest and fakes never take the slot. Anything else that uses the GPU (the model benchmark, another sweep) only takes part if it takes the same slot.
+- **The Docker suites.** Instead of a bare `flock <lockfile> pytest ...`:
+
+  ```
+  uv run python -m cognitive_harness2.coordination run --slot rootless-docker --label suite:full -- uv run pytest -q
+  ```
+
+  It holds `rootless-docker` (the lock file `~/.agents/cognitive-engine-docker-tests.lock`, so it and a plain `flock(1)` still exclude each other), exports `CE_BUILDSLOT_HELD_ROOTLESS_DOCKER=1` so code inside it that takes the same slot does not wait for its own parent, writes the holder sidecar, and forwards SIGINT, SIGTERM and SIGHUP to the command. Exit status: the command's (128 plus the signal if killed), 75 when the slot was not free in time (the message names the holder when it is known), 127 for a missing command, 2 for a bad call. `--timeout S` bounds the wait; the default waits without limit, like `flock`.
+
+The marker is a cooperation device inside one process tree, not enforcement: any process that sets it skips the lock. Lock files must be on a local filesystem. Tests keep their slots in a directory private to the pytest process (`COGNITIVE_HARNESS2_SLOTS_DIR`).
+
 ## Configuration
 
 | variable | default |
@@ -933,6 +950,8 @@ Subagent definitions (`c5`) and skills (`c6`) carry YAML frontmatter defining ex
 | `COGNITIVE_HARNESS2_ZDR_ENDPOINTS` | unset: comma-separated hosts you attest are zero-retention, for the slice 1 probe path only (the Proposer gate reads the channel profile instead) |
 | `COGNITIVE_HARNESS2_CHANNELS_FILE` | unset: `~/.config/cognitive-engine/harness2-channels.toml`. The channel profile (see **Channel profile**); no file means no channel is declared and everything is denied. Set to a missing file: malformed, refused loudly |
 | `COGNITIVE_HARNESS2_EXPERIENCE_ROOT` | `~/.local/share/cognitive-engine/experiences` |
+| `COGNITIVE_HARNESS2_GPU_SLOT` | unset (on): a real sweep also holds the cross-process `gpu-model` slot; `off`, `0`, `false` or `no` keeps the in-process gate alone |
+| `COGNITIVE_HARNESS2_SLOTS_DIR` | unset: `$XDG_STATE_HOME/cognitive-engine/slots`, where slots with no predefined lock file keep theirs (tests point it at a private directory) |
 | `COGNITIVE_HARNESS2_MODEL_SANDBOX` | unset (rootless Docker). `sbx` opts the stage-1 model sessions into the sbx route (see "sbx model route"); any other value is refused |
 
 The API key is read from `JEV_OPENROUTER_API_KEY` or `OPENROUTER_API_KEY` and is never returned or logged.

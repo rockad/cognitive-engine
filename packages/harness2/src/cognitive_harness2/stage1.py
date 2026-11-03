@@ -61,7 +61,8 @@ from . import channels, egress, image, ollama_guard, proposer_hint, run_scope, s
 from . import session_runner as sr
 from .contained_proposer import (OPENCODE_PROMPT, SessionConfig, build_command, make_proposer, make_selector_prop,
                                  session_env, TMP_EXEC)
-from .model_gate import GATE
+from .coordination import GPU_SLOT, FlockBuildSlot, SlottedGate, gpu_slot_enabled
+from .model_gate import GATE, ModelGate
 from .substrate import CognitiveSubstrate, ExecutionGrant, ExecutionRefused, SolverExecution, SolverJob
 from .settings import ENV_CHANNELS_FILE
 from .sweep_plan import CostCap, SweepCandidate, SweepPlan, SweepRefused, plan_sweep
@@ -912,6 +913,8 @@ class SweepContext:
     run_task: Callable[..., Any] | None = None      # tests may replace upstream's run_task
     # which runtime model sessions use (preflight's `model_runtime`): Docker unless sbx was asked for explicitly and is usable
     runtime: sbx_session.ModelRuntime = field(default_factory=lambda: sbx_session.ModelRuntime(sbx_session.RUNTIME_DOCKER, True))
+    # the model gate every session takes: the in-process GATE, or (a real sweep) one that also holds the cross-process GPU slot
+    gate: ModelGate = GATE
 
 
 @dataclass
@@ -1314,14 +1317,14 @@ def execute_sweep(ctx: SweepContext) -> SweepOutcome:
         execution = SolverExecution(
             runner=solver_runner, grant=g, cli=ctx.cli, results_root=results, workspace_root=solver_scratch,
             task_loader=s.ts.solver_task, argv_builder=checked_solver_argv(s, solver_env), env_builder=solver_env,
-            tmp_exec=TMP_EXEC["opencode"], gate=GATE, gate_wait_s=g.max_wall_s)
+            tmp_exec=TMP_EXEC["opencode"], gate=ctx.gate, gate_wait_s=g.max_wall_s)
         substrate = CognitiveSubstrate(ctx.surface, execution=execution)
 
         session = SessionConfig(
             verified=ctx.verified, image=ctx.image, profile=s.profile, channel=s.channel, zdr=s.zdr,
             classification=s.classification, scratch_root=str(proposer_scratch), cli_paths={"opencode": ctx.cli},
             timeout_s=g.per_session_s, api_path=API_PATH, gate_wait_s=g.max_wall_s, budget=budget, observer=observer,
-            runtime=ctx.runtime)
+            runtime=ctx.runtime, gate=ctx.gate)
         prop = make_proposer(ctx.up, session, audit_dir=ctx.run_dir / "proposer-audit", timeout=int(g.per_session_s), hint=hint)
         spec = ctx.up.spec.BenchSpec(**{**ss.spec_fields(adapter_root), "name": s.ts.spec_name},
                                      prompts=ctx.up.spec.BenchPrompts(**s.ts.prompt_fields),
@@ -1434,7 +1437,7 @@ def _teardown(ctx: SweepContext, scratch: Path, session_ids: Sequence[str], befo
         left_docker = [*left_docker, *left]
     new_entries = sorted(runtime_entries() - before_entries)
     return {"scratch_left": scratch.exists(), "docker_leftovers": left_docker, "sessions_seen": len(session_ids),
-            "gate_locked": GATE.locked(), "new_runtime_entries": new_entries}
+            "gate_locked": ctx.gate.locked(), "gpu_slot_holder": _slot_holder(ctx.gate), "new_runtime_entries": new_entries}
 
 
 # ── plan and run, as commands ─────────────────────────────────────────────────────
@@ -1535,11 +1538,31 @@ def run_run(args: argparse.Namespace, *, environ: Mapping[str, str], probes: Pro
         err("the confirmation phrase was not typed exactly; nothing was started")
         return 2
     approval = Approval(approver_name(), "tty", phrase, typed=typed, agent_env=agent_env_record(environ))
-    return _approved(s, plan, pre, up, surface, sweep_id, run_dir, approval, real=True, run_task=run_task, out=out)
+    return _approved(s, plan, pre, up, surface, sweep_id, run_dir, approval, real=True, run_task=run_task, out=out, environ=environ)
+
+
+def sweep_gate(*, real: bool, environ: Mapping[str, str] | None = None) -> ModelGate:
+    """The gate a sweep takes around every model session. A REAL sweep (the user approved a real model) also holds the
+    cross-process `gpu-model` slot, so a second process on the same GPU waits; the selftest, fakes and
+    `COGNITIVE_HARNESS2_GPU_SLOT=off` keep the in-process `GATE` alone, as before."""
+    return SlottedGate(FlockBuildSlot(), GPU_SLOT) if real and gpu_slot_enabled(environ) else GATE
+
+
+def _slot_holder(gate: ModelGate) -> str | None:
+    """Who holds the cross-process GPU slot at teardown (another process: ours is released by now), as text; None when the
+    gate has no slot, nobody is known to hold it, or it cannot be read. Informational: it never makes a run dirty."""
+    if not isinstance(gate, SlottedGate):
+        return None
+    try:
+        info = gate.slot_holder()
+    except OSError:
+        return None
+    return None if info is None else info.describe()
 
 
 def _approved(s: Settings, plan: SweepPlan, pre: Preflight, up: Any, surface: Any, sweep_id: str, run_dir: Path,
               approval: Approval, *, real: bool, run_task: Callable[..., Any] | None, out: TextIO,
+              environ: Mapping[str, str] | None = None,
               grant: ExecutionGrant | None = None) -> int:
     """From here on the sweep is approved: create the run directory, the grant and the audit, then run."""
     run_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
@@ -1555,7 +1578,7 @@ def _approved(s: Settings, plan: SweepPlan, pre: Preflight, up: Any, surface: An
         assert pre.runtime.kind == sbx_session.RUNTIME_SBX or (pre.verified is not None and pre.image is not None)
         ctx = SweepContext(settings=s, plan=plan, grant=g, approval=approval, verified=pre.verified, image=pre.image,
                            cli=pre.cli, up=up, surface=surface, run_dir=run_dir, audit=audit, approved_for_real_model=real,
-                           run_task=run_task, runtime=pre.runtime)
+                           run_task=run_task, runtime=pre.runtime, gate=sweep_gate(real=real, environ=environ))
         outcome = execute_sweep(ctx)
     finally:
         audit.close()

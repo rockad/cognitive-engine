@@ -1304,3 +1304,57 @@ def test_the_sbx_leftover_check_finds_and_removes_this_sweeps_sandboxes_only(tmp
     assert sbx_session.leftover_sandboxes(str(fake), ["00000000000a"], environ=env) == []
     assert set((state / "sandboxes").read_text().split()) == {sbx_session.sandbox_name("00000000000b", pid=os.getpid()), "somebody-elses"}
     assert sbx_session.leftover_sandboxes(str(fake), [], environ=env) == []
+
+# ══ the model gate: in-process for the selftest and fakes, plus the cross-process GPU slot for a REAL sweep ═══════════
+
+def test_a_real_sweep_gets_the_cross_process_gate_and_everything_else_keeps_the_plain_one():
+    from cognitive_harness2 import coordination as co
+    from cognitive_harness2.model_gate import GATE
+    assert isinstance(stage1.sweep_gate(real=True, environ={}), co.SlottedGate)
+    assert stage1.sweep_gate(real=False, environ={}) is GATE                      # the selftest and fakes
+    for off in ("off", "OFF", "0", "false", "no", " off "):
+        assert stage1.sweep_gate(real=True, environ={co.GPU_SLOT_ENV: off}) is GATE
+    for on in ("on", "1", "yes", "of", "banana", ""):                              # a typo keeps the protection on
+        assert isinstance(stage1.sweep_gate(real=True, environ={co.GPU_SLOT_ENV: on}), co.SlottedGate)
+
+
+def test_the_sweep_context_carries_the_gate_and_defaults_to_the_in_process_one():
+    from cognitive_harness2.model_gate import GATE
+    fields = {f.name: f for f in dataclasses.fields(stage1.SweepContext)}
+    assert fields["gate"].default is GATE
+
+
+def test_the_teardown_names_who_else_holds_the_gpu_slot_and_only_for_a_slotted_gate(tmp_path):
+    from cognitive_harness2 import coordination as co
+    from cognitive_harness2.model_gate import GATE
+    slots = co.FlockBuildSlot(state_dir=tmp_path)
+    gate = co.SlottedGate(slots)
+    assert stage1._slot_holder(GATE) is None and stage1._slot_holder(gate) is None          # nothing holds it
+    with slots.hold(co.GPU_SLOT, label="bench:other"):
+        assert "bench:other" in stage1._slot_holder(gate)
+    assert stage1._slot_holder(gate) is None
+
+
+@pytest.mark.requires_rootless_docker
+def test_a_sweep_takes_the_cross_process_slot_around_every_proposer_and_solver_session(tmp_path, verified, proposer_image, up, monkeypatch):
+    """The selftest on the real daemon, with a slotted gate injected: all 7 sessions (3 proposer, 4 solver) go through the
+    gate, each holds the slot while it runs, and the slot is free again after the teardown."""
+    from cognitive_harness2 import coordination as co
+    held: list[str] = []
+
+    class Recording(co.FlockBuildSlot):
+        def hold(self, name, **kw):
+            held.append(kw.get("label") or "")
+            return super().hold(name, **kw)
+
+    slots = Recording(state_dir=tmp_path / "slots")
+    monkeypatch.setattr(stage1, "sweep_gate", lambda **kw: co.SlottedGate(slots))
+    (tmp_path / "st").mkdir()
+    (tmp_path / "st").chmod(0o755)
+    outcome = run_selftest(base=tmp_path / "st", out=io.StringIO())
+    r = outcome.report
+    assert selftest_problems(outcome) == [], r
+    assert sorted(x.split(":")[0] for x in held) == ["proposer"] * 3 + ["solver"] * 4
+    assert r["teardown"]["gate_locked"] is False and r["teardown"]["gpu_slot_holder"] is None
+    with slots.hold(co.GPU_SLOT, timeout=1):                                       # released: nothing still holds it
+        pass

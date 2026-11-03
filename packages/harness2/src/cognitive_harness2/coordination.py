@@ -43,6 +43,7 @@ Flock implementation:
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import contextlib
 import fcntl
@@ -50,20 +51,27 @@ import json
 import math
 import os
 import re
+import signal
 import socket
+import subprocess
+import sys
 import threading
 import time
-from collections.abc import AsyncIterator, Iterator, Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from .model_gate import _wait_seconds
+from .model_gate import GateTimeout, ModelGate, _wait_seconds
 
-__all__ = ["DEFAULT_PATHS", "BuildSlot", "FlockBuildSlot", "HolderInfo", "SlotTimeout", "marker_name"]
+__all__ = ["DEFAULT_PATHS", "GPU_SLOT", "GPU_SLOT_ENV", "SLOTS_DIR_ENV", "BuildSlot", "FlockBuildSlot", "HolderInfo",
+           "SlotTimeout", "SlottedGate", "gpu_slot_enabled", "main", "marker_name"]
 
 MARKER_PREFIX = "CE_BUILDSLOT_HELD_"
+SLOTS_DIR_ENV = "COGNITIVE_HARNESS2_SLOTS_DIR"      # where the slots that have no predefined lock file keep theirs
+GPU_SLOT_ENV = "COGNITIVE_HARNESS2_GPU_SLOT"        # "off" (or 0/false/no) keeps a real stage-1 run on the in-process gate only
+GPU_SLOT = "gpu-model"
 _NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 _SIDECAR_MAX_BYTES = 4096
 _LABEL_MAX = 120
@@ -206,7 +214,7 @@ class FlockBuildSlot:
     """`BuildSlot` over `fcntl.flock` lock files, cross-process on one host, no daemon and no port.
 
     `paths` maps a slot name to its lock file; a name not in it uses `<state_dir>/<name>.lock` (default
-    `$XDG_STATE_HOME/cognitive-engine/slots`, created 0700). `rootless-docker` defaults to the lock file the shell
+    `$COGNITIVE_HARNESS2_SLOTS_DIR`, else `$XDG_STATE_HOME/cognitive-engine/slots`, created 0700). `rootless-docker` defaults to the lock file the shell
     wrapper uses, so wrapper and Python exclude each other."""
 
     def __init__(self, paths: Mapping[str, str | os.PathLike[str]] | None = None, *, state_dir: str | os.PathLike[str] | None = None,
@@ -215,6 +223,8 @@ class FlockBuildSlot:
             raise ValueError("poll_s must be a number of seconds, more than 0 and at most 5")
         self._paths = {_checked(k): Path(v).expanduser() for k, v in {**DEFAULT_PATHS, **(paths or {})}.items()}
         base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+        if state_dir is None and os.environ.get(SLOTS_DIR_ENV):
+            state_dir = os.environ[SLOTS_DIR_ENV]
         self._state_dir = Path(state_dir).expanduser() if state_dir is not None else base / "cognitive-engine" / "slots"
         self._poll_s = float(poll_s)
         self._host = host if host is not None else socket.gethostname()
@@ -337,3 +347,106 @@ class FlockBuildSlot:
         finally:
             if held is not None:
                 held.release()
+
+
+# ── the model gate, cross-process ─────────────────────────────────────────────────
+
+def gpu_slot_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    """Whether a real sweep also takes the cross-process GPU slot: yes, unless `COGNITIVE_HARNESS2_GPU_SLOT` is exactly
+    off, 0, false or no (any case). A typo keeps the protection on."""
+    env = os.environ if environ is None else environ
+    return (env.get(GPU_SLOT_ENV) or "").strip().lower() not in {"off", "0", "false", "no"}
+
+
+class SlottedGate(ModelGate):
+    """`ModelGate` that, once it has the in-process semaphore, also holds a cross-process slot (default `gpu-model`), so a
+    second PROCESS on the same GPU (another sweep, a benchmark that uses the slot too) waits as a second thread would.
+
+    The documented order is kept: the semaphore first, then the slot, released in reverse. The wait is one budget, the
+    earlier of `timeout` and `deadline`, shared by both. When the slot is not free in time the semaphore is given back
+    and a `GateTimeout` (the type every caller of the gate already handles) is raised, naming the slot holder when it is
+    known. `locked()` and `slot_holder()` let a teardown check say who else is on the GPU."""
+
+    def __init__(self, slots: BuildSlot, name: str = GPU_SLOT) -> None:
+        super().__init__()
+        self._slots, self._slot_name = slots, _checked(name)
+        self._stack: contextlib.ExitStack | None = None
+
+    def acquire(self, timeout: float | None = None, *, deadline: float | None = None, label: str = "") -> None:
+        wait = _wait_seconds(timeout, deadline)
+        end = None if wait is None else time.monotonic() + wait
+        super().acquire(None, deadline=end, label=label)
+        stack = contextlib.ExitStack()
+        try:
+            stack.enter_context(self._slots.hold(self._slot_name, deadline=end, label=label or None))
+        except SlotTimeout as e:
+            super().release()
+            raise GateTimeout(f"the model gate was not free in time across processes ({e})") from e
+        except BaseException:
+            super().release()
+            raise
+        self._stack = stack
+
+    def release(self) -> None:
+        stack, self._stack = self._stack, None
+        try:
+            if stack is not None:
+                stack.close()
+        finally:
+            super().release()
+
+    def slot_holder(self) -> HolderInfo | None:
+        """Who holds the cross-process slot (this process included), best effort, or None."""
+        return self._slots.holder(self._slot_name)
+
+
+# ── a command under a slot: `python -m cognitive_harness2.coordination run --slot NAME -- COMMAND ...` ──────────────
+
+EX_TEMPFAIL = 75
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run COMMAND while holding a slot, so a shell user gets the same lock, holder report and nesting marker as Python
+    code. The command inherits `CE_BUILDSLOT_HELD_<SLOT>=1`, so anything inside it that takes the same slot does not wait for
+    its own parent. SIGINT, SIGTERM and SIGHUP go to the command and the slot is held until it exits. Exit status: the
+    command's (128 plus the signal if it was killed), 75 when the slot was not free in time, 127 when the command is not
+    found, 2 for a bad call."""
+    ap = argparse.ArgumentParser(prog="python -m cognitive_harness2.coordination", description=main.__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    run = sub.add_parser("run", help="hold a slot while a command runs")
+    run.add_argument("--slot", required=True, help="slot name: lower-case letters, digits and '-'")
+    run.add_argument("--timeout", type=float, default=None, help="seconds to wait for the slot (default: wait without limit)")
+    run.add_argument("--label", default=None, help="who is holding it, shown to anyone who waits (default: the command)")
+    run.add_argument("--ttl-hint", type=float, default=None, help="how long this is expected to take, in seconds (a hint only)")
+    run.add_argument("command", nargs=argparse.REMAINDER, help="-- COMMAND [ARGS...]")
+    args = ap.parse_args(argv)
+    cmd = args.command[1:] if args.command[:1] == ["--"] else args.command
+    if not cmd:
+        ap.error("no command given (use: run --slot NAME -- COMMAND [ARGS...])")
+    try:
+        marker = marker_name(args.slot)
+        wait = _wait_seconds(args.timeout, None)
+    except (ValueError, TypeError) as e:
+        ap.error(str(e))
+    label = args.label or f"cli:{os.path.basename(cmd[0])}"
+    try:
+        with FlockBuildSlot().hold(args.slot, timeout=wait, label=label, ttl_hint=args.ttl_hint):
+            try:
+                proc = subprocess.Popen(cmd, env={**os.environ, marker: "1"})
+            except OSError as e:
+                print(f"cannot run {cmd[0]!r}: {e}", file=sys.stderr)
+                return 127
+            previous = {s: signal.signal(s, lambda n, _f: proc.send_signal(n)) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+            try:
+                rc = proc.wait()
+            finally:
+                for s, handler in previous.items():
+                    signal.signal(s, handler)
+            return rc if rc >= 0 else 128 - rc
+    except SlotTimeout as e:
+        print(f"{e}", file=sys.stderr)
+        return EX_TEMPFAIL
+
+
+if __name__ == "__main__":
+    sys.exit(main())

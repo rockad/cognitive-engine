@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 import pytest
+
 from cognitive_harness2 import coordination
 from cognitive_harness2.coordination import (
     BuildSlot,
@@ -475,3 +476,201 @@ def test_a_marker_for_one_slot_bypasses_only_that_slot_never_a_look_alike(flock_
     with pytest.raises(SlotTimeout), flock_rig.slots.hold("a-c", timeout=0.2):      # a different slot, held by someone: not skipped
         pass
     other.release()
+
+
+# ══ SlottedGate: the model gate with a cross-process slot behind it ═════════════════════════════════════════════════
+
+from cognitive_harness2.coordination import (
+    GPU_SLOT,
+    GPU_SLOT_ENV,
+    SLOTS_DIR_ENV,
+    SlottedGate,
+    gpu_slot_enabled,
+)
+from cognitive_harness2.coordination import main as coordination_main
+from cognitive_harness2.model_gate import GateTimeout, ModelGate
+
+
+def test_the_slotted_gate_is_a_model_gate_that_waits_for_another_process(flock_rig):
+    gate = SlottedGate(flock_rig.slots)
+    assert isinstance(gate, ModelGate)
+    child = flock_rig.start_holder(name=GPU_SLOT, label="bench:other")
+    t0 = time.monotonic()
+    with pytest.raises(GateTimeout) as ei, gate.hold(0.3, label="solver:x"):
+        pytest.fail("entered the gate while another process holds the GPU slot")
+    assert time.monotonic() - t0 < 5 and isinstance(ei.value, TimeoutError)
+    assert "bench:other" in str(ei.value)                      # the holder is named
+    assert not gate.locked()                                   # the in-process semaphore was given back
+    child.release()
+    with gate.hold(5, label="solver:y"):
+        assert gate.locked()
+    assert not gate.locked()
+
+
+def test_the_slotted_gate_holds_the_slot_while_held_and_releases_it_in_reverse_order(flock_rig):
+    gate = SlottedGate(flock_rig.slots)
+    with gate.hold(2, label="proposer:p1"):
+        info = gate.slot_holder()
+        assert info is not None and info.label == "proposer:p1" and info.pid == os.getpid()
+        with pytest.raises(SlotTimeout), flock_rig.slots.hold(GPU_SLOT, timeout=0.1):
+            pass
+        flock_rig.start_holder(name="other-slot")           # an unrelated slot is unaffected
+    assert gate.slot_holder() is None and not gate.locked()
+    with flock_rig.slots.hold(GPU_SLOT, timeout=1):
+        pass
+
+
+def test_the_timeout_is_one_budget_for_the_semaphore_and_the_slot(flock_rig):
+    gate = SlottedGate(flock_rig.slots)
+    flock_rig.start_holder(name=GPU_SLOT)
+    t0 = time.monotonic()
+    with pytest.raises(GateTimeout), gate.hold(0.4):
+        pass
+    assert time.monotonic() - t0 < 3
+    t0 = time.monotonic()
+    with pytest.raises(GateTimeout), gate.hold(30, deadline=time.monotonic() + 0.3):
+        pass
+    assert time.monotonic() - t0 < 3 and not gate.locked()
+
+
+def test_two_threads_of_this_process_still_take_turns_through_the_semaphore(flock_rig):
+    gate = SlottedGate(flock_rig.slots)
+    inside, peak, lock = 0, 0, threading.Lock()
+
+    def work():
+        nonlocal inside, peak
+        with gate.hold(20, label="t"):
+            with lock:
+                inside += 1
+                peak = max(peak, inside)
+            time.sleep(0.05)
+            with lock:
+                inside -= 1
+
+    threads = [threading.Thread(target=work) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert peak == 1 and not gate.locked()
+
+
+async def test_the_slotted_gate_works_from_asyncio_and_a_cancelled_wait_leaks_nothing(flock_rig):
+    gate = SlottedGate(flock_rig.slots)
+    async with gate.ahold(2, label="async"):
+        assert gate.locked()
+    child = flock_rig.start_holder(name=GPU_SLOT)
+
+    async def waiter():
+        async with gate.ahold(30):
+            pass
+
+    task = asyncio.create_task(waiter())
+    await asyncio.sleep(0.3)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    child.release()
+    await asyncio.sleep(0.5)
+    assert not gate.locked()
+    async with gate.ahold(3):
+        pass
+
+
+def test_a_slot_that_cannot_be_opened_is_an_error_and_gives_the_semaphore_back(tmp_path):
+    slots = FlockBuildSlot({GPU_SLOT: tmp_path / "no-such-dir" / "gpu.lock"}, state_dir=tmp_path)
+    gate = SlottedGate(slots)
+    with pytest.raises(OSError), gate.hold(1):
+        pass
+    assert not gate.locked()
+
+
+def test_the_slotted_gate_refuses_a_bad_slot_name(tmp_path):
+    with pytest.raises(ValueError):
+        SlottedGate(FlockBuildSlot(state_dir=tmp_path), "Bad_Name")
+
+
+@pytest.mark.parametrize("value,expected", [(None, True), ("", True), ("on", True), ("1", True), ("of", True), ("banana", True),
+                                            ("off", False), ("OFF", False), ("0", False), ("false", False), ("No", False), (" off ", False)])
+def test_the_gpu_slot_switch_turns_off_only_on_an_exact_off_value(value, expected):
+    env = {} if value is None else {GPU_SLOT_ENV: value}
+    assert gpu_slot_enabled(env) is expected
+
+
+def test_the_default_slots_directory_follows_the_environment_and_an_explicit_one_wins(tmp_path, monkeypatch):
+    monkeypatch.setenv(SLOTS_DIR_ENV, str(tmp_path / "from-env"))
+    assert FlockBuildSlot().lock_path("gpu-model") == tmp_path / "from-env" / "gpu-model.lock"
+    assert FlockBuildSlot(state_dir=tmp_path / "explicit").lock_path("gpu-model") == tmp_path / "explicit" / "gpu-model.lock"
+    monkeypatch.delenv(SLOTS_DIR_ENV)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    assert FlockBuildSlot().lock_path("gpu-model") == tmp_path / "xdg" / "cognitive-engine" / "slots" / "gpu-model.lock"
+
+
+# ══ the command-line wrapper: `python -m cognitive_harness2.coordination run --slot NAME -- COMMAND` ════════════════
+
+CLI = [sys.executable, "-m", "cognitive_harness2.coordination"]
+
+
+@pytest.fixture
+def cli_env(tmp_path):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CE_BUILDSLOT_")}
+    env[SLOTS_DIR_ENV] = str(tmp_path / "cli-slots")
+    (tmp_path / "cli-slots").mkdir()
+    return env
+
+
+def run_cli(env, *args, timeout=30):
+    return subprocess.run([*CLI, "run", *args], env=env, capture_output=True, text=True, timeout=timeout, check=False)
+
+
+def test_the_wrapper_runs_the_command_passes_its_status_and_exports_the_marker(cli_env):
+    out = run_cli(cli_env, "--slot", "test-cli", "--", sys.executable, "-c",
+                  "import os, sys; sys.exit(7 if os.environ.get('CE_BUILDSLOT_HELD_TEST_CLI') == '1' else 3)")
+    assert out.returncode == 7, out.stderr
+    assert run_cli(cli_env, "--slot", "test-cli", "--", sys.executable, "-c", "print('ok')").stdout.strip() == "ok"
+
+
+def test_a_hold_inside_the_wrapped_command_does_not_wait_for_its_own_parent(cli_env):
+    code = ("from cognitive_harness2.coordination import FlockBuildSlot\n"
+            "with FlockBuildSlot().hold('test-cli', timeout=1):\n    print('INSIDE')\n")
+    out = run_cli(cli_env, "--slot", "test-cli", "--", sys.executable, "-c", code)
+    assert out.returncode == 0 and out.stdout.strip() == "INSIDE", out.stderr
+
+
+def test_a_second_wrapper_times_out_with_75_and_names_the_first(cli_env, tmp_path):
+    first = subprocess.Popen([*CLI, "run", "--slot", "test-cli", "--label", "suite:first", "--", "sleep", "20"], env=cli_env)
+    try:
+        slots = FlockBuildSlot(state_dir=tmp_path / "cli-slots")
+        deadline = time.monotonic() + 10
+        while slots.holder("test-cli") is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        out = run_cli(cli_env, "--slot", "test-cli", "--timeout", "0.3", "--", "true")
+        assert out.returncode == 75 and "suite:first" in out.stderr, out.stderr
+    finally:
+        first.terminate()
+        first.wait(timeout=10)
+
+
+def test_a_signal_to_the_wrapper_reaches_the_command_and_the_slot_is_then_free(cli_env, tmp_path):
+    proc = subprocess.Popen([*CLI, "run", "--slot", "test-cli", "--", "sleep", "30"], env=cli_env)
+    slots = FlockBuildSlot(state_dir=tmp_path / "cli-slots")
+    deadline = time.monotonic() + 10
+    while slots.holder("test-cli") is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    proc.send_signal(signal.SIGTERM)
+    assert proc.wait(timeout=10) == 128 + signal.SIGTERM                 # the command was killed by the signal, not orphaned
+    with slots.hold("test-cli", timeout=2):
+        pass
+
+
+def test_the_wrapper_reports_a_missing_command_a_missing_command_line_and_a_bad_slot(cli_env):
+    assert run_cli(cli_env, "--slot", "test-cli", "--", "no-such-command-xyz").returncode == 127
+    assert run_cli(cli_env, "--slot", "test-cli").returncode == 2
+    assert run_cli(cli_env, "--slot", "Bad_Name", "--", "true").returncode == 2
+    assert run_cli(cli_env, "--slot", "test-cli", "--timeout", "-1", "--", "true").returncode == 2
+
+
+def test_main_returns_the_commands_status_in_process(cli_env, monkeypatch):
+    for k, v in cli_env.items():
+        monkeypatch.setenv(k, v)
+    assert coordination_main(["run", "--slot", "test-cli", "--", sys.executable, "-c", "raise SystemExit(5)"]) == 5
