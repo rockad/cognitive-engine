@@ -6,9 +6,10 @@
 - **Runtime**: Python 3.12 / uv
 - **License**: Apache-2.0
 - **Target Subsystem**: `packages/harness2/`
-- **Target Branch**: `feat/track3-harness2`
+- **Target Branch**: `feat/track3-harness2` (the PR is `feat/stage1-integration`, PR #5, which contains it; PR #6 `feat/model-bench` is stacked on #5)
 - **Parent Blueprint**: [RFC 001: Cognitive Engine Architecture](001-harness2-jev-unified-cognitive-substrate.md)
 - **Implementation Plan**: [Multi-Track Implementation Plan](../plans/2026-10-26-multi-track-implementation-plan.md)
+- **Follow-up**: [RFC 006: Subscription Proposer Channels (Stage 3) and sbx for Model Sessions](006-subscription-channels-and-sbx-model-sessions.md) (Stage 3 design, credential delivery, sbx default criteria)
 
 ---
 
@@ -348,16 +349,18 @@ Slice 3b executes through three strictly sequential, user-gated stages:
 - [x] Glibc-based rootless container image (`ubuntu:26.04`) built and verified on local daemon (run #4, 2026-10-31).
 - [x] Host unix-socket bridge and forward proxy container route container traffic to loopback Ollama only (7/7 sessions reached the model). The ollama management API is no longer reachable: the route allow-list closes it (section 9.5).
 - [x] Containerized `opencode` session launched and output captured (7 sessions exit 0).
-- [x] Frontmatter freeze validator covered by slice 3a / WS-D tests. **Not exercised by a live accepted edit**: no proposer edit was accepted in run #4.
+- [x] Frontmatter freeze validator covered by slice 3a / WS-D tests. **Not exercised by a selected edit**: no proposer edit was adopted in run #4 or in any completed run; one legal edit passed the gates in the aborted run `a81f` (section 9.11).
 - [x] Smoke sweep (P=3 proposer sessions, R=4 solver rollouts) completed in 127 s, $0, clean teardown. Resource caps were not stressed.
 
 ### Slice 3b Stage 2: OpenRouter Integration (Gated)
 - [ ] OpenRouter channel profile validates against schema with strict ZDR enforcement.
 - [ ] Dollar budget cap enforced fail-closed by ledger pre-flight.
+- Prerequisites found 2026-11-02 (PR #5 head `9f12381`): `stage1.py` pins `ZDR = "strict"` and its preflight accepts only an `opencode` channel with `retention = "local"` on a loopback endpoint, and the solver runner refuses a non-local channel, so the stage-1 runner must be generalised first; the key cannot be passed in the environment (RFC 006 section 2.3, decision D9). Experiment design: [Experiments plan](../plans/2026-11-02-experiments-plan.md) EXP-1.
 
 ### Slice 3b Stage 3: Subscription Channels (Gated)
 - [ ] Subscription channel profiles validate with `retention: unknown` and clamp sweep classification to `open`.
 - [ ] Containerized `claude_cli` and `agy_cli` sessions execute without leaking credentials outside container.
+- Design: [RFC 006](006-subscription-channels-and-sbx-model-sessions.md) (Proposed, not accepted). It proposes to strengthen the second box to "the long-lived credential is never present in the session container" (a credential route in the egress proxy for `claude_cli`; `agy_cli` keeps a file credential until the proxy has HTTP/2). The box text here is unchanged until RFC 006 is accepted.
 
 ---
 
@@ -371,8 +374,8 @@ The following architectural assumptions are tracked and verified across slice sp
 5. **Local model viability**: **VERIFIED by run #4 and the benchmark (section 9.2)** for `gemma4:e4b` 16k with thinking ON. `gemma4:12b` is **DISPROVEN** on this host (8 GB GPU shared with the desktop).
 6. **Native `sbx` MicroVMs**: **VERIFIED live (2026-10-31, v0.50.1)**. The real command flow is `create` / `cp` / `exec` / `rm --force`, and its daemon needs the `kvm` gid (started via `sg kvm`). `sbx` is now the AUTO default for model-free untrusted execution, with a loud Docker fallback; model sessions stay on Docker (section 9.7).
 7. **Live OpenRouter Quota Response Schema**: **STILL UNVERIFIED**. Field names for `GET /api/v1/key` are verified against mock schemas but pending validation against live endpoint responses (Stage 2).
-8. **Accepted proposer edit applied and re-scored**: **STILL UNVERIFIED**. No proposer edit has been accepted in run #4, the three stage 1b runs or stage 1c (sections 9.3, 9.4 and 9.11).
-9. **`claude_cli` token delivery (value vs file)**: **STILL UNVERIFIED / unsolved** (Stage 3).
+8. **Accepted proposer edit applied, re-scored and selected**: **STILL UNVERIFIED**. One legal edit was accepted by the gates (run `a81f`, aborted by Ctrl-C, one rollout sample, unmeasured), but no edit has been ADOPTED by selection: in the four completed hard-set runs (`1493`, `82cd`, `5ead`, `d08d`) the verdict was `base-kept` every time (sections 9.3, 9.4 and 9.11). The improvement loop remains UNPROVEN.
+9. **`claude_cli` token delivery (value vs file)**: **STILL UNVERIFIED / unsolved** (Stage 3). [RFC 006](006-subscription-channels-and-sbx-model-sessions.md) proposes a delivery design (credential route in the proxy); the Claude CLI's behaviour with a custom base URL is untested (RFC 006 spike A-11).
 
 ---
 
@@ -404,7 +407,7 @@ Proven by run #4:
 - The channel runs at $0 within a 127 s sweep.
 
 **Not proven:**
-- **No accepted proposer edit has been exercised.** All three proposer stages kept the base harness because the base already passes the task. The edit-apply, frontmatter-freeze-on-live-edit and re-score path has therefore never run on a real candidate.
+- **No proposer edit has been adopted in run #4.** All three proposer stages kept the base harness because the base already passes the task, so the edit-apply, frontmatter-freeze-on-live-edit and re-score path did not run in run #4. (Later, one legal edit passed the gates in the aborted stage 1b run `a81f`: section 9.11. No edit has been adopted by selection in any completed run.)
 - The stage-1 task is too easy to discriminate harnesses; the inv1 2/3 result is noise, not signal. Stage 1b (section 9.4) did not change this.
 - Nothing about stages 2 and 3 (OpenRouter, subscription channels).
 
@@ -414,12 +417,14 @@ Stage 1b added a harder task set so that a proposer edit could be accepted and r
 
 | Run | Model | Outcome |
 |---|---|---|
-| 1b-1 | gemma4:e4b (16k) | No proposer edit accepted. The INV proposer edited a `c7` script and the slot table refused it. |
-| 1b-2 | gemma4:e4b (16k) | No proposer edit accepted. The INV proposer edited a `c7` script again and the slot table refused it. |
-| 1b-3 | qwen3-4b-16k | No proposer edit accepted. The qwen proposers made no edit. |
+| 1b-1 | gemma4:e4b (16k) | No proposer edit adopted (verdict `base-kept`). The INV proposer edited a `c7` script and the slot table refused it. |
+| 1b-2 | gemma4:e4b (16k) | No proposer edit adopted (verdict `base-kept`). The INV proposer edited a `c7` script again and the slot table refused it. |
+| 1b-3 | qwen3-4b-16k | No proposer edit adopted (verdict `base-kept`). The qwen proposers made no edit. |
+
+These are the completed runs `1493`, `82cd` and `5ead`. Two more hard-set runs were aborted by the user (Ctrl-C) before any selection: `a81f` (the first stage 1b run, 161 s, three proposer sessions; one legal `systemprompt.md` edit passed the gates, see section 9.11) and `72a1` (qwen, 118 s, two proposer sessions, no edit).
 
 Honest reading:
-- **The loop is unproven.** No run produced an accepted edit, so apply, frontmatter freeze on a live edit, and re-score have still never run on a real candidate.
+- **The loop is unproven.** No completed run adopted an edit. One legal edit was accepted by the gates in the aborted run `a81f`, scored once, unmeasured and never selected, so apply, frontmatter freeze on a live edit, and re-score have not been shown to produce an improvement.
 - The base harness was estimated to pass about half the time at k=1 (earlier estimate, superseded by the 0/8 measurement in section 9.11), so a pass/fail difference between harnesses at k=1 is noise, not signal.
 - The two refusals are evidence that the slot table works against a real proposer (it stopped a `c7` edit), not evidence that the optimizer improves anything.
 - The proposed next step, telling the proposer which files are mutable, was tried in stage 1c and did not stop illegal edits (section 9.11).
@@ -440,7 +445,7 @@ Everything else is refused, which closes the ollama management API that run #4 l
 The approval of a real-model sweep (`stage1 run --approve <channel>`, `confirm_on_terminal`) is a human-in-the-loop control. What it does (hardened 2026-10-31 after an independent adversarial review, section 9.10):
 - The process must have a controlling terminal: the confirmation is read from `/dev/tty`, never from stdin, so pipes, redirected stdin and scripts without a tty are refused.
 - The typed text is the approval phrase plus a fresh four-word nonce shown on the terminal, so a prewritten answer does not work.
-- The command refuses to run, with no flag to override it, when the environment carries a known agent-harness marker (`CLAUDECODE`, the Claude Code runtime variables `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_EXECPATH`, `CLAUDE_CODE_CHILD_SESSION`, `CLAUDE_CODE_SESSION_ATTENDED`, `CLAUDE_CODE_MESSAGING_SOCKET` and `CLAUDE_CODE_BRIDGE_SESSION_ID`, `OPENCODE`, `CODEX_SANDBOX*`, `ANTIGRAVITY*`, `GEMINI_CLI*`, `AGY_*`; the Antigravity, Gemini and `AGY_` names are prefix guesses, not names the repo has observed; the `CLAUDE_CODE_*` settings a person exports, such as `CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE`, are NOT markers).
+- The command refuses to run, with no flag to override it, when the environment carries a known agent-harness marker (`CLAUDECODE`, the Claude Code runtime variables `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_EXECPATH`, `CLAUDE_CODE_CHILD_SESSION`, `CLAUDE_CODE_SESSION_ATTENDED`, `CLAUDE_CODE_MESSAGING_SOCKET` and `CLAUDE_CODE_BRIDGE_SESSION_ID`; the code at PR #5's head also lists `CLAUDE_PID` and `CLAUDE_JOB_DIR`, an ASSUMPTION that Claude Code sets them only in its own sessions and the user's own terminal does not, UNVERIFIED until the user checks it; `OPENCODE`, `CODEX_SANDBOX*`, `ANTIGRAVITY*`, `GEMINI_CLI*`, `AGY_*`; the Antigravity, Gemini and `AGY_` names are prefix guesses, not names the repo has observed; the `CLAUDE_CODE_*` settings a person exports, such as `CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE`, are NOT markers).
 
 What it does not guarantee: a process running as the same user can allocate and drive a pty (`pty.fork`, `script`, `expect`, `tmux send-keys`), read the nonce and type it back, and it can scrub the environment markers. The gate stops pipes, scripts and anything running inside a known agent harness; it is not a defence against a determined same-user process, and the human remains the control. `tests/test_stage1_approval_pty.py` asserts both sides (a pty driver without markers is still approved; with markers it is refused). The containment of model sessions (section 6.2 item 3) does not rely on this gate.
 
@@ -466,7 +471,7 @@ The slot table (section 6.2 item 5) is now enforced on every task set, easy and 
 
 ### 9.9 Known gaps and open items
 
-- **Proposer signal**: no accepted proposer edit yet (sections 9.4, 9.11). The mutable-files hint did not stop illegal edits. Improvement-loop experiments are stopped by user decision (2026-11-01) until a smarter proposer (stage 2, separate go); keeping the legal parts of a proposal is an unchosen option that deviates from upstream.
+- **Proposer signal**: no proposer edit adopted by selection yet; one legal edit passed the gates in the aborted run `a81f` (sections 9.4, 9.11). The mutable-files hint did not stop illegal edits. Improvement-loop experiments are stopped by user decision (2026-11-01) until a smarter proposer (stage 2, separate go); keeping the legal parts of a proposal is an unchosen option that deviates from upstream.
 - **`sbx` model-session route**: exists, opt-in (`COGNITIVE_HARNESS2_MODEL_SANDBOX=sbx`); not yet proven by a real stage-1 run on `sbx` (section 9.11).
 - **Test isolation**: done. Leak checks use per-run ids rather than daemon-wide counts, so a concurrent agent's containers no longer break the "nothing left behind" assertions.
 - **`claude_cli` token delivery** (value vs file): unsolved.
@@ -490,7 +495,7 @@ Stage 1c asked two things: does telling the proposer which files are mutable sto
 | Run id | `stage1-20261101T185011Z-d08d` |
 | Flags | `--task-set hard --rollouts 8 --proposer-hint on`; profile `caps.sessions=21` |
 | Sessions | 14 of 21 planned ran (3 proposers plus 11 solver rollouts), 441 s |
-| Health | All exit 0, no timeouts, no denied requests, teardown clean |
+| Health | All exit 0 (14 of 14), no timeouts, teardown clean. Correction (2026-11-02, RESOLVED): the earlier text said "no denied requests", which was WRONG. All 14 sessions logged denied requests (76 in total: 20 over the 3 proposer sessions, 56 over the 11 solver sessions; 4 or 8 per session), all reason `unix-route-model-denied` on `harness2-proxy.internal:11434`. Cause: `opencode` calls `POST /api/show` for every model that `GET /api/tags` lists (all models installed in the user's Ollama; the denial log lines name `qwen3:4b`, `qwen3-4b-16k:latest`, `nemotron-3-nano:4b` and `gemma4:e4b`), and the proxy's model pin allows only the approved model (`gemma4-e4b-16k`, both spellings), so the show calls for the other models are refused. That is the model pin working as designed; the sessions completed normally and `opencode` only gets no metadata for the other models. The run summary showed none because `sessions_summary.denied_requests` counts path denials, not model denials: a reporting gap (Checks plan R-18). Side effect: `GET /api/tags` lists the installed model names to the session (low sensitivity; already allowed). Earlier gemma runs (`a81f`, `1493`, `82cd`) and the qwen run `72a1` had path denials for `POST /api/show` before it was allowed; the qwen run `5ead` had 0 denials because it ran before model pinning existed (image `a879f4c50276`) |
 | Verdict | `base-kept` |
 
 Baseline (rollouts `base1`..`base8`): **0 of 8 passed**. Answers: -302.27, -1292.27, -1191.31, -292.27, 10572.61, -291.27, -291.27, 7729.49; the correct answer is -1291.27. The baseline on the hard task is a measurement now. The "about half" in section 9.4 was an earlier estimate and is superseded. The unedited starting harness rolled in `dom1` and `agg1` (passed) and `inv1` (failed): 2 of 3, not separable from luck.
@@ -504,7 +509,8 @@ Proposer hint: the runner's `ENVIRONMENT RULES` block, derived from the slot tab
 No edited harness was adopted, so the 7 extra final rollouts did not run (extras for the base always run, decision 2026-11-01).
 
 Honest reading:
-- No proposer edit has been accepted in any real run: 5 real hard-set runs across gemma and qwen. The loop is unproven; this run does not change that.
+- Correction (2026-11-02, verified from `report.json` and `audit.jsonl`): the earlier statement "no proposer edit has been accepted in any real run" was WRONG. The correct claim: one legal edit was accepted by the gates (run `a81f`, aborted, one rollout sample, unmeasured). Six hard-set runs started proposer sessions (gemma and qwen): four completed (`1493`, `82cd`, `5ead`, `d08d`) and in all four no edit was ADOPTED by selection (verdict `base-kept` every time); two were aborted by the user (`a81f`, `72a1`). The improvement loop remains UNPROVEN; this run does not change that.
+- Detail on `a81f` (names and counts only; edit content not read): status `aborted` (`KeyboardInterrupt` at 161 s, no `report.json` selection). The first proposer's `mutation_check` is `ok: true` with `changed: ["systemprompt.md"]` (slot `c1`), so a slot-table-legal edit passed the slot table and harvest. Its candidate rollout `dom1` (the first proposer's session ran 40.7 s, matching `dom1`'s 40.8 s wall; the retained `harnesses/dom1/systemprompt.md` is 306 bytes against the base's 149, `harnesses/inv1` equals the base) scored `-302.27` (2 of 3 criteria, failed); the unedited `inv1` passed once (`-1291.27`, the correct answer) and `base1` failed (`-291.27`). No repeats, no composed final, no selection: one sample on an aborted sweep shows that a legal edit CAN be produced and accepted by the gates, and says nothing about improvement.
 - The 4B local proposers' habit is to write the answer into a script, which the slot table refuses.
 - The slot table again worked against a real proposer.
 
