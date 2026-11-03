@@ -1,0 +1,16 @@
+# Lookup (packages/lookup). Needs an ingested index, otherwise baseline_call fails.
+name = "lookup"
+
+[ok]
+tool = "archive_stats"            # read-only
+
+[strict]
+tool = "search_archive"           # read-only; safe even if a bad call were wrongly accepted
+args = { query = "conformance" }
+unknown_key = "visiblity"         # the real typo the visibility filter must never swallow
+wrong_type = { field = "limit", value = "ten" }
+bad_enum = { field = "visibility", value = "public" }
+missing_required = "query"
+
+[argless]
+tool = "archive_stats"

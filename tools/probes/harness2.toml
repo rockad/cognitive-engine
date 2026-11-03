@@ -1,0 +1,18 @@
+# Harness² (packages/harness2). harness2_status is read-only and offline, and
+# harness2_propose with dry_run=true only reports the policy verdict: nothing is
+# generated, no model is called, and no sandbox runs, so every call below is harmless.
+name = "harness2"
+
+[ok]
+tool = "harness2_status"
+
+[strict]
+tool = "harness2_propose"
+args = { task = "conformance probe", targets = [{ component = "prompt", content = "be helpful" }], dry_run = true }
+unknown_key = "dryrun"
+wrong_type = { field = "n", value = "three" }
+bad_enum = { field = "zdr", value = "maybe" }
+missing_required = "task"
+
+[argless]
+tool = "harness2_status"

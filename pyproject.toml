@@ -3,10 +3,41 @@ name = "cognitive-engine"
 version = "1.0.0"
 description = "Autonomous Cognitive Substrate: System 1 Coprocessor (Jev), System 2 Recursive Optimizer (Harness²), and Unified SQLite Memory"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["cognitive-memory", "cognitive-lookup", "cognitive-harness2"]
 
 [tool.uv.workspace]
 members = [
     "packages/harness2",
-    "packages/memory"
+    "packages/memory",
+    "packages/lookup",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=1.2.0",
+    # The pinned upstream google-research/harness2, so `uv run pytest` can smoke-test the import.
+    "cognitive-harness2[upstream]",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "requires_sbx_live: runs a real throwaway Docker Sandbox microVM (create/exec/rm); skipped unless COGNITIVE_HARNESS2_SBX_LIVE=1 and `sbx ls` works",
+    "requires_rootless_docker: runs real containers against the host rootless Docker daemon; must run, never skip",
+    "requires_sbx: runs the read-only `sbx version` against a real install; skipped when sbx is absent",
+    "real_cli: runs the REAL opencode binary (stub model, no ollama) in a contained session; skipped unless COGNITIVE_HARNESS2_REAL_CLI=1 and the binary exists",
+]
+testpaths = ["packages/memory/tests", "packages/lookup/tests", "packages/harness2/tests", "tools/tests"]
+pythonpath = ["tools"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+# Both packages use a `tests/` package with its own __init__; importlib mode
+# keeps the two `tests` namespaces from colliding in one run.
+addopts = "--import-mode=importlib"
+
+# Installed into the root environment so a bare `uv run pytest` can import both
+# packages without `--all-packages`.
+[tool.uv.sources]
+cognitive-memory = { workspace = true }
+cognitive-lookup = { workspace = true }
+cognitive-harness2 = { workspace = true }

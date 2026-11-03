@@ -1,0 +1,17 @@
+# Memory (packages/memory, upstream basic-memory). read_note is read-only, and a note
+# that does not exist is a normal (non-error) answer, so the unmodified call is accepted.
+name = "memory"
+
+[ok]
+tool = "list_memory_projects"
+
+[strict]
+tool = "read_note"
+args = { identifier = "conformance-probe" }
+unknown_key = "identifer"
+wrong_type = { field = "page", value = "ten" }
+bad_enum = { field = "output_format", value = "xml" }
+missing_required = "identifier"
+
+[argless]
+tool = "basic_memory_diagnostics"   # takes no arguments and is read-only

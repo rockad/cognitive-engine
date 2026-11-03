@@ -1,0 +1,18 @@
+# Jev (packages/jev). Every negative call below is harmless if wrongly accepted:
+# jev_quota only reads the statusline file, and jev_select_model fails fast without
+# an OpenRouter key.
+name = "jev"
+
+[ok]
+tool = "jev_get_mode"             # read-only
+
+[strict]
+tool = "jev_select_model"
+args = { task = "conformance probe" }
+unknown_key = "quotaStrategie"
+wrong_type = { field = "task", value = { wrong = true } }
+bad_enum = { field = "quotaStrategy", value = "frugal" }
+missing_required = "task"
+
+[argless]
+tool = "jev_get_mode"

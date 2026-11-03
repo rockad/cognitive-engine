@@ -1,0 +1,1076 @@
+"""The session runner without a daemon: authorisation, every docker argv, redaction. Nothing is started.
+
+`subprocess` is replaced with a recorder, so a test that reaches docker at all is visible, and the
+refusals are shown to happen before the first call.
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+import textwrap
+from types import SimpleNamespace
+
+import pytest
+
+from cognitive_harness2 import channels, egress_proxy, sandbox, session_runner as sr, upstream_egress
+from cognitive_harness2.image import ImageRef
+from cognitive_harness2.session_runner import (Credential, ProposerSessionRunner, SessionLimits, SessionRefused,
+                                               SessionSpec)
+
+SOCK = "unix:///run/user/1000/docker.sock"
+V = sandbox.VerifiedDocker("/usr/bin/docker", SOCK)
+IMG = ImageRef("cognitive-harness2-proposer:0123456789ab", "sha256:" + "5" * 64)
+OK = upstream_egress.Decision(True, ("approved",))
+SECRET = "SENTINEL-credential-7f3a91c2"
+
+TOML = textwrap.dedent("""
+    [channels.local]
+    kind = "opencode"
+    provider = "ollama"
+    endpoint = "http://127.0.0.1:11434"
+    model = "ollama/gemma4:12b"
+    retention = "local"
+    max_classification = "restricted"
+    approval = "per-sweep"
+    [channels.local.caps]
+    sessions = 3
+    wall_s = 2700
+    cost_usd = 1
+
+    [channels.agy]
+    kind = "agy_cli"
+    provider = "google"
+    endpoints = ["https://daily-cloudcode-pa.googleapis.com"]
+    model = "gemini-3-flash"
+    retention = "unknown"
+    max_classification = "open"
+    approval = "per-sweep"
+    [channels.agy.caps]
+    sessions = 3
+    wall_s = 2700
+    cost_usd = 1
+
+    [channels.claude]
+    kind = "claude_cli"
+    provider = "anthropic"
+    endpoints = ["https://api.anthropic.com", "https://statsig.anthropic.com:443"]
+    model = "claude-sonnet-5-5"
+    retention = "unknown"
+    max_classification = "open"
+    approval = "per-sweep"
+    [channels.claude.caps]
+    sessions = 3
+    wall_s = 2700
+    cost_usd = 1
+
+    [channels.router]
+    kind = "opencode"
+    provider = "openrouter"
+    endpoint = "https://openrouter.ai"
+    model = "openrouter/anthropic/claude-sonnet-5-5"
+    retention = "zdr-attested"
+    max_classification = "gated"
+    approval = "per-sweep"
+    [channels.router.caps]
+    sessions = 3
+    wall_s = 2700
+    cost_usd = 5
+""")
+PROFILE = channels.parse_text(TOML, source="test")
+
+
+@pytest.fixture
+def world(tmp_path):
+    cli = tmp_path / "bin" / "fake-cli"
+    cli.parent.mkdir()
+    cli.write_text("#!/bin/sh\nexit 0\n")
+    cli.chmod(0o755)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    return SimpleNamespace(cli=str(cli), ws=str(ws), tmp=tmp_path)
+
+
+def runner(name="local", *, zdr=None, cls="open", decision=OK, **kw):
+    zdr = zdr or ("off" if name in ("agy", "claude") else "strict")
+    return ProposerSessionRunner(V, IMG, PROFILE.channels[name], zdr=zdr, classification=cls, proposer_decision=decision, **kw)
+
+
+def spec(world, **kw):
+    base = dict(argv=(sr.container_cli_path(world.cli), "run", "--model", "x"), workspace=world.ws, cli=world.cli, timeout_s=60)
+    base.update(kw)
+    return SessionSpec(**base)
+
+
+class Trap:
+    """Replaces subprocess.run and Popen: records instead of running."""
+
+    def __init__(self, monkeypatch):
+        self.calls = []
+        monkeypatch.setattr(sr.subprocess, "run", self.run)
+        monkeypatch.setattr(sr.subprocess, "Popen", self.run)
+
+    def run(self, argv, **kw):
+        self.calls.append((list(argv), kw))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+
+# ── authorisation: everything refuses before docker is touched ───────────────────
+
+def test_a_local_channel_is_authorised_with_a_bridge_and_no_allow_list(world):
+    plan = runner().authorize(spec(world))
+    assert plan.bridge_target == ("127.0.0.1", 11434) and plan.allow == () and plan.local
+    assert runner().local_endpoint == "http://harness2-proxy.internal:11434"
+
+
+def test_a_hosted_channel_gets_exactly_the_profiles_endpoints(world):
+    plan = runner("agy", decision=None).authorize(spec(world))
+    assert plan.allow == (("daily-cloudcode-pa.googleapis.com", 443),) and plan.bridge_target is None
+    plan = runner("claude").authorize(spec(world))
+    assert plan.allow == (("api.anthropic.com", 443), ("statsig.anthropic.com", 443))
+    plan = runner("router", cls="open").authorize(spec(world))
+    assert plan.allow == (("openrouter.ai", 443),)
+
+
+def test_the_channel_verdict_is_recomputed_here_and_a_refusal_stops_everything(world, monkeypatch):
+    trap = Trap(monkeypatch)
+    for r in (runner("agy", cls="gated", decision=None),            # unknown retention carries only open content
+              runner("agy", zdr="strict", decision=None),           # zdr=strict permits only local or zdr-attested
+              runner("claude", cls="restricted"),
+              runner("router", cls="restricted"),                    # above the channel ceiling
+              runner("local", zdr="bogus"), runner("claude", cls=None)):
+        with pytest.raises(SessionRefused, match="channel decision"):
+            r.run(spec(world))
+    assert trap.calls == []
+
+
+def test_the_proposer_decision_is_required_for_opencode_and_claude_but_not_agy(world, monkeypatch):
+    trap = Trap(monkeypatch)
+    refused = upstream_egress.Decision(False, ("no",))
+    for name, zdr in (("local", "strict"), ("claude", "off")):
+        for d in (None, refused, "yes", SimpleNamespace(allowed=True)):
+            with pytest.raises(SessionRefused, match="proposer decision"):
+                runner(name, zdr=zdr, decision=d).run(spec(world))
+    runner("agy", zdr="off", decision=None).authorize(spec(world))
+    with pytest.raises(SessionRefused, match="proposer decision"):
+        runner("agy", zdr="off", decision=refused).authorize(spec(world))
+    assert trap.calls == []
+
+
+@pytest.mark.parametrize("t", [0, -1, 2701, float("nan"), True, "60", None])
+def test_the_wall_clock_must_be_within_the_channel_cap(world, t):
+    with pytest.raises(SessionRefused, match="timeout_s"):
+        runner().authorize(spec(world, timeout_s=t))
+
+
+def test_argv0_must_be_the_mounted_cli_path(world):
+    cli = sr.container_cli_path(world.cli)
+    assert cli == "/opt/cli/fake-cli"
+    for argv in (("/bin/sh", "-c", "id"), ("sh",), ("fake-cli",), (world.cli,), ("/opt/cli/other",), (), [], ("/opt/cli/fake-cli/../../bin/sh",), (cli, 5)):
+        with pytest.raises(SessionRefused):
+            runner().authorize(spec(world, argv=argv))
+    runner().authorize(spec(world, argv=[cli, "-p", "a; rm -rf /", "$(id)", "`id`", "--x=\n"]))   # data, never a shell string
+
+
+def test_a_credential_value_in_argv_or_env_is_refused(world):
+    cred = Credential("/home/agent/.tok", SECRET)
+    cli = sr.container_cli_path(world.cli)
+    with pytest.raises(SessionRefused, match="argv would carry"):
+        runner("agy", decision=None).authorize(spec(world, argv=(cli, f"--token={SECRET}"), credential=cred))
+    with pytest.raises(SessionRefused, match="env FOO"):
+        runner("agy", decision=None).authorize(spec(world, env={"FOO": f"x{SECRET}"}, credential=cred))
+    assert SECRET not in repr(cred) and SECRET not in str(cred) and SECRET not in repr(spec(world, credential=cred))
+
+
+@pytest.mark.parametrize("name", ["HTTP_PROXY", "https_proxy", "NO_PROXY", "no_proxy", "ALL_PROXY", "FOO_PROXY", "HOME", "PATH", "TMPDIR",
+                                  "DOCKER_HOST", "DOCKER_CONFIG", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY", "GITHUB_TOKEN",
+                                  "MY_SECRET", "lower", "A B", "1X", "X=Y", ""])
+def test_the_session_environment_cannot_override_proxy_or_smuggle_secrets(world, name):
+    with pytest.raises(SessionRefused):
+        runner().authorize(spec(world, env={name: "v"}))
+
+
+def test_a_clean_environment_is_accepted_and_values_are_checked(world):
+    runner().authorize(spec(world, env={"OPENCODE_PERMISSION": '{"bash":"allow"}', "OLLAMA_BASE_URL": "http://harness2-proxy.internal:11434"}))
+    for v in ("a\nb", "a\0b", "x" * 5000):
+        with pytest.raises(SessionRefused):
+            runner().authorize(spec(world, env={"FOO": v}))
+
+
+def test_workspace_rules(world, tmp_path, monkeypatch):
+    home = os.path.expanduser("~")
+    for bad in ("relative/dir", "", "/", home, os.path.dirname(home), "/etc", "/usr/lib", "/proc/self", "/dev", "/var/run",
+                str(tmp_path / "nope"), world.cli, world.ws + "/../ws", world.ws + "//", "/tmp", "/home/agent",
+                f"{world.tmp}/a,b", f'{world.tmp}/a"b'):
+        with pytest.raises(SessionRefused):
+            runner().authorize(spec(world, workspace=bad))
+    link = tmp_path / "link"
+    link.symlink_to(world.ws)
+    with pytest.raises(SessionRefused, match="symlink"):
+        runner().authorize(spec(world, workspace=str(link)))
+    with pytest.raises(SessionRefused, match="workspace root"):
+        runner(workspace_roots=[str(tmp_path / "elsewhere")]).authorize(spec(world))
+    runner(workspace_roots=[str(tmp_path)]).authorize(spec(world))
+
+
+def test_the_cli_must_be_a_regular_file_outside_the_workspace(world, tmp_path):
+    d = tmp_path / "adir"
+    d.mkdir()
+    for bad in (str(d), str(tmp_path / "missing"), "relative-cli", "/dev/null"):
+        with pytest.raises(SessionRefused):
+            runner().authorize(spec(world, cli=bad, argv=("/opt/cli/x",)))
+    inside = tmp_path / "ws" / "cli"
+    inside.write_text("#!/bin/sh\n")
+    with pytest.raises(SessionRefused, match="inside the workspace"):
+        runner().authorize(spec(world, cli=str(inside), argv=("/opt/cli/cli",)))
+    link = tmp_path / "bin" / "alias"
+    link.symlink_to(world.cli)
+    plan = runner().authorize(spec(world, cli=str(link), argv=("/opt/cli/alias",)))
+    assert plan.cli_host == os.path.realpath(world.cli) and plan.cli_container == "/opt/cli/alias"
+
+
+def test_bad_limits_credentials_and_runner_construction(world):
+    for lim in (SessionLimits(pids=1), SessionLimits(memory="lots"), SessionLimits(cpus="-1"), SessionLimits(cpus="1;id"),
+                SessionLimits(tmpfs_size="0m"), SessionLimits(max_output_bytes=1)):
+        with pytest.raises(SessionRefused):
+            runner().authorize(spec(world, limits=lim))
+    for path in ("relative", "/proc/x", "/opt/cli/tok", "/tmp/tok", "/a/../b", "/a,b", ""):
+        with pytest.raises(SessionRefused):
+            Credential(path, "v")
+    for value in ("", "a\0b", "x" * 70000):
+        with pytest.raises(SessionRefused):
+            Credential("/home/agent/t", value)
+    with pytest.raises(SessionRefused):
+        Credential("/home/agent/t", "v", env_var="HTTP_PROXY")
+    ch = PROFILE.channels["local"]
+    for args in (("tcp://h", IMG, ch), (V, "ubuntu:latest", ch), (V, IMG, {"kind": "opencode"})):
+        with pytest.raises(SessionRefused):
+            ProposerSessionRunner(*args, zdr="strict", classification="open")
+    with pytest.raises(SessionRefused):
+        ProposerSessionRunner(sandbox.VerifiedDocker("/usr/bin/docker", "tcp://127.0.0.1:2375"), IMG, ch, zdr="strict", classification="open")
+    for net in ("host", "none", "bridge", "a b", "-x", "container:abc"):
+        with pytest.raises(SessionRefused):
+            runner(egress_network=net)
+
+
+def test_loopback_and_remote_endpoints_cannot_be_mixed(world):
+    mixed = channels.parse_text(TOML.replace('endpoints = ["https://api.anthropic.com", "https://statsig.anthropic.com:443"]',
+                                             'endpoints = ["https://api.anthropic.com", "http://127.0.0.1:9"]'), source="t")
+    r = ProposerSessionRunner(V, IMG, mixed.channels["claude"], zdr="off", classification="open", proposer_decision=OK)
+    with pytest.raises(SessionRefused, match="mixing"):
+        r.authorize(spec(world))
+
+
+# ── the argv of every docker call ────────────────────────────────────────────────
+
+def names():
+    return sr.Names("abc123def456")
+
+
+def flags(argv, flag):
+    return [argv[i + 1] for i, a in enumerate(argv) if a == flag]
+
+
+def mounts(argv):
+    return flags(argv, "--mount")
+
+
+def session_argv(world, name="agy", **kw):
+    r = runner(name, decision=None if name == "agy" else OK)
+    plan = r.authorize(spec(world, **kw))
+    return plan, sr.build_session_run(plan, names(), docker=V.path, host=V.host,
+                                      cred_file="/run/user/1000/h2s-x/cred/randomname" if plan.spec.credential else None)
+
+
+def test_every_hardening_flag_is_on_the_session_command_line(world):
+    plan, argv = session_argv(world, credential=Credential("/home/agent/.gemini/tok", SECRET, env_var="TOKEN_FILE"),
+                              tmpfs_dirs=("/home/agent/.gemini",))
+    assert argv[:5] == [V.path, "-H", SOCK, "run", "--rm"]
+    for pair in (("--user", "65534:65534"), ("--cap-drop", "ALL"), ("--security-opt", "no-new-privileges"), ("--pids-limit", "256"),
+                 ("--memory", "2g"), ("--memory-swap", "2g"), ("--cpus", "2"), ("--network", names().internal), ("--pull", "never"),
+                 ("--dns", "127.0.0.1"), ("--workdir", plan.workspace), ("--entrypoint", "")):
+        assert pair[1] in flags(argv, pair[0]), pair
+    assert "--read-only" in argv and "--init" not in argv
+    assert flags(argv, "--network") == [names().internal]
+    for forbidden in ("--privileged", "--cap-add", "-p", "--publish", "-P", "--volume", "-v", "--volumes-from", "--device", "--pid",
+                      "--ipc", "--uts", "--userns", "--security-opt=seccomp=unconfined", "--net", "--link", "--env-file", "--add-host"):
+        assert forbidden not in argv, forbidden
+    assert "seccomp=unconfined" not in " ".join(argv) and "apparmor=unconfined" not in " ".join(argv)
+    assert not any("docker.sock" in a for a in argv[3:]) and not any(os.path.expanduser("~") + ":" in a or a == os.path.expanduser("~") for a in argv)
+    tmpfs = flags(argv, "--tmpfs")
+    assert any(t.startswith("/tmp:") and "noexec" in t and "nosuid" in t and "size=256m" in t for t in tmpfs)
+    assert any(t.startswith("/home/agent:") and "noexec" in t and "uid=65534" in t for t in tmpfs)
+    assert any(t.startswith("/home/agent/.gemini:") for t in tmpfs)
+    # the image id, then exactly the caller's argv, last
+    assert argv[-len(plan.spec.argv) - 1] == IMG.id and tuple(argv[-len(plan.spec.argv):]) == plan.spec.argv
+
+
+def test_mounts_are_exactly_cli_ro_workspace_rw_same_path_and_the_credential_ro(world):
+    plan, argv = session_argv(world, credential=Credential("/home/agent/.gemini/tok", SECRET))
+    m = mounts(argv)
+    assert m == [f"type=bind,src={os.path.realpath(world.cli)},dst=/opt/cli/fake-cli,readonly",
+                 f"type=bind,src={world.ws},dst={world.ws}",
+                 "type=bind,src=/run/user/1000/h2s-x/cred/randomname,dst=/home/agent/.gemini/tok,readonly"]
+    assert m[1].split(",")[1][4:] == m[1].split(",")[2][4:] and "readonly" not in m[1]
+    _, plain = session_argv(world)
+    assert len(mounts(plain)) == 2          # no credential, no third mount
+
+
+def test_no_secret_is_anywhere_in_any_argv(world):
+    plan, argv = session_argv(world, credential=Credential("/home/agent/tok", SECRET, env_var="TOKEN_FILE"))
+    assert not any(SECRET in a for a in argv)
+    assert "TOKEN_FILE=/home/agent/tok" in flags(argv, "-e")            # the path, never the value
+    proxy = sr.build_proxy_create(plan, names(), docker=V.path, host=V.host, proxy_dir="/run/user/1000/h2s-x/proxy", bridge_dir=None)
+    assert not any(SECRET in a for a in proxy)
+    assert not any(SECRET in a for a in sr.build_reclaim_run(plan, names(), docker=V.path, host=V.host))
+
+
+def test_the_session_environment_is_closed_and_forces_the_proxy(world):
+    plan, argv = session_argv(world, env={"OPENCODE_PERMISSION": "{}"})
+    env = dict(e.split("=", 1) for e in flags(argv, "-e"))
+    proxy = "http://harness2-proxy.internal:3128"
+    assert env["HTTP_PROXY"] == env["HTTPS_PROXY"] == env["http_proxy"] == env["https_proxy"] == proxy
+    assert env["NO_PROXY"] == env["no_proxy"] == "127.0.0.1,localhost,::1" and env["HOME"] == "/home/agent" and env["OPENCODE_PERMISSION"] == "{}"
+    assert not any(k.startswith("DOCKER_") for k in env) and not any(k in env for k in ("SSH_AUTH_SOCK", "GITHUB_TOKEN"))
+    assert "-e" not in [a for a in argv if a in ("-e",) and False]
+    assert "-i" not in argv
+    assert "-i" in session_argv(world, stdin=b"prompt")[1]
+
+
+def test_tmp_exec_is_opt_in_and_extra_tmpfs_must_live_under_home(world):
+    assert any("exec,size" in t and "noexec" not in t for t in flags(session_argv(world, tmp_exec=True)[1], "--tmpfs"))
+    for bad in ("/etc", "/tmp/x", "/home/agent/../x", "/home/agent", "relative"):
+        with pytest.raises(SessionRefused):
+            runner().authorize(spec(world, tmpfs_dirs=(bad,)))
+
+
+def test_a_workspace_under_tmp_is_allowed_next_to_the_tmpfs(tmp_path):
+    ws = tmp_path / "w"
+    ws.mkdir()
+    cli = tmp_path / "c"
+    cli.write_text("x")
+    if not str(ws).startswith("/tmp/"):
+        pytest.skip("tmp_path is not under /tmp here")
+    plan = runner().authorize(SessionSpec(argv=("/opt/cli/c",), workspace=str(ws), cli=str(cli), timeout_s=5))
+    assert plan.workspace == str(ws)
+
+
+def test_the_proxy_container_command_line(world):
+    plan = runner().authorize(spec(world))
+    local = sr.build_proxy_create(plan, names(), docker=V.path, host=V.host, proxy_dir="/p", bridge_dir="/b")
+    assert local[:4] == [V.path, "-H", SOCK, "create"]
+    for pair in (("--user", "0:0"), ("--cap-drop", "ALL"), ("--security-opt", "no-new-privileges"), ("--network", names().internal),
+                 ("--network-alias", "harness2-proxy.internal"), ("--pids-limit", "64"), ("--memory", "128m")):
+        assert pair[1] in flags(local, pair[0]), pair
+    assert "--read-only" in local and flags(local, "--network") == [names().internal]       # egress is connected later, never here
+    assert mounts(local) == ["type=bind,src=/p,dst=/proxy,readonly", "type=bind,src=/b,dst=/bridge,readonly"]
+    assert local[-5:] == ["-I", "/opt/harness2/egress_proxy.py", "--config", "/proxy/proxy.json"][-4:] or "proxy.json" in local[-1]
+    hosted = sr.build_proxy_create(runner("agy", decision=None).authorize(spec(world)), names(), docker=V.path, host=V.host,
+                                   proxy_dir="/p", bridge_dir=None)
+    assert flags(hosted, "--user") == ["65534:65534"] and mounts(hosted) == ["type=bind,src=/p,dst=/proxy,readonly"]
+    # the bridge directory is mounted into the proxy only, never into the session
+    _, sess = session_argv(world, name="local")
+    assert not any("bridge" in m for m in mounts(sess))
+
+
+def test_the_reclaim_container_has_no_network_and_only_the_workspace(world):
+    plan = runner().authorize(spec(world))
+    argv = sr.build_reclaim_run(plan, names(), docker=V.path, host=V.host)
+    assert flags(argv, "--network") == ["none"] and flags(argv, "--cap-add") == ["CHOWN", "DAC_OVERRIDE", "FOWNER"]
+    assert mounts(argv) == [f"type=bind,src={world.ws},dst={world.ws}"] and "--read-only" in argv and "--cap-drop" in argv
+    assert argv[-3:] == ["-c", sr.RECLAIM_SCRIPT, "sh"] or argv[-1] == world.ws       # the path is an argument, never in the script
+    assert world.ws not in sr.RECLAIM_SCRIPT
+
+
+def test_the_proxy_config_matches_the_channel_and_loads_in_the_real_proxy(world):
+    for name, decision, check in (("agy", None, lambda p: p.decide("daily-cloudcode-pa.googleapis.com", 443).allowed
+                                   and not p.decide("daily-cloudcode-pa.googleapis.com", 80).allowed
+                                   and not p.decide("example.com", 443).allowed),
+                                  ("local", OK, lambda p: p.decide("127.0.0.1", 11434).unix == "/bridge/ollama.sock"
+                                   and not p.decide("example.com", 443).allowed and not p.allow)):
+        plan = runner(name, decision=decision).authorize(spec(world))
+        policy, host, port, listeners, _ = egress_proxy.parse_config(sr.proxy_config(plan))
+        assert (host, port) == ("0.0.0.0", 3128) and check(policy)
+        assert "test_allow_cidrs" not in sr.proxy_config(plan)             # only an explicit test hook ever sets it
+    assert egress_proxy.parse_config(sr.proxy_config(plan))[3] == [(11434, "/bridge/ollama.sock")]
+
+
+# ── docker calls: pinned, stripped, and nothing before the gate ──────────────────
+
+def test_every_docker_call_is_pinned_and_carries_no_docker_variable(world, monkeypatch):
+    for k in ("DOCKER_HOST", "DOCKER_CONFIG", "DOCKER_CONTEXT", "DOCKER_CERT_PATH", "DOCKER_TLS_VERIFY"):
+        monkeypatch.setenv(k, "evil")
+    trap = Trap(monkeypatch)
+    r = runner()
+    r._docker(["ps"])
+    r._quiet(["rm", "-f", "x"])
+    r._ids("containers", "abc")
+    r._ids("networks", "abc")
+    r._access_log(names())
+    assert len(trap.calls) == 5
+    for argv, kw in trap.calls:
+        assert argv[:3] == [V.path, "-H", SOCK]
+        assert not any(k.upper().startswith("DOCKER_") for k in kw["env"])
+
+
+def test_a_failed_gate_means_no_docker_call_at_all(world, monkeypatch):
+    trap = Trap(monkeypatch)
+    r = runner()
+
+    def closed():
+        raise sandbox.SandboxUnavailable("the Docker daemon does not report name=rootless")
+    monkeypatch.setattr(r, "_gate", closed)
+    with pytest.raises(sandbox.SandboxUnavailable, match="rootless"):
+        r.run(spec(world))
+    assert trap.calls == []
+    assert [p for p in os.listdir(world.ws)] == []
+
+
+def test_the_gate_is_checked_against_the_pinned_image_id_and_the_verified_socket(world, monkeypatch):
+    seen = {}
+
+    def fake(which, *, image, host, **kw):
+        seen.update(image=image, host=host, path=which("docker"))
+        raise sandbox.SandboxUnavailable("stop here")
+    monkeypatch.setattr(sr.sandbox, "verify_rootless_docker", fake)
+    with pytest.raises(sandbox.SandboxUnavailable):
+        runner().run(spec(world))
+    assert seen == {"image": IMG.id, "host": SOCK, "path": V.path}
+
+
+# ── output hygiene ───────────────────────────────────────────────────────────────
+
+def test_redaction_removes_the_value_everywhere_and_a_truncated_prefix():
+    assert sr.redact(f"a {SECRET} b {SECRET}", [SECRET]) == "a [REDACTED] b [REDACTED]"
+    assert SECRET[:12] not in sr.redact("tail " + SECRET[:12], [SECRET])
+    assert sr.redact("clean", [SECRET]) == "clean" and sr.redact("x", []) == "x"
+    assert SECRET not in sr.redact(SECRET.upper() + SECRET, [SECRET, SECRET.upper()])
+
+
+@pytest.mark.parametrize("raw,clean", [
+    ("\x1b[2J\x1b[Hhello", "hello"), ("a\x1b[31mred\x1b[0mb", "aredb"), ("\x1b]0;title\x07text", "text"),
+    ("\x1b]8;;http://x\x1b\\link\x1b]8;;\x1b\\", "link"), ("bell\x07\x08back\r\n", "bellback\n"), ("tab\tok\nline", "tab\tok\nline"),
+    ("nul\x00x", "nulx"), ("c1\x9bcontrol", "c1control"), ("\x1bc reset", " reset"), ("plain ünïcode", "plain ünïcode"),
+])
+def test_terminal_escapes_and_control_characters_are_stripped(raw, clean):
+    assert sr.sanitize_terminal(raw) == clean
+
+
+def test_the_file_size_limit_is_a_flag_and_is_validated(world):
+    assert "fsize=268435456:268435456" in flags(session_argv(world)[1], "--ulimit")
+    for n in (0, 1000, 1 << 40, "big"):
+        with pytest.raises(SessionRefused):
+            runner().authorize(spec(world, limits=SessionLimits(file_bytes=n)))
+
+
+# ── WS-E: the solver role and the shared sweep budget ─────────────────────────────
+
+from cognitive_harness2.sweep_budget import BudgetExhausted, SweepBudget  # noqa: E402
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 100.0
+
+    def __call__(self):
+        return self.t
+
+
+def budget(**kw):
+    clock = kw.pop("clock", None) or _Clock()
+    return SweepBudget(kw.pop("total", 2700.0), kw.pop("per", 600.0), kw.pop("n", 7), clock=clock, **kw), clock
+
+
+def solver(name="local", *, decision=None, **kw):
+    return runner(name, decision=decision, role="solver", **kw)
+
+
+def test_the_default_role_is_proposer_and_a_role_must_be_one_of_two(world):
+    assert runner().role == "proposer" and runner().budget is None
+    for bad in ("judge", "", None, "Solver", 3):
+        with pytest.raises(SessionRefused, match="role"):
+            runner(role=bad)
+    with pytest.raises(SessionRefused, match="budget"):
+        runner(budget=object())
+
+
+def test_a_solver_on_an_opencode_channel_needs_no_proposer_decision_but_a_proposer_still_does(world):
+    for name, zdr in (("local", "strict"), ("claude", "off")):
+        plan = runner(name, zdr=zdr, decision=None, role="solver").authorize(spec(world))
+        assert plan.spec.argv[0] == "/opt/cli/fake-cli"
+        with pytest.raises(SessionRefused, match="proposer decision"):
+            runner(name, zdr=zdr, decision=None).authorize(spec(world))          # byte-identical proposer behaviour
+
+
+def test_a_solver_with_a_refusing_decision_is_still_refused(world):
+    refused = upstream_egress.Decision(False, ("no",))
+    for d in (refused, SimpleNamespace(allowed=True), "yes"):
+        with pytest.raises(SessionRefused, match="proposer decision"):
+            solver(decision=d).authorize(spec(world))
+
+
+def test_a_solver_still_needs_the_channel_decision_for_its_channel(world, monkeypatch):
+    trap = Trap(monkeypatch)
+    for r in (solver("agy", cls="gated"), solver("agy", zdr="strict"), solver("claude", cls="restricted", zdr="off"),
+              solver("router", cls="restricted"), solver("local", zdr="bogus"), solver("claude", cls=None)):
+        with pytest.raises(SessionRefused, match="channel decision"):
+            r.run(spec(world))
+    assert trap.calls == []
+
+
+def test_a_solver_gets_the_same_hardening_as_a_proposer(world):
+    sp = spec(world)
+    for name, zdr in (("local", "strict"), ("agy", "off"), ("router", "strict")):
+        a = runner(name, zdr=zdr, cls="open", role="solver", decision=None).authorize(sp)
+        b = runner(name, zdr=zdr, cls="open", decision=OK).authorize(sp)
+        names_ = sr.Names("abc123abc123")
+        argv_a = sr.build_session_run(a, names_, docker=V.path, host=SOCK, cred_file=None)
+        argv_b = sr.build_session_run(b, names_, docker=V.path, host=SOCK, cred_file=None)
+        assert argv_a == argv_b
+        assert sr.build_proxy_create(a, names_, docker=V.path, host=SOCK, proxy_dir="/p", bridge_dir=None) == \
+            sr.build_proxy_create(b, names_, docker=V.path, host=SOCK, proxy_dir="/p", bridge_dir=None)
+        assert "--cap-drop" in argv_a and "--read-only" in argv_a and "no-new-privileges" in argv_a
+        assert "exec" not in sr._tmpfs("/tmp", "1m", exec_=False, owned=False)[1].split(",")
+
+
+def test_the_solver_refusals_are_the_proposer_refusals(world):
+    s = solver()
+    cli = sr.container_cli_path(world.cli)
+    for bad in (dict(argv=("/bin/sh", "-c", "id")), dict(env={"HTTP_PROXY": "x"}), dict(env={"MY_SECRET": "x"}),
+                dict(timeout_s=9999), dict(workspace="/etc"), dict(workspace="/etc/x"),
+                dict(argv=(cli, "x"), tmpfs_dirs=("/elsewhere",)), dict(limits=SessionLimits(pids=1))):
+        with pytest.raises(SessionRefused):
+            s.authorize(spec(world, **bad))
+
+
+def test_tmp_exec_is_off_unless_asked_for(world):
+    assert SessionSpec(argv=("/opt/cli/x",), workspace="/w", cli="/c", timeout_s=1).tmp_exec is False
+    plan = solver().authorize(spec(world))
+    argv = sr.build_session_run(plan, sr.Names("abc123abc123"), docker=V.path, host=SOCK, cred_file=None)
+    assert all("noexec" in t for t in argv if t.startswith("/tmp:") or t.startswith("/home/agent:"))
+    plan = solver().authorize(spec(world, tmp_exec=True))
+    argv = sr.build_session_run(plan, sr.Names("abc123abc123"), docker=V.path, host=SOCK, cred_file=None)
+    assert any(t.startswith("/tmp:") and ",exec," in t for t in argv)
+
+
+# ── the budget around run() ──────────────────────────────────────────────────────────
+
+CANNED = sr.SessionResult("r1", 0, "out", "", False, False, 1.0, ())
+
+
+def stub_execute(monkeypatch, r, *, result=CANNED, exc=None, seen=None):
+    def _execute(plan):
+        if seen is not None:
+            seen.append(plan)
+        if exc is not None:
+            raise exc
+        return result
+    monkeypatch.setattr(r, "_execute", _execute)
+    monkeypatch.setattr(r, "_gate", lambda: None)
+
+
+def test_run_reserves_before_the_gate_and_an_exhausted_budget_starts_nothing(world, monkeypatch):
+    trap = Trap(monkeypatch)
+    b, clock = budget(n=1)
+    r = solver(budget=b)
+    gate = []
+    monkeypatch.setattr(r, "_gate", lambda: gate.append(1))
+    monkeypatch.setattr(r, "_execute", lambda plan: CANNED)
+    r.run(spec(world))
+    with pytest.raises(BudgetExhausted) as e:
+        r.run(spec(world))
+    assert e.value.reason == "sessions" and gate == [1]
+    clock.t += 99999
+    b2, c2 = budget(total=10.0)
+    c2.t += 10
+    r2 = solver(budget=b2)
+    monkeypatch.setattr(r2, "_gate", lambda: gate.append(2))
+    with pytest.raises(BudgetExhausted) as e:
+        r2.run(spec(world))
+    assert e.value.reason == "deadline" and gate == [1]
+    assert trap.calls == []
+
+
+def test_a_refused_spec_never_reserves(world, monkeypatch):
+    trap = Trap(monkeypatch)
+    b, _ = budget()
+    for bad in (dict(argv=("/bin/sh",)), dict(timeout_s=99999)):
+        with pytest.raises(SessionRefused):
+            solver(budget=b).run(spec(world, **bad))
+    with pytest.raises(SessionRefused):
+        solver("agy", cls="gated", budget=b).run(spec(world))
+    assert b.snapshot()["counts"]["total"] == 0 and b.snapshot()["sessions"] == [] and trap.calls == []
+
+
+def test_the_session_timeout_is_clipped_to_the_reservation(world, monkeypatch):
+    b, clock = budget(total=700.0, per=600.0)
+    r = solver(budget=b)
+    seen: list = []
+    stub_execute(monkeypatch, r, seen=seen)
+    r.run(spec(world, timeout_s=2000))
+    assert seen[-1].spec.timeout_s == 600.0                     # the per-session cap
+    clock.t += 300
+    r.run(spec(world, timeout_s=500))
+    assert seen[-1].spec.timeout_s == 400.0                     # what is left of the sweep
+    clock.t -= 300
+    b2, _ = budget(total=700.0, per=600.0)
+    r2 = solver(budget=b2)
+    stub_execute(monkeypatch, r2, seen=seen)
+    r2.run(spec(world, timeout_s=30))
+    assert seen[-1].spec.timeout_s == 30                        # the caller asked for less
+
+
+def test_without_a_budget_the_timeout_is_untouched(world, monkeypatch):
+    r = runner()
+    seen: list = []
+    stub_execute(monkeypatch, r, seen=seen)
+    r.run(spec(world, timeout_s=2000))
+    assert seen[0].spec.timeout_s == 2000
+
+
+def test_sessions_are_counted_by_role_and_recorded(world, monkeypatch):
+    b, clock = budget(role_caps={"proposer": 1, "solver": 2})
+    p, s = runner(budget=b), solver(budget=b)
+    for r in (p, s):
+        stub_execute(monkeypatch, r)
+    p.run(spec(world))
+    s.run(spec(world))
+    s.run(spec(world))
+    with pytest.raises(BudgetExhausted, match="proposer"):
+        p.run(spec(world))
+    with pytest.raises(BudgetExhausted, match="solver"):
+        s.run(spec(world))
+    snap = b.snapshot()
+    assert snap["counts"] == {"proposer": 1, "solver": 2, "total": 3}
+    assert [x["outcome"] for x in snap["sessions"]] == ["ok", "ok", "ok"]
+    assert [x["role"] for x in snap["sessions"]] == ["proposer", "solver", "solver"]
+
+
+@pytest.mark.parametrize("how,outcome,counted", [
+    (dict(exc=sr.SessionError("boom")), "error", 1),
+    (dict(exc=KeyboardInterrupt()), "error", 1),
+    (dict(exc=sr.SessionCleanupError(["container x"])), "leftovers", 1),
+    (dict(result=sr.SessionResult("r", None, "", "", True, False, 9.0, ())), "timed_out", 1),
+])
+def test_the_reservation_is_always_released_with_how_the_session_ended(world, monkeypatch, how, outcome, counted):
+    b, _ = budget()
+    r = solver(budget=b)
+    stub_execute(monkeypatch, r, **how)
+    try:
+        r.run(spec(world))
+    except BaseException:  # noqa: BLE001
+        pass
+    snap = b.snapshot()
+    assert snap["active"] == 0 and snap["counts"]["total"] == counted
+    assert snap["sessions"][0]["outcome"] == outcome
+
+
+def test_a_failed_gate_gives_the_slot_back(world, monkeypatch):
+    trap = Trap(monkeypatch)
+    b, _ = budget(n=1)
+    r = solver(budget=b)
+
+    def closed():
+        raise sandbox.SandboxUnavailable("down")
+    monkeypatch.setattr(r, "_gate", closed)
+    with pytest.raises(sandbox.SandboxUnavailable):
+        r.run(spec(world))
+    snap = b.snapshot()
+    assert snap["counts"]["total"] == 0 and snap["sessions"][0]["outcome"] == "refused" and trap.calls == []
+    stub_execute(monkeypatch, r)
+    r.run(spec(world))                                       # the single slot was still there
+
+
+
+# ── the observer: what the stage-1 audit trail is built from ──────────────────────────
+
+def watched(**kw):
+    events: list = []
+    return events, solver(observer=lambda name, f: events.append((name, dict(f))), **kw)
+
+
+def test_the_observer_sees_a_reservation_and_nothing_that_could_hold_a_prompt(world, monkeypatch):
+    b, _ = budget()
+    events, r = watched(budget=b)
+    stub_execute(monkeypatch, r)
+    r.run(spec(world, env={"MY_VAR": "SENTINEL-env-value"}, argv=(sr.container_cli_path(world.cli), "run", "SENTINEL-prompt")))
+    assert [n for n, _ in events] == ["session_reserved"]
+    f = events[0][1]
+    assert f["role"] == "solver" and f["timeout_s"] == 60 and isinstance(f["reservation"], int)
+    assert "SENTINEL" not in repr(events)
+
+
+def test_the_observer_sees_every_refusal_with_its_reason_and_nothing_starts(world, monkeypatch):
+    trap = Trap(monkeypatch)
+    b, clock = budget(n=1)
+    events, r = watched(budget=b)
+    with pytest.raises(SessionRefused):
+        r.run(spec(world, argv=("/bin/sh", "-c", "id")))
+    stub_execute(monkeypatch, r)
+    r.run(spec(world))
+    with pytest.raises(BudgetExhausted):
+        r.run(spec(world))
+    names = [n for n, _ in events]
+    assert names == ["session_refused", "session_reserved", "session_refused"]
+    assert events[0][1]["reason"].startswith("refused") and events[2][1]["reason"] == "budget:sessions"
+    assert trap.calls == []
+
+
+def test_a_gate_failure_is_reported_as_a_refusal_and_gives_the_slot_back(world, monkeypatch):
+    b, _ = budget()
+    events, r = watched(budget=b)
+
+    def closed():
+        raise sandbox.SandboxUnavailable("down")
+    monkeypatch.setattr(r, "_gate", closed)
+    with pytest.raises(sandbox.SandboxUnavailable):
+        r.run(spec(world))
+    assert [n for n, _ in events] == ["session_reserved", "session_refused"]
+    assert events[1][1]["reason"] == "gate:SandboxUnavailable"
+
+
+def test_a_failing_observer_never_breaks_a_session_and_is_counted(world, monkeypatch):
+    def boom(name, fields):
+        raise RuntimeError("audit disk full")
+    b, _ = budget()
+    r = solver(observer=boom, budget=b)
+    stub_execute(monkeypatch, r)
+    assert r.run(spec(world)).exit_code == 0
+    assert r.observer_errors >= 1
+
+
+def test_the_observer_must_be_callable(world):
+    with pytest.raises(SessionRefused, match="observer"):
+        solver(observer="not callable")
+
+
+# ── NO_PROXY: the session's own loopback, set by the runner, nothing else ────────
+
+@pytest.mark.parametrize("name", ["agy", "claude", "local", "router"])
+def test_no_proxy_is_the_sessions_own_loopback_only_on_every_channel(world, name):
+    plan, argv = session_argv(world, name)
+    env = dict(e.split("=", 1) for e in flags(argv, "-e"))
+    entries = env["NO_PROXY"].split(",")
+    assert entries == ["127.0.0.1", "localhost", "::1"] and env["no_proxy"] == env["NO_PROXY"]
+    assert sr.PROXY_ALIAS not in env["NO_PROXY"]                  # the proxy, the host and external names are never bypassed
+
+
+def test_the_callers_config_still_cannot_set_any_proxy_variable_in_either_case(world):
+    for name in ("NO_PROXY", "no_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NODE_USE_ENV_PROXY", "MY_PROXY"):
+        with pytest.raises(SessionRefused):
+            runner().authorize(spec(world, env={name: "127.0.0.1,harness2-proxy.internal,example.com"}))
+
+
+def test_a_local_channel_routes_the_proxy_alias_to_the_bridge_socket_and_a_hosted_one_routes_nothing(world):
+    plan = runner("local").authorize(spec(world))
+    cfg = sr.proxy_config(plan)
+    sock = f"{sr.BRIDGE_MOUNT}/ollama.sock"
+    allow = [["GET", "/api/tags"], ["GET", "/v1/models"], ["POST", "/v1/chat/completions"], ["POST", "/v1/completions"], ["POST", "/api/show"]]
+    models = ["gemma4:12b"]                      # the channel's model id without its provider prefix; it has a tag, so no `:latest` twin
+    assert cfg["unix_routes"] == [{"host": "127.0.0.1", "port": 11434, "unix": sock, "allow": allow, "allowed_models": models},
+                                  {"host": sr.PROXY_ALIAS, "port": 11434, "unix": sock, "allow": allow, "allowed_models": models}]
+    assert cfg["listeners"] == [{"port": 11434, "unix": sock}] and cfg["allow"] == []
+    assert "unix_routes" not in sr.proxy_config(runner("claude").authorize(spec(world)))
+
+
+def test_the_local_route_carries_the_chat_and_model_list_pairs_and_none_of_ollamas_management_api(world):
+    """The bridge socket reaches the WHOLE HTTP API of the host's ollama and the session is untrusted: the config the proxy
+    loads must allow the OpenAI-compatible surface, the two read-only native routes (the model list and the model info),
+    and nothing that deletes, pulls, creates, pushes or copies a model."""
+    policy, _, _, listeners, _ = egress_proxy.parse_config(sr.proxy_config(runner("local").authorize(spec(world))))
+    for host in ("127.0.0.1", sr.PROXY_ALIAS):
+        granted = policy.route_allow[(host, 11434)]
+        assert granted == {("GET", "/api/tags"), ("GET", "/v1/models"), ("POST", "/v1/chat/completions"), ("POST", "/v1/completions"),
+                           ("POST", "/api/show")}
+        assert not [p for _, p in granted if p.startswith("/api/") and p not in ("/api/tags", "/api/show")]
+        assert not [m for m, _ in granted if m not in ("GET", "POST")]
+    assert listeners == [(11434, f"{sr.BRIDGE_MOUNT}/ollama.sock")]
+
+
+# ── what the proxy log says about a session, as numbers and host:port only ───────
+
+LOG = ("ACCESS decision=allow host=harness2-proxy.internal port=11434 reason=unix-route",
+       "ACCESS decision=allow host=unix-listener:11434 port=0 reason=unix-listener",
+       "ACCESS decision=allow host=upstream.example port=443 reason=allow-listed",
+       "ACCESS decision=deny host=127.0.0.1 port=34175 reason=not-allow-listed",
+       "ACCESS decision=deny host=127.0.0.1 port=34175 reason=not-allow-listed",
+       "ACCESS decision=deny host=github.com port=443 reason=not-allow-listed",
+       "ACCESS decision=deny host=<none> port=0 reason=rate-limit",
+       "something else entirely")
+
+
+def test_egress_summary_counts_model_requests_and_names_denied_hosts_only():
+    s = sr.egress_summary(LOG)
+    assert s == {"model_requests": 2, "egress_allowed": 3, "egress_denied": 4,
+                 "denied_hosts": ["127.0.0.1:34175", "github.com:443", "<none>:0"],
+                 "denied_reasons": ["not-allow-listed", "rate-limit"]}
+    assert sr.egress_summary(()) == {"model_requests": 0, "egress_allowed": 0, "egress_denied": 0,
+                                     "denied_hosts": [], "denied_reasons": []}
+
+
+def test_egress_summary_is_bounded_and_ignores_anything_that_is_not_a_decision_line():
+    many = [f"ACCESS decision=deny host=h{i}.example port=443 reason=not-allow-listed" for i in range(50)]
+    s = sr.egress_summary(many)
+    assert s["egress_denied"] == 50 and len(s["denied_hosts"]) == 10
+    assert sr.egress_summary(["ACCESS decision=allow host=x port=1 reason=unix-route extra=1", "", "ACCESS"])["model_requests"] == 0
+
+
+def test_every_container_and_network_a_scoped_process_creates_carries_its_run_id_and_an_unscoped_one_adds_nothing(world, monkeypatch):
+    from cognitive_harness2 import run_scope
+    rid = "0123abcd"
+    mark = ["--label", f"{run_scope.LABEL}={rid}"]
+
+    def builders() -> list[list[str]]:
+        plan, session = session_argv(world)
+        return [session, sr.build_proxy_create(plan, names(), docker=V.path, host=V.host, proxy_dir="/p", bridge_dir=None),
+                sr.build_reclaim_run(plan, names(), docker=V.path, host=V.host)]
+
+    def has_mark(argv: list[str]) -> bool:
+        return any(argv[i:i + 2] == mark for i in range(len(argv) - 1))
+
+    monkeypatch.setenv(run_scope.ENV, rid)
+    assert all(has_mark(a) for a in builders())
+    monkeypatch.delenv(run_scope.ENV)
+    assert not any(run_scope.LABEL in " ".join(a) for a in builders())      # production argv: unchanged
+
+
+# ── what the proxy refused, by method and path (the route filter's denials, from the new log fields) ─────────────
+
+PD = "ACCESS decision=deny host=harness2-proxy.internal port=11434 reason=unix-route-path-denied"
+
+
+def _pd(method, path):
+    return f"{PD} method={method} path={path}"
+
+
+def test_egress_summary_without_method_and_path_adds_no_denied_requests_key():
+    old = [PD, "ACCESS decision=deny host=h port=1 reason=not-allow-listed", *LOG]
+    s = sr.egress_summary(old)
+    assert "denied_requests" not in s and s["egress_denied"] == 6 and s["denied_reasons"] == ["not-allow-listed", "rate-limit", "unix-route-path-denied"]
+    assert "denied_requests" not in sr.egress_summary(())
+
+
+@pytest.mark.parametrize("lines,expected", [
+    ([_pd("GET", "/api/version")], {"GET /api/version": 1}),
+    ([_pd("GET", "/api/version")] * 3 + [_pd("HEAD", "/api/tags")], {"GET /api/version": 3, "HEAD /api/tags": 1}),
+    ([_pd("GET", "/v1/models?<12>"), _pd("GET", "/v1/models/")], {"GET /v1/models?<12>": 1, "GET /v1/models/": 1}),
+    ([_pd("?", "/x%0D%0A")], {"? /x%0D%0A": 1}),
+    # other denial reasons never land here, even when they carry method and path text
+    (["ACCESS decision=deny host=h port=1 reason=not-allow-listed method=GET path=/x"], None),
+    (["ACCESS decision=allow host=h port=1 reason=unix-route method=GET path=/x"], None),
+    # a line the parser cannot read as exactly these fields is ignored, never half-read
+    ([PD + " method=GET"], None), ([PD + " path=/x"], None), ([PD + " method=GET path=/a b"], None),
+    ([PD + " method=get path=/x"], None), ([PD + " method=GET path=/x extra=1"], None),
+])
+def test_egress_summary_counts_denied_requests_by_method_and_path(lines, expected):
+    s = sr.egress_summary(lines)
+    if expected is None:
+        assert "denied_requests" not in s
+    else:
+        assert s["denied_requests"] == expected and s["egress_denied"] == len(lines) and s["model_requests"] == 0
+
+
+def test_denied_requests_are_capped_at_20_distinct_keys_and_the_rest_go_to_other():
+    lines = [_pd("GET", f"/p{i}") for i in range(35)] + [_pd("GET", "/p0")] * 2 + [_pd("GET", "/p34")]
+    s = sr.egress_summary(lines)
+    d = s["denied_requests"]
+    assert len(d) == 21 and list(d)[:20] == [f"GET /p{i}" for i in range(20)] and d["GET /p0"] == 3
+    assert d["other"] == 16 and sum(d.values()) == s["egress_denied"] == 38
+    exact = sr.egress_summary([_pd("GET", f"/p{i}") for i in range(20)])["denied_requests"]
+    assert len(exact) == 20 and "other" not in exact
+
+
+def test_a_forged_line_inside_a_path_cannot_inflate_allowed_counts():
+    fake = "ACCESS decision=allow host=harness2-proxy.internal port=11434 reason=unix-route"
+    # as the proxy writes it: the fake text is one defanged token of a single deny line
+    one = _pd("GET", "/x%0D%0A" + fake.replace(" ", "%20"))
+    s = sr.egress_summary([one])
+    assert s["egress_allowed"] == 0 and s["model_requests"] == 0 and s["egress_denied"] == 1
+    assert list(s["denied_requests"]) == ["GET /x%0D%0AACCESS%20decision=allow%20host=harness2-proxy.internal%20port=11434%20reason=unix-route"]
+    # and a raw newline that got past everything is not two lines to the parser: the whole element fails to match
+    s = sr.egress_summary([f"{_pd('GET', '/x')}\n{fake}", f"{PD} method=GET path=/x\r\n{fake}"])
+    assert s["egress_allowed"] == 0 and s["model_requests"] == 0 and s["egress_denied"] == 0 and "denied_requests" not in s
+
+
+# ── the model the proxy lets through is the approved channel's model (F3) ────────────────────────────────────────────
+
+@pytest.mark.parametrize("model,names", [
+    ("ollama/gemma4-e4b-16k", ["gemma4-e4b-16k", "gemma4-e4b-16k:latest"]),     # untagged: ollama also accepts ':latest'
+    ("ollama/gemma4:12b", ["gemma4:12b"]),                                      # tagged: exactly that
+    ("ollama/qwen3:30b", ["qwen3:30b"]),
+    ("gemma4-e4b-16k", ["gemma4-e4b-16k", "gemma4-e4b-16k:latest"]),            # no provider prefix at all
+])
+def test_the_local_model_names_are_the_channels_model_without_its_provider_prefix(model, names):
+    assert sr.local_model_names(model) == names
+
+
+@pytest.mark.parametrize("model", ["ollama/x:cloud", "ollama/x-cloud", "ollama/a b", "ollama/", "ollama/é"])
+def test_a_channel_model_that_cannot_be_an_allowed_model_is_refused_before_anything_starts(world, model):
+    with pytest.raises(SessionRefused):
+        sr.local_model_names(model)
+
+
+def test_the_local_plan_carries_the_allowed_models_into_every_unix_route_and_a_hosted_plan_has_none(world):
+    plan = runner("local").authorize(spec(world))
+    assert plan.allowed_models == ("gemma4:12b",)
+    cfg = sr.proxy_config(plan)
+    assert [r["allowed_models"] for r in cfg["unix_routes"]] == [["gemma4:12b"], ["gemma4:12b"]]
+    assert runner("claude").authorize(spec(world)).allowed_models == ()
+    # the whole config the proxy would load must parse (the proxy fails to start on a route without the list)
+    from cognitive_harness2 import egress_proxy
+    pol = egress_proxy.parse_config(cfg)[0]
+    assert pol.route_models[("127.0.0.1", 11434)] == frozenset({"gemma4:12b"})
+
+
+def test_the_egress_summary_counts_a_model_denied_line_into_denied_models_and_keeps_its_reason():
+    lines = ["ACCESS decision=deny host=harness2-proxy.internal port=11434 reason=unix-route-model-denied model=x:cloud",
+             "ACCESS decision=deny host=harness2-proxy.internal port=11434 reason=unix-route-model-denied model=(missing)",
+             "ACCESS decision=allow host=harness2-proxy.internal port=11434 reason=unix-route"]
+    s = sr.egress_summary(lines)
+    assert s["egress_denied"] == 2 and s["egress_allowed"] == 1 and s["model_requests"] == 1
+    assert s["denied_reasons"] == ["unix-route-model-denied"]
+    assert s["denied_models"] == {"x:cloud": 1, "(missing)": 1} and "denied_requests" not in s
+
+
+def test_denied_models_are_capped_at_20_distinct_keys_and_the_rest_go_to_other():
+    base = "ACCESS decision=deny host=harness2-proxy.internal port=11434 reason=unix-route-model-denied model="
+    lines = [f"{base}m{i}" for i in range(35)] + [f"{base}m0"] * 2 + [f"{base}m34"]
+    s = sr.egress_summary(lines)
+    d = s["denied_models"]
+    assert len(d) == 21 and list(d)[:20] == [f"m{i}" for i in range(20)] and d["m0"] == 3
+    assert d["other"] == 16 and sum(d.values()) == s["egress_denied"] == 38
+
+
+# ── the proxy's running counters beat a log cut at the cap (F4) ──────────────────────────────────────────────────────
+
+import json as _json
+
+SUM = "ACCESS-SUMMARY "
+DENY_LINE = "ACCESS decision=deny host=harness2-proxy.internal port=11434 reason=unix-route-path-denied method=GET path=/api/version"
+
+
+def _summary_line(**over):
+    body = {"v": 1, "final": True, "egress_allowed": 7, "egress_denied": 3000, "model_requests": 7,
+            "denied_hosts": ["harness2-proxy.internal:11434"], "denied_reasons": ["unix-route-path-denied"],
+            "denied_requests": {"GET /api/version": 3000}}
+    body.update(over)
+    return SUM + _json.dumps(body, sort_keys=True)
+
+
+def _runner_with_logs(monkeypatch, lines):
+    out = "\n".join(lines) + "\n"
+
+    def run(argv, **kw):
+        return subprocess.CompletedProcess(argv, 0, out if "logs" in argv else "", "")
+    monkeypatch.setattr(sr.subprocess, "run", run)
+    return runner()
+
+
+def test_the_summary_line_beats_the_lines_when_it_is_final():
+    lines = [DENY_LINE] * 5 + [_summary_line()]
+    s = sr.egress_summary(lines)
+    assert s["egress_denied"] == 3000 and s["egress_allowed"] == 7 and s["model_requests"] == 7
+    assert s["denied_requests"] == {"GET /api/version": 3000} and s["denied_hosts"] == ["harness2-proxy.internal:11434"]
+    assert "truncated" not in s
+
+
+def test_the_summary_line_with_denied_models_beats_the_lines_when_it_is_final():
+    lines = [DENY_LINE] * 5 + [_summary_line(denied_models={"x:cloud": 9})]
+    s = sr.egress_summary(lines)
+    assert s["denied_models"] == {"x:cloud": 9} and s["denied_requests"] == {"GET /api/version": 3000}
+
+
+def test_the_latest_of_several_summaries_is_the_one_used():
+    lines = [_summary_line(final=False, egress_denied=100), DENY_LINE, _summary_line(final=True, egress_denied=250)]
+    assert sr.egress_summary(lines)["egress_denied"] == 250
+
+
+def test_a_stale_periodic_summary_does_not_hide_lines_that_are_all_there():
+    """No final summary (the proxy was killed) and the log was not cut: the lines are complete, the last periodic summary is
+    up to 99 requests behind, so the lines are counted."""
+    lines = [DENY_LINE] * 130 + [_summary_line(final=False, egress_denied=100)]
+    assert sr.egress_summary(lines)["egress_denied"] == 130
+
+
+def test_a_cut_log_with_a_periodic_summary_uses_it_and_says_truncated():
+    lines = [DENY_LINE] * 5 + [_summary_line(final=False, egress_denied=400), "ACCESS-TRUNCATED"]
+    s = sr.egress_summary(lines)
+    assert s["egress_denied"] == 400 and s["truncated"] is True
+
+
+def test_a_cut_log_without_a_summary_counts_the_lines_it_has_and_says_truncated():
+    s = sr.egress_summary([DENY_LINE] * 5 + ["ACCESS-TRUNCATED"])
+    assert s["egress_denied"] == 5 and s["truncated"] is True
+    assert "truncated" not in sr.egress_summary([DENY_LINE] * 5)
+
+
+@pytest.mark.parametrize("bad", [
+    SUM + "not json", SUM + "[]", SUM + "{}", SUM + _json.dumps({"v": 2}),
+    _summary_line(egress_denied=-1), _summary_line(egress_denied=10 ** 12), _summary_line(egress_denied="3000"),
+    _summary_line(egress_denied=True), _summary_line(extra=1), _summary_line(denied_hosts="h:1"),
+    _summary_line(denied_hosts=["h:1"] * 11), _summary_line(denied_hosts=["has space:1"]), _summary_line(denied_reasons=[5]),
+    _summary_line(denied_requests={"GET /x": -1}), _summary_line(denied_requests={f"GET /p{i}": 1 for i in range(22)}),
+    _summary_line(denied_requests={"GET /a b": 1}), _summary_line(final="yes"),
+    _summary_line(denied_models={"x:cloud": -1}), _summary_line(denied_models={f"m{i}": 1 for i in range(22)}),
+    _summary_line(denied_models={"has a space": 1}), _summary_line(denied_models="x:cloud"),
+    SUM + _json.dumps({"v": 1, "final": True, "egress_allowed": 0, "egress_denied": 0, "model_requests": 0, "denied_hosts": [],
+                       "denied_reasons": []}) + " trailing",
+    " " + _summary_line(), "x" + _summary_line(), SUM + "{" * 100000,
+])
+def test_a_malformed_or_forged_summary_is_ignored_and_the_lines_are_counted(bad):
+    s = sr.egress_summary([DENY_LINE, DENY_LINE, bad])
+    assert s["egress_denied"] == 2 and "truncated" not in s
+
+
+def test_a_forged_summary_inside_a_path_is_impossible_the_line_is_one_deny_token():
+    forged = _summary_line(egress_denied=0).replace(" ", "%20")
+    line = f"{PD} method=GET path=/x%0A{forged}"
+    s = sr.egress_summary([line, line])
+    assert s["egress_denied"] == 2 and list(s["denied_requests"]) == [f"GET /x%0A{forged}"]
+
+
+def test_access_log_keeps_every_summary_line_even_past_the_size_cap_and_marks_the_cut(monkeypatch):
+    flood = [DENY_LINE] * 5000                                   # about 750 KB of lines, well over MAX_ACCESS_LOG_BYTES
+    assert sum(map(len, flood)) > 2 * sr.MAX_ACCESS_LOG_BYTES
+    r = _runner_with_logs(monkeypatch, flood + [_summary_line(egress_denied=5000)])
+    log = r._access_log(names())
+    assert len([x for x in log if x.startswith("ACCESS decision=")]) < 5000
+    assert sum(len(x) for x in log if x.startswith("ACCESS decision=")) <= sr.MAX_ACCESS_LOG_BYTES
+    assert log[-1].startswith(SUM) and "ACCESS-TRUNCATED" in log
+    s = sr.egress_summary(log)
+    assert s["egress_denied"] == 5000 and "truncated" not in s
+
+
+def test_access_log_without_a_summary_marks_the_cut_and_the_runner_reports_it(monkeypatch):
+    r = _runner_with_logs(monkeypatch, [DENY_LINE] * 5000)
+    log = r._access_log(names())
+    assert log[-1] == "ACCESS-TRUNCATED"
+    s = sr.egress_summary(log)
+    assert s["truncated"] is True and 0 < s["egress_denied"] < 5000
+
+
+def test_access_log_under_the_cap_has_no_marker_and_only_the_last_valid_summary(monkeypatch):
+    r = _runner_with_logs(monkeypatch, [DENY_LINE, _summary_line(final=False, egress_denied=1), "ACCESS-SUMMARY garbage",
+                                        _summary_line(final=True, egress_denied=1)])
+    log = r._access_log(names())
+    assert log.count("ACCESS-TRUNCATED") == 0 and len([x for x in log if x.startswith(SUM)]) == 1
+    assert sr.egress_summary(log)["egress_denied"] == 1
+
+
+def test_access_log_drops_a_forged_line_that_is_not_a_clean_summary_and_defangs_control_characters(monkeypatch):
+    r = _runner_with_logs(monkeypatch, [DENY_LINE, SUM + '{"v":1}\x1b[31m', "ACCESS-TRUNCATED"])
+    log = r._access_log(names())
+    assert not [x for x in log if x.startswith(SUM)]
+    assert "ACCESS-TRUNCATED" not in log                           # a bare marker in the log is the proxy's text, not ours: ignored
+
+
+def test_the_proxy_is_stopped_before_its_log_is_read_so_the_final_summary_is_in_it(monkeypatch):
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv[3:])
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    monkeypatch.setattr(sr.subprocess, "run", run)
+    r = runner()
+    n = names()
+    r._finish_proxy(n)
+    assert calls and calls[0][0] == "stop" and n.proxy in calls[0] and "-t" in calls[0]

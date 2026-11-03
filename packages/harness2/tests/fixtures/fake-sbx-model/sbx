@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# A STATEFUL FAKE `sbx` for tests/test_sbx_session.py. It emulates what `SbxSessionRunner` calls, with the outputs and
+# exit codes observed on a real v0.50.1 (2026-11-01): sandbox-scoped HTTP allow rules (`policy allow network --sandbox N
+# localhost:P --method M --path X` prints "Added rule <id> ..."), `policy ls --json [N]` (N: only the rules that apply to N),
+# `policy rm network --sandbox N --id ID --force`, `rm --force` removing the sandbox AND its scoped rules, `exec`.
+# It records every call and never starts a VM; it touches nothing but $FAKE_SBX_DIR.
+#
+# Knobs (environment): FAKE_SBX_POLICY_FILE (the global listing), FAKE_SBX_VERSION, FAKE_SBX_CREATE=fail,
+# FAKE_SBX_ALLOW_FAIL_AT=N (the Nth `policy allow` fails), FAKE_SBX_POLICY_RM=fail, FAKE_SBX_RM=leak,
+# FAKE_SBX_EXTRA (JSON array of rules added to every listing), FAKE_SBX_EXTRA_FOR_SANDBOX (only to `policy ls NAME`),
+# FAKE_SBX_CHECK=allowed, FAKE_SBX_GATEWAY (what `printenv HTTP_PROXY` says), FAKE_SBX_NO_CLI=1 (`test -x` fails),
+# FAKE_SBX_SESSION (a bash script run as the session; FAKE_SBX_PORT is the port named by the first rule),
+# FAKE_SBX_EXEC_RC/OUT/ERR, FAKE_SBX_EXEC_HANG=1, FAKE_SBX_LS=fail, FAKE_SBX_ADDED_SCOPE=global|other|none (what scope `policy allow`
+# reports and stores: an sbx that ignored --sandbox, a rule of somebody else's sandbox, or a line with no scope at all).
+set -u
+D="${FAKE_SBX_DIR:?FAKE_SBX_DIR is required}"
+mkdir -p "$D"; touch "$D/sandboxes" "$D/rules" "$D/workspaces"
+{ printf '%s\x1f' "$@"; printf '\n'; } >> "$D/calls"
+
+exists() { grep -qx -- "$1" "$D/sandboxes"; }
+missing() { echo "error: sandbox '$1' not found" >&2; }
+
+emit_policy() {  # $1: optional sandbox name
+  local extra="${FAKE_SBX_EXTRA:-[]}"
+  if [ -n "${1:-}" ] && [ -n "${FAKE_SBX_EXTRA_FOR_SANDBOX:-}" ]; then extra="$FAKE_SBX_EXTRA_FOR_SANDBOX"; fi
+  jq -Rn --slurpfile base "${FAKE_SBX_POLICY_FILE:?}" --arg only "${1:-}" --argjson extra "$extra" '
+    [inputs | split("\t") | select(length==5) | {id:.[0], sb:.[1], method:.[2], path:.[3], host:.[4]}] as $r
+    | {rules: ($base[0].rules + $extra + [ $r[] | select($only=="" or .sb==$only or .sb=="-") | {id:.id, name:.id,
+        scope:(if .sb=="-" then "global" else "sandbox:"+.sb end), applies_to:(if .sb=="-" then "all" else "sandbox:"+.sb end),
+        resource_type:"http", decision:"allow", resources:[.host],
+        origin:"scoped", layer:"local", status:"active", editable:true, sandbox_id:.sb,
+        actions:["http:request:"+(.method|ascii_downcase)], methods:[.method], http_targets:[{host:.host, path:.path}]} ])}' "$D/rules"
+}
+
+case "${1:-}" in
+  version)
+    echo "sbx version ${FAKE_SBX_VERSION:-v9.9.9} deadbeef" ;;
+  settings)
+    echo '[{"key":"browser.enabled","type":"bool","value":false},{"key":"ssh.agentForwardingEnabled","type":"bool","value":false}]' ;;
+  policy)
+    case "${2:-}" in
+      ls)
+        shift 2; n=""
+        for a in "$@"; do case "$a" in --json) ;; -*) ;; *) n="$a" ;; esac; done
+        if [ -n "$n" ] && ! exists "$n"; then missing "$n"; exit 1; fi
+        emit_policy "$n" ;;
+      allow)
+        # policy allow network --sandbox N RESOURCE --method M --path P
+        n="$5"; res="$6"; method="$8"; path="${10}"
+        c=$(( $(cat "$D/allow_count" 2>/dev/null || echo 0) + 1 )); echo "$c" > "$D/allow_count"
+        if [ "${FAKE_SBX_ALLOW_FAIL_AT:-0}" = "$c" ]; then echo "error: allow network rule: request failed: 500" >&2; exit 1; fi
+        exists "$n" || { echo "error: allow network rule: sandbox \"$n\" not found" >&2; exit 1; }
+        id="rule-$c-$n"
+        case "${FAKE_SBX_ADDED_SCOPE:-}" in
+          global)  # an sbx that ignored --sandbox: the rule is GLOBAL, and says so
+            printf '%s\t%s\t%s\t%s\t%s\n' "$id" "-" "$method" "$path" "$res" >> "$D/rules"
+            echo "Added rule $id to policy local (scope: global): $method $res$path" ;;
+          other)   # a rule scoped to somebody else's sandbox
+            printf '%s\t%s\t%s\t%s\t%s\n' "$id" "somebody-else" "$method" "$path" "$res" >> "$D/rules"
+            echo "Added rule $id to policy local (scope: sandbox:somebody-else): $method $res$path" ;;
+          none)    # no scope in the line at all
+            printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$n" "$method" "$path" "$res" >> "$D/rules"
+            echo "Added rule $id to policy local: $method $res$path" ;;
+          *)
+            printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$n" "$method" "$path" "$res" >> "$D/rules"
+            echo "Added rule $id to policy local (scope: sandbox:$n): $method $res$path" ;;
+        esac ;;
+      rm)
+        # policy rm network [--sandbox N] --id ID --force: with --sandbox only that sandbox's rules, without it only global ones
+        [ "${FAKE_SBX_POLICY_RM:-}" = fail ] && { echo "error: rm rule failed" >&2; exit 1; }
+        shift 3; sb="-"; id=""
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --sandbox) sb="$2"; shift 2 ;;
+            --id) id="$2"; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        awk -F'\t' -v id="$id" -v sb="$sb" '!($1==id && $2==sb)' "$D/rules" > "$D/rules.new"; mv "$D/rules.new" "$D/rules"
+        echo "Removed rule from policy local: id=$id" ;;
+      check)
+        # policy check network --sandbox N --json TARGET
+        n="$5"; t="$7"
+        exists "$n" || { echo "error: check network policy: request failed: 404 Not Found: sandbox \"$n\" not found" >&2; exit 1; }
+        if [ "${FAKE_SBX_CHECK:-denied}" = allowed ]; then echo "{\"allowed\":true,\"target\":\"$t\"}"; exit 0; fi
+        echo "{\"allowed\":false,\"target\":\"$t\",\"reason\":\"No matching allow rule (default deny)\"}"; exit 1 ;;
+    esac ;;
+  create)
+    if [ "${FAKE_SBX_CREATE:-}" = fail ]; then echo "error: request failed: 500 Internal Server Error: failed to run sandbox container" >&2; exit 1; fi
+    n="$4"; echo "$n" >> "$D/sandboxes"
+    last="${*: -1}"; case "$last" in /*) printf '%s\t%s\n' "$n" "$last" >> "$D/workspaces" ;; esac ;;
+  ls)
+    [ "${FAKE_SBX_LS:-}" = fail ] && { echo "error: daemon unreachable" >&2; exit 1; }
+    cat "$D/sandboxes" ;;
+  cp)
+    exists "${3%%:*}" || { missing "${3%%:*}"; exit 1; }
+    printf '%s\t%s\n' "$2" "$3" >> "$D/cp" ;;
+  exec)
+    shift
+    stdin=0; user=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -i) stdin=1; shift ;;
+        -w) shift 2 ;;
+        -u) user="$2"; shift 2 ;;
+        --) shift; break ;;
+        -*) shift ;;
+        *) break ;;
+      esac
+    done
+    n="$1"; shift
+    exists "$n" || { missing "$n"; exit 125; }
+    if [ "${1:-}" = printenv ]; then echo "${FAKE_SBX_GATEWAY:-http://gateway.docker.internal:3128}"; exit 0; fi
+    if [ "${1:-}" = test ]; then [ -n "${FAKE_SBX_NO_CLI:-}" ] && exit 1; exit 0; fi
+    if [ "${1:-}" = bash ] && [ "${2:-}" = -c ] && case "${3:-}" in ulimit*) true ;; *) false ;; esac; then
+      printf '%s\0' "$@" > "$D/session_argv"
+      if [ "$stdin" = 1 ]; then cat > "$D/session_stdin"; fi
+      [ "${FAKE_SBX_EXEC_HANG:-}" = 1 ] && sleep 60
+      if [ -n "${FAKE_SBX_SESSION:-}" ]; then
+        FAKE_SBX_PORT=$(head -1 "$D/rules" | cut -f5 | sed 's/.*://') FAKE_SBX_SANDBOX="$n" bash "$FAKE_SBX_SESSION"
+        exit $?
+      fi
+      printf '%s' "${FAKE_SBX_EXEC_OUT:-}"; printf '%s' "${FAKE_SBX_EXEC_ERR:-}" >&2
+      exit "${FAKE_SBX_EXEC_RC:-0}"
+    fi
+    echo "$user $*" >> "$D/exec_other"
+    exit 0 ;;
+  rm)
+    # rm --force N [N...]
+    shift
+    for n in "$@"; do
+      case "$n" in -*) continue ;; esac
+      exists "$n" || { missing "$n"; continue; }
+      [ "${FAKE_SBX_RM:-}" = leak ] && continue
+      grep -vx -- "$n" "$D/sandboxes" > "$D/sandboxes.new"; mv "$D/sandboxes.new" "$D/sandboxes"
+      awk -F'\t' -v n="$n" '$2!=n' "$D/rules" > "$D/rules.new"; mv "$D/rules.new" "$D/rules"
+    done ;;
+  *)
+    echo "fake sbx: unsupported: $*" >&2; exit 2 ;;
+esac

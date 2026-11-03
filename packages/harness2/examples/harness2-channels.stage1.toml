@@ -1,0 +1,28 @@
+# Channel profile for STAGE 1: a local smoke run of the Harness2 method, k=1, on a model served by YOUR Ollama.
+#
+#   - ONE channel, `local-ollama`: opencode talking to Ollama on this machine's loopback. Nothing leaves the machine.
+#   - Hard caps for one sweep: 7 contained sessions (3 proposer + 4 solver rollouts), 45 minutes of wall clock, $0.
+#   - It is a template. Copy it, point `workspace_roots` at a directory YOU own, and keep it OUT of ~/.config unless
+#     you mean to make it your standing profile (the stage-1 runner never writes there):
+#
+#         cp packages/harness2/examples/harness2-channels.stage1.toml ~/h2-stage1/channels.toml
+#         export COGNITIVE_HARNESS2_CHANNELS_FILE=~/h2-stage1/channels.toml     # or pass --profile
+#
+#   - To allow a longer total wall clock, raise `wall_s` HERE: a command-line --wall-s can only lower it.
+
+# Directories a contained session may use as its working directory (absolute, normalised, must exist before a run).
+workspace_roots = ["/home/rockad/h2-workspaces"]
+
+[channels.local-ollama]
+kind = "opencode"
+provider = "ollama"                      # the model id's prefix
+endpoint = "http://127.0.0.1:11434/v1"   # Ollama's OpenAI-compatible API, on loopback
+model = "ollama/gemma4:12b"              # `ollama list` must show gemma4:12b
+retention = "local"
+max_classification = "restricted"
+approval = "per-sweep"                   # the only value: a human approves each sweep
+
+[channels.local-ollama.caps]
+sessions = 7        # P = 3 proposer sessions + R = 4 solver rollouts at k=1
+wall_s = 2700       # 45 minutes for the whole sweep
+cost_usd = 0        # a local model: the sweep may spend nothing
