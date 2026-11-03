@@ -213,7 +213,17 @@ export function detectActiveHarness(): JevHarness {
       return h as JevHarness;
     }
   }
-  if (process.env.ANTIGRAVITY_CLI || process.env.GEMINI_CLI || process.env.CORTEX_SESSION) {
+  if (
+    process.env.ANTIGRAVITY_AGENT ||
+    process.env.ANTIGRAVITY_APP_DATA_DIR ||
+    process.env.ANTIGRAVITY_LS_ADDRESS ||
+    process.env.ANTIGRAVITY_LS_VERSION ||
+    process.env.ANTIGRAVITY_CONVERSATION_ID ||
+    process.env.ANTIGRAVITY_PROJECT_ID ||
+    process.env.ANTIGRAVITY_CLI ||
+    process.env.GEMINI_CLI ||
+    process.env.CORTEX_SESSION
+  ) {
     return 'antigravity';
   }
   if (process.env.CLAUDE_CODE || process.env.CLAUDE_PROJECT_DIR || process.env.CLAUDECODE) {
@@ -221,6 +231,21 @@ export function detectActiveHarness(): JevHarness {
   }
   if (process.env.OPENCODE_SESSION || process.env.OPENCODE_HOME) {
     return 'opencode';
+  }
+  try {
+    const hasIndexArg = process.argv.some(arg => arg.includes('src/index.ts') || arg.endsWith('index.ts'));
+    if (hasIndexArg) {
+      const quotaPath = path.join(os.homedir(), '.gemini', 'antigravity-cli', 'quota-state.json');
+      if (fsSync.existsSync(quotaPath)) {
+        const stat = fsSync.statSync(quotaPath);
+        const ageHours = (Date.now() - stat.mtimeMs) / (1000 * 60 * 60);
+        if (ageHours < 48) {
+          return 'antigravity';
+        }
+      }
+    }
+  } catch {
+    // ignore
   }
   return 'cli';
 }
@@ -248,7 +273,17 @@ export function normalizeTier(rawTier: string): CognitiveTier {
   const t = (rawTier || '').toLowerCase().trim();
   if (t === 'free' || t === 'openrouter_free' || t.includes('free')) return 'free';
   if (t === 'cheap' || t === 'flash_lite' || t.includes('haiku') || t.includes('lite') || t.includes('cheap')) return 'cheap';
-  if (t === 'deep' || t === 'pro' || t.includes('opus') || t.includes('expensive') || t.includes('deep') || t === 'pro' || /(?:^|[-_/:])pro(?:$|[-_/:])/.test(t)) return 'deep';
+  if (
+    t === 'deep' ||
+    t === 'pro' ||
+    t.includes('argon') ||
+    t.includes('fable') ||
+    t.includes('opus') ||
+    t.includes('expensive') ||
+    t.includes('deep') ||
+    t === 'pro' ||
+    /(?:^|[-_/:])pro(?:$|[-_/:])/.test(t)
+  ) return 'deep';
   if (t === 'standard' || t === 'flash' || t.includes('sonnet') || t.includes('standard') || t.includes('flash')) return 'standard';
   return 'standard';
 }
@@ -710,13 +745,20 @@ export function getHarnessModels(harness?: JevHarness, startDir?: string): Harne
   const targetHarness = harness || detectActiveHarness();
   const cfg = loadJevConfigSync(startDir);
   const defaultModels: HarnessModelMap =
-    DEFAULT_JEV_CONFIG.harnesses?.[targetHarness]?.models as HarnessModelMap ||
-    DEFAULT_JEV_CONFIG.harnesses?.cli?.models as HarnessModelMap || {
-      free: 'openrouter/free',
-      cheap: 'google/gemma-4-31b-it:free',
-      standard: 'typesafe/jev-router',
-      deep: 'typesafe/jev-router'
-    };
+    targetHarness === 'antigravity'
+      ? {
+          free: 'openrouter/free',
+          cheap: 'flash_lite',
+          standard: 'flash',
+          deep: 'pro'
+        }
+      : (DEFAULT_JEV_CONFIG.harnesses?.[targetHarness]?.models as HarnessModelMap) ||
+        (DEFAULT_JEV_CONFIG.harnesses?.cli?.models as HarnessModelMap) || {
+          free: 'openrouter/free',
+          cheap: 'google/gemma-4-31b-it:free',
+          standard: 'typesafe/jev-router',
+          deep: 'typesafe/jev-router'
+        };
 
   const configuredModels = cfg.harnesses?.[targetHarness]?.models || {};
 
