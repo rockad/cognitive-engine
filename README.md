@@ -15,7 +15,7 @@ Autonomous Cognitive Substrate uniting System 1 Coprocessor (`Jev`), System 2 Re
 - `packages/memory/`: Unified SQLite Memory Substrate (Python/uv)
 - `adapters/antigravity/`: Antigravity integration adapter
 - `adapters/claude/`: Claude Code integration adapter
-- `adapters/opencode/`: OpenCode integration adapter
+- `adapters/opencode/`: OpenCode integration adapter (deferred)
 
 ## References
 

@@ -1,0 +1,11 @@
+{
+  "name": "@cognitive-engine/adapter-claude",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "Claude Code plugin bundle for Jev: native manifest and MCP registration",
+  "scripts": {
+    "test": "bun test"
+  }
+}

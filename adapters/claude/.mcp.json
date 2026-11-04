@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "jev": {
+      "command": "bun",
+      "args": ["run", "${COGNITIVE_ENGINE_HOME}/packages/jev/src/index.ts"]
+    }
+  }
+}

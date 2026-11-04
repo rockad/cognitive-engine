@@ -1,0 +1,17 @@
+{
+  "name": "jev",
+  "version": "1.0.0",
+  "description": "TypeSafe Jev System 1 coprocessor: calibrated routing, quality gates and free-tier offloading over MCP",
+  "author": {
+    "name": "Aleksandr Korolev"
+  },
+  "license": "MIT",
+  "keywords": [
+    "jev",
+    "system-1",
+    "mcp",
+    "routing",
+    "openrouter"
+  ],
+  "hooks": "./hooks/hooks.json"
+}
