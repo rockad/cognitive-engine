@@ -13,6 +13,7 @@ import {
 import { evaluateClaude } from '../src/guard.ts';
 import { run } from '../src/hook.ts';
 import { claudeDecisionsFile } from '../src/claude-audit.ts';
+import { BUILTIN_AGENT_TYPES, userClaudeDir } from '../src/agent-definitions.ts';
 import { clearConfigCacheForTesting } from '../src/core/config.ts';
 
 const FIX = path.join(import.meta.dir, 'fixtures', 'payloads');
@@ -24,7 +25,7 @@ let savedEnv: NodeJS.ProcessEnv = {};
 
 beforeEach(() => {
   savedEnv = { ...process.env };
-  for (const v of ['JEV_HARNESS', 'ANTIGRAVITY_CLI', 'GEMINI_CLI', 'CLAUDE_CODE', 'CLAUDECODE', 'CLAUDE_PROJECT_DIR', 'OPENCODE_SESSION', 'OPENCODE_HOME', 'CORTEX_SESSION']) delete process.env[v];
+  for (const v of ['JEV_HARNESS', 'ANTIGRAVITY_CLI', 'GEMINI_CLI', 'CLAUDE_CODE', 'CLAUDECODE', 'CLAUDE_PROJECT_DIR', 'OPENCODE_SESSION', 'OPENCODE_HOME', 'CORTEX_SESSION', 'CLAUDE_CONFIG_DIR']) delete process.env[v];
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'jev-wf-'));
   process.env.HOME = tmp;
   process.env.JEV_CONFIG_FILE = path.join(tmp, 'config.json');
@@ -74,7 +75,9 @@ return r`)).toEqual([]);
   it('a phase model in meta is ranked too', () => {
     const s = check(`export const meta = { name: 'a', description: 'b', phases: [{ title: 'T', model: 'opus' }] }\nawait agent('x')`);
     expect(s).toHaveLength(1);
-    expect(s[0].reason).toContain('meta.phases:');
+    expect(s[0].reason).toContain('meta.phases model');
+    expect(s[0].reason).toContain('only a progress-display hint');
+    expect(s[0].reason).toContain('ranked in case that changes');
     expect(check(`export const meta = { name: 'a', description: 'b', phases: [{ title: 'T', model: 'haiku' }] }`)).toEqual([]);
   });
 
@@ -222,6 +225,154 @@ describe('agentType', () => {
     expect(checkScriptText(`await agent('p', {agentType: 'deep'})`, SESSION, r)).toHaveLength(1);
     expect(checkScriptText(`await agent('p', {agentType: 'user-cheap'})`, SESSION, r)).toEqual([]);
     expect(checkScriptText(`await agent('p', {agentType: '../deep'})`, SESSION, r)).toHaveLength(1); // not followed: not found
+  });
+
+  it('lets a built-in type through, as the Agent guard does, and ranks a same-named definition file', () => {
+    const r = fsResolver(path.join(tmp, 'proj'));
+    for (const t of ['general-purpose', 'Explore', 'Plan', 'statusline-setup', 'claude-code-guide', 'claude']) {
+      expect(BUILTIN_AGENT_TYPES.has(t)).toBe(true);
+      expect(checkScriptText(`await agent('p', {agentType: '${t}'})`, SESSION, r)).toEqual([]);
+    }
+    expect(checkScriptText(`await agent('p', {agentType: 'general-purpose', model: 'opus'})`, SESSION, r)).toHaveLength(1);
+    fs.mkdirSync(path.join(tmp, '.claude', 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(tmp, '.claude', 'agents', 'Plan.md'), '---\nmodel: opus\n---\n');
+    expect(checkScriptText(`await agent('p', {agentType: 'Plan'})`, SESSION, r)).toHaveLength(1);
+  });
+
+  it('reads user agents and workflows from CLAUDE_CONFIG_DIR when it is set', () => {
+    const cfg = path.join(tmp, 'alt-config');
+    fs.mkdirSync(path.join(cfg, 'agents'), { recursive: true });
+    fs.mkdirSync(path.join(cfg, 'workflows'), { recursive: true });
+    const home = path.join(tmp, 'home'); // a sibling of proj, so the project walk never reaches it
+    process.env.HOME = home;
+    fs.mkdirSync(path.join(home, '.claude', 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(cfg, 'agents', 'cfg-deep.md'), '---\nmodel: opus\n---\n');
+    fs.writeFileSync(path.join(cfg, 'workflows', 'cfg-wf.js'), `await agent('x', {model: 'opus'})`);
+    fs.writeFileSync(path.join(home, '.claude', 'agents', 'stale.md'), '---\nmodel: opus\n---\n');
+    process.env.CLAUDE_CONFIG_DIR = cfg;
+    const r = fsResolver(path.join(tmp, 'proj'));
+    expect(checkScriptText(`await agent('p', {agentType: 'cfg-deep'})`, SESSION, r)).toHaveLength(1);
+    expect(checkScriptText(`await workflow('cfg-wf')`, SESSION, r)).toHaveLength(1);
+    // The stale ~/.claude copy is not consulted, so it is not found (asks as unreadable).
+    expect(checkScriptText(`await agent('p', {agentType: 'stale'})`, SESSION, r)[0].reason).toContain('not an agent Jev can read');
+  });
+
+  it('resolves a RELATIVE CLAUDE_CONFIG_DIR against the hook cwd, not the process cwd', () => {
+    const project = path.join(tmp, 'proj');
+    const abs = path.join(tmp, 'abs');
+    fs.mkdirSync(path.join(abs, 'agents'), { recursive: true });
+    fs.mkdirSync(path.join(abs, 'workflows'), { recursive: true });
+    process.env.HOME = path.join(tmp, 'home'); // a sibling of proj, so the project walk never reaches it
+    fs.mkdirSync(path.join(tmp, 'home', '.claude', 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(abs, 'agents', 'rel-deep.md'), '---\nmodel: opus\n---\n');
+    fs.writeFileSync(path.join(abs, 'workflows', 'rel-wf.js'), `await agent('x', {model: 'opus'})`);
+    fs.writeFileSync(path.join(tmp, 'home', '.claude', 'agents', 'stale.md'), '---\nmodel: opus\n---\n');
+    process.env.CLAUDE_CONFIG_DIR = '../abs';
+    expect(userClaudeDir(project)).toBe(abs);
+    const r = fsResolver(project);
+    expect(checkScriptText(`await agent('p', {agentType: 'rel-deep'})`, SESSION, r)).toHaveLength(1);
+    expect(checkScriptText(`await workflow('rel-wf')`, SESSION, r)).toHaveLength(1);
+    expect(checkScriptText(`await agent('p', {agentType: 'stale'})`, SESSION, r)[0].reason).toContain('not an agent Jev can read');
+    // The ask names the resolved dir, not the raw relative value.
+    expect(checkScriptText(`await agent('p', {agentType: 'nope'})`, SESSION, r)[0].reason).toContain(path.join(abs, 'agents'));
+  });
+
+  it('an empty or unset CLAUDE_CONFIG_DIR means HOME/.claude', () => {
+    fs.mkdirSync(path.join(tmp, '.claude', 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(tmp, '.claude', 'agents', 'home-deep.md'), '---\nmodel: opus\n---\n');
+    const r = fsResolver(path.join(tmp, 'proj'));
+    process.env.CLAUDE_CONFIG_DIR = '';
+    expect(userClaudeDir(path.join(tmp, 'proj'))).toBe(path.join(tmp, '.claude'));
+    expect(checkScriptText(`await agent('p', {agentType: 'home-deep'})`, SESSION, r)).toHaveLength(1);
+    delete process.env.CLAUDE_CONFIG_DIR;
+    expect(userClaudeDir(path.join(tmp, 'proj'))).toBe(path.join(tmp, '.claude'));
+    expect(checkScriptText(`await agent('p', {agentType: 'home-deep'})`, SESSION, r)).toHaveLength(1);
+  });
+
+  it('an absolute CLAUDE_CONFIG_DIR is used as is, and reads settings and plugins from it', () => {
+    const cfg = path.join(tmp, 'alt-config');
+    const plugin = path.join(tmp, 'plug');
+    fs.mkdirSync(path.join(cfg, 'plugins'), { recursive: true });
+    fs.mkdirSync(path.join(plugin, 'agents'), { recursive: true });
+    fs.mkdirSync(path.join(tmp, '.claude', 'plugins'), { recursive: true });
+    fs.writeFileSync(path.join(plugin, 'agents', 'pa.md'), '---\nmodel: opus\n---\n');
+    fs.writeFileSync(path.join(cfg, 'plugins', 'installed_plugins.json'), JSON.stringify({ plugins: { 'plug@m': [{ installPath: plugin }] } }));
+    process.env.CLAUDE_CONFIG_DIR = cfg;
+    expect(userClaudeDir('/anywhere')).toBe(cfg);
+    const r = fsResolver(path.join(tmp, 'proj'));
+    expect(checkScriptText(`await agent('p', {agentType: 'plug:pa'})`, SESSION, r)).toHaveLength(1);
+    // HOME/.claude's plugin manifest is not consulted.
+    fs.writeFileSync(path.join(tmp, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({ plugins: { 'other@m': [{ installPath: plugin }] } }));
+    expect(checkScriptText(`await agent('p', {agentType: 'other:pa'})`, SESSION, r)[0].reason).toContain('not an agent Jev can read');
+  });
+});
+
+describe('effort', () => {
+  const eff = (e: string, extra = '') => `await agent('p', {effort: '${e}'${extra}})`;
+
+  it('low, medium and high pass', () => {
+    for (const e of ['low', 'medium', 'high']) expect(check(eff(e))).toEqual([]);
+  });
+
+  it('xhigh and max ask with a clear reason', () => {
+    for (const e of ['xhigh', 'max']) {
+      const s = check(eff(e));
+      expect(s).toHaveLength(1);
+      expect(s[0].reason).toContain(`effort "${e}"`);
+      expect(s[0].reason).toContain('interim effort threshold');
+    }
+  });
+
+  it('any other literal asks as unrecognised', () => {
+    for (const e of ['ultra', 'HIGH', '', 'Max']) {
+      const s = check(eff(e));
+      expect(s).toHaveLength(1);
+      expect(s[0].reason).toContain('not a level Jev recognises');
+    }
+    expect(check(`await agent('p', {effort: 5})`)).toHaveLength(1); // a non-string literal is not a plain string
+  });
+
+  it('a non-literal effort is unverifiable and asks', () => {
+    for (const v of ['level', 'args.effort', "'x' + y", 'cond ? "low" : "max"', 'undefined', '`${lvl}`']) {
+      const s = check(`await agent('p', {effort: ${v}})`);
+      expect(s).toHaveLength(1);
+      expect(s[0].reason).toContain('effort is not a plain string literal');
+    }
+  });
+
+  it('follows a single-binding const like model does', () => {
+    expect(check(`const E = 'low'; await agent('p', {effort: E})`)).toEqual([]);
+    expect(check(`const E = 'max'; await agent('p', {effort: E})`)).toHaveLength(1);
+    expect(check(`let E = 'low'; await agent('p', {effort: E})`)[0].reason).toContain('effort is not a plain string literal');
+  });
+
+  it('a spread or computed key asks and names effort', () => {
+    expect(check(`await agent('p', {...opts})`)[0].reason).toContain('`effort`');
+    expect(check(`await agent('p', {[k]: 'low'})`)[0].reason).toContain('`effort`');
+    expect(check(`await agent('p', {effort: 'low', ...opts})`)).toHaveLength(1);
+  });
+
+  it('is read in either options position and with a quoted key', () => {
+    expect(check(`await agent({effort: 'max'})`)).toHaveLength(1);
+    expect(check(`await agent('p', {'effort': 'max'})`)).toHaveLength(1);
+    expect(check(`await agent('p', {"effort": 'low'})`)).toEqual([]);
+  });
+
+  it('is checked alongside model and agentType, each on its own', () => {
+    expect(check(eff('low', `, model: 'haiku'`))).toEqual([]);
+    expect(check(eff('max', `, model: 'haiku'`))).toHaveLength(1);
+    expect(check(eff('low', `, model: 'opus'`))).toHaveLength(1);
+    const both = check(eff('max', `, model: 'opus'`));
+    expect(both).toHaveLength(2);
+    const r = fake({ agents: { cheap: 'haiku', deep: 'opus' } });
+    expect(check(eff('high', `, agentType: 'cheap'`), SESSION, r)).toEqual([]);
+    expect(check(eff('xhigh', `, agentType: 'cheap'`), SESSION, r)).toHaveLength(1);
+    expect(check(eff('high', `, agentType: 'deep'`), SESSION, r)).toHaveLength(1);
+    expect(check(eff('xhigh', `, agentType: 'deep'`), SESSION, r)).toHaveLength(2);
+  });
+
+  it('an effort key outside agent() options is not read', () => {
+    expect(check(`const x = {effort: 'max'}; await agent('p')`)).toEqual([]);
   });
 });
 
