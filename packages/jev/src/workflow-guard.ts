@@ -40,7 +40,7 @@
  *   sandbox exposes an object that holds the function. Unknown sandbox objects are not modelled.
  * - Options of `pipeline`/`parallel`/`phase` helpers are not inspected, only `agent()` and `meta`.
  * - `effort` in the agent() options has only an INTERIM threshold, with no spec behind it (see
- *   docs/rfc/006-subagent-effort-bounding.md): a literal `xhigh` or `max` asks, `low`, `medium` and
+ *   docs/rfc/007-subagent-effort-bounding.md): a literal `xhigh` or `max` asks, `low`, `medium` and
  *   `high` pass, and any other literal or a non-literal value (variable, expression, spread) is
  *   unverifiable and asks. The session's own effort is not read, so it is not compared, and effort
  *   does not compose with the model ceiling or the low-quota clamp.
@@ -834,7 +834,7 @@ function parseFindings(script: string): Finding[] {
 const PHASE_MODEL_WHAT = 'meta.phases model (in Claude Code this is only a progress-display hint, but it is ranked in case that changes):';
 
 /**
- * INTERIM threshold, chosen by the user with no spec behind it (docs/rfc/006-subagent-effort-bounding.md):
+ * INTERIM threshold, chosen by the user with no spec behind it (docs/rfc/007-subagent-effort-bounding.md):
  * a literal `effort` at these levels asks. The levels below them pass; any other literal asks.
  */
 const EFFORT_ASK = new Set(['xhigh', 'max']);

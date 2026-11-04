@@ -1,6 +1,6 @@
-# RFC 006: Future Design Note — Bounding Subagent Effort
+# RFC 007: Future Design Note — Bounding Subagent Effort
 
-- **RFC Number**: 006
+- **RFC Number**: 007
 - **Track**: Track 1 (follow-up to RFC 002)
 - **Status**: Note (no design yet)
 - **Runtime**: TypeScript / Bun
