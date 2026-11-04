@@ -7,35 +7,62 @@
  * - a subagent may not run on a stronger model than the session without user approval (Claude Code)
  * - the Pro tier always requires manual user approval (Antigravity)
  *
- * It answers `ask`, never allow: when it cannot decide (unreadable input, unknown session model for
- * a strong tier, an internal error) it asks rather than letting the call through silently.
+ * It answers `ask`, never allow: when it cannot decide (unreadable input, an unknown model, an
+ * unknown session model, an internal error) it asks rather than letting the call through silently.
  *
  * Everything else Jev does for a turn (advice, dispatch, telemetry) is advice from the MCP tools.
  */
-import * as fs from 'node:fs';
-import * as os from 'node:os';
-import * as path from 'node:path';
 import { modelTierRank } from './core/governance.js';
+import { describeAgentLookup, missingAgentDetail, readAgentDefinition } from './agent-definitions.js';
+import { assessInherited, assessModelRequest, inheritsSessionModel, type InheritCheck } from './models.js';
+import { evaluateWorkflowInput, type ScriptFact } from './workflow-guard.js';
+import { resolveSessionModel, sessionModelFromTranscript, type SessionModel, type SessionModelSource } from './session-model.js';
+import { lowerModel } from './project-config.js';
+
+export { sessionModelFromTranscript };
 
 export interface Verdict {
   decision: 'ask';
   reason: string;
+  /** Facts for the decision audit (tool, models, call sites). Never prompt or script text. */
+  audit?: Record<string, unknown>;
 }
 
 export type GuardHarness = 'claude' | 'antigravity';
 
-const CLAUDE_RANK: ReadonlyArray<readonly [RegExp, number]> = [
-  [/haiku/i, 1],
-  [/sonnet/i, 2],
-  [/opus/i, 3],
-  [/fable/i, 4]
-];
+/** Which config file could not be trusted: the user's or a project's. */
+export type ConfigScope = 'user' | 'project';
 
-/** Relative strength of a Claude model id or alias; null when unknown or "inherit". */
-export function claudeModelRank(model: string | undefined | null): number | null {
-  if (!model) return null;
-  const hit = CLAUDE_RANK.find(([pattern]) => pattern.test(model));
-  return hit ? hit[1] : null;
+/**
+ * Facts the evaluation leaves for the hook entrypoint beyond the verdict: for a Workflow call, the
+ * decision and the hashes of the script text analysed (see workflow-pin.ts). A caller that does not
+ * pass one gets none, and `evaluateClaude` then has no side effects.
+ */
+export interface GuardContext {
+  /** In: a valid project config's `guard.ceiling` (project-config.ts) and the file it came from. */
+  projectCeiling?: string | null;
+  projectCeilingFile?: string;
+  /** Out: for a Workflow call, the decision and the script hashes (workflow-pin.ts). */
+  workflow?: { decision: 'allow' | 'ask'; scripts: ScriptFact[] };
+}
+
+/**
+ * The session model the call is compared against: the lower of the real session model and the
+ * project ceiling, with a note for the ask text when the ceiling is what lowered it. Without a
+ * ceiling (or when the session model is unknown or unrankable) it is the session model unchanged.
+ */
+function ceilingFor(session: SessionModel, ctx: GuardContext | undefined): { model: string | null; note: string; inherit: InheritCheck | null } {
+  const ceiling = ctx?.projectCeiling;
+  if (!ceiling) return { model: session.model, note: '', inherit: null };
+  // What a subagent that inherits the session model runs on is the REAL session model, which the
+  // ceiling can be below: it is ranked against the ceiling too.
+  const inherit: InheritCheck = { sessionModel: session.model, ceiling };
+  const model = lowerModel(session.model, ceiling);
+  const note =
+    model !== session.model
+      ? ` The project ceiling "${ceiling}"${ctx?.projectCeilingFile ? ` (${ctx.projectCeilingFile})` : ''} is below the session model "${session.model}", so it is the limit here; a project file can only tighten the ceiling.`
+      : '';
+  return { model, note, inherit };
 }
 
 export interface AgentCall {
@@ -45,64 +72,70 @@ export interface AgentCall {
   model?: string;
 }
 
-/** Rank from which a model counts as "strong" (opus and above) when the session model is unknown. */
+/** Rank from which a model counts as Pro tier on Antigravity (opus and above). */
 const STRONG_RANK = 3;
 
 /**
- * Claude Code Agent/Task call: ask when the model the subagent will run on is stronger than the
- * session's. That is the call's own `model`, or, when the call sets none, the `model` in the
- * subagent's definition file. "inherit" runs on the session model, so it passes.
+ * Claude Code Agent/Task call: ask when the model the subagent will run on is above the session's.
+ * That is the call's own `model`, or, when the call sets none, the `model` in the subagent's
+ * definition file. "inherit" or no model runs on the session model, so it passes, unless a project
+ * ceiling is set (`inherit`): then the session model is ranked against the ceiling.
  *
- * When the session model is unknown the two cannot be compared, so the guard fails closed for the
- * strong tiers (opus and above) and lets weaker requests through.
+ * Ranking is version-aware (see models.ts). Equal or lower passes silently. A requested model Jev
+ * cannot rank, or a session model that is unknown, asks.
  */
 export function decideClaudeAgentCall(
   call: AgentCall,
   sessionModel: string | null,
-  definitionModel: string | null = null
+  definitionModel: string | null = null,
+  sessionModelSource: SessionModelSource = 'none',
+  inherit: InheritCheck | null = null
 ): Verdict | null {
   const model = call.model !== undefined ? call.model : definitionModel;
-  const requested = claudeModelRank(model);
-  if (requested === null) return null;
+  // A call that runs on the session model is ranked against the project ceiling when there is one.
+  const assessment = inherit && inheritsSessionModel(model) ? assessInherited(inherit) : assessModelRequest(model, sessionModel);
+  if (assessment.kind === 'allowed') return null;
+  const advice =
+    assessment.kind === 'escalation'
+      ? 'Approve to run it on the stronger model, or deny and re-run it on the session model or a cheaper one.'
+      : 'Approve to run it, or deny and re-run it on a model Jev can rank.';
+  return {
+    decision: 'ask',
+    reason: `[jev] This delegation needs approval: ${assessment.reason}. ${advice}`,
+    audit: { kind: assessment.kind, requested: model ?? null, sessionModel, sessionModelSource }
+  };
+}
 
-  const ceiling = claudeModelRank(sessionModel);
-  if (ceiling === null) {
-    if (requested < STRONG_RANK) return null;
-    return {
-      decision: 'ask',
-      reason:
-        `[jev] This delegation runs on model "${model}" and the session model could not be determined. ` +
-        'Approve to run it, or deny and re-run it on a cheaper model.'
-    };
-  }
-  if (requested <= ceiling) return null;
+/** Claude Code's built-in subagent types: they have no definition file and run on the session model. */
+const BUILTIN_AGENT_TYPES: ReadonlySet<string> = new Set(['general-purpose', 'Explore', 'Plan', 'statusline-setup', 'claude-code-guide']);
+
+/**
+ * A call with no `model` runs on its subagent's definition. When the type is not a built-in and no
+ * definition can be found, its model cannot be read, so ask (the Workflow guard does the same). No
+ * `subagent_type` is the general-purpose default and passes.
+ */
+function unknownAgentVerdict(call: AgentCall, cwd: string | undefined): Verdict | null {
+  const type: unknown = call.subagent_type;
+  if (type === undefined || type === null) return null;
+  const definition = typeof type === 'string' ? readAgentDefinition(type, cwd) : { found: false, model: null };
+  if (definition.found) return null;
+  if (typeof type === 'string' && BUILTIN_AGENT_TYPES.has(type)) return null;
+  const label = typeof type === 'string' ? JSON.stringify(type) : `a non-string value (${typeof type})`;
   return {
     decision: 'ask',
     reason:
-      `[jev] This delegation runs on model "${model}", stronger than the session model "${sessionModel}". ` +
-      'Approve to run it on the stronger model, or deny and re-run it on the session model or a cheaper one.'
+      `[jev] The subagent type ${label} is not a built-in agent and ${missingAgentDetail(describeAgentLookup(cwd))} ` +
+      'Approve only if that agent is trusted to run on the session model or a cheaper one, or deny and re-run with an explicit model.',
+    audit: { kind: 'unknown-agent', subagent_type: typeof type === 'string' ? type : null }
   };
 }
 
 /**
- * The `model:` from a subagent's definition (`<cwd>/.claude/agents/<name>.md`, then
- * `~/.claude/agents/<name>.md`), or null. The name is restricted to file-name characters.
+ * The `model:` from a subagent's definition (project `.claude/agents` from the cwd up to the project
+ * root, then `~/.claude/agents`, then installed plugins), or null. See agent-definitions.ts.
  */
 export function agentDefinitionModel(subagentType: string | undefined, cwd: string | undefined): string | null {
-  if (!subagentType || !/^[A-Za-z0-9_.-]+$/.test(subagentType)) return null;
-  const dirs = [cwd ? path.join(cwd, '.claude', 'agents') : null, path.join(process.env.HOME || os.homedir(), '.claude', 'agents')];
-  for (const dir of dirs) {
-    if (!dir) continue;
-    try {
-      const text = fs.readFileSync(path.join(dir, `${subagentType}.md`), 'utf8');
-      const front = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text)?.[1];
-      const model = front && /^model:\s*(.+?)\s*$/m.exec(front)?.[1]?.replace(/^["']|["']$/g, '');
-      if (model) return model;
-    } catch {
-      // no definition here
-    }
-  }
-  return null;
+  return readAgentDefinition(subagentType, cwd).model;
 }
 
 export interface AntigravitySubagent {
@@ -126,47 +159,59 @@ export function decideAntigravitySubagents(subagents: AntigravitySubagent[]): Ve
   };
 }
 
-/** The model of the most recent assistant turn in a Claude Code transcript, or null. */
-export function sessionModelFromTranscript(transcriptPath: string | undefined): string | null {
-  if (!transcriptPath) return null;
-  try {
-    const TAIL_BYTES = 256 * 1024;
-    const fd = fs.openSync(transcriptPath, 'r');
-    try {
-      const { size } = fs.fstatSync(fd);
-      const start = Math.max(0, size - TAIL_BYTES);
-      const buf = Buffer.alloc(size - start);
-      fs.readSync(fd, buf, 0, buf.length, start);
-      const lines = buf.toString('utf8').split('\n');
-      if (start > 0) lines.shift(); // first line is likely cut mid-record
-      for (let i = lines.length - 1; i >= 0; i--) {
-        if (!lines[i]) continue;
-        try {
-          const entry = JSON.parse(lines[i]);
-          const model = entry?.type === 'assistant' ? entry?.message?.model : undefined;
-          if (typeof model === 'string' && model && !model.startsWith('<')) return model;
-        } catch {
-          // skip partial or non-JSON line
-        }
-      }
-    } finally {
-      fs.closeSync(fd);
+/** Claude Code Workflow call -> verdict (see workflow-guard.ts). Shape mismatches ask and are audited. */
+export function evaluateClaudeWorkflow(input: any, sink?: GuardContext): Verdict | null {
+  const session = resolveSessionModel(input);
+  const effective = ceilingFor(session, sink);
+  const decision = evaluateWorkflowInput(input.tool_input, input.cwd, effective.model, undefined, effective.inherit);
+  if (sink) sink.workflow = { decision: decision.decision, scripts: decision.scripts };
+  if (decision.decision === 'allow') return null;
+  return {
+    decision: 'ask',
+    reason: decision.message + effective.note,
+    audit: {
+      kind: 'workflow',
+      tool_name: 'Workflow',
+      session_id: input.session_id,
+      sessionModel: session.model,
+      ...(sink?.projectCeiling ? { projectCeiling: sink.projectCeiling } : {}),
+      sessionModelSource: session.source,
+      scripts: decision.scripts,
+      sites: decision.sites.map((s) => ({ file: s.file, line: s.line, col: s.col, reason: s.reason }))
     }
-  } catch {
-    // unreadable transcript: unknown model
-  }
-  return null;
+  };
 }
-
 /** Claude Code PreToolUse input -> verdict. */
-export function evaluateClaude(input: any): Verdict | null {
+export function evaluateClaude(input: any, sink?: GuardContext): Verdict | null {
+  if (typeof input?.tool_name !== 'string') {
+    return {
+      decision: 'ask',
+      reason: '[jev] The hook input has no tool name, so the call could not be evaluated. Approve only if you intended it.',
+      audit: { kind: 'malformed-input' }
+    };
+  }
+  if (input.tool_name === 'Workflow') return evaluateClaudeWorkflow(input, sink);
   if (input?.tool_name !== 'Agent' && input?.tool_name !== 'Task') return null;
-  const call: AgentCall = input.tool_input ?? {};
-  return decideClaudeAgentCall(
-    call,
-    sessionModelFromTranscript(input.transcript_path),
-    call.model === undefined ? agentDefinitionModel(call.subagent_type, input.cwd) : null
-  );
+  const raw = input.tool_input ?? {};
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    return {
+      decision: 'ask',
+      reason: `[jev] The ${input.tool_name} call's input could not be read. Approve only if you intended it.`,
+      audit: { kind: 'malformed-input', tool_name: input.tool_name }
+    };
+  }
+  const call = raw as AgentCall;
+  const session = resolveSessionModel(input);
+  const effective = ceilingFor(session, sink);
+  const facts = { tool_name: input.tool_name, session_id: input.session_id, ...(sink?.projectCeiling ? { projectCeiling: sink.projectCeiling } : {}) };
+  let definitionModel: string | null = null;
+  if (call.model === undefined) {
+    const unknown = unknownAgentVerdict(call, input.cwd);
+    if (unknown) return { ...unknown, audit: { ...unknown.audit, ...facts } };
+    definitionModel = agentDefinitionModel(call.subagent_type, input.cwd);
+  }
+  const verdict = decideClaudeAgentCall(call, effective.model, definitionModel, session.source, effective.inherit);
+  return verdict ? { ...verdict, reason: verdict.reason + effective.note, audit: { ...verdict.audit, ...facts } } : null;
 }
 
 /** Antigravity PreToolUse input -> verdict. A malformed subagent list fails closed (ask). */
@@ -184,6 +229,37 @@ export function guardErrorVerdict(err: unknown): Verdict {
   return {
     decision: 'ask',
     reason: `[jev] The subagent guard could not evaluate this call (${err instanceof Error ? err.message : String(err)}). Approve only if you intended it.`
+  };
+}
+
+/**
+ * The verdict for every guarded call while the Jev config cannot be trusted. Never an allow and
+ * never limited to escalations: the user cannot know whether Jev is meant to be on or off.
+ */
+export function configMalformedVerdict(file: string, problems: string[], scope: ConfigScope = 'user'): Verdict {
+  const list = problems.map((p) => `- ${p}`).join('\n');
+  if (scope === 'project') {
+    return {
+      decision: 'ask',
+      reason:
+        `[jev] The project Jev config ${file} cannot be read, so the subagent guard cannot tell what it tightens and asks on every guarded call.\n` +
+        `Problems:\n${list}\n` +
+        'Fix: repair the file or remove it. A project file can only tighten the user config (a lower `guard.ceiling` model such as ' +
+        '{"guard":{"ceiling":"sonnet"}}, a mode that is not lower than yours); it can never turn the guard off or raise the ceiling. ' +
+        'Approve this call only if you intended it.',
+      audit: { kind: 'project-config-malformed', file, problems }
+    };
+  }
+  const stray = problems.some((p) => p.startsWith("top-level 'mode'"));
+  return {
+    decision: 'ask',
+    reason:
+      `[jev] The Jev config ${file} is malformed, so the subagent guard cannot tell whether Jev is on or off and asks on every guarded call.\n` +
+      `Problems:\n${list}\n` +
+      `Fix: run \`/jev status\` to see what Jev reads, then repair the file to the expected shape ` +
+      `{"defaults":{"mode":"on-demand"}}${stray ? ' (move the top-level "mode" under "defaults")' : ''}, ` +
+      `or set \`/jev off\` explicitly to silence the guard. Approve this call only if you intended it.`,
+    audit: { kind: 'config-malformed', file, problems }
   };
 }
 

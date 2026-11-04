@@ -6,13 +6,35 @@ Native Claude Code plugin bundle for Jev: `.claude-plugin/plugin.json` plus `.mc
 
 The hook runs `packages/jev/src/hook.ts claude` before every `Agent` or `Task` call. If the call requests a model stronger than the session's (for example `opus` from a Sonnet session), it returns `permissionDecision: "ask"` and Claude Code prompts you.
 
-- The session model is read from the last assistant turn of the session transcript, so the hook keeps no state.
+- Ranking is version-aware: family first (fable > opus > sonnet > haiku), then version (5.5 > 5 > 4.8). Aliases resolve by the table in `packages/jev/src/models.ts` (`opus`, `sonnet`, `haiku` to 5.5, `fable` to 5.1). Any request strictly above the session model asks; equal or lower passes silently; a model Jev cannot rank asks.
+- The session model comes from a per-session state file written by the `PostModelSwitch` recorder (`record-hook.ts`, log-only and fail-open), falling back to the last assistant turn of the transcript. State lives in `~/.config/jev/claude_sessions/`.
+- Every ask and every observed model change (with its source) is appended to `~/.config/jev/claude_decisions.jsonl`: model names and reasons only, never prompt text. The guard never blocks or alters Claude Code's own model-switch fallbacks.
 - It is deterministic and makes no network call.
-- It is active only when the Jev mode for Claude Code is `on`. In `on-demand` and `off` it stays silent.
+- It is active in Jev modes `on` and `on-demand` and silent only in `off`.
 - It still fires under `--permission-mode bypassPermissions`: a hook `ask` is not auto-approved by bypass mode (checked with `claude -p`, where the call was blocked rather than run).
 - It is the only enforcement point; `jev_dispatch` and its tier clamp are advice. Nothing the agent passes to a tool counts as approval, only your answer to the prompt.
 - It also checks the `model:` in the subagent's definition (`.claude/agents/<name>.md`) when the call sets none.
-- Once on, it fails closed: if it cannot read the call, hits an error, or cannot determine the session model for an `opus`-class request, it asks instead of letting the call through. Weaker requests with an unknown session model proceed.
+- Once active, it fails closed: if it cannot read the call, hits an error, or cannot determine the session model, it asks instead of letting the call through.
+
+## The workflow guard
+
+Agents spawned inside a `Workflow` do not pass through the `Agent|Task` hook (verified on Claude Code 2.1.312: only `SubagentStart`/`SubagentStop` fire for them, and those cannot block), so a second `PreToolUse` entry with matcher `Workflow` runs the same `hook.ts claude`. `packages/jev/src/workflow-guard.ts` reads the script (inline `script`, a `scriptPath` file, or a saved workflow `name` from `.claude/workflows`, plus `workflow()` references one level deep), parses it with acorn and checks every `agent` and `workflow` reference.
+
+- A literal `model` (or an `agentType` whose definition sets one) is ranked against the session model like a direct call. No `model` inherits and is allowed.
+- Anything it cannot read statically asks and names the call site (`file:line:col`): an alias such as `const a = agent`, spread options, computed keys, a model from a variable or `args`, a template with `${}`, member access, `eval`, a parse error, an unreadable or oversized file, a missing agent definition, an unknown `tool_input` shape.
+- The rule is that `agent` and `workflow` may appear only as the callee of a direct call. Anything that could reach them another way also asks: `this`, `arguments`, `globalThis`/`global`/`window`/`self`, `Function`, `eval`, `Reflect`, `Proxy`, `process`, `require`, `Bun`, `Deno`, `module`, `exports`, `import.meta`; the member names `constructor`, `__proto__`, `prototype`, `getPrototypeOf`, `getOwnPropertyDescriptor(s)`; destructuring `agent`/`workflow`; reading them off anything but a plain local name; `setTimeout`/`setInterval` given a string; and any computed lookup whose key is not a literal or provably a number (it could spell `constructor`).
+- Known limits. A static check cannot be sound, so this is a fail-closed filter and not a sandbox:
+  - "Provably a number" trusts `.length`, the index parameter of `map`/`forEach`/`filter`/`some`/`every`/`find*`/`flatMap` callbacks and local names that only ever hold numbers. A user-defined `map` that passes a string, or an object whose `length` is a string, gets through.
+  - `setTimeout(name, ms)` is allowed because it is the common sleep shape. Node and Bun throw on a string there; a runtime that evaluates it would not be covered.
+  - `x.agent` read off a plain unbound name such as `args` is allowed (it is data unless the sandbox hands out an object that holds the function).
+  - Options of `pipeline`, `parallel` and `phase` are not inspected, only `agent()` and `meta.phases`.
+  - The script is checked as written. A file changed between the check and the run, or a saved workflow that Claude Code resolves differently from Jev, is not covered.
+  - Deliberate false positives: every `this`, variable-key lookups such as `o[k]` on plain data (writes into a local `{}`/`[]` are fine), and a local method that happens to be named `agent` or `workflow`.
+
+## Requirements
+
+- Claude Code **>= 2.1.295**: the guard entries use `"onFailure": "block"`, so a crashing, timing-out or missing hook blocks the tool call instead of failing open. Older versions ignore the key and fail open.
+- The three recorder hooks (`SessionStart`, `PostModelSwitch`, and `PostToolUse` for `Workflow`) only observe and deliberately fail open; `PostToolUse` prints only when a workflow file changed after the guard analysed it.
 
 ## Install
 
@@ -29,7 +51,9 @@ Jev reads its OpenRouter key from `~/.config/zsh/secrets.env` or `~/.config/jev/
 
 ## Enable the guard
 
-The hook is silent until the Jev mode for Claude Code is `on`. Run `/jev on`, or set `harnesses.claude-code.mode` to `"on"` in `~/.config/jev/config.json`.
+The hook is active in `on` and `on-demand`. Run `/jev on-demand` (or `/jev on`), or set `harnesses.claude-code.mode` in `~/.config/jev/config.json`. Only an explicit `off` silences it (`{"defaults":{"mode":"off"}}`, or `/jev off`). A missing config file keeps the loader default, which is `off`.
+
+A config that exists but cannot be trusted is not treated as `off`. Unreadable, a broken symlink, over 1 MB, invalid JSON, not an object, an unknown mode, a wrong type for a key Jev reads, a stray top-level `"mode"` (the mistake `{"mode":"on"}`; the mode belongs at `defaults.mode`), a near-miss key that Jev would silently ignore (`"default"` for `defaults`, `"claude"` or `"antigravty"` under `harnesses`; the message says which key was probably meant), a `mode` under a harness name that matches nothing, or `JEV_CONFIG_FILE` pointing at a file that does not exist makes the guard ask on **every** `Agent`, `Task` and `Workflow` call. The prompt names the file and the problems, a one-line message goes to stderr, and a `config_malformed` event (path and problem list only) is appended to the decisions log. Fix the file to `{"defaults":{"mode":"on-demand"}}`, run `/jev status` to see what Jev reads, or set `/jev off` explicitly.
 
 ## Validate
 

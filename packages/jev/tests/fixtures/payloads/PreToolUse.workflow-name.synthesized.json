@@ -1,0 +1,20 @@
+{
+  "session_id": "<session-id>",
+  "transcript_path": "~/.claude/projects/-~--claude-jobs-JOB-tmp-scratch/<uuid>.jsonl",
+  "cwd": "~/.claude/jobs/JOB/tmp/scratch",
+  "prompt_id": "<prompt-id>",
+  "permission_mode": "default",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Workflow",
+  "tool_input": {
+    "name": "ok-test",
+    "args": {
+      "probe": "canary"
+    }
+  },
+  "tool_use_id": "toolu_REDACTED",
+  "_synthesized": "NOT a capture. Hand-written from the Workflow tool schema ({name} saved-workflow form), because the name form was never run in the canary. Field names of the envelope copy PreToolUse.workflow-script.json."
+}

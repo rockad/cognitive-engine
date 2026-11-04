@@ -8,7 +8,8 @@ import {
   readJevModeSync,
   detectActiveHarness,
   writeModeState as coreWriteModeState,
-  loadJevConfigSync
+  loadJevConfigSync,
+  inspectJevConfigFile
 } from '../core/index.js';
 
 export { coreWriteModeState as writeModeState };
@@ -138,8 +139,18 @@ export async function handleGetModeTool(_args?: ToolInput<typeof getModeShape>):
   const activeMode = readJevModeSync(activeHarness);
   const cfg = loadJevConfigSync();
   const details = getModeDetails(activeMode);
+  const inspection = inspectJevConfigFile();
+  const configWarning =
+    inspection.state === 'malformed'
+      ? {
+          warning: `The Jev config is malformed, so the mode below may not be what you intended and the subagent guard asks on every guarded call. Expected shape: {"defaults":{"mode":"on-demand"}}, or set the mode to off explicitly.`,
+          file: inspection.file,
+          problems: inspection.problems
+        }
+      : undefined;
 
   const result = {
+    ...(configWarning ? { configWarning } : {}),
     harness: activeHarness,
     mode: activeMode,
     defaultMode: cfg.defaults?.mode || 'off',

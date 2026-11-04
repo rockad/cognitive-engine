@@ -253,7 +253,17 @@ export function normalizeTier(rawTier: string): CognitiveTier {
   return 'standard';
 }
 
-let cachedConfig: { at: number; data: JevConfig; dirKey: string } | null = null;
+let cachedConfig: { at: number; data: JevConfig; dirKey: string; userProblem: string | null } | null = null;
+
+/**
+ * Why the last load could not use the user config file (unreadable, over the size limit, not valid
+ * JSON), or null when it read it or the file is simply absent. The loader still falls back to its
+ * defaults in that case; the guard hook uses this to see that a file it had just validated
+ * stopped being readable, and asks instead of trusting the fallback.
+ */
+export function userConfigLoadProblem(): string | null {
+  return cachedConfig?.userProblem ?? null;
+}
 const CONFIG_CACHE_TTL_MS = 2000;
 
 export function clearConfigCacheForTesting(): void {
@@ -318,6 +328,292 @@ export function sanitizeProjectConfig(parsed: any): Partial<JevConfig> {
   return sanitized;
 }
 
+/** Path of the user config the loader reads (JEV_CONFIG_FILE wins over the home default). */
+export function jevUserConfigFile(): string {
+  return process.env.JEV_CONFIG_FILE || JEV_CONFIG_FILE;
+}
+
+export const VALID_JEV_MODES: readonly JevMode[] = ['off', 'on-demand', 'on'];
+const KNOWN_HARNESSES: readonly JevHarness[] = ['antigravity', 'claude-code', 'opencode', 'cli'];
+
+const KNOWN_TOP_LEVEL_KEYS: readonly string[] = ['version', 'defaults', 'routing', 'models', 'tiers', 'timeouts', 'cache', 'thresholds', 'harnesses', 'privacy'];
+const TOP_LEVEL_ALIASES: Readonly<Record<string, string>> = { default: 'defaults', harness: 'harnesses' };
+const HARNESS_ALIASES: Readonly<Record<string, string>> = { claude: 'claude-code', claudecode: 'claude-code', gemini: 'antigravity', agy: 'antigravity' };
+
+/** Optimal-string-alignment distance: insert, delete, substitute and adjacent transposition each cost 1. */
+function editDistance(a: string, b: string): number {
+  const d: number[][] = Array.from({ length: a.length + 1 }, (_, i) => [i, ...new Array<number>(b.length).fill(0)]);
+  for (let j = 1; j <= b.length; j++) d[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1);
+    }
+  }
+  return d[a.length][b.length];
+}
+
+/**
+ * The known key a misspelled one was probably meant to be, or undefined when it is not a near miss.
+ * Rule: a key that is not exactly a known key is a near miss when, compared case-insensitively, it
+ * is an explicit alias, or its edit distance to a known key is at most 2 (at most 1 when the known
+ * key has 5 characters or fewer, so a short unrelated name like `api` is not taken for `cli`).
+ */
+function nearMissOf(key: string, known: readonly string[], aliases: Readonly<Record<string, string>>): string | undefined {
+  if (known.includes(key)) return undefined;
+  const lower = key.toLowerCase();
+  if (aliases[lower]) return aliases[lower];
+  let best: { k: string; dist: number } | undefined;
+  for (const k of known) {
+    const dist = editDistance(lower, k);
+    if (dist <= (k.length <= 5 ? 1 : 2) && (!best || dist < best.dist)) best = { k, dist };
+  }
+  return best?.k;
+}
+
+export interface JevConfigValidation {
+  ok: boolean;
+  /** One human-readable line per problem; names the key path and the expected shape, never file contents. */
+  problems: string[];
+}
+
+function describeType(v: unknown): string {
+  if (v === null) return 'null';
+  if (Array.isArray(v)) return 'an array';
+  return `a ${typeof v}`;
+}
+
+/**
+ * Whether a parsed user config (~/.config/jev/config.json) can be trusted. Single source of truth
+ * for the guard hook and for `jev_get_mode`.
+ *
+ * Recognized keys are exactly the ones the loader and its getters read; every other key is left
+ * alone, since other tools may add their own. A missing key is "unset" and never a problem. Where
+ * the loader already merges a value, a wrong type or an unknown mode is what makes the resolved
+ * mode untrustworthy, so those are reported; the only rejected key the loader does not read is a
+ * top-level `mode`, which is the common mistake for `defaults.mode`.
+ */
+export function validateJevConfig(raw: unknown): JevConfigValidation {
+  const problems: string[] = [];
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    problems.push(`the top level must be a JSON object, found ${describeType(raw)}`);
+    return { ok: false, problems };
+  }
+  const cfg = raw as Record<string, unknown>;
+  const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+  const object = (at: string, v: unknown): Record<string, unknown> | null => {
+    if (v === undefined) return null;
+    if (isObj(v)) return v;
+    problems.push(`${at} must be an object, found ${describeType(v)}`);
+    return null;
+  };
+  const typed = (at: string, v: unknown, type: 'string' | 'number' | 'boolean') => {
+    if (v !== undefined && typeof v !== type) problems.push(`${at} must be a ${type}, found ${describeType(v)}`);
+  };
+  const stringList = (at: string, v: unknown) => {
+    if (v === undefined) return;
+    if (!Array.isArray(v) || v.some((x) => typeof x !== 'string')) {
+      problems.push(`${at} must be an array of strings, found ${Array.isArray(v) ? 'an array with non-string items' : describeType(v)}`);
+    }
+  };
+  const stringMap = (at: string, v: unknown) => {
+    const o = object(at, v);
+    if (!o) return;
+    for (const [k, val] of Object.entries(o)) typed(`${at}.${k}`, val, 'string');
+  };
+  const mode = (at: string, v: unknown) => {
+    if (v === undefined) return;
+    if (typeof v !== 'string') {
+      problems.push(`${at} must be one of ${VALID_JEV_MODES.join(', ')}, found ${describeType(v)}`);
+    } else if (!(VALID_JEV_MODES as readonly string[]).includes(v)) {
+      problems.push(`${at} must be one of ${VALID_JEV_MODES.join(', ')}, found ${JSON.stringify(v.slice(0, 40))}`);
+    }
+  };
+  const routing = (at: string, v: unknown, strategy: boolean) => {
+    const r = object(at, v);
+    if (!r) return;
+    if (strategy && r.strategy !== undefined && r.strategy !== 'router' && r.strategy !== 'keyword') {
+      problems.push(`${at}.strategy must be "router" or "keyword"`);
+    }
+    typed(`${at}.swap`, r.swap, 'boolean');
+    stringMap(`${at}.models`, r.models);
+  };
+
+  if ('mode' in cfg) problems.push("top-level 'mode' is ignored; use defaults.mode");
+  for (const key of Object.keys(cfg)) {
+    if (key === 'mode') continue;
+    const intended = nearMissOf(key, KNOWN_TOP_LEVEL_KEYS, TOP_LEVEL_ALIASES);
+    if (intended) problems.push(`top-level '${key.slice(0, 40)}' is ignored; did you mean '${intended}'?`);
+  }
+  typed('version', cfg.version, 'number');
+
+  const defaults = object('defaults', cfg.defaults);
+  if (defaults) {
+    mode('defaults.mode', defaults.mode);
+    typed('defaults.requireUpgradeApproval', defaults.requireUpgradeApproval, 'boolean');
+    typed('defaults.swap', defaults.swap, 'boolean');
+    stringList('defaults.availableSubagents', defaults.availableSubagents);
+    stringList('defaults.agentPaths', defaults.agentPaths);
+  }
+
+  routing('routing', cfg.routing, true);
+  stringMap('models', cfg.models);
+
+  const tiers = object('tiers', cfg.tiers);
+  if (tiers) {
+    for (const [name, t] of Object.entries(tiers)) {
+      const entry = object(`tiers.${name}`, t);
+      if (!entry) continue;
+      typed(`tiers.${name}.description`, entry.description, 'string');
+      typed(`tiers.${name}.concurrencyCap`, entry.concurrencyCap, 'number');
+      typed(`tiers.${name}.requiresApproval`, entry.requiresApproval, 'boolean');
+    }
+  }
+
+  const timeouts = object('timeouts', cfg.timeouts);
+  if (timeouts) for (const k of ['decisionMs', 'fallbackMs', 'freeModelMs', 'freeExecutionMs']) typed(`timeouts.${k}`, timeouts[k], 'number');
+
+  const cache = object('cache', cfg.cache);
+  if (cache) {
+    typed('cache.ttlSec', cache.ttlSec, 'number');
+    typed('cache.shmPath', cache.shmPath, 'string');
+    typed('cache.fallbackPath', cache.fallbackPath, 'string');
+  }
+
+  const thresholds = object('thresholds', cfg.thresholds);
+  if (thresholds) for (const [k, val] of Object.entries(thresholds)) typed(`thresholds.${k}`, val, 'number');
+
+  const harnesses = object('harnesses', cfg.harnesses);
+  if (harnesses) {
+    for (const [name, block] of Object.entries(harnesses)) {
+      if ((KNOWN_HARNESSES as readonly string[]).includes(name)) continue;
+      const shown = name.slice(0, 40);
+      const intended = nearMissOf(name, KNOWN_HARNESSES, HARNESS_ALIASES);
+      if (intended) {
+        problems.push(`harnesses.${shown} is ignored; did you mean '${intended}'?`);
+      } else if (isObj(block) && 'mode' in block) {
+        problems.push(`harnesses.${shown} sets a mode but '${shown}' is not a known harness (${KNOWN_HARNESSES.join(', ')}), so the mode applies to nothing`);
+      }
+    }
+    for (const h of KNOWN_HARNESSES) {
+      const at = `harnesses.${h}`;
+      const hc = object(at, harnesses[h]);
+      if (!hc) continue;
+      mode(`${at}.mode`, hc.mode);
+      stringMap(`${at}.models`, hc.models);
+      stringList(`${at}.freePool`, hc.freePool);
+      routing(`${at}.routing`, hc.routing, false);
+      typed(`${at}.requireUpgradeApproval`, hc.requireUpgradeApproval, 'boolean');
+      stringList(`${at}.availableSubagents`, hc.availableSubagents);
+      stringList(`${at}.agentPaths`, hc.agentPaths);
+    }
+  }
+
+  return { ok: problems.length === 0, problems };
+}
+
+/**
+ * The mode a harness resolves to from a user config object: its own `harnesses.<h>.mode`, else
+ * `defaults.mode`, else `off`. The single place this precedence lives: {@link loadJevConfigSync}
+ * applies it to every harness, and the guard hook calls it on the same object it just validated,
+ * so the two cannot disagree. Pass only a config that passed {@link validateJevConfig}.
+ */
+export function resolveJevModeFromConfig(config: unknown, harness: JevHarness): JevMode {
+  const cfg = (config && typeof config === 'object' ? config : {}) as {
+    defaults?: { mode?: JevMode };
+    harnesses?: Record<string, { mode?: JevMode } | undefined>;
+  };
+  return cfg.harnesses?.[harness]?.mode || cfg.defaults?.mode || 'off';
+}
+
+export type JevConfigFileInspection =
+  | { state: 'missing'; file: string; problems: [] }
+  | { state: 'valid'; file: string; problems: []; config: Record<string, unknown> }
+  | { state: 'malformed'; file: string; problems: string[] };
+
+/** The config file is never legitimately larger than this; a bigger one is malformed, not parsed. */
+export const MAX_JEV_CONFIG_BYTES = 1024 * 1024;
+
+/** The filesystem calls the config reader makes, injectable so tests can simulate a file that changes under it. */
+export interface JevConfigIo {
+  lstat: (file: string) => fsSync.Stats;
+  stat: (file: string) => fsSync.Stats;
+  readFile: (file: string) => Buffer;
+}
+
+export const DEFAULT_CONFIG_IO: JevConfigIo = {
+  lstat: (f) => fsSync.lstatSync(f),
+  stat: (f) => fsSync.statSync(f),
+  readFile: (f) => fsSync.readFileSync(f)
+};
+
+export type ConfigFileRead = { kind: 'missing' } | { kind: 'problem'; problem: string } | { kind: 'text'; text: string };
+
+/**
+ * Reads the config file once, defensively: lstat first so a dangling symlink is not mistaken for
+ * "no file", a size check before and after the read, and a regular-file check so a FIFO or
+ * directory is never read. A path with no entry at all is `missing`.
+ */
+export function readConfigFile(file: string, io: JevConfigIo): ConfigFileRead {
+  let isLink = false;
+  try {
+    isLink = io.lstat(file).isSymbolicLink();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return { kind: 'missing' };
+    const code = (err as NodeJS.ErrnoException)?.code;
+    return { kind: 'problem', problem: `the file could not be read${code ? ` (${code})` : ''}` };
+  }
+  let size: number;
+  try {
+    const st = io.stat(file);
+    if (!st.isFile()) return { kind: 'problem', problem: 'the file could not be read (not a regular file)' };
+    size = st.size;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (isLink) return { kind: 'problem', problem: 'broken symlink: the target does not exist or cannot be read' };
+    return { kind: 'problem', problem: `the file could not be read${code ? ` (${code})` : ''}` };
+  }
+  if (size > MAX_JEV_CONFIG_BYTES) return { kind: 'problem', problem: 'config is over the 1 MB limit' };
+  let bytes: Buffer;
+  try {
+    bytes = io.readFile(file);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    return { kind: 'problem', problem: `the file could not be read${code ? ` (${code})` : ''}` };
+  }
+  if (bytes.length > MAX_JEV_CONFIG_BYTES) return { kind: 'problem', problem: 'config is over the 1 MB limit' };
+  return { kind: 'text', text: bytes.toString('utf8') };
+}
+
+/**
+ * Reads and validates the user config file. `missing` means no file at all (the loader then uses
+ * its defaults), except when JEV_CONFIG_FILE names the path: pointing at a file that is not there
+ * is a mistake, not "unset". `malformed` means the file is there but cannot be trusted:
+ * unreadable, a broken symlink, over the size limit, not valid JSON, or rejected by
+ * {@link validateJevConfig}.
+ */
+export function inspectJevConfigFile(file: string = jevUserConfigFile(), io: JevConfigIo = DEFAULT_CONFIG_IO): JevConfigFileInspection {
+  const read = readConfigFile(file, io);
+  if (read.kind === 'missing') {
+    if (process.env.JEV_CONFIG_FILE && process.env.JEV_CONFIG_FILE === file) {
+      return { state: 'malformed', file, problems: ['JEV_CONFIG_FILE points at a file that does not exist'] };
+    }
+    return { state: 'missing', file, problems: [] };
+  }
+  if (read.kind === 'problem') return { state: 'malformed', file, problems: [read.problem] };
+  const text = read.text;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { state: 'malformed', file, problems: ['the file is not valid JSON'] };
+  }
+  const v = validateJevConfig(parsed);
+  return v.ok ? { state: 'valid', file, problems: [], config: parsed as Record<string, unknown> } : { state: 'malformed', file, problems: v.problems };
+}
+
 export function loadJevConfigSync(startDir?: string, bypassCache = false): JevConfig {
   const now = Date.now();
   const dirKey = startDir ? path.resolve(startDir) : '';
@@ -330,32 +626,31 @@ export function loadJevConfigSync(startDir?: string, bypassCache = false): JevCo
 
   // Level 2: User Config (~/.config/jev/config.json or process.env.JEV_CONFIG_FILE)
   const userConfigFile = process.env.JEV_CONFIG_FILE || JEV_CONFIG_FILE;
+  let userProblem: string | null = null;
   try {
-    if (fsSync.existsSync(userConfigFile)) {
-      const parsed = JSON.parse(fsSync.readFileSync(userConfigFile, 'utf8'));
+    const read = readConfigFile(userConfigFile, DEFAULT_CONFIG_IO);
+    if (read.kind === 'problem') userProblem = read.problem;
+    if (read.kind === 'text') {
+      const parsed = JSON.parse(read.text);
       if (parsed && typeof parsed === 'object') {
         config = deepMergeWithArrayReplacement(config, parsed);
         if (typeof parsed.version === 'number') {
           config.version = parsed.version;
         }
 
-        // Mode inheritance: if user config specifies defaults.mode, but omits harnesses[h].mode,
-        // the harness MUST inherit from defaults.mode.
-        if (parsed.defaults && parsed.defaults.mode) {
-          const userDefaultMode = parsed.defaults.mode as JevMode;
-          if (config.harnesses) {
-            for (const h of Object.keys(config.harnesses) as JevHarness[]) {
-              if (!parsed.harnesses?.[h]?.mode) {
-                if (!config.harnesses[h]) config.harnesses[h] = {} as any;
-                config.harnesses[h]!.mode = userDefaultMode;
-              }
-            }
+        // Mode inheritance: a harness takes its own mode, else defaults.mode, else off
+        // (resolveJevModeFromConfig, shared with the guard hook).
+        if (config.harnesses) {
+          for (const h of Object.keys(config.harnesses) as JevHarness[]) {
+            if (!config.harnesses[h]) config.harnesses[h] = {} as any;
+            config.harnesses[h]!.mode = resolveJevModeFromConfig(parsed, h);
           }
         }
       }
     }
   } catch {
     // Return default on error
+    userProblem = 'the file is not valid JSON';
   }
 
   // Level 3: Project Config (.agents/jev.json primary, .jev.json fallback) - UNTRUSTED INPUT
@@ -374,7 +669,7 @@ export function loadJevConfigSync(startDir?: string, bypassCache = false): JevCo
     }
   }
 
-  cachedConfig = { at: now, data: config, dirKey };
+  cachedConfig = { at: now, data: config, dirKey, userProblem };
   return config;
 }
 

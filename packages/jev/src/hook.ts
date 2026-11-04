@@ -2,45 +2,168 @@
 /**
  * PreToolUse hook entrypoint: `bun hook.ts claude|antigravity`, hook JSON on stdin.
  *
- * Silent unless the Jev mode for the harness is `on`. Once on, it never lets a call it cannot
- * evaluate through silently: malformed input or an internal error produces an `ask`, so the user
- * decides. The matcher in each adapter limits the hook to subagent calls, so this only prompts
- * on calls that spawn subagents.
+ * Active in Jev modes `on` and `on-demand` for both harnesses, silent only in `off` (plan 3.1.3
+ * review decision of 2026-10-28). Once active it never lets a call it cannot evaluate through
+ * silently: malformed or empty input and internal errors produce an `ask`, so the user decides.
+ * A Jev config that cannot be trusted (validateJevConfig) is neither off nor on: every guarded
+ * call asks, loudly, until the file is fixed or Jev is set off explicitly.
+ * The matcher in each adapter limits the hook to calls that spawn subagents, so this only prompts
+ * on those calls.
  */
-import { readJevMode } from './core/config.js';
 import {
+  inspectJevConfigFile,
+  readJevMode,
+  resolveJevModeFromConfig,
+  userConfigLoadProblem,
+  type JevConfigFileInspection,
+  type JevHarness,
+  type JevMode
+} from './core/config.js';
+import {
+  configMalformedVerdict,
   evaluateAntigravity,
   evaluateClaude,
   formatVerdict,
   guardErrorVerdict,
+  type ConfigScope,
   type GuardHarness,
+  type GuardContext,
   type Verdict
 } from './guard.js';
+import { writeWorkflowPin } from './workflow-pin.js';
+import { inspectProjectConfig, tightenMode } from './project-config.js';
+import { appendClaudeDecision } from './claude-audit.js';
 
-const HARNESSES: Record<GuardHarness, { jevHarness: 'claude-code' | 'antigravity'; evaluate: (input: any) => Verdict | null }> = {
+const HARNESSES: Record<
+  GuardHarness,
+  { jevHarness: 'claude-code' | 'antigravity'; evaluate: (input: any, sink?: GuardContext) => Verdict | null }
+> = {
   claude: { jevHarness: 'claude-code', evaluate: evaluateClaude },
   antigravity: { jevHarness: 'antigravity', evaluate: evaluateAntigravity }
 };
 
-export async function run(harnessArg: string | undefined, stdin: string): Promise<string | null> {
+/** Whether the hook payload is one of the calls this guard is registered for. Unparseable input counts as guarded. */
+function isGuardedCall(harnessArg: string, stdin: string): boolean {
+  try {
+    const parsed = JSON.parse(stdin);
+    if (harnessArg === 'claude') {
+      const name = parsed?.tool_name;
+      return typeof name !== 'string' || name === 'Agent' || name === 'Task' || name === 'Workflow';
+    }
+    const name = parsed?.toolCall?.name;
+    return typeof name !== 'string' || name === 'invoke_subagent';
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * The Jev config exists but cannot be trusted (validateJevConfig). The loader would silently read
+ * it as some default mode, possibly `off`, so the guard fails loudly on every guarded call: an
+ * `ask` naming the file and the problems, a stderr line, and a `config_malformed` audit event.
+ */
+function configMalformedResponse(harnessArg: GuardHarness, file: string, problems: string[], stdin: string, scope: ConfigScope = 'user'): string | null {
+  if (!isGuardedCall(harnessArg, stdin)) return null;
+  const verdict = configMalformedVerdict(file, problems, scope);
+  process.stderr.write(
+    scope === 'project'
+      ? `[jev] project config ${file} is malformed (${problems.join('; ')}): the subagent guard asks on every guarded call. Fix or remove that file.\n`
+      : `[jev] config ${file} is malformed (${problems.join('; ')}): the subagent guard asks on every guarded call. Run /jev status, or set jev off.\n`
+  );
+  if (harnessArg === 'claude') {
+    let toolName: unknown;
+    let sessionId: unknown;
+    try {
+      const parsed = JSON.parse(stdin);
+      toolName = parsed?.tool_name;
+      sessionId = parsed?.session_id;
+    } catch {
+      // unparseable input: audit without the tool name
+    }
+    appendClaudeDecision({ event: 'config_malformed', ...(scope === 'project' ? { scope } : {}), tool_name: toolName, session_id: sessionId, file, problems });
+  }
+  return formatVerdict(harnessArg, verdict);
+}
+
+function auditAsk(verdict: Verdict, stdin: string): void {
+  let toolName: unknown;
+  let sessionId: unknown;
+  try {
+    const parsed = JSON.parse(stdin);
+    toolName = parsed?.tool_name;
+    sessionId = parsed?.session_id;
+  } catch {
+    // unparseable input: audit without the tool name
+  }
+  appendClaudeDecision({ event: 'ask', tool_name: toolName, session_id: sessionId, ...verdict.audit, reason: verdict.reason });
+}
+
+/** Seams for tests that need the config to change between the hook's steps. */
+export interface HookDeps {
+  inspect?: () => JevConfigFileInspection;
+  readMode?: (harness: JevHarness) => Promise<JevMode>;
+}
+
+export async function run(harnessArg: string | undefined, stdin: string, deps: HookDeps = {}): Promise<string | null> {
   const harness = HARNESSES[harnessArg as GuardHarness];
   if (!harness) return null;
 
   let verdict: Verdict | null;
   try {
-    if ((await readJevMode(harness.jevHarness)) !== 'on') return null;
-    verdict = harness.evaluate(JSON.parse(stdin));
+    // One read of the config file. The mode is derived from the very object that was validated;
+    // the loader is only a cross-check, and any disagreement (the file changed or became
+    // unreadable between the two reads) asks instead of falling back to off.
+    const inspection = (deps.inspect ?? inspectJevConfigFile)();
+    if (inspection.state === 'malformed') {
+      return configMalformedResponse(harnessArg as GuardHarness, inspection.file, inspection.problems, stdin);
+    }
+    const derived = inspection.state === 'valid' ? resolveJevModeFromConfig(inspection.config, harness.jevHarness) : 'off';
+    const loaded = await (deps.readMode ?? readJevMode)(harness.jevHarness);
+    // The loader swallows an unreadable or invalid file and falls back to its defaults, which can
+    // coincide with a derived `off`; its recorded problem catches that case.
+    const loaderProblem = inspection.state === 'valid' ? userConfigLoadProblem() : null;
+    if (loaded !== derived || loaderProblem) {
+      return configMalformedResponse(
+        harnessArg as GuardHarness,
+        inspection.file,
+        [
+          loaderProblem
+            ? `the file was valid when the guard read it but not on the second read (${loaderProblem})`
+            : `the file changed while the guard was reading it (first read: ${derived}, second read: ${loaded})`
+        ],
+        stdin
+      );
+    }
+    if (derived === 'off') return null;
+    const input = JSON.parse(stdin);
+    // A project file may only tighten (project-config.ts); one that cannot be read asks.
+    const project = inspectProjectConfig(input?.cwd, harness.jevHarness);
+    if (project.state === 'malformed') return configMalformedResponse(harnessArg as GuardHarness, project.file, project.problems, stdin, 'project');
+    const sink: GuardContext = project.state === 'valid' ? { projectCeiling: project.ceiling, projectCeilingFile: project.file } : {};
+    verdict = harness.evaluate(input, sink);
+    // The user's mode, raised (never lowered) by the project's; for the guard on and on-demand act alike.
+    if (verdict) verdict.audit = { ...verdict.audit, mode: tightenMode(derived, project.state === 'valid' ? project.mode : null) };
+    // Bind the decision to the text it analysed (workflow-pin.ts); the PostToolUse recorder checks it.
+    if (sink.workflow) writeWorkflowPin(input?.tool_use_id, input?.session_id, sink.workflow.decision, sink.workflow.scripts);
   } catch (err) {
     verdict = guardErrorVerdict(err);
+    verdict.audit = { kind: 'guard-error' };
   }
-  return verdict ? formatVerdict(harnessArg as GuardHarness, verdict) : null;
+  if (!verdict) return null;
+  if (harnessArg === 'claude') auditAsk(verdict, stdin);
+  return formatVerdict(harnessArg as GuardHarness, verdict);
 }
 
 if (import.meta.main) {
+  let stdin = '';
   try {
-    const out = await run(process.argv[2], await Bun.stdin.text());
-    if (out) process.stdout.write(`${out}\n`);
+    stdin = await Bun.stdin.text();
   } catch {
-    // stdin could not be read at all: nothing to evaluate
+    // unreadable stdin: run() treats empty input as unevaluable and asks
   }
+  const out = await run(process.argv[2], stdin).catch((err) => {
+    const harness = process.argv[2] === 'antigravity' ? 'antigravity' : 'claude';
+    return formatVerdict(harness, guardErrorVerdict(err));
+  });
+  if (out) process.stdout.write(`${out}\n`);
 }
