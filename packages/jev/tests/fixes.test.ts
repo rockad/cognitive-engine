@@ -6,7 +6,10 @@ import {
   defaultEffortForSubagent,
   isFreeModel,
   assertFreeModel,
-  buildRouterCompletionMessages
+  buildRouterCompletionMessages,
+  readQuotaView,
+  modelTierRank,
+  clampTierToSessionCeiling
 } from '../src/shared.ts';
 
 const PLUGIN_ROOT = path.resolve(import.meta.dir, '..');
@@ -15,21 +18,21 @@ const PLUGIN_ROOT = path.resolve(import.meta.dir, '..');
  * QUOTA_STATE_FILE is resolved from the home directory at import time, so the
  * quota view is exercised in a child process with its own HOME.
  */
-function quotaViewUnderHome(home: string, extraEnv: Record<string, string> = {}): { ok: boolean; strategy?: string; fiveHour?: number | null; error?: string } {
+function quotaViewUnderHome(home: string, extraEnv: Record<string, string> = {}): { ok: boolean; strategy?: string; fiveHour?: number | null; weekly?: number | null; error?: string } {
   const script =
     "const m = await import('./src/shared.ts');" +
     'try { const v = await m.readQuotaView();' +
-    ' console.log(JSON.stringify({ ok: true, strategy: v.strategy, fiveHour: v.gemini.five_hour })); }' +
+    ' console.log(JSON.stringify({ ok: true, strategy: v.strategy, fiveHour: v.gemini.five_hour, weekly: v.gemini.weekly })); }' +
     ' catch (e) { console.log(JSON.stringify({ ok: false, error: String(e) })); }';
   const proc = Bun.spawnSync(['bun', '-e', script], { cwd: PLUGIN_ROOT, env: { ...process.env, ...extraEnv, HOME: home } });
   return JSON.parse(proc.stdout.toString().trim());
 }
 
-function writeQuotaState(home: string, buckets: Record<string, unknown>): void {
+function writeQuotaState(home: string, buckets: Record<string, unknown>, activeModel?: string): void {
   const dir = path.join(home, '.gemini', 'antigravity-cli');
   fs.mkdirSync(dir, { recursive: true });
   const now = Math.floor(Date.now() / 1000);
-  fs.writeFileSync(path.join(dir, 'quota-state.json'), JSON.stringify({ schema: 2, updated_at: now, buckets }));
+  fs.writeFileSync(path.join(dir, 'quota-state.json'), JSON.stringify({ schema: 2, updated_at: now, buckets, active_model: activeModel }));
 }
 
 describe('readQuotaView', () => {
@@ -154,6 +157,26 @@ describe('readQuotaView', () => {
 
     expect(view.strategy).toBe('conserve');
   });
+
+  it('checks gemini-argon-wtu-weekly bucket when activeModel is an argon model', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'jev-home-'));
+    const resetAt = Math.floor(Date.now() / 1000) + 3600;
+    writeQuotaState(
+      home,
+      {
+        'gemini-5h': { remaining_fraction: 0.8, reset_at: resetAt },
+        'gemini-weekly': { remaining_fraction: 0.8, reset_at: resetAt },
+        'gemini-argon-wtu-weekly': { remaining_fraction: 0.15, reset_at: resetAt }
+      },
+      'gemini-2.5-argon'
+    );
+
+    const view = await readQuotaView(home);
+    expect(view.gemini.weekly).toBe(0.15);
+    expect(view.strategy).toBe('conserve');
+    expect(view.active.pool).toBe('gemini');
+    expect(view.active.weekly).toBe(0.15);
+  });
 });
 
 describe('defaultEffortForSubagent keyword matching', () => {
@@ -226,4 +249,72 @@ describe('WS2 Jev Plugin Core & CLI Fixes', () => {
     expect(content).toContain('Jev mode set to OFF (MCP server disable scheduled in 150ms after response flush)');
   });
 });
+
+describe('modelTierRank', () => {
+  it('returns rank 3 for argon, fable, pro, opus, expensive, deep', () => {
+    expect(modelTierRank('argon')).toBe(3);
+    expect(modelTierRank('gemini-2.5-argon')).toBe(3);
+    expect(modelTierRank('fable')).toBe(3);
+    expect(modelTierRank('claude-fable-5-1')).toBe(3);
+    expect(modelTierRank('pro')).toBe(3);
+    expect(modelTierRank('gemini-1.5-pro')).toBe(3);
+    expect(modelTierRank('opus')).toBe(3);
+    expect(modelTierRank('claude-3-opus')).toBe(3);
+    expect(modelTierRank('expensive')).toBe(3);
+    expect(modelTierRank('deep')).toBe(3);
+  });
+
+  it('returns rank 2 for flash, standard, cheap', () => {
+    expect(modelTierRank('flash')).toBe(2);
+    expect(modelTierRank('standard')).toBe(2);
+    expect(modelTierRank('cheap')).toBe(2);
+  });
+
+  it('returns rank 1 for flash_lite', () => {
+    expect(modelTierRank('flash_lite')).toBe(1);
+    expect(modelTierRank('flash-lite')).toBe(1);
+  });
+
+  it('returns rank 0 for free tiers', () => {
+    expect(modelTierRank('openrouter_free')).toBe(0);
+    expect(modelTierRank('free')).toBe(0);
+  });
+});
+
+describe('clampTierToSessionCeiling with argon and prompt overrides', () => {
+  it('clamps pro down to flash when session ceiling is flash and no override is present', () => {
+    const res = clampTierToSessionCeiling('pro', 'gemini-flash');
+    expect(res.clampedTier).toBe('flash');
+    expect(res.wasClamped).toBe(true);
+    expect(res.ceilingTier).toBe('flash');
+  });
+
+  it('does not clamp when prompt contains explicit pro override keyword', () => {
+    const keywords = [
+      'deep reasoning',
+      'cross-system architecture',
+      'manual pro approval',
+      'claude opus',
+      'gemini pro',
+      'gemini argon',
+      'argon',
+      'claude fable',
+      'fable'
+    ];
+    for (const kw of keywords) {
+      const res = clampTierToSessionCeiling('pro', 'gemini-flash', `Task requires ${kw} here`);
+      expect(res.clampedTier).toBe('pro');
+      expect(res.wasClamped).toBe(false);
+      expect(res.ceilingTier).toBe('flash');
+    }
+  });
+
+  it('does not clamp pro when active model is argon (tier 3)', () => {
+    const res = clampTierToSessionCeiling('pro', 'gemini-2.5-argon');
+    expect(res.clampedTier).toBe('pro');
+    expect(res.wasClamped).toBe(false);
+    expect(res.ceilingTier).toBe('pro');
+  });
+});
+
 

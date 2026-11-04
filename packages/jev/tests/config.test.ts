@@ -32,6 +32,12 @@ describe('Jev Multi-Level Configuration Engine (v2 Schema & Cascading Loader)', 
 
     const HARNESS_ENV_VARS = [
       'JEV_HARNESS',
+      'ANTIGRAVITY_AGENT',
+      'ANTIGRAVITY_APP_DATA_DIR',
+      'ANTIGRAVITY_LS_ADDRESS',
+      'ANTIGRAVITY_LS_VERSION',
+      'ANTIGRAVITY_CONVERSATION_ID',
+      'ANTIGRAVITY_PROJECT_ID',
       'ANTIGRAVITY_CLI',
       'GEMINI_CLI',
       'CLAUDE_CODE',
@@ -101,14 +107,24 @@ describe('Jev Multi-Level Configuration Engine (v2 Schema & Cascading Loader)', 
       expect(detectActiveHarness()).toBe('opencode');
     });
 
-    it('detects Antigravity from ANTIGRAVITY_CLI or GEMINI_CLI', () => {
+    it('detects Antigravity from ANTIGRAVITY_* environment variables', () => {
       delete process.env.JEV_HARNESS;
-      process.env.ANTIGRAVITY_CLI = '1';
-      expect(detectActiveHarness()).toBe('antigravity');
-
-      delete process.env.ANTIGRAVITY_CLI;
-      process.env.GEMINI_CLI = '1';
-      expect(detectActiveHarness()).toBe('antigravity');
+      const agyVars = [
+        'ANTIGRAVITY_AGENT',
+        'ANTIGRAVITY_APP_DATA_DIR',
+        'ANTIGRAVITY_LS_ADDRESS',
+        'ANTIGRAVITY_LS_VERSION',
+        'ANTIGRAVITY_CONVERSATION_ID',
+        'ANTIGRAVITY_PROJECT_ID',
+        'ANTIGRAVITY_CLI',
+        'GEMINI_CLI',
+        'CORTEX_SESSION'
+      ];
+      for (const v of agyVars) {
+        process.env[v] = '1';
+        expect(detectActiveHarness()).toBe('antigravity');
+        delete process.env[v];
+      }
     });
 
     it('detects Claude Code from CLAUDE_CODE or CLAUDE_PROJECT_DIR or CLAUDECODE', () => {
@@ -134,6 +150,12 @@ describe('Jev Multi-Level Configuration Engine (v2 Schema & Cascading Loader)', 
 
     it('falls back to "cli" when no harness environment signals are present', () => {
       delete process.env.JEV_HARNESS;
+      delete process.env.ANTIGRAVITY_AGENT;
+      delete process.env.ANTIGRAVITY_APP_DATA_DIR;
+      delete process.env.ANTIGRAVITY_LS_ADDRESS;
+      delete process.env.ANTIGRAVITY_LS_VERSION;
+      delete process.env.ANTIGRAVITY_CONVERSATION_ID;
+      delete process.env.ANTIGRAVITY_PROJECT_ID;
       delete process.env.ANTIGRAVITY_CLI;
       delete process.env.GEMINI_CLI;
       delete process.env.CLAUDE_CODE;
@@ -229,6 +251,10 @@ describe('Jev Multi-Level Configuration Engine (v2 Schema & Cascading Loader)', 
       expect(normalizeTier('claude-3-opus')).toBe('deep');
       expect(normalizeTier('gemini-1.5-pro')).toBe('deep');
       expect(normalizeTier('expensive')).toBe('deep');
+      expect(normalizeTier('argon')).toBe('deep');
+      expect(normalizeTier('gemini-2.5-argon')).toBe('deep');
+      expect(normalizeTier('fable')).toBe('deep');
+      expect(normalizeTier('claude-fable-5-1')).toBe('deep');
     });
 
     it('falls back to "standard" for unrecognized tier names', () => {
