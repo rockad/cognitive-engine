@@ -13,14 +13,16 @@ The hook runs `packages/jev/src/hook.ts claude` before every `Agent` or `Task` c
 - It is active in Jev modes `on` and `on-demand` and silent only in `off`.
 - It still fires under `--permission-mode bypassPermissions`: a hook `ask` is not auto-approved by bypass mode (checked with `claude -p`, where the call was blocked rather than run).
 - It is the only enforcement point; `jev_dispatch` and its tier clamp are advice. Nothing the agent passes to a tool counts as approval, only your answer to the prompt.
-- It also checks the `model:` in the subagent's definition (`.claude/agents/<name>.md`) when the call sets none.
+- It also checks the `model:` in the subagent's definition (`<project>/.claude/agents/<name>.md`, then the user config dir, then installed plugins) when the call sets none. The user config dir is `CLAUDE_CONFIG_DIR` when that is set and non-empty (it replaces `~/.claude` entirely; a relative value is resolved against the hook's working directory), else `~/.claude`.
+- Built-in subagent types (`general-purpose`, `Explore`, `Plan`, `statusline-setup`, `claude-code-guide`, `claude`) have no definition file and inherit the session model, so they pass. A definition file with the same name wins and is ranked.
 - Once active, it fails closed: if it cannot read the call, hits an error, or cannot determine the session model, it asks instead of letting the call through.
 
 ## The workflow guard
 
-Agents spawned inside a `Workflow` do not pass through the `Agent|Task` hook (verified on Claude Code 2.1.312: only `SubagentStart`/`SubagentStop` fire for them, and those cannot block), so a second `PreToolUse` entry with matcher `Workflow` runs the same `hook.ts claude`. `packages/jev/src/workflow-guard.ts` reads the script (inline `script`, a `scriptPath` file, or a saved workflow `name` from `.claude/workflows`, plus `workflow()` references one level deep), parses it with acorn and checks every `agent` and `workflow` reference.
+Agents spawned inside a `Workflow` do not pass through the `Agent|Task` hook (verified on Claude Code 2.1.312: only `SubagentStart`/`SubagentStop` fire for them, and those cannot block), so a second `PreToolUse` entry with matcher `Workflow` runs the same `hook.ts claude`. `packages/jev/src/workflow-guard.ts` reads the script (inline `script`, a `scriptPath` file, or a saved workflow `name` from `<project>/.claude/workflows` or the user config dir's `workflows/` (`CLAUDE_CONFIG_DIR`, else `~/.claude`), plus `workflow()` references one level deep), parses it with acorn and checks every `agent` and `workflow` reference.
 
-- A literal `model` (or an `agentType` whose definition sets one) is ranked against the session model like a direct call. No `model` inherits and is allowed.
+- A literal `model` (or an `agentType` whose definition sets one) is ranked against the session model like a direct call. No `model` inherits and is allowed. A built-in `agentType` inherits too, unless a definition file of that name exists.
+- `effort` has an interim threshold: a literal `xhigh` or `max` asks, `low`, `medium` and `high` pass, and any other literal or a non-literal value (variable, expression, spread) asks. The threshold is a user choice with no spec behind it; see [docs/rfc/007-subagent-effort-bounding.md](../../docs/rfc/007-subagent-effort-bounding.md).
 - Anything it cannot read statically asks and names the call site (`file:line:col`): an alias such as `const a = agent`, spread options, computed keys, a model from a variable or `args`, a template with `${}`, member access, `eval`, a parse error, an unreadable or oversized file, a missing agent definition, an unknown `tool_input` shape.
 - The rule is that `agent` and `workflow` may appear only as the callee of a direct call. Anything that could reach them another way also asks: `this`, `arguments`, `globalThis`/`global`/`window`/`self`, `Function`, `eval`, `Reflect`, `Proxy`, `process`, `require`, `Bun`, `Deno`, `module`, `exports`, `import.meta`; the member names `constructor`, `__proto__`, `prototype`, `getPrototypeOf`, `getOwnPropertyDescriptor(s)`; destructuring `agent`/`workflow`; reading them off anything but a plain local name; `setTimeout`/`setInterval` given a string; and any computed lookup whose key is not a literal or provably a number (it could spell `constructor`).
 - Known limits. A static check cannot be sound, so this is a fail-closed filter and not a sandbox:
@@ -28,6 +30,9 @@ Agents spawned inside a `Workflow` do not pass through the `Agent|Task` hook (ve
   - `setTimeout(name, ms)` is allowed because it is the common sleep shape. Node and Bun throw on a string there; a runtime that evaluates it would not be covered.
   - `x.agent` read off a plain unbound name such as `args` is allowed (it is data unless the sandbox hands out an object that holds the function).
   - Options of `pipeline`, `parallel` and `phase` are not inspected, only `agent()` and `meta.phases`.
+  - `effort` is bounded only by the interim `xhigh`/`max` threshold above. The session's own effort is not read, and effort does not compose with the model ceiling or the low-quota clamp.
+  - `meta.phases[].model` is ranked although in Claude Code it is only a progress-display hint, so a phase label above the session model asks (a false positive, never a miss). The ask reason says so.
+  - Definition and workflow lookup honours `CLAUDE_CONFIG_DIR` (absolute, or relative to the hook cwd; empty or unset means `~/.claude`). A stale `~/.claude` is not consulted while it is set.
   - The script is checked as written. A file changed between the check and the run, or a saved workflow that Claude Code resolves differently from Jev, is not covered.
   - Deliberate false positives: every `this`, variable-key lookups such as `o[k]` on plain data (writes into a local `{}`/`[]` are fine), and a local method that happens to be named `agent` or `workflow`.
 

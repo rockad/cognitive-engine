@@ -13,7 +13,7 @@
  * Everything else Jev does for a turn (advice, dispatch, telemetry) is advice from the MCP tools.
  */
 import { modelTierRank } from './core/governance.js';
-import { describeAgentLookup, missingAgentDetail, readAgentDefinition } from './agent-definitions.js';
+import { BUILTIN_AGENT_TYPES, describeAgentLookup, missingAgentDetail, readAgentDefinition } from './agent-definitions.js';
 import { assessInherited, assessModelRequest, inheritsSessionModel, type InheritCheck } from './models.js';
 import { evaluateWorkflowInput, type ScriptFact } from './workflow-guard.js';
 import { resolveSessionModel, sessionModelFromTranscript, type SessionModel, type SessionModelSource } from './session-model.js';
@@ -106,9 +106,6 @@ export function decideClaudeAgentCall(
   };
 }
 
-/** Claude Code's built-in subagent types: they have no definition file and run on the session model. */
-const BUILTIN_AGENT_TYPES: ReadonlySet<string> = new Set(['general-purpose', 'Explore', 'Plan', 'statusline-setup', 'claude-code-guide']);
-
 /**
  * A call with no `model` runs on its subagent's definition. When the type is not a built-in and no
  * definition can be found, its model cannot be read, so ask (the Workflow guard does the same). No
@@ -132,7 +129,7 @@ function unknownAgentVerdict(call: AgentCall, cwd: string | undefined): Verdict 
 
 /**
  * The `model:` from a subagent's definition (project `.claude/agents` from the cwd up to the project
- * root, then `~/.claude/agents`, then installed plugins), or null. See agent-definitions.ts.
+ * root, then the user config dir (`CLAUDE_CONFIG_DIR`, else `~/.claude`) agents, then installed plugins), or null. See agent-definitions.ts.
  */
 export function agentDefinitionModel(subagentType: string | undefined, cwd: string | undefined): string | null {
   return readAgentDefinition(subagentType, cwd).model;

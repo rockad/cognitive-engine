@@ -39,6 +39,17 @@
  * - `x.agent` read off a plain unbound name (such as `args`) is allowed: it is data unless the
  *   sandbox exposes an object that holds the function. Unknown sandbox objects are not modelled.
  * - Options of `pipeline`/`parallel`/`phase` helpers are not inspected, only `agent()` and `meta`.
+ * - `effort` in the agent() options has only an INTERIM threshold, with no spec behind it (see
+ *   docs/rfc/007-subagent-effort-bounding.md): a literal `xhigh` or `max` asks, `low`, `medium` and
+ *   `high` pass, and any other literal or a non-literal value (variable, expression, spread) is
+ *   unverifiable and asks. The session's own effort is not read, so it is not compared, and effort
+ *   does not compose with the model ceiling or the low-quota clamp.
+ * - `meta.phases[].model` is ranked although in Claude Code it is only a progress-display hint, so a
+ *   phase label above the session model asks (a false positive, never a miss). The reason says so.
+ * - Agent definitions and saved workflows are looked up where Claude Code looks: the project
+ *   `.claude/` dirs, then the user config dir, which is `CLAUDE_CONFIG_DIR` when set and non-empty
+ *   (replacing `~/.claude` entirely; a relative value is resolved against the hook cwd) and
+ *   `~/.claude` otherwise, plus the plugin dirs listed in that config dir's installed_plugins.json.
  * - The script is checked as written, on every call (a scriptPath re-invocation is re-read and
  *   re-analysed). The hook cannot see a file changing between the check and Claude Code's own read,
  *   or what a saved workflow resolves to if Claude Code's lookup differs from `fsResolver`. Each
@@ -65,10 +76,9 @@
  */
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
 import * as acorn from 'acorn';
-import { describeAgentLookup, missingAgentDetail, readAgentDefinition, type AgentDefinition } from './agent-definitions.js';
+import { BUILTIN_AGENT_TYPES, describeAgentLookup, missingAgentDetail, readAgentDefinition, userClaudeDir, type AgentDefinition } from './agent-definitions.js';
 import { assessInherited, assessModelRequest, inheritsSessionModel, type InheritCheck } from './models.js';
 
 /** Largest script (inline or file) the guard will parse. Bigger asks. */
@@ -126,15 +136,14 @@ function readCapped(file: string): { text: string; label: string } | { error: st
   }
 }
 
-/** Resolver backed by the filesystem: `<cwd>/.claude/...` first, then `~/.claude/...`. */
+/** Resolver backed by the filesystem: `<cwd>/.claude/...` first, then the user config dir (`CLAUDE_CONFIG_DIR`, else `~/.claude`). */
 export function fsResolver(cwd: string | undefined): WorkflowResolver {
   const base = cwd || process.cwd();
   return {
     readScriptFile: (file) => readCapped(path.resolve(base, file)),
     findNamedWorkflow: (name) => {
       if (!/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(name)) return { error: `workflow name "${name}" is not a plain name` };
-      const home = process.env.HOME || os.homedir();
-      for (const dir of [path.join(base, '.claude', 'workflows'), path.join(home, '.claude', 'workflows')]) {
+      for (const dir of [path.join(base, '.claude', 'workflows'), path.join(userClaudeDir(base), 'workflows')]) {
         for (const ext of ['.js', '.mjs']) {
           const file = path.join(dir, `${name}${ext}`);
           if (fs.existsSync(file)) return readCapped(file);
@@ -152,6 +161,8 @@ export function fsResolver(cwd: string | undefined): WorkflowResolver {
 type Finding =
   | { kind: 'model'; model: string; where: string; line: number; col: number }
   | { kind: 'agentType'; agentType: string; line: number; col: number }
+  /** A literal `effort` in agent() options (interim threshold, see EFFORT_ASK). */
+  | { kind: 'effort'; effort: string; line: number; col: number }
   /** An agent() call that names no model of its own: it runs on the session model. */
   | { kind: 'inherit'; line: number; col: number }
   | { kind: 'nested'; ref: { name?: string; scriptPath?: string }; line: number; col: number }
@@ -284,12 +295,21 @@ function analyseOptions(opts: Node, out: Finding[], ctx: Bindings): void {
   let agentTypeNode: { value: string; node: Node } | null = null;
   for (const prop of opts.properties) {
     if (prop.type === 'SpreadElement') {
-      out.push({ kind: 'unverifiable', reason: 'options use a spread, so `model` cannot be read', ...pos(prop) });
+      out.push({ kind: 'unverifiable', reason: 'options use a spread, so `model` and `effort` cannot be read', ...pos(prop) });
       continue;
     }
     const name = keyName(prop, ctx);
     if (name === undefined) {
-      out.push({ kind: 'unverifiable', reason: 'options use a computed key, which could be `model`', ...pos(prop) });
+      out.push({ kind: 'unverifiable', reason: 'options use a computed key, which could be `model` or `effort`', ...pos(prop) });
+      continue;
+    }
+    if (name === 'effort') {
+      const value = prop.kind === 'init' && !prop.method ? staticString(prop.value, ctx) : null;
+      if (value === null) {
+        out.push({ kind: 'unverifiable', reason: 'effort is not a plain string literal (variable, expression, template with ${} or args), so it cannot be checked', ...pos(prop) });
+      } else {
+        out.push({ kind: 'effort', effort: value, ...pos(prop) });
+      }
       continue;
     }
     if (name === 'model') {
@@ -811,6 +831,24 @@ function parseFindings(script: string): Finding[] {
 
 // ── Evaluation ─────────────────────────────────────────────────────────────────────────────────
 
+const PHASE_MODEL_WHAT = 'meta.phases model (in Claude Code this is only a progress-display hint, but it is ranked in case that changes):';
+
+/**
+ * INTERIM threshold, chosen by the user with no spec behind it (docs/rfc/007-subagent-effort-bounding.md):
+ * a literal `effort` at these levels asks. The levels below them pass; any other literal asks.
+ */
+const EFFORT_ASK = new Set(['xhigh', 'max']);
+const EFFORT_PASS = new Set(['low', 'medium', 'high']);
+
+/** The ask reason for a literal `effort`, or null when it passes. */
+function effortReason(effort: string): string | null {
+  if (EFFORT_ASK.has(effort)) {
+    return `agent() call: effort ${JSON.stringify(effort)} is above the interim effort threshold (xhigh and max ask; low, medium and high pass). The model ceiling does not bound effort, so this needs your approval.`;
+  }
+  if (EFFORT_PASS.has(effort)) return null;
+  return `agent() call: effort ${JSON.stringify(effort)} is not a level Jev recognises (low, medium, high, xhigh, max), so it cannot be checked.`;
+}
+
 function modelSite(
   file: string,
   f: { line: number; col: number },
@@ -851,8 +889,13 @@ export function checkScriptText(
         sites.push({ file: label, line: f.line, col: f.col, reason: f.reason });
         break;
       case 'model': {
-        const s = modelSite(label, f, f.model, sessionModel, f.where === 'model' ? 'agent() call:' : 'meta.phases:', inherit);
+        const s = modelSite(label, f, f.model, sessionModel, f.where === 'model' ? 'agent() call:' : PHASE_MODEL_WHAT, inherit);
         if (s) sites.push(s);
+        break;
+      }
+      case 'effort': {
+        const reason = effortReason(f.effort);
+        if (reason) sites.push({ file: label, line: f.line, col: f.col, reason });
         break;
       }
       case 'inherit': {
@@ -861,7 +904,10 @@ export function checkScriptText(
         break;
       }
       case 'agentType': {
-        const def = resolver.agentDefinition(f.agentType);
+        // A built-in type has no definition file and runs on the session model, as in the Agent guard;
+        // a definition file with the same name still wins.
+        const looked = resolver.agentDefinition(f.agentType);
+        const def = !looked.found && BUILTIN_AGENT_TYPES.has(f.agentType) ? { found: true, model: null } : looked;
         if (!def.found) {
           const lookup = resolver.describeLookup?.() ?? 'no agent definition directory (nothing is searched)';
           sites.push({ file: label, line: f.line, col: f.col, reason: `agentType ${JSON.stringify(f.agentType)} is not an agent Jev can read: ${missingAgentDetail(lookup)}` });
