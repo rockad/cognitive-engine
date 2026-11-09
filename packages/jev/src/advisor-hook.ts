@@ -28,8 +28,10 @@ import {
 import { appendClaudeDecision } from './claude-audit.js';
 import { resolveSessionModel } from './session-model.js';
 import {
+  applyUserIntent,
   buildDirective,
   dispatchQuestions,
+  parseUserIntent,
   parseDispatch,
   resolveClaudeSubagentCriteria,
   safeSessionId,
@@ -92,9 +94,12 @@ export async function onUserPromptSubmit(input: HookInput, deps: HookDeps): Prom
   const rec = await deps.dispatch(task, quotaStrategy, criteria);
   if (!rec) return null;
   const sessionModel = deps.readSessionModel(input);
-  deps.log({ hook: 'UserPromptSubmit', session: sessionId, ...rec, quota: quotaStrategy, sessionModel });
+  // The user's own words first: an explicit model or cost instruction changes what is advised.
+  const intent = parseUserIntent(task);
+  const advised = applyUserIntent(rec, intent);
+  deps.log({ hook: 'UserPromptSubmit', session: sessionId, ...advised, quota: quotaStrategy, sessionModel });
 
-  let additionalContext = buildDirective(rec, sessionModel, quotaStrategy);
+  let additionalContext = buildDirective(advised, sessionModel, quotaStrategy, intent);
   try {
     const memory = await withTimeout(fetchRecallMemory(), 600);
     if (memory && memory.activeGoal) {
