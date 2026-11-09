@@ -9,9 +9,9 @@
  */
 import { defaultEffortForSubagent, applyEffortGovernance, discoverWorkspaceAgents, type ThinkingEffort } from './core/index.js';
 import { compareModels, parseModel } from './models.js';
+import { STAGE_RUBRIC, STAGE_RUBRIC_TEXT, type ClaudeModelAlias, type JevTier } from './stage-rubric.js';
 
-export type JevTier = 'openrouter_free' | 'flash_lite' | 'flash' | 'pro';
-export type ClaudeModelAlias = 'haiku' | 'sonnet' | 'opus' | 'fable';
+export type { JevTier, ClaudeModelAlias };
 
 /** Claude Code's built-in subagents (plus `self` for doing the work directly). */
 export const CLAUDE_SUBAGENT_CRITERIA: Readonly<Record<string, string>> = {
@@ -21,6 +21,26 @@ export const CLAUDE_SUBAGENT_CRITERIA: Readonly<Record<string, string>> = {
   self: 'Direct answer or edit in the main session without delegation'
 };
 
+/** The kebab-case form discovery registers every agent under (core/discovery.ts, registerAgent). */
+const kebab = (name: string): string => name.toLowerCase().replace(/[\s_]+/g, '-');
+
+/**
+ * Drop display-name aliases such as "Code Engineer" when discovery also registered the kebab-case
+ * name ("code-engineer"): only the latter is a Claude Code `subagent_type`, and the router otherwise
+ * sees the same agent twice under different spellings (case study 5.6). A name with no alias is kept
+ * as is, and so is a lower-case name with no whitespace (`code_engineer`, a file-name alias): the
+ * filter looks only at names Claude Code could not have been given, a space or a capital letter.
+ */
+export function withoutDisplayNames(discovered: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, desc] of Object.entries(discovered)) {
+    const isDisplayName = /\s|[A-Z]/.test(name);
+    if (isDisplayName && kebab(name) !== name && Object.hasOwn(discovered, kebab(name))) continue;
+    out[name] = desc;
+  }
+  return out;
+}
+
 /**
  * Resolve Claude subagent criteria dynamically by discovering custom workspace agents
  * and merging them with the Claude built-ins.
@@ -28,7 +48,7 @@ export const CLAUDE_SUBAGENT_CRITERIA: Readonly<Record<string, string>> = {
 export async function resolveClaudeSubagentCriteria(workspaceDir?: string): Promise<Record<string, string>> {
   const discovered = await discoverWorkspaceAgents(workspaceDir, 'claude-code');
   const criteria: Record<string, string> = { ...CLAUDE_SUBAGENT_CRITERIA };
-  for (const [name, desc] of Object.entries(discovered)) {
+  for (const [name, desc] of Object.entries(withoutDisplayNames(discovered))) {
     if (name === 'none') continue;
     criteria[name] = desc;
   }
@@ -41,9 +61,9 @@ export async function resolveClaudeSubagentCriteria(workspaceDir?: string): Prom
 
 export const TIER_CRITERIA: Readonly<Record<JevTier, string>> = {
   openrouter_free: 'Lightweight summaries, drafts, syntax transforms, formatting, boilerplate ($0 cost)',
-  flash_lite: 'Trivial triage, quick lookups, file moves, formatting',
-  flash: 'Standard agentic steps, routine edits, content synthesis, local commands',
-  pro: 'Deep reasoning, architecture, complex multi-file refactors, high-stakes writing'
+  flash_lite: `Trivial triage, quick lookups, file moves, formatting; ${STAGE_RUBRIC.mechanical.rule}`,
+  flash: `Standard agentic steps, routine edits, content synthesis, local commands; ${STAGE_RUBRIC['settled-edit'].rule}`,
+  pro: `Deep reasoning, architecture, complex multi-file refactors, high-stakes writing; ${STAGE_RUBRIC.judgement.rule}`
 };
 
 /** Jev tiers mapped onto Claude model aliases accepted by the Agent tool's `model` field. */
@@ -114,8 +134,7 @@ function sessionAllowsOpus(sessionModel: string | null): boolean {
   return session !== 'unknown' && opus !== 'unknown' && compareModels(session, opus) >= 0;
 }
 
-/** The context line injected before the turn. */
-export function buildDirective(rec: Dispatch, sessionModel: string | null, quotaStrategy: string, intent: UserIntent = {}): string {
+function directiveBody(rec: Dispatch, sessionModel: string | null, quotaStrategy: string, intent: UserIntent = {}): string {
   const head =
     `[JEV] cost-tiered recommendation (quota=${quotaStrategy}): subagent="${rec.subagent}", ` +
     `tier="${rec.tier}", model="${rec.model}", effort="${rec.effort}".`;
@@ -237,9 +256,55 @@ export function applyUserIntent(rec: Dispatch, intent: UserIntent): Dispatch {
   return rec;
 }
 
-/** Keep only characters that are safe in a file name. */
-export function safeSessionId(id: unknown): string | null {
-  if (typeof id !== 'string') return null;
-  const clean = id.replace(/[^A-Za-z0-9_-]/g, '');
-  return clean.length ? clean : null;
+/** A turn that delegates paid work: the rubric helps there and is noise on the rest. */
+function isDelegationTurn(rec: Dispatch): boolean {
+  return rec.subagent !== 'self' && rec.tier !== 'openrouter_free' && rec.by !== 'instruction-model';
+}
+
+/** The context line injected before the turn, with the stage rubric on delegation turns (5.3). */
+export function buildDirective(rec: Dispatch, sessionModel: string | null, quotaStrategy: string, intent: UserIntent = {}): string {
+  const body = directiveBody(rec, sessionModel, quotaStrategy, intent);
+  return isDelegationTurn(rec) ? `${body} ${STAGE_RUBRIC_TEXT}` : body;
+}
+
+// ── Turns that need no advice (5.5) ─────────────────────────────────────────────────────────────
+
+/** The part of a prompt sent to Jev: pasted material must not dominate the decision. */
+export const TASK_TRIM_CHARS = 2000;
+/** A prompt this long is a paste, not a task: no advice at all. */
+export const PASTE_SKIP_CHARS = 20_000;
+
+/** Prompts the host injects on the user's behalf, never a task of the user's. */
+const SYSTEM_TURN = /^\s*<(?:task-notification|local-command-[a-z]+|bash-(?:input|stdout|stderr)|system-reminder)\b/i;
+
+/** True for a prompt that carries no delegation intent by its shape alone, before any Jev call. */
+export function isNonTaskPrompt(prompt: string): boolean {
+  return SYSTEM_TURN.test(prompt) || prompt.length > PASTE_SKIP_CHARS;
+}
+
+/**
+ * Generous on purpose: the cost of a missed hint is small, but the cost of a wrong silence is a
+ * task that gets no advice. Anything that reads like work counts.
+ */
+const WORK_VERB =
+  /\b(?:write|edit|fix|add|create|implement|refactor|run\s+(?:the|a|an|it|this|that|all|my|each|every|bun|npm|make|git)|build|port|update|delete|remove|rename|change|move|review|check|test|find|search|read|explain|plan|design|commit|push|open|start|fold|launch|spawn|delegate|proceed|go ahead|deploy|install|analy[sz]e|summari[sz]e|investigate|debug|migrate|draft|document|list|show|look|verify|clean|merge|rewrite|generate|convert|set up|workflow|workstreams?)\b/i;
+
+/**
+ * A status or acknowledgement turn: Jev says `self` on a cheap tier and the prompt holds no verb of
+ * work ("A3 completed the run", "thanks, looks good"). The user's explicit instruction always counts.
+ */
+export function isStatusTurn(rec: Dispatch, task: string, intent: UserIntent = {}): boolean {
+  if (intent.model || intent.cost) return false;
+  const cheap = rec.tier === 'flash_lite' || rec.tier === 'openrouter_free';
+  return rec.subagent === 'self' && cheap && !WORK_VERB.test(task);
+}
+
+/** What goes to Jev: the head of the prompt only. */
+export function trimTask(task: string): string {
+  return task.length > TASK_TRIM_CHARS ? task.slice(0, TASK_TRIM_CHARS) : task;
+}
+
+/** A short stable id of a turn, the same wherever the same prompt is seen. A hash, never the text. */
+export function turnId(prompt: string): string {
+  return new Bun.CryptoHasher('sha256').update(prompt.trim()).digest('hex').slice(0, 12);
 }

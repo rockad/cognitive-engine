@@ -5,7 +5,6 @@ import * as path from 'node:path';
 import {
   parseDispatch,
   buildDirective,
-  safeSessionId,
   resolveClaudeSubagentCriteria,
   CLAUDE_SUBAGENT_CRITERIA,
   type Dispatch
@@ -65,14 +64,6 @@ describe('buildDirective', () => {
     const directive = buildDirective(proRec, null, 'normal');
 
     expect(directive).toContain('let the user choose');
-  });
-});
-
-describe('safeSessionId', () => {
-  it('strips path characters', () => {
-    const id = safeSessionId('../../etc/passwd');
-
-    expect(id).toBe('etcpasswd');
   });
 });
 

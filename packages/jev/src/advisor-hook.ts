@@ -23,10 +23,12 @@ import {
   logJevTelemetry,
   checkEgress,
   egressContextDirs,
-  type JevMode
+  type JevMode,
+  type JevTelemetryEvent
 } from './core/index.js';
 import { appendClaudeDecision } from './claude-audit.js';
 import { resolveSessionModel } from './session-model.js';
+import { writeLastAdvice, type LastAdvice } from './advisor-state.js';
 import {
   applyUserIntent,
   buildDirective,
@@ -34,7 +36,10 @@ import {
   parseUserIntent,
   parseDispatch,
   resolveClaudeSubagentCriteria,
-  safeSessionId,
+  isNonTaskPrompt,
+  isStatusTurn,
+  trimTask,
+  turnId,
   type Dispatch
 } from './advisor-logic.js';
 
@@ -57,6 +62,8 @@ export type HookDeps = {
   readQuotaStrategy: () => Promise<string>;
   dispatch: (task: string, quotaStrategy: string, criteria?: Record<string, string>) => Promise<Dispatch | null>;
   log: (entry: Record<string, unknown>) => void;
+  /** Remember the advice for the session so a later hook can join it with what was used. */
+  remember?: (sessionId: string | null, advice: LastAdvice) => void;
   /** Egress policy for the hook's working directory; absent means no policy. */
   egressAllowed?: (cwd: string | undefined) => boolean;
 };
@@ -82,22 +89,48 @@ export function withTimeout<T>(
 
 export async function onUserPromptSubmit(input: HookInput, deps: HookDeps): Promise<HookOutput> {
   if ((await deps.readMode()) !== 'on') return null;
-  const task = (input.prompt || '').trim();
-  if (task.length < 8) return null;
-  const sessionId = safeSessionId(input.session_id);
+  const prompt = (input.prompt || '').trim();
+  if (prompt.length < 8) return null;
+  // Host-injected turns and pasted blobs carry no task: no advice and no Jev call (5.5).
+  if (isNonTaskPrompt(prompt)) return null;
+  const sessionId = typeof input.session_id === 'string' ? input.session_id : null;
   if (deps.egressAllowed && !deps.egressAllowed(input.cwd)) {
-    deps.log({ hook: 'UserPromptSubmit', session: sessionId, egress: 'blocked' });
+    deps.log({ hook: 'UserPromptSubmit', session_id: sessionId, egress: 'blocked' });
     return null;
   }
   const quotaStrategy = await deps.readQuotaStrategy();
   const criteria = await resolveClaudeSubagentCriteria(input.cwd);
-  const rec = await deps.dispatch(task, quotaStrategy, criteria);
+  const rec = await deps.dispatch(trimTask(prompt), quotaStrategy, criteria);
   if (!rec) return null;
-  const sessionModel = deps.readSessionModel(input);
   // The user's own words first: an explicit model or cost instruction changes what is advised.
-  const intent = parseUserIntent(task);
+  const intent = parseUserIntent(prompt);
+  // A status turn ("A3 completed the run") gets no line. An instruction in the prompt always does.
+  if (isStatusTurn(rec, prompt, intent)) return null;
+  const sessionModel = deps.readSessionModel(input);
   const advised = applyUserIntent(rec, intent);
-  deps.log({ hook: 'UserPromptSubmit', session: sessionId, ...advised, quota: quotaStrategy, sessionModel });
+  const turn = turnId(prompt);
+  deps.log({
+    hook: 'UserPromptSubmit',
+    session_id: sessionId,
+    turn,
+    subagent: advised.subagent,
+    tier: advised.tier,
+    effort: advised.effort,
+    confidence: advised.confidence,
+    ...(advised.routerTier ? { routerTier: advised.routerTier } : {}),
+    ...(advised.by ? { by: advised.by } : {}),
+    recommended_model: advised.model,
+    quota: quotaStrategy,
+    sessionModel
+  });
+  deps.remember?.(sessionId, {
+    turn,
+    tier: advised.tier,
+    model: advised.model,
+    subagent: advised.subagent,
+    ...(advised.by ? { by: advised.by } : {}),
+    at: new Date().toISOString()
+  });
 
   let additionalContext = buildDirective(advised, sessionModel, quotaStrategy, intent);
   try {
@@ -134,19 +167,33 @@ async function liveDispatch(task: string, quotaStrategy: string, criteria?: Reco
   }
 }
 
+/**
+ * The shared telemetry record for one advice (case study 5.7). `modelRecommended` is the field that
+ * says what it is: UserPromptSubmit recommends a model, it does not use one. `modelUsed` is kept as
+ * a deprecated alias of the same value for one release so existing readers of the file keep
+ * working; drop it in 2.5. `turn` joins the record to the PreToolUse record of the same turn.
+ */
+export function adviceTelemetry(entry: Record<string, unknown>): JevTelemetryEvent {
+  const str = (v: unknown) => (typeof v === 'string' ? v : undefined);
+  const recommended = str(entry.recommended_model);
+  return {
+    harness: 'claude',
+    toolOrHook: String(entry.hook || 'hook'),
+    sessionId: str(entry.session_id) ?? null,
+    turn: str(entry.turn),
+    taskSummary: str(entry.subagent) ? `subagent: ${entry.subagent}` : undefined,
+    tierRecommended: str(entry.tier),
+    modelRecommended: recommended,
+    modelUsed: recommended,
+    quotaStrategy: str(entry.quota)
+  };
+}
+
 function appendLog(entry: Record<string, unknown>): void {
   try {
-    // Never prompt text: the entry holds the recommendation and model names only.
+    // Never prompt text: the entry holds the recommendation, model names and a prompt hash only.
     appendClaudeDecision({ ...entry, event: 'advice' });
-    void logJevTelemetry({
-      harness: 'claude',
-      toolOrHook: String(entry.hook || 'hook'),
-      sessionId: typeof entry.session === 'string' ? entry.session : null,
-      taskSummary: typeof entry.subagent === 'string' ? `subagent: ${entry.subagent}` : undefined,
-      tierRecommended: typeof entry.tier === 'string' ? entry.tier : undefined,
-      modelUsed: typeof entry.model === 'string' ? entry.model : undefined,
-      quotaStrategy: typeof entry.quota === 'string' ? entry.quota : undefined
-    });
+    void logJevTelemetry(adviceTelemetry(entry));
   } catch {
     // logging is best-effort
   }
@@ -164,6 +211,7 @@ const liveDeps: HookDeps = {
   },
   dispatch: liveDispatch,
   log: appendLog,
+  remember: writeLastAdvice,
   egressAllowed: (cwd) => checkEgress(egressContextDirs([cwd])).allowed
 };
 
