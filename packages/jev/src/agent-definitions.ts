@@ -36,6 +36,9 @@ export interface AgentDefinition {
   model: string | null;
 }
 
+/** Claude Code's built-in subagent types: they have no definition file and run on the session model. */
+export const BUILTIN_AGENT_TYPES: ReadonlySet<string> = new Set(['general-purpose', 'Explore', 'Plan', 'statusline-setup', 'claude-code-guide', 'claude']);
+
 const SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/;
 
 /** Parse `name` or `plugin:name` into its parts, or null for anything else. */
@@ -50,6 +53,17 @@ function homeDir(): string {
   return process.env.HOME || os.homedir();
 }
 
+/**
+ * Claude Code's user config dir: `CLAUDE_CONFIG_DIR` when set and non-empty (it replaces `~/.claude`
+ * entirely; a relative value is resolved against the working directory, verified on 2.1.318), else
+ * `~/.claude`. `cwd` is the hook's working directory (default `process.cwd()`).
+ */
+export function userClaudeDir(cwd?: string): string {
+  const dir = process.env.CLAUDE_CONFIG_DIR;
+  if (dir) return path.resolve(cwd || process.cwd(), dir);
+  return path.join(homeDir(), '.claude');
+}
+
 /** Project-level `.claude/agents` dirs: the cwd up to the project root, nearest first (project-root.ts). */
 function projectAgentDirs(cwd: string | undefined): string[] {
   return projectDirs(cwd).map((dir) => path.join(dir, '.claude', 'agents'));
@@ -61,7 +75,7 @@ function projectAgentDirs(cwd: string | undefined): string[] {
  * `true` enables a plugin key (`name@marketplace`). Unreadable or odd files contribute nothing.
  */
 function enabledPluginKeys(cwd: string | undefined): Set<string> {
-  const files = [path.join(homeDir(), '.claude', 'settings.json')];
+  const files = [path.join(userClaudeDir(cwd), 'settings.json')];
   // Project roots: the parents of the project `.claude/agents` dirs, farthest (project root) first.
   for (const agents of [...projectAgentDirs(cwd)].reverse()) {
     const claudeDir = path.dirname(agents);
@@ -91,7 +105,7 @@ function pluginAgentDirs(cwd: string | undefined): Array<[string, string]> {
   const out: Array<{ name: string; dir: string; key: string }> = [];
   let doc: any;
   try {
-    doc = JSON.parse(fs.readFileSync(path.join(homeDir(), '.claude', 'plugins', 'installed_plugins.json'), 'utf8'));
+    doc = JSON.parse(fs.readFileSync(path.join(userClaudeDir(cwd), 'plugins', 'installed_plugins.json'), 'utf8'));
   } catch {
     return [];
   }
@@ -117,7 +131,7 @@ export function agentLookupDirs(subagentType: unknown, cwd: string | undefined):
   const dirs = new Set<string>();
   if (!parsed.plugin) {
     for (const d of projectAgentDirs(cwd)) dirs.add(d);
-    dirs.add(path.join(homeDir(), '.claude', 'agents'));
+    dirs.add(path.join(userClaudeDir(cwd), 'agents'));
   }
   for (const [plugin, dir] of pluginAgentDirs(cwd)) if (!parsed.plugin || plugin === parsed.plugin) dirs.add(dir);
   return [...dirs];
@@ -128,8 +142,8 @@ export function describeAgentLookup(cwd: string | undefined): string {
   const project = projectAgentDirs(cwd);
   return (
     `${project.length > 0 ? project.join(', ') : '<cwd>/.claude/agents'} (hook cwd up to the project root), ` +
-    `${path.join(homeDir(), '.claude', 'agents')}, and the agents/ dir of each plugin in ` +
-    `${path.join(homeDir(), '.claude', 'plugins', 'installed_plugins.json')} (enabled plugins first; a "plugin:agent" name only looks in that plugin)`
+    `${path.join(userClaudeDir(cwd), 'agents')}, and the agents/ dir of each plugin in ` +
+    `${path.join(userClaudeDir(cwd), 'plugins', 'installed_plugins.json')} (enabled plugins first; a "plugin:agent" name only looks in that plugin)`
   );
 }
 
@@ -267,7 +281,7 @@ export function readAgentDefinition(subagentType: string | undefined, cwd: strin
   const parsed = parseAgentName(subagentType);
   if (!parsed) return result;
   // (a walk without a project root can reach $HOME, whose .claude/agents is the USER level, not the project's)
-  const userDir = path.join(homeDir(), '.claude', 'agents');
+  const userDir = path.join(userClaudeDir(cwd), 'agents');
   const projectDirSet = new Set(parsed.plugin ? [] : projectAgentDirs(cwd).filter((d) => d !== userDir));
   // The FIRST definition file found decides, as in Claude Code (it uses only the highest-priority
   // definition). A nearer file with no model means "inherit" and is never skipped for a farther file

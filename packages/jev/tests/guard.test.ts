@@ -17,7 +17,7 @@ import { clearConfigCacheForTesting } from '../src/core/config.ts';
 let tmp = '';
 let savedEnv: NodeJS.ProcessEnv = {};
 
-const HARNESS_ENV_VARS = ['JEV_HARNESS', 'ANTIGRAVITY_CLI', 'GEMINI_CLI', 'CLAUDE_CODE', 'CLAUDECODE', 'CLAUDE_PROJECT_DIR', 'OPENCODE_SESSION', 'OPENCODE_HOME', 'CORTEX_SESSION'];
+const HARNESS_ENV_VARS = ['JEV_HARNESS', 'ANTIGRAVITY_CLI', 'GEMINI_CLI', 'CLAUDE_CODE', 'CLAUDECODE', 'CLAUDE_PROJECT_DIR', 'OPENCODE_SESSION', 'OPENCODE_HOME', 'CORTEX_SESSION', 'CLAUDE_CONFIG_DIR'];
 
 function transcript(...models: Array<string | null>): string {
   const file = path.join(tmp, 't.jsonl');
@@ -145,6 +145,38 @@ describe('Claude Code ceiling', () => {
     expect(evaluateClaude({ ...base, tool_input: { subagent_type: 'deep' } })?.decision).toBe('ask');
     expect(evaluateClaude({ ...base, tool_input: { subagent_type: 'deep', model: 'haiku' } })).toBeNull();
     expect(evaluateClaude({ ...base, tool_input: { subagent_type: 'Explore' } })).toBeNull();
+  });
+
+  it('lets every built-in type through with no definition file, and ranks a same-named definition file', () => {
+    const project = path.join(tmp, 'proj');
+    const base = { tool_name: 'Agent', transcript_path: transcript('claude-sonnet-5-5'), cwd: project };
+    for (const t of ['general-purpose', 'Explore', 'Plan', 'statusline-setup', 'claude-code-guide', 'claude']) {
+      expect(evaluateClaude({ ...base, tool_input: { subagent_type: t } })).toBeNull();
+    }
+    expect(evaluateClaude({ ...base, tool_input: { subagent_type: 'claude', model: 'opus' } })?.decision).toBe('ask');
+    expect(evaluateClaude({ ...base, tool_input: { subagent_type: 'not-builtin' } })?.decision).toBe('ask');
+    fs.mkdirSync(path.join(project, '.claude', 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(project, '.claude', 'agents', 'claude.md'), '---\nmodel: opus\n---\n');
+    fs.writeFileSync(path.join(project, '.claude', 'agents', 'Explore.md'), '---\nmodel: haiku\n---\n');
+    expect(evaluateClaude({ ...base, tool_input: { subagent_type: 'claude' } })?.decision).toBe('ask');
+    expect(evaluateClaude({ ...base, tool_input: { subagent_type: 'Explore' } })).toBeNull();
+  });
+
+  it('reads agent definitions from CLAUDE_CONFIG_DIR, resolving a relative value against the hook cwd', () => {
+    const project = path.join(tmp, 'proj');
+    fs.mkdirSync(path.join(tmp, 'cfg', 'agents'), { recursive: true });
+    process.env.HOME = path.join(tmp, 'home'); // a sibling of proj, so the project walk never reaches it
+    fs.mkdirSync(path.join(tmp, 'home', '.claude', 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(tmp, 'cfg', 'agents', 'cfg-deep.md'), '---\nmodel: opus\n---\n');
+    fs.writeFileSync(path.join(tmp, 'home', '.claude', 'agents', 'stale.md'), '---\nmodel: opus\n---\n');
+    process.env.CLAUDE_CONFIG_DIR = '../cfg';
+    expect(agentDefinitionModel('cfg-deep', project)).toBe('opus');
+    expect(agentDefinitionModel('stale', project)).toBeNull();
+    process.env.CLAUDE_CONFIG_DIR = path.join(tmp, 'cfg');
+    expect(agentDefinitionModel('cfg-deep', project)).toBe('opus');
+    process.env.CLAUDE_CONFIG_DIR = '';
+    expect(agentDefinitionModel('stale', project)).toBe('opus');
+    expect(agentDefinitionModel('cfg-deep', project)).toBeNull();
   });
 
   it('asks for an opus call when the transcript is unreadable', () => {
