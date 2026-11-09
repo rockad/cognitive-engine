@@ -53,7 +53,7 @@ Set `JEV_LIVE_TEST=1` to include tests that call OpenRouter.
 
 ## Lineage
 
-Ported from `agentic-hub/plugins/jev` v2.3.0. Track 1 kept only the subagent-ceiling check (see below) from the Claude Code hooks; the session-start and model-switch recorders followed with the guard, and the `UserPromptSubmit` advisor is ported in [Prompt advisor hook](#prompt-advisor-hook-claude-code). Hooks are not prohibited: add one wherever a workflow or process needs it.
+Ported from `agentic-hub/plugins/jev` v2.3.0; version 2.4.0 adds the Claude prompt advisor and the case-study improvements (see [CHANGELOG.md](CHANGELOG.md)). Track 1 kept only the subagent-ceiling check (see below) from the Claude Code hooks; the session-start and model-switch recorders followed with the guard, and the `UserPromptSubmit` advisor is ported in [Prompt advisor hook](#prompt-advisor-hook-claude-code). Hooks are not prohibited: add one wherever a workflow or process needs it.
 
 ## Subagent guard hook
 
