@@ -1,0 +1,90 @@
+# Advisory CI for cognitive-engine.
+#
+# ADVISORY: every job sets `continue-on-error: true`, so a red step is reported
+# in the run and on the PR but the job's conclusion is still "success" and never
+# blocks a merge. We do this at the job level (rather than leaving the checks
+# un-required in branch protection) so the behaviour is versioned with the repo
+# and holds even if someone later marks these checks as required. To make a job
+# blocking, delete its `continue-on-error` line.
+#
+# Skip rule for the Python jobs: tests that need a local Ollama daemon or the
+# sbx sandbox are not runnable on a hosted runner. They must be marked
+# `@pytest.mark.ollama` / `@pytest.mark.sbx` and are deselected here with
+# `-m "not ollama and not sbx"`. (No such tests exist yet; the Python packages
+# are scaffolds with no tests, so the pytest jobs skip with a notice until the
+# first `test_*.py` / `*_test.py` file lands.)
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  typecheck:
+    name: tsc (TypeScript workspaces)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.x
+      - run: bun install --frozen-lockfile
+      # Every workspace that ships a tsconfig.json (jev, antigravity, opencode);
+      # run all of them and fail at the end if any failed.
+      - name: bunx tsc --noEmit
+        run: |
+          status=0
+          for dir in packages/* adapters/*; do
+            [ -f "$dir/tsconfig.json" ] || continue
+            echo "::group::tsc $dir"
+            (cd "$dir" && bunx tsc --noEmit) || status=1
+            echo "::endgroup::"
+          done
+          exit $status
+
+  bun-test:
+    name: bun test (jev + adapters)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.x
+      - run: bun install --frozen-lockfile
+      - run: bun test packages/jev adapters
+
+  pytest:
+    name: pytest (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [harness2, memory]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+      - name: pytest (skipping Ollama and sbx tests)
+        working-directory: packages/${{ matrix.package }}
+        run: |
+          # Scaffold packages have no tests yet; pytest would exit 5 ("no tests
+          # collected"), so skip explicitly until a test file exists.
+          if [ -z "$(find . -type f \( -name 'test_*.py' -o -name '*_test.py' \) -not -path './.venv/*' -print -quit)" ]; then
+            echo "::notice::no Python tests in packages/${{ matrix.package }}; skipping"
+            exit 0
+          fi
+          uv run --with pytest pytest -q -m "not ollama and not sbx"
