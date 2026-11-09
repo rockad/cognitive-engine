@@ -21,6 +21,10 @@
  * key). A UTF-8 BOM before the opening `---` is ignored. Line endings may be LF, CRLF or CR.
  *
  * The strict answer is then checked against Claude Code's own pipeline (`parseFrontmatterModel`).
+ *
+ * The top-level `name` and `effort` are read by the same rules. `effort` is the reasoning effort the
+ * agent runs at: a plain string is returned as written (the guard ranks it, see `effortReason` in
+ * agent-definitions.ts), and anything that is not a plain string, including an integer, is `unreadable`.
  */
 
 export type FrontmatterModel = { kind: 'none' } | { kind: 'model'; value: string } | { kind: 'unreadable'; reason: string };
@@ -28,8 +32,11 @@ export type FrontmatterModel = { kind: 'none' } | { kind: 'model'; value: string
 /** The top-level `name` of a definition: Claude Code registers the agent under it, not under the file name. */
 export type FrontmatterName = { kind: 'none' } | { kind: 'name'; value: string } | { kind: 'unreadable'; reason: string };
 
+/** The top-level `effort` of a definition: the reasoning effort Claude Code runs the agent at (a level name, or an integer it reads as a number). */
+export type FrontmatterEffort = { kind: 'none' } | { kind: 'effort'; value: string } | { kind: 'unreadable'; reason: string };
+
 /** What the strict reader found: the whole block unreadable, or one answer per key it is asked about. */
-type StrictScan = { kind: 'unreadable'; reason: string } | { kind: 'fields'; model: FrontmatterModel; name: FrontmatterName };
+type StrictScan = { kind: 'unreadable'; reason: string } | { kind: 'fields'; model: FrontmatterModel; name: FrontmatterName; effort: FrontmatterEffort };
 
 const unreadable = (reason: string): { kind: 'unreadable'; reason: string } => ({ kind: 'unreadable', reason });
 
@@ -107,7 +114,7 @@ function plainProblem(text: string): string | null {
   return null;
 }
 
-const NO_FIELDS: StrictScan = { kind: 'fields', model: { kind: 'none' }, name: { kind: 'none' } };
+const NO_FIELDS: StrictScan = { kind: 'fields', model: { kind: 'none' }, name: { kind: 'none' }, effort: { kind: 'none' } };
 
 /** The `model` and `name` of the frontmatter in `raw` (the whole file text), read strictly by this module's own parser. */
 function strictFrontmatter(raw: string): StrictScan {
@@ -134,6 +141,9 @@ function strictFrontmatter(raw: string): StrictScan {
   let nameSeen = false;
   let nameValue: string | null = null;
   let nameProblem: string | null = null;
+  let effortSeen = false;
+  let effortValue: string | null = null;
+  let effortProblem: string | null = null;
 
   for (let n = 0; n < front.length; n++) {
     const line = front[n];
@@ -163,18 +173,21 @@ function strictFrontmatter(raw: string): StrictScan {
     const folded = key.normalize('NFKC').replace(INVISIBLE, '').trim().toLowerCase();
     const isModel = key.trim() === 'model' || (keyIsQuoted && key === 'model');
     const isName = key.trim() === 'name' || (keyIsQuoted && key === 'name');
+    const isEffort = key.trim() === 'effort' || (keyIsQuoted && key === 'effort');
     if (!isModel && folded === 'model') return unreadable(`a key "${key}" differs from "model" only by case or Unicode form`);
+    // A look-alike of `effort` taints the effort answer only: the model and name stay readable.
+    if (!isEffort && folded === 'effort') effortProblem ??= `a key "${key}" differs from "effort" only by case or Unicode form`;
 
     // Consume this entry's value. A quoted or flow value must close on its own line: Claude Code's
     // fallback re-quotes single lines of a block it could not parse, which reads a "continuation"
     // line as a top-level key (`model: opus` inside a quoted description becomes a real key).
     let last = n;
-    if (!isModel && !isName && (rest[0] === '"' || rest[0] === "'")) {
+    if (!isModel && !isName && !isEffort && (rest[0] === '"' || rest[0] === "'")) {
       const closed = quotedEnd(front, n, rest);
       if (closed === null) return unreadable(`the quoted value of "${key}" is not closed`);
       if (closed !== n) return unreadable(`the quoted value of "${key}" spans several lines, which Claude Code's fallback parser can read differently`);
       last = closed;
-    } else if (!isModel && !isName && (rest[0] === '[' || rest[0] === '{')) {
+    } else if (!isModel && !isName && !isEffort && (rest[0] === '[' || rest[0] === '{')) {
       const closed = flowEnd(front, n, rest);
       if (closed === null) return unreadable(`the flow value of "${key}" is not closed`);
       if (closed !== n) return unreadable(`the flow value of "${key}" spans several lines, which Claude Code's fallback parser can read differently`);
@@ -230,11 +243,34 @@ function strictFrontmatter(raw: string): StrictScan {
         else nameValue = plain;
       }
     }
+    if (isEffort) {
+      if (effortSeen) effortProblem ??= 'the frontmatter has more than one "effort" key';
+      effortSeen = true;
+      if (continuation) effortProblem ??= '"effort" has a nested or multi-line value, not a plain string';
+      else if (rest === '' || rest[0] === '#') effortValue = null;
+      else if (rest[0] === '"') {
+        const m = /^"([^"\\]*)"[ \t]*(?:#.*)?$/.exec(rest);
+        if (m) effortValue = m[1];
+        else effortProblem ??= '"effort" is a double-quoted string that is unterminated or uses an escape sequence';
+      } else if (rest[0] === "'") {
+        const m = /^'([^']*)'[ \t]*(?:#.*)?$/.exec(rest);
+        if (m) effortValue = m[1];
+        else effortProblem ??= '"effort" is a single-quoted string that is unterminated or uses an escaped quote';
+      } else {
+        const problem = plainProblem(rest);
+        const plain = rest.replace(/[ \t]+#.*$/, '').trim();
+        if (problem) effortProblem ??= `the value of "effort" ${problem}, so it is not a plain string`;
+        else if (/:(?:[ \t]|$)/.test(plain)) effortProblem ??= 'the value of "effort" contains ": ", which YAML reads as a mapping';
+        else effortValue = plain;
+      }
+    }
     n = entryEnd;
   }
 
   return {
     kind: 'fields',
+    effort:
+      effortProblem !== null ? unreadable(effortProblem) : effortSeen && effortValue !== null && effortValue !== '' ? { kind: 'effort', value: effortValue } : { kind: 'none' },
     model: seen && value !== null ? { kind: 'model', value } : { kind: 'none' },
     name: nameProblem !== null ? unreadable(nameProblem) : nameSeen && nameValue !== null && nameValue !== '' ? { kind: 'name', value: nameValue } : { kind: 'none' }
   };
@@ -313,7 +349,7 @@ function ccFrontmatter(raw: string, yaml: YamlParse): Record<string, unknown> | 
 }
 
 /** The string Claude Code would read for the top-level `key` of `raw`, trimmed ('' for none), or an `unreadable` reason. */
-function ccString(raw: string, yaml: YamlParse, key: 'model' | 'name'): { ok: true; value: string } | { ok: false; reason: string } {
+function ccString(raw: string, yaml: YamlParse, key: 'model' | 'name' | 'effort'): { ok: true; value: string } | { ok: false; reason: string } {
   const front = ccFrontmatter(raw, yaml);
   if (front === null) return { ok: false, reason: "Claude Code's YAML parser rejects this frontmatter, so what it would run is not known" };
   const v = front[key];
@@ -328,7 +364,7 @@ function ccString(raw: string, yaml: YamlParse, key: 'model' | 'name'): { ok: tr
  * null, not under bun) only a conservative rule applies: a block with a line the fallback could
  * re-quote is not trusted.
  */
-function crossCheck(raw: string, yaml: YamlParse | null, key: 'model' | 'name', mine: string): string | null {
+function crossCheck(raw: string, yaml: YamlParse | null, key: 'model' | 'name' | 'effort', mine: string): string | null {
   if (yaml === null) {
     const block = ccBlock(raw);
     return block !== null && fallbackMightApply(block)
@@ -342,16 +378,16 @@ function crossCheck(raw: string, yaml: YamlParse | null, key: 'model' | 'name', 
 }
 
 /**
- * The `model` and `name` of the frontmatter in `raw` (the whole file text). Jev's strict reader and
+ * The `model`, `name` and `effort` of the frontmatter in `raw` (the whole file text). Jev's strict reader and
  * a faithful copy of Claude Code's pipeline (its block regex, `Bun.YAML.parse`, then its quoting
  * fallback when that throws) both answer; if either cannot, or they differ on a key, that key is
  * `unreadable` so the caller asks. Without a YAML parser only the strict reader runs, plus a
  * conservative rule (see `crossCheck`).
  */
-export function parseFrontmatterFields(raw: string, yaml: YamlParse | null = bunYaml()): { model: FrontmatterModel; name: FrontmatterName } {
+export function parseFrontmatterFields(raw: string, yaml: YamlParse | null = bunYaml()): { model: FrontmatterModel; name: FrontmatterName; effort: FrontmatterEffort } {
   const strict = strictFrontmatter(raw);
-  if (strict.kind === 'unreadable') return { model: strict, name: strict };
-  let { model, name } = strict;
+  if (strict.kind === 'unreadable') return { model: strict, name: strict, effort: strict };
+  let { model, name, effort } = strict;
   if (model.kind !== 'unreadable') {
     const problem = crossCheck(raw, yaml, 'model', model.kind === 'model' ? model.value.trim() : '');
     if (problem !== null) model = unreadable(problem);
@@ -360,7 +396,11 @@ export function parseFrontmatterFields(raw: string, yaml: YamlParse | null = bun
     const problem = crossCheck(raw, yaml, 'name', name.kind === 'name' ? name.value.trim() : '');
     if (problem !== null) name = unreadable(problem);
   }
-  return { model, name };
+  if (effort.kind !== 'unreadable') {
+    const problem = crossCheck(raw, yaml, 'effort', effort.kind === 'effort' ? effort.value.trim() : '');
+    if (problem !== null) effort = unreadable(problem);
+  }
+  return { model, name, effort };
 }
 
 /**
@@ -386,5 +426,10 @@ export function parseFrontmatterModel(raw: string, yaml: YamlParse | null = bunY
  * (an unrankable model asks) and the ask names the problem. It must never read as "no model".
  */
 export function unreadableModelValue(reason: string): string {
+  return `<unreadable agent frontmatter: ${reason}>`;
+}
+
+/** The effort value an agent definition reports when its frontmatter is present but its `effort` cannot be established; it is no effort level, so `effortReason` asks. */
+export function unreadableEffortValue(reason: string): string {
   return `<unreadable agent frontmatter: ${reason}>`;
 }

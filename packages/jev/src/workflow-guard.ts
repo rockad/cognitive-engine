@@ -42,8 +42,13 @@
  * - `effort` in the agent() options has only an INTERIM threshold, with no spec behind it (see
  *   docs/rfc/007-subagent-effort-bounding.md): a literal `xhigh` or `max` asks, `low`, `medium` and
  *   `high` pass, and any other literal or a non-literal value (variable, expression, spread) is
- *   unverifiable and asks. The session's own effort is not read, so it is not compared, and effort
+ *   unverifiable and asks. The `effort:` of an agentType's definition is checked the same way (the
+ *   same `effortReason` as the Agent guard). The session's own effort is not read, so it is not compared, and effort
  *   does not compose with the model ceiling or the low-quota clamp.
+ * - The environment can set an agent's model: `CLAUDE_CODE_SUBAGENT_MODEL` (when the call and its
+ *   definition set none), and `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` / `CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL`
+ *   (replacing the call's and the definition's). The hook's own environment is read, and the model
+ *   that results is ranked like a written one (`subagentModelCandidates`, models.ts).
  * - `meta.phases[].model` is ranked although in Claude Code it is only a progress-display hint, so a
  *   phase label above the session model asks (a false positive, never a miss). The reason says so.
  * - Agent definitions and saved workflows are looked up where Claude Code looks: the project
@@ -78,8 +83,8 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as acorn from 'acorn';
-import { BUILTIN_AGENT_TYPES, describeAgentLookup, missingAgentDetail, readAgentDefinition, userClaudeDir, type AgentDefinition } from './agent-definitions.js';
-import { assessInherited, assessModelRequest, inheritsSessionModel, type InheritCheck } from './models.js';
+import { BUILTIN_AGENT_TYPES, describeAgentLookup, effortReason, missingAgentDetail, readAgentDefinition, userClaudeDir, type AgentDefinition } from './agent-definitions.js';
+import { assessInherited, assessModelRequest, inheritsSessionModel, modelSourceNote, subagentModelCandidates, type InheritCheck } from './models.js';
 
 /** Largest script (inline or file) the guard will parse. Bigger asks. */
 export const MAX_SCRIPT_BYTES = 512 * 1024;
@@ -160,7 +165,8 @@ export function fsResolver(cwd: string | undefined): WorkflowResolver {
 
 type Finding =
   | { kind: 'model'; model: string; where: string; line: number; col: number }
-  | { kind: 'agentType'; agentType: string; line: number; col: number }
+  /** `modelSet`: the call also names a model, which wins over the definition's (only its effort is read then). */
+  | { kind: 'agentType'; agentType: string; modelSet: boolean; line: number; col: number }
   /** A literal `effort` in agent() options (interim threshold, see EFFORT_ASK). */
   | { kind: 'effort'; effort: string; line: number; col: number }
   /** An agent() call that names no model of its own: it runs on the session model. */
@@ -329,8 +335,8 @@ function analyseOptions(opts: Node, out: Finding[], ctx: Bindings): void {
       }
     }
   }
-  // An explicit model wins over the agent definition's, as for the Agent tool.
-  if (agentTypeNode && !modelSeen) out.push({ kind: 'agentType', agentType: agentTypeNode.value, ...pos(agentTypeNode.node) });
+  // An explicit model wins over the agent definition's, as for the Agent tool; the definition's effort applies either way.
+  if (agentTypeNode) out.push({ kind: 'agentType', agentType: agentTypeNode.value, modelSet: modelSeen, ...pos(agentTypeNode.node) });
 }
 
 function analyseAgentCall(call: Node, out: Finding[], ctx: Bindings): void {
@@ -833,34 +839,38 @@ function parseFindings(script: string): Finding[] {
 
 const PHASE_MODEL_WHAT = 'meta.phases model (in Claude Code this is only a progress-display hint, but it is ranked in case that changes):';
 
-/**
- * INTERIM threshold, chosen by the user with no spec behind it (docs/rfc/007-subagent-effort-bounding.md):
- * a literal `effort` at these levels asks. The levels below them pass; any other literal asks.
- */
-const EFFORT_ASK = new Set(['xhigh', 'max']);
-const EFFORT_PASS = new Set(['low', 'medium', 'high']);
-
-/** The ask reason for a literal `effort`, or null when it passes. */
-function effortReason(effort: string): string | null {
-  if (EFFORT_ASK.has(effort)) {
-    return `agent() call: effort ${JSON.stringify(effort)} is above the interim effort threshold (xhigh and max ask; low, medium and high pass). The model ceiling does not bound effort, so this needs your approval.`;
-  }
-  if (EFFORT_PASS.has(effort)) return null;
-  return `agent() call: effort ${JSON.stringify(effort)} is not a level Jev recognises (low, medium, high, xhigh, max), so it cannot be checked.`;
+/** Rank one model (null: the session model) against the session model, or the project ceiling when it inherits. */
+function assessOne(requested: string | null | undefined, session: string | null, inherit: InheritCheck | null) {
+  // A model that means "the session model" is ranked against the project ceiling when there is one.
+  return inherit && inheritsSessionModel(requested) ? assessInherited(inherit) : assessModelRequest(requested, session);
 }
 
+/** A `meta.phases[].model`: only a progress-display hint, so it is ranked as written and no environment override applies. */
+function hintSite(file: string, f: { line: number; col: number }, requested: string, session: string | null, inherit: InheritCheck | null): CallSite | null {
+  const a = assessOne(requested, session, inherit);
+  if (a.kind === 'allowed') return null;
+  return { file, line: f.line, col: f.col, reason: `${PHASE_MODEL_WHAT} ${a.reason}` };
+}
+
+/**
+ * An agent() call's model: the call's own, else its definition's, else the environment's
+ * (CLAUDE_CODE_SUBAGENT_MODEL), with CLAUDE_CODE_SUBAGENT_MODEL_FORCE and
+ * CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL replacing the first two (see `subagentModelCandidates`).
+ * Every model the call can run on is ranked.
+ */
 function modelSite(
   file: string,
   f: { line: number; col: number },
-  requested: string | null,
+  requested: { call?: string; definition?: string | null },
   session: string | null,
   what: string,
   inherit: InheritCheck | null = null
 ): CallSite | null {
-  // A model that means "the session model" is ranked against the project ceiling when there is one.
-  const a = inherit && inheritsSessionModel(requested) ? assessInherited(inherit) : assessModelRequest(requested, session);
-  if (a.kind === 'allowed') return null;
-  return { file, line: f.line, col: f.col, reason: `${what} ${a.reason}` };
+  for (const c of subagentModelCandidates({ ...requested, workflow: true })) {
+    const a = assessOne(c.model, session, inherit);
+    if (a.kind !== 'allowed') return { file, line: f.line, col: f.col, reason: `${what} ${a.reason}${modelSourceNote(c.source)}` };
+  }
+  return null;
 }
 
 /**
@@ -889,17 +899,17 @@ export function checkScriptText(
         sites.push({ file: label, line: f.line, col: f.col, reason: f.reason });
         break;
       case 'model': {
-        const s = modelSite(label, f, f.model, sessionModel, f.where === 'model' ? 'agent() call:' : PHASE_MODEL_WHAT, inherit);
+        const s = f.where === 'model' ? modelSite(label, f, { call: f.model }, sessionModel, 'agent() call:', inherit) : hintSite(label, f, f.model, sessionModel, inherit);
         if (s) sites.push(s);
         break;
       }
       case 'effort': {
-        const reason = effortReason(f.effort);
+        const reason = effortReason(f.effort, 'agent() call');
         if (reason) sites.push({ file: label, line: f.line, col: f.col, reason });
         break;
       }
       case 'inherit': {
-        const s = modelSite(label, f, null, sessionModel, 'agent() call with no model:', inherit);
+        const s = modelSite(label, f, {}, sessionModel, 'agent() call with no model:', inherit);
         if (s) sites.push(s);
         break;
       }
@@ -907,13 +917,20 @@ export function checkScriptText(
         // A built-in type has no definition file and runs on the session model, as in the Agent guard;
         // a definition file with the same name still wins.
         const looked = resolver.agentDefinition(f.agentType);
-        const def = !looked.found && BUILTIN_AGENT_TYPES.has(f.agentType) ? { found: true, model: null } : looked;
+        const def: AgentDefinition = !looked.found && BUILTIN_AGENT_TYPES.has(f.agentType) ? { found: true, model: null } : looked;
         if (!def.found) {
+          // An explicit model decides the model; without a definition there is no effort to read either.
+          if (f.modelSet) break;
           const lookup = resolver.describeLookup?.() ?? 'no agent definition directory (nothing is searched)';
           sites.push({ file: label, line: f.line, col: f.col, reason: `agentType ${JSON.stringify(f.agentType)} is not an agent Jev can read: ${missingAgentDetail(lookup)}` });
         } else {
-          const s = modelSite(label, f, def.model, sessionModel, `agentType "${f.agentType}" definition:`, inherit);
-          if (s) sites.push(s);
+          if (!f.modelSet) {
+            const s = modelSite(label, f, { definition: def.model }, sessionModel, `agentType "${f.agentType}" definition:`, inherit);
+            if (s) sites.push(s);
+          }
+          // The definition's own effort applies whatever model the call names (the call's literal `effort` is checked on its own finding).
+          const reason = def.effort === undefined || def.effort === null ? null : effortReason(def.effort, `agentType "${f.agentType}" definition`);
+          if (reason) sites.push({ file: label, line: f.line, col: f.col, reason });
         }
         break;
       }

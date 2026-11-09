@@ -13,8 +13,8 @@
  * Everything else Jev does for a turn (advice, dispatch, telemetry) is advice from the MCP tools.
  */
 import { modelTierRank } from './core/governance.js';
-import { BUILTIN_AGENT_TYPES, describeAgentLookup, missingAgentDetail, readAgentDefinition } from './agent-definitions.js';
-import { assessInherited, assessModelRequest, inheritsSessionModel, type InheritCheck } from './models.js';
+import { BUILTIN_AGENT_TYPES, describeAgentLookup, effortReason, missingAgentDetail, readAgentDefinition } from './agent-definitions.js';
+import { assessInherited, assessModelRequest, callSetsModel, inheritsSessionModel, modelSourceNote, readSubagentModelEnv, subagentModelCandidates, type InheritCheck, type ModelSource, type SubagentModelEnv } from './models.js';
 import { evaluateWorkflowInput, type ScriptFact } from './workflow-guard.js';
 import { resolveSessionModel, sessionModelFromTranscript, type SessionModel, type SessionModelSource } from './session-model.js';
 import { lowerModel } from './project-config.js';
@@ -70,46 +70,98 @@ export interface AgentCall {
   prompt?: string;
   subagent_type?: string;
   model?: string;
+  /** The reasoning effort for this call: a level (`low` to `max`) or, on newer Claude Code, `lower`/`higher`. */
+  effort?: unknown;
+}
+
+/** What else the Agent decision reads besides the call, its definition's model and the session model. */
+export interface AgentDecisionContext {
+  /** The `effort:` of the subagent's definition (agent-definitions.ts), when it has one. */
+  definitionEffort?: string | null;
+  /** The subagent-model environment variables; default: this process's (models.ts). */
+  env?: SubagentModelEnv;
 }
 
 /** Rank from which a model counts as Pro tier on Antigravity (opus and above). */
 const STRONG_RANK = 3;
 
 /**
- * Claude Code Agent/Task call: ask when the model the subagent will run on is above the session's.
- * That is the call's own `model`, or, when the call sets none, the `model` in the subagent's
- * definition file. "inherit" or no model runs on the session model, so it passes, unless a project
- * ceiling is set (`inherit`): then the session model is ranked against the ceiling.
+ * Claude Code Agent/Task call: ask when the model the subagent will run on is above the session's,
+ * or when its effort is above the interim threshold.
  *
- * Ranking is version-aware (see models.ts). Equal or lower passes silently. A requested model Jev
- * cannot rank, or a session model that is unknown, asks.
+ * Model: the call's own `model`, or, when the call sets none, the `model` in the subagent's
+ * definition file, or, when that sets none either, `CLAUDE_CODE_SUBAGENT_MODEL`. With
+ * `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` on, that variable's model replaces the call's and the
+ * definition's, so a forced model is ranked like any other and never bypasses the ceiling
+ * (`subagentModelCandidates`, models.ts). "inherit" or no model runs on the session model, so it
+ * passes, unless a project ceiling is set (`inherit`): then the session model is ranked against the
+ * ceiling. Ranking is version-aware (see models.ts). Equal or lower passes silently. A requested
+ * model Jev cannot rank, or a session model that is unknown, asks.
+ *
+ * Effort: the call's `effort` and the definition's `effort:` (`ctx.definitionEffort`) are each
+ * checked with `effortReason`, the same threshold the Workflow guard applies (RFC 007, interim).
  */
 export function decideClaudeAgentCall(
   call: AgentCall,
   sessionModel: string | null,
   definitionModel: string | null = null,
   sessionModelSource: SessionModelSource = 'none',
-  inherit: InheritCheck | null = null
+  inherit: InheritCheck | null = null,
+  ctx: AgentDecisionContext = {}
 ): Verdict | null {
-  const model = call.model !== undefined ? call.model : definitionModel;
-  // A call that runs on the session model is ranked against the project ceiling when there is one.
-  const assessment = inherit && inheritsSessionModel(model) ? assessInherited(inherit) : assessModelRequest(model, sessionModel);
-  if (assessment.kind === 'allowed') return null;
-  const advice =
-    assessment.kind === 'escalation'
-      ? 'Approve to run it on the stronger model, or deny and re-run it on the session model or a cheaper one.'
-      : 'Approve to run it, or deny and re-run it on a model Jev can rank.';
+  const candidates = subagentModelCandidates({ call: call.model, definition: definitionModel }, ctx.env ?? readSubagentModelEnv());
+  let failed: { assessment: Exclude<ReturnType<typeof assessModelRequest>, { kind: 'allowed' }>; source: ModelSource; model: string | null | undefined } | null = null;
+  for (const c of candidates) {
+    // A call that runs on the session model is ranked against the project ceiling when there is one.
+    const a = inherit && inheritsSessionModel(c.model) ? assessInherited(inherit) : assessModelRequest(c.model, sessionModel);
+    if (a.kind !== 'allowed') {
+      failed = { assessment: a, source: c.source, model: c.model };
+      break;
+    }
+  }
+  const effortReasons: string[] = [];
+  if (call.effort !== undefined) {
+    const r = effortReason(call.effort, 'Agent call', true);
+    if (r) effortReasons.push(r);
+  }
+  if (ctx.definitionEffort !== undefined && ctx.definitionEffort !== null) {
+    const r = effortReason(ctx.definitionEffort, `the definition of "${call.subagent_type}"`);
+    if (r) effortReasons.push(r);
+  }
+  if (failed === null && effortReasons.length === 0) return null;
+  const reasons = [...(failed ? [failed.assessment.reason + modelSourceNote(failed.source)] : []), ...effortReasons.map((r) => r.replace(/\.$/, ''))];
+  const advice = [
+    ...(failed
+      ? [
+          failed.assessment.kind === 'escalation'
+            ? 'Approve to run it on the stronger model, or deny and re-run it on the session model or a cheaper one.'
+            : 'Approve to run it, or deny and re-run it on a model Jev can rank.'
+        ]
+      : []),
+    ...(effortReasons.length > 0 ? ['Approve to run it at that effort, or deny and re-run it at a lower one.'] : [])
+  ];
+  const shown = failed ?? { source: candidates[0].source, model: candidates[0].model };
   return {
     decision: 'ask',
-    reason: `[jev] This delegation needs approval: ${assessment.reason}. ${advice}`,
-    audit: { kind: assessment.kind, requested: model ?? null, sessionModel, sessionModelSource }
+    reason: `[jev] This delegation needs approval: ${reasons.join('; ')}. ${advice.join(' ')}`,
+    audit: {
+      kind: failed ? failed.assessment.kind : 'effort',
+      requested: shown.model ?? null,
+      modelSource: shown.source,
+      sessionModel,
+      sessionModelSource,
+      ...(effortReasons.length > 0
+        ? { effort: { call: call.effort === undefined ? null : typeof call.effort === 'string' ? call.effort : typeof call.effort, definition: ctx.definitionEffort ?? null } }
+        : {})
+    }
   };
 }
 
 /**
- * A call with no `model` runs on its subagent's definition. When the type is not a built-in and no
- * definition can be found, its model cannot be read, so ask (the Workflow guard does the same). No
- * `subagent_type` is the general-purpose default and passes.
+ * A call with no `model` runs on its subagent's definition (or, with CLAUDE_CODE_SUBAGENT_MODEL_FORCE
+ * on, on the forced model, so the definition is moot and nothing is asked). When the type is not a
+ * built-in and no definition can be found, its model cannot be read, so ask (the Workflow guard does
+ * the same). No `subagent_type` is the general-purpose default and passes.
  */
 function unknownAgentVerdict(call: AgentCall, cwd: string | undefined): Verdict | null {
   const type: unknown = call.subagent_type;
@@ -201,13 +253,14 @@ export function evaluateClaude(input: any, sink?: GuardContext): Verdict | null 
   const session = resolveSessionModel(input);
   const effective = ceilingFor(session, sink);
   const facts = { tool_name: input.tool_name, session_id: input.session_id, ...(sink?.projectCeiling ? { projectCeiling: sink.projectCeiling } : {}) };
-  let definitionModel: string | null = null;
-  if (call.model === undefined) {
+  const env = readSubagentModelEnv();
+  if (!callSetsModel(call.model) && !env.force) {
     const unknown = unknownAgentVerdict(call, input.cwd);
     if (unknown) return { ...unknown, audit: { ...unknown.audit, ...facts } };
-    definitionModel = agentDefinitionModel(call.subagent_type, input.cwd);
   }
-  const verdict = decideClaudeAgentCall(call, effective.model, definitionModel, session.source, effective.inherit);
+  // The definition is read whatever the call's model: its `effort:` applies either way.
+  const definition = readAgentDefinition(call.subagent_type, input.cwd);
+  const verdict = decideClaudeAgentCall(call, effective.model, definition.model, session.source, effective.inherit, { definitionEffort: definition.effort, env });
   return verdict ? { ...verdict, reason: verdict.reason + effective.note, audit: { ...verdict.audit, ...facts } } : null;
 }
 

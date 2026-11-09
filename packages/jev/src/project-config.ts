@@ -130,9 +130,10 @@ const MODE_RANK: Record<JevMode, number> = { off: 0, 'on-demand': 1, on: 2 };
 /**
  * Read and validate the project config that applies to `startDir`, for `harness`. Never throws.
  *
- * EVERY file from the cwd up to the project root counts, so a nested file can never cancel an
- * ancestor's ceiling: the lowest valid ceiling and the highest mode across them win, and one
- * malformed file anywhere on the way makes the whole result malformed (the nearest malformed file
+ * EVERY file from the cwd up to the FILESYSTEM root counts (not just the project or git root), plus the
+ * ones above `CLAUDE_PROJECT_DIR` and, in a linked git worktree, above the main checkout (see
+ * `findProjectConfigs`), so a nested file can never cancel an ancestor's ceiling: the lowest valid
+ * ceiling and the highest mode across them win, and one malformed file anywhere on the way makes the whole result malformed (the nearest malformed file
  * is the one reported). `file` is the file the effective ceiling came from, else the nearest file.
  */
 export function inspectProjectConfig(startDir: string | undefined, harness: JevHarness = 'claude-code'): ProjectConfig {

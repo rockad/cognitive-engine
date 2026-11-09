@@ -23,7 +23,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { parseFrontmatterFields, readClaudeCodeName, unreadableModelValue } from './agent-frontmatter.js';
+import { parseFrontmatterFields, readClaudeCodeName, unreadableEffortValue, unreadableModelValue } from './agent-frontmatter.js';
 import { projectDirs } from './project-root.js';
 
 export interface AgentDefinition {
@@ -34,12 +34,50 @@ export interface AgentDefinition {
    * frontmatter whose model cannot be established is reported as a value Jev cannot rank.
    */
   model: string | null;
+  /**
+   * The `effort:` from the first definition found, as written; absent when it sets none. Like `model`,
+   * an effort that cannot be established is reported as a value that is no effort level, so every
+   * caller asks (see `effortReason`).
+   */
+  effort?: string;
 }
 
 /** Claude Code's built-in subagent types: they have no definition file and run on the session model. */
 export const BUILTIN_AGENT_TYPES: ReadonlySet<string> = new Set(['general-purpose', 'Explore', 'Plan', 'statusline-setup', 'claude-code-guide', 'claude']);
 
-const SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/;
+/**
+ * INTERIM threshold on a subagent's reasoning effort, chosen by the user with no spec behind it
+ * (docs/rfc/007-subagent-effort-bounding.md): `xhigh` and `max` ask, `low`, `medium` and `high` pass,
+ * anything else cannot be checked and asks. Shared by the Agent guard (the call's `effort` and the
+ * definition's) and the Workflow guard (an `agent()` option and the definition's), so the two cannot
+ * disagree on the same input.
+ */
+const EFFORT_ASK: ReadonlySet<string> = new Set(['xhigh', 'max']);
+const EFFORT_PASS: ReadonlySet<string> = new Set(['low', 'medium', 'high']);
+
+/**
+ * The ask reason for one `effort` value, or null when it passes. `what` names where it came from
+ * (`agent() call`, `Agent call`, `the definition of "x"`). `relative` is for the Agent tool, whose
+ * `effort` also takes `lower` and `higher` (one step from the effort the agent would otherwise run
+ * at): `lower` can only reduce it and passes; `higher` is relative to the session effort, which the
+ * guard does not read, so it asks.
+ */
+export function effortReason(effort: unknown, what: string, relative = false): string | null {
+  if (typeof effort !== 'string') {
+    return `${what}: effort is ${effort === null ? 'null' : `a ${typeof effort}`}, not a string, so it cannot be checked.`;
+  }
+  if (EFFORT_ASK.has(effort)) {
+    return `${what}: effort ${JSON.stringify(effort)} is above the interim effort threshold (xhigh and max ask; low, medium and high pass). The model ceiling does not bound effort, so this needs your approval.`;
+  }
+  if (EFFORT_PASS.has(effort)) return null;
+  if (relative && effort === 'lower') return null;
+  if (relative && effort === 'higher') {
+    return `${what}: effort "higher" is one step above the session effort, which Jev does not read, so it cannot be checked against the interim threshold.`;
+  }
+  return `${what}: effort ${JSON.stringify(effort)} is not a level Jev recognises (low, medium, high, xhigh, max), so it cannot be checked.`;
+}
+
+const SEGMENT =/^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/;
 
 /** Parse `name` or `plugin:name` into its parts, or null for anything else. */
 function parseAgentName(subagentType: unknown): { plugin: string | null; agent: string } | null {
@@ -155,7 +193,7 @@ export function missingAgentDetail(lookup: string): string {
   return `no definition for it could be found, so the model it will run on cannot be checked against the session ceiling. Looked in ${lookup}.`;
 }
 
-/** A definition's model as a comparable string: none and `inherit` are the same, case does not matter. */
+/** A definition's model or effort as a comparable string: none and `inherit` are the same, case does not matter. */
 function modelKey(model: string | null): string {
   const m = model === null ? '' : model.trim().toLowerCase();
   return m === '' ? 'inherit' : m;
@@ -216,7 +254,7 @@ function listMarkdown(root: string): { files: string[]; truncated: boolean } | n
 type DirScan =
   | { kind: 'none' }
   | { kind: 'conflict'; reason: string }
-  | { kind: 'def'; file: string; model: string | null; unreadable: boolean };
+  | { kind: 'def'; file: string; model: string | null; effort: string | null; unreadable: boolean };
 
 /**
  * The definition of `agent` in ONE agents directory, as Claude Code would register it: every `.md`
@@ -233,7 +271,7 @@ type DirScan =
 function scanAgentDir(dir: string, agent: string): DirScan {
   const listing = listMarkdown(dir);
   if (listing === null) return { kind: 'none' };
-  const claims: Array<{ file: string; model: string | null; unreadable: boolean }> = [];
+  const claims: Array<{ file: string; model: string | null; effort: string | null; unreadable: boolean }> = [];
   const conflicts: string[] = [];
   if (listing.truncated) conflicts.push(`${dir} holds more agent files than Jev reads (${MAX_AGENT_FILES}), or nests deeper than ${MAX_AGENT_DEPTH} levels`);
   for (const file of listing.files) {
@@ -248,11 +286,12 @@ function scanAgentDir(dir: string, agent: string): DirScan {
     } catch {
       continue; // not readable: not a definition (as before)
     }
-    const { model, name } = parseFrontmatterFields(text);
+    const { model, name, effort } = parseFrontmatterFields(text);
     const claim = () => ({
       file,
-      unreadable: model.kind === 'unreadable',
-      model: model.kind === 'unreadable' ? unreadableModelValue(model.reason) : model.kind === 'model' ? model.value : null
+      unreadable: model.kind === 'unreadable' || effort.kind === 'unreadable',
+      model: model.kind === 'unreadable' ? unreadableModelValue(model.reason) : model.kind === 'model' ? model.value : null,
+      effort: effort.kind === 'unreadable' ? unreadableEffortValue(effort.reason) : effort.kind === 'effort' ? effort.value : null
     });
     if (name.kind === 'name') {
       if (name.value === agent) claims.push(claim());
@@ -271,9 +310,14 @@ function scanAgentDir(dir: string, agent: string): DirScan {
   if (conflicts.length > 0) return { kind: 'conflict', reason: `${conflicts.join('; ')}` };
   if (claims.length === 0) return { kind: 'none' };
   if (claims.length > 1) {
-    return { kind: 'conflict', reason: `more than one file in ${dir} defines "${agent}", and which one Claude Code runs is not known: ${claims.map((c) => `${c.file} (${c.model ?? 'no model'})`).join(' vs ')}` };
+    return { kind: 'conflict', reason: `more than one file in ${dir} defines "${agent}", and which one Claude Code runs is not known: ${claims.map((c) => `${c.file} (${c.model ?? 'no model'}, ${c.effort ?? 'no effort'})`).join(' vs ')}` };
   }
   return { kind: 'def', ...claims[0] };
+}
+
+/** `effort` is left off a definition that sets none, so a definition without one has the same shape as before. */
+function withEffort(def: AgentDefinition, effort: string | null): AgentDefinition {
+  return effort === null ? def : { ...def, effort };
 }
 
 export function readAgentDefinition(subagentType: string | undefined, cwd: string | undefined): AgentDefinition {
@@ -290,25 +334,23 @@ export function readAgentDefinition(subagentType: string | undefined, cwd: strin
   // subdirectory of the project must not shadow the root's for the guard alone. Every project-level
   // definition of the name is therefore read, and when they disagree on the model the answer is the
   // unrankable "conflict" value, which makes both guards ask.
-  const project: Array<{ file: string; model: string | null; unreadable: boolean }> = [];
+  const project: Array<{ file: string; model: string | null; effort: string | null; unreadable: boolean }> = [];
   for (const dir of agentLookupDirs(subagentType, cwd)) {
     const inProject = projectDirSet.has(dir);
     if (project.length > 0 && !inProject) break; // past the project: the project definition decided
     const scan = scanAgentDir(dir, parsed.agent);
     if (scan.kind === 'none') continue; // no definition here
-    if (scan.kind === 'conflict') return { found: true, model: unreadableModelValue(scan.reason) };
-    if (!inProject) return { found: true, model: scan.model };
+    if (scan.kind === 'conflict') return { found: true, model: unreadableModelValue(scan.reason), effort: unreadableEffortValue(scan.reason) };
+    if (!inProject) return withEffort({ found: true, model: scan.model }, scan.effort);
     project.push(scan);
   }
   if (project.length === 0) return result;
   const [first, ...others] = project;
-  const differing = others.filter((o) => o.unreadable || first.unreadable || modelKey(o.model) !== modelKey(first.model));
-  if (differing.length === 0) return { found: true, model: first.model };
-  const describeOne = (d: { file: string; model: string | null }) => `${d.file} (${d.model ?? 'no model'})`;
-  return {
-    found: true,
-    model: unreadableModelValue(
-      `the project defines "${parsed.agent}" in more than one place with different models, and which one Claude Code runs is not known: ${[first, ...differing].map(describeOne).join(' vs ')}`
-    )
-  };
+  const differing = others.filter(
+    (o) => o.unreadable || first.unreadable || modelKey(o.model) !== modelKey(first.model) || modelKey(o.effort) !== modelKey(first.effort)
+  );
+  if (differing.length === 0) return withEffort({ found: true, model: first.model }, first.effort);
+  const describeOne = (d: { file: string; model: string | null; effort: string | null }) => `${d.file} (${d.model ?? 'no model'}, ${d.effort ?? 'no effort'})`;
+  const why = `the project defines "${parsed.agent}" in more than one place with different models or efforts, and which one Claude Code runs is not known: ${[first, ...differing].map(describeOne).join(' vs ')}`;
+  return { found: true, model: unreadableModelValue(why), effort: unreadableEffortValue(why) };
 }

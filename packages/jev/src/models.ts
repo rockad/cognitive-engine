@@ -142,3 +142,95 @@ export function assessInherited(check: InheritCheck): ModelAssessment {
   }
   return { kind: 'allowed' };
 }
+
+// ── Environment overrides of the subagent model ───────────────────────────────────────────────────
+//
+// Claude Code lets the environment set the model of a subagent: `CLAUDE_CODE_SUBAGENT_MODEL` (the
+// default for subagents that name no model), `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` (that model replaces
+// the call's and the definition's) and, for agents spawned inside a Workflow,
+// `CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL`. The guard reads the hook process's environment, which is the
+// one Claude Code runs with. Precedence below was read from the Claude Code 2.1.321 binary; the public
+// documentation may order the plain (unforced) variable differently, so treat it as version-bound.
+
+/** The subagent-model variables as the hook process sees them. `null` means unset, empty or `inherit`. */
+export interface SubagentModelEnv {
+  /** `CLAUDE_CODE_SUBAGENT_MODEL`. */
+  model: string | null;
+  /** `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` is truthy (`1`, `true`, `yes`, `on`, as Claude Code reads it). */
+  force: boolean;
+  /** `CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL`. */
+  workflowModel: string | null;
+}
+
+const envModel = (v: string | undefined): string | null => {
+  const m = v?.trim() ?? '';
+  return m === '' || m.toLowerCase() === 'inherit' ? null : m;
+};
+
+export function readSubagentModelEnv(env: Readonly<Record<string, string | undefined>> = process.env): SubagentModelEnv {
+  return {
+    model: envModel(env.CLAUDE_CODE_SUBAGENT_MODEL),
+    force: ['1', 'true', 'yes', 'on'].includes((env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE ?? '').trim().toLowerCase()),
+    workflowModel: envModel(env.CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL)
+  };
+}
+
+export type ModelSource = 'call' | 'definition' | 'env' | 'env-forced' | 'workflow-env' | 'session';
+
+/** A model a subagent may run on, and where it comes from. `model` null means the session model. */
+export interface ModelCandidate {
+  model: string | null | undefined;
+  source: ModelSource;
+}
+
+/** True when a call's `model` is set to something: Claude Code reads an empty or null one as unset. */
+export function callSetsModel(model: unknown): boolean {
+  return model !== undefined && model !== null && !(typeof model === 'string' && model.trim() === '');
+}
+
+/**
+ * Every model a subagent call can run on, given what the call, its definition and the environment
+ * say. Every candidate must be ranked; the list has one entry except when two forced sources
+ * disagree about which wins (a Workflow agent with both a workflow model and a forced model set).
+ *
+ * - Workflow agents: `CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL` replaces the call's and the definition's
+ *   model.
+ * - `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` on: the forced model replaces the call's and the definition's;
+ *   only an explicit `model: "inherit"` on the call still gives the session model. With no model
+ *   set, the session model.
+ * - Otherwise: the call's model, else the definition's (an explicit `inherit` there is the session
+ *   model, not the variable), else `CLAUDE_CODE_SUBAGENT_MODEL`, else the session model.
+ */
+export function subagentModelCandidates(
+  input: { call?: unknown; definition?: string | null; workflow?: boolean },
+  env: SubagentModelEnv = readSubagentModelEnv()
+): ModelCandidate[] {
+  if (input.workflow && env.workflowModel) {
+    const out: ModelCandidate[] = [{ model: env.workflowModel, source: 'workflow-env' }];
+    if (env.force && env.model && env.model !== env.workflowModel) out.push({ model: env.model, source: 'env-forced' });
+    return out;
+  }
+  if (env.force) {
+    if (typeof input.call === 'string' && input.call.trim().toLowerCase() === 'inherit') return [{ model: null, source: 'call' }];
+    return env.model ? [{ model: env.model, source: 'env-forced' }] : [{ model: null, source: 'session' }];
+  }
+  if (callSetsModel(input.call)) return [{ model: input.call as string, source: 'call' }];
+  if (input.definition !== undefined && input.definition !== null && input.definition.trim() !== '') {
+    return [{ model: input.definition, source: 'definition' }];
+  }
+  return env.model ? [{ model: env.model, source: 'env' }] : [{ model: null, source: 'session' }];
+}
+
+/** The clause an ask reason adds when the model being ranked came from the environment, else ''. */
+export function modelSourceNote(source: ModelSource): string {
+  switch (source) {
+    case 'env-forced':
+      return ' (CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on, so the subagent runs on CLAUDE_CODE_SUBAGENT_MODEL and the call\'s own model is ignored)';
+    case 'env':
+      return ' (this is CLAUDE_CODE_SUBAGENT_MODEL, which applies because neither the call nor its definition sets a model)';
+    case 'workflow-env':
+      return ' (this is CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL, which replaces the model of every agent in a workflow)';
+    default:
+      return '';
+  }
+}

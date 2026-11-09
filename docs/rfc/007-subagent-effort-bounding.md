@@ -15,13 +15,19 @@ The tier-ceiling design in RFC 002 bounds which model a subagent runs on. It nev
 
 ## 2. Current interim behaviour
 
-The Workflow guard (`packages/jev/src/workflow-guard.ts`) reads a literal `effort` in `agent()` options:
+Both guards apply one function, `effortReason` (`packages/jev/src/agent-definitions.ts`), to every effort they can read:
+
+- The Workflow guard (`workflow-guard.ts`) reads a literal `effort` in `agent()` options and the `effort:` of an `agentType`'s definition.
+- The Agent guard (`guard.ts`) reads the call's `effort` and the `effort:` of the subagent's definition (the strict frontmatter reader in `agent-frontmatter.ts`, cross-checked against Claude Code's own parser, as for `model`).
+
+The threshold:
 
 - `xhigh` and `max` ask.
 - `low`, `medium` and `high` pass.
-- Any other literal, or a non-literal value (variable, expression, spread), is unverifiable and asks, as `model` is treated.
+- On the Agent tool only, `lower` passes (one step below an effort the agent would otherwise run at, so it cannot raise it) and `higher` asks (one step above the session effort, which the guard does not read).
+- Any other literal, a value that is not a string (including an integer in a definition), or a non-literal value in a workflow (variable, expression, spread), is unverifiable and asks, as `model` is treated.
 
-This threshold is an interim choice made by the user. There is no specification behind it. The direct `Agent` guard does not read effort at all.
+This threshold is an interim choice made by the user. There is no specification behind it. `CLAUDE_CODE_SUBAGENT_EFFORT` (the environment default for subagent effort) is not read, and the precedence between the call's effort, the definition's and the environment's is not modelled: the guard asks when either the call's or the definition's effort is above the threshold.
 
 ## 3. What a proper plan must decide
 

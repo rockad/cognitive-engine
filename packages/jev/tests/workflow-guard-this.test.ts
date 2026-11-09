@@ -1,3 +1,4 @@
+import './clear-subagent-env.ts';
 import { describe, it, expect } from 'bun:test';
 import { checkScriptText } from '../src/workflow-guard.ts';
 
