@@ -10,7 +10,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 export interface ClaudeDecisionRecord {
-  event: 'ask' | 'model_change' | 'config_malformed' | 'workflow_changed' | 'advice';
+  event: 'ask' | 'model_change' | 'config_malformed' | 'workflow_changed' | 'advice' | 'agent_call';
   [key: string]: unknown;
 }
 

@@ -24,12 +24,13 @@ describe('claude plugin bundle', () => {
     expect(hooks.PostToolUse[0].hooks[0].command).toContain('record-hook.ts" PostToolUse');
     expect(hooks.SessionStart[0].hooks[0].command).toContain('record-hook.ts" SessionStart');
     expect(hooks.PostModelSwitch[0].hooks[0].command).toContain('record-hook.ts" PostModelSwitch');
-    expect(hooks.PreToolUse.map((e: any) => e.matcher)).toEqual(['Agent|Task', 'Workflow']);
+    expect(hooks.PreToolUse.map((e: any) => e.matcher)).toEqual(['Agent|Task', 'Workflow', 'Agent|Task|Workflow']);
     expect(hooks.PreToolUse[0].hooks[0].command).toContain('packages/jev/src/hook.ts" claude');
   });
 
-  it('registers the jev stdio server', () => {
+  it('registers the jev stdio server and tells it which harness it serves', () => {
     expect(mcp.mcpServers.jev.command).toBe('bun');
+    expect(mcp.mcpServers.jev.env).toEqual({ JEV_HARNESS: 'claude-code' });
     expect(mcp.mcpServers.jev.args.at(-1)).toBe('${COGNITIVE_ENGINE_HOME}/packages/jev/src/index.ts');
   });
 

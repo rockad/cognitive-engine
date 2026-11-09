@@ -6,16 +6,26 @@ const root = path.resolve(import.meta.dir, '..');
 const { hooks } = JSON.parse(fs.readFileSync(path.join(root, 'hooks', 'hooks.json'), 'utf8'));
 
 const handlers = (event: string): any[] => hooks[event].flatMap((entry: any) => entry.hooks);
+// The PreToolUse entries that guard (hook.ts), as opposed to the advisory one (advisor-hook.ts).
+const guardEntries = (): any[] => hooks.PreToolUse.filter((e: any) => e.hooks.every((h: any) => h.command.includes('src/hook.ts" claude')));
+const guardHandlers = (): any[] => guardEntries().flatMap((e: any) => e.hooks);
 
 describe('hooks.json failure policy', () => {
   it('guards the Agent|Task and Workflow tools with the same hook', () => {
-    const matchers = hooks.PreToolUse.map((e: any) => e.matcher);
-    expect(matchers).toEqual(['Agent|Task', 'Workflow']);
-    for (const h of handlers('PreToolUse')) expect(h.command).toContain('packages/jev/src/hook.ts" claude');
+    expect(guardEntries().map((e: any) => e.matcher)).toEqual(['Agent|Task', 'Workflow']);
+    for (const h of guardHandlers()) expect(h.command).toContain('packages/jev/src/hook.ts" claude');
   });
 
   it('every guard entry blocks on hook failure', () => {
-    for (const h of handlers('PreToolUse')) expect(h.onFailure).toBe('block');
+    expect(guardHandlers()).toHaveLength(2);
+    for (const h of guardHandlers()) expect(h.onFailure).toBe('block');
+  });
+
+  it('the pre-flight reminder sits beside the guard, fail-open, on the same tools', () => {
+    const advisory = hooks.PreToolUse.filter((e: any) => !guardEntries().includes(e));
+    expect(advisory.map((e: any) => e.matcher)).toEqual(['Agent|Task|Workflow']);
+    expect(advisory[0].hooks[0].command).toContain('advisor-hook.ts" pre-tool-use');
+    expect(advisory[0].hooks[0].onFailure).toBeUndefined();
   });
 
   it('recorder hooks stay fail-open', () => {

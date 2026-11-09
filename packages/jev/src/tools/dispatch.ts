@@ -29,6 +29,15 @@ const dispatchShape = {
   availableSubagents: z.array(z.string()).optional().describe('Optional candidate subagents (defaults to dynamically discovered workspace agents)')
 };
 
+/**
+ * The shared telemetry file labels every record `antigravity` unless told otherwise. On Claude Code
+ * the record says so, which is how the pre-flight reminder (advisor-state.ts) finds a recent
+ * dispatch call. Other harnesses keep the existing label, unchanged.
+ */
+export function telemetryHarness(): { harness?: 'claude-code' } {
+  return detectActiveHarness() === 'claude-code' ? { harness: 'claude-code' } : {};
+}
+
 export const dispatchTool = defineTool({
   name: 'jev_dispatch',
   description: 'Intelligently route a task to the optimal subagent and model tier ("openrouter_free" | "flash_lite" | "flash" | "pro") in a single ~800ms decision call using TypeSafe Jev. "pro" tier models require explicit manual user approval before invocation.',
@@ -156,7 +165,7 @@ export async function handleDispatchTool(args: ToolInput<typeof dispatchShape>):
       confidence = Math.min(saAnswer?.confidence ?? 0.85, tierAnswer?.confidence ?? 0.85);
     } catch (fallbackErr: any) {
       const latencyMs = Math.round(performance.now() - start);
-      await logTelemetry({ tool: 'jev_dispatch', status: 'error', error: String(fallbackErr), latencyMs });
+      await logTelemetry({ tool: 'jev_dispatch', status: 'error', error: String(fallbackErr), latencyMs, ...telemetryHarness() });
       throw new Error(
         `jev_dispatch: all dispatch tiers failed. Tier 1 (Jev Decisions API) and Tier 2 (${FALLBACK_MODEL}) both unavailable. ` +
         `Last error: ${fallbackErr.message}. Ensure OPENROUTER_API_KEY is set and valid in mcp_config.json.`
@@ -223,7 +232,8 @@ export async function handleDispatchTool(args: ToolInput<typeof dispatchShape>):
   await logTelemetry({
     tool: 'jev_dispatch',
     task: task.slice(0, 100),
-    ...result
+    ...result,
+    ...telemetryHarness()
   });
 
   return {
@@ -431,7 +441,8 @@ export async function handleBatchDispatchTool(args: ToolInput<typeof batchDispat
     taskCount: plannedTasks.length,
     estimatedCostUsd: manifest.estimatedCostUsd,
     requiresUserApproval: anyProRequested,
-    latencyMs
+    latencyMs,
+    ...telemetryHarness()
   });
 
   return {

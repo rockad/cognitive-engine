@@ -1,9 +1,11 @@
 #!/usr/bin/env bun
 /**
- * Claude Code advisor hook for Jev: `bun advisor-hook.ts user-prompt-submit`, hook JSON on stdin.
+ * Claude Code advisor hook for Jev: `bun advisor-hook.ts user-prompt-submit|pre-tool-use`, hook JSON on stdin.
  *
- * Ported from the agentic-hub Jev plugin (claude/hook.ts). Registered for UserPromptSubmit in
- * adapters/claude/hooks/hooks.json. It advises subagent / model / effort through `additionalContext`.
+ * Ported from the agentic-hub Jev plugin (claude/hook.ts). Registered in adapters/claude/hooks/hooks.json:
+ * - user-prompt-submit  advises subagent / model / effort through `additionalContext`.
+ * - pre-tool-use        (Agent, Task, Workflow) logs the model requested next to the last recommendation
+ *                       and may add a pre-flight reminder. It is not the guard: it never asks or denies.
  *
  * - Active only in Jev mode "on". The PreToolUse guard (hook.ts) is separate and independent: this
  *   hook never asks, never denies and never blocks.
@@ -28,12 +30,13 @@ import {
 } from './core/index.js';
 import { appendClaudeDecision } from './claude-audit.js';
 import { resolveSessionModel } from './session-model.js';
-import { writeLastAdvice, type LastAdvice } from './advisor-state.js';
+import { STAGE_RUBRIC_TEXT } from './stage-rubric.js';
+import { hasRecentDispatch, readLastAdvice, recentAgentCalls, writeLastAdvice, type LastAdvice } from './advisor-state.js';
 import {
-  applyUserIntent,
   buildDirective,
   dispatchQuestions,
   parseUserIntent,
+  resolveModel,
   parseDispatch,
   resolveClaudeSubagentCriteria,
   isNonTaskPrompt,
@@ -52,6 +55,8 @@ export type HookInput = {
   transcript_path?: string;
   cwd?: string;
   prompt?: string;
+  tool_name?: string;
+  tool_input?: { model?: unknown; subagent_type?: unknown };
 };
 
 export type HookOutput = { hookSpecificOutput: Record<string, unknown> } | null;
@@ -107,7 +112,7 @@ export async function onUserPromptSubmit(input: HookInput, deps: HookDeps): Prom
   // A status turn ("A3 completed the run") gets no line. An instruction in the prompt always does.
   if (isStatusTurn(rec, prompt, intent)) return null;
   const sessionModel = deps.readSessionModel(input);
-  const advised = applyUserIntent(rec, intent);
+  const { advised, rule } = resolveModel({ userIntent: intent, rec, sessionModel });
   const turn = turnId(prompt);
   deps.log({
     hook: 'UserPromptSubmit',
@@ -120,6 +125,7 @@ export async function onUserPromptSubmit(input: HookInput, deps: HookDeps): Prom
     ...(advised.routerTier ? { routerTier: advised.routerTier } : {}),
     ...(advised.by ? { by: advised.by } : {}),
     recommended_model: advised.model,
+    rule,
     quota: quotaStrategy,
     sessionModel
   });
@@ -150,6 +156,64 @@ export async function onUserPromptSubmit(input: HookInput, deps: HookDeps): Prom
   };
 }
 
+// ── PreToolUse: pre-flight reminder and recommended-versus-used log (5.10) ──────────────────────
+
+export type PreToolDeps = {
+  readMode: () => Promise<JevMode>;
+  /** The last advice given in this session, to join with what is requested now. */
+  lastAdvice: (sessionId: string | null) => LastAdvice | null;
+  /** A `jev_dispatch` or `jev_batch_dispatch` call from Claude Code shows in the shared telemetry. */
+  recentDispatch: () => boolean;
+  /** This session's recent agent calls, and whether one already carried a reminder. */
+  recentAgentCalls: (sessionId: string | null) => { count: number; reminded: boolean };
+  log: (entry: Record<string, unknown>) => void;
+};
+
+/** Agent calls in the window before a lone one counts as part of a staged plan. */
+export const STAGED_AGENT_CALLS = 2;
+
+/** What the reminder says. It names the tool and the rubric and never blocks anything. */
+export function preflightReminder(toolName: string): string {
+  return (
+    `[JEV] ${toolName} is about to delegate, and no jev_dispatch or jev_batch_dispatch call from Claude Code shows in the last 30 minutes. ` +
+    `For staged work, call jev_batch_dispatch with the streams first and follow its tiers. ${STAGE_RUBRIC_TEXT} ` +
+    'This is a reminder, not a block.'
+  );
+}
+
+/**
+ * Registered for Agent, Task and Workflow, next to the guard and independent of it. It never asks,
+ * denies or blocks: its only outputs are an `agent_call` record (the model requested next to the
+ * last recommendation, joined by `turn`) and, when it looks like staged work with no dispatch call,
+ * one `additionalContext` reminder. Staged means a Workflow, or the third agent call of the session
+ * in ten minutes. A reminder is sent once per ten minutes per session, so a long run is not nagged.
+ */
+export async function onPreToolUse(input: HookInput, deps: PreToolDeps): Promise<HookOutput> {
+  const tool = input.tool_name;
+  if (tool !== 'Agent' && tool !== 'Task' && tool !== 'Workflow') return null;
+  if ((await deps.readMode()) !== 'on') return null;
+  const sessionId = typeof input.session_id === 'string' ? input.session_id : null;
+  const call = input.tool_input || {};
+  const advice = deps.lastAdvice(sessionId);
+  const recent = deps.recentAgentCalls(sessionId);
+  const staged = tool === 'Workflow' || recent.count >= STAGED_AGENT_CALLS;
+  const remind = staged && !recent.reminded && !deps.recentDispatch();
+  deps.log({
+    hook: 'PreToolUse',
+    event: 'agent_call',
+    session_id: sessionId,
+    tool_name: tool,
+    turn: advice?.turn ?? null,
+    tier: advice?.tier ?? null,
+    recommended_model: advice?.model ?? null,
+    requested_model: typeof call.model === 'string' ? call.model : null,
+    subagent_type: typeof call.subagent_type === 'string' ? call.subagent_type : null,
+    reminded: remind
+  });
+  if (!remind) return null;
+  return { hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: preflightReminder(tool) } };
+}
+
 async function liveDispatch(task: string, quotaStrategy: string, criteria?: Record<string, string>): Promise<Dispatch | null> {
   try {
     const data = await withTimeout(
@@ -176,15 +240,17 @@ async function liveDispatch(task: string, quotaStrategy: string, criteria?: Reco
 export function adviceTelemetry(entry: Record<string, unknown>): JevTelemetryEvent {
   const str = (v: unknown) => (typeof v === 'string' ? v : undefined);
   const recommended = str(entry.recommended_model);
+  // A PreToolUse record is the other half of the join: the model requested for a delegation.
+  const used = entry.hook === 'PreToolUse' ? str(entry.requested_model) : recommended;
   return {
     harness: 'claude',
     toolOrHook: String(entry.hook || 'hook'),
     sessionId: str(entry.session_id) ?? null,
     turn: str(entry.turn),
-    taskSummary: str(entry.subagent) ? `subagent: ${entry.subagent}` : undefined,
+    taskSummary: str(entry.subagent) ? `subagent: ${entry.subagent}` : str(entry.subagent_type) ? `subagent: ${entry.subagent_type}` : undefined,
     tierRecommended: str(entry.tier),
     modelRecommended: recommended,
-    modelUsed: recommended,
+    modelUsed: used,
     quotaStrategy: str(entry.quota)
   };
 }
@@ -192,7 +258,7 @@ export function adviceTelemetry(entry: Record<string, unknown>): JevTelemetryEve
 function appendLog(entry: Record<string, unknown>): void {
   try {
     // Never prompt text: the entry holds the recommendation, model names and a prompt hash only.
-    appendClaudeDecision({ ...entry, event: 'advice' });
+    appendClaudeDecision({ event: 'advice', ...entry });
     void logJevTelemetry(adviceTelemetry(entry));
   } catch {
     // logging is best-effort
@@ -215,12 +281,23 @@ const liveDeps: HookDeps = {
   egressAllowed: (cwd) => checkEgress(egressContextDirs([cwd])).allowed
 };
 
+const livePreToolDeps: PreToolDeps = {
+  readMode: () => readJevMode('claude-code'),
+  lastAdvice: readLastAdvice,
+  recentDispatch: () => hasRecentDispatch(),
+  recentAgentCalls: (sessionId) => recentAgentCalls(sessionId),
+  log: appendLog
+};
+
 async function main(event: string | undefined): Promise<void> {
   // The key is picked up the same way the MCP server and the OpenCode plugin do.
   loadEnvFile(path.join(JEV_DIR, 'env'));
   loadEnvFile(path.resolve(import.meta.dir, '..', '.env'));
   const input = JSON.parse((await Bun.stdin.text()) || '{}') as HookInput;
-  const output = event === 'user-prompt-submit' ? await onUserPromptSubmit(input, liveDeps) : null;
+  const output =
+    event === 'user-prompt-submit' ? await onUserPromptSubmit(input, liveDeps)
+    : event === 'pre-tool-use' ? await onPreToolUse(input, livePreToolDeps)
+    : null;
   if (output) process.stdout.write(JSON.stringify(output));
 }
 

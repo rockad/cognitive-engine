@@ -127,6 +127,51 @@ export function dispatchQuestions(criteria: Record<string, string> = CLAUDE_SUBA
   };
 }
 
+// ── Precedence (5.9) ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Which rule decided the model, in this order:
+ * 1. `instruction`: the user's own words in this turn ("use opus", "minimal viable model").
+ * 2. `guard`: the Jev mode guard, which gates the opus tier behind the user's approval when the
+ *    session model is below it. An explicit request for opus (1) satisfies it.
+ * 3. `standing`: the user's standing rule (default sonnet, escalate only where a wrong judgement is
+ *    expensive). Jev cannot read the user's CLAUDE.md, so this layer is the router's tier as shaped
+ *    by the stage rubric (stage-rubric.ts), which is a copy of that rule.
+ */
+export type AppliedRule = 'instruction' | 'guard' | 'standing';
+
+export const RULE_LABEL: Readonly<Record<AppliedRule, string>> = {
+  instruction: 'rule: per your instruction',
+  guard: 'rule: per the Jev guard',
+  standing: 'rule: per standing rule'
+};
+
+/** The rule that decided an already-resolved recommendation. */
+export function appliedRule(rec: Dispatch, sessionModel: string | null): AppliedRule {
+  if (rec.by) return 'instruction';
+  return rec.tier === 'pro' && !sessionAllowsOpus(sessionModel) ? 'guard' : 'standing';
+}
+
+export interface Resolution {
+  /** The recommendation to advise, after the user's instruction was applied. */
+  advised: Dispatch;
+  rule: AppliedRule;
+  /** The user has to approve before the model is used: only the guard rule asks. */
+  needsApproval: boolean;
+}
+
+/**
+ * Resolve the model for a turn from the user's instruction, Jev's recommendation and the session
+ * model, by the order above. The PreToolUse guard (guard.ts) cannot read the prompt and is not
+ * changed by this: above the session model it still shows its one prompt, and that prompt is the
+ * user's approval, so the advice says not to ask a second time.
+ */
+export function resolveModel(args: { userIntent: UserIntent; rec: Dispatch; sessionModel: string | null }): Resolution {
+  const advised = applyUserIntent(args.rec, args.userIntent);
+  const rule = appliedRule(advised, args.sessionModel);
+  return { advised, rule, needsApproval: rule === 'guard' };
+}
+
 /** Whether the session model is opus or stronger, so an opus delegation is within the ceiling. Unknown counts as no. */
 function sessionAllowsOpus(sessionModel: string | null): boolean {
   const session = parseModel(sessionModel);
@@ -136,7 +181,7 @@ function sessionAllowsOpus(sessionModel: string | null): boolean {
 
 function directiveBody(rec: Dispatch, sessionModel: string | null, quotaStrategy: string, intent: UserIntent = {}): string {
   const head =
-    `[JEV] cost-tiered recommendation (quota=${quotaStrategy}): subagent="${rec.subagent}", ` +
+    `[JEV] cost-tiered recommendation (quota=${quotaStrategy}; ${RULE_LABEL[appliedRule(rec, sessionModel)]}): subagent="${rec.subagent}", ` +
     `tier="${rec.tier}", model="${rec.model}", effort="${rec.effort}".`;
   const ceiling = sessionModel
     ? `The session model "${sessionModel}" is the hard ceiling: never delegate to a stronger model without explicit user approval.`
