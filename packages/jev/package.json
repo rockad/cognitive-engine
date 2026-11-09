@@ -24,6 +24,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.31.0",
+    "acorn": "8.19.0",
     "zod": "^3.24.2"
   },
   "devDependencies": {

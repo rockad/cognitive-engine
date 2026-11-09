@@ -3,7 +3,6 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
-  claudeModelRank,
   decideClaudeAgentCall,
   decideAntigravitySubagents,
   agentDefinitionModel,
@@ -45,14 +44,6 @@ afterEach(() => {
 });
 
 describe('Claude Code ceiling', () => {
-  it('ranks haiku < sonnet < opus < fable and ignores unknowns', () => {
-    expect(claudeModelRank('haiku')!).toBeLessThan(claudeModelRank('sonnet')!);
-    expect(claudeModelRank('sonnet')!).toBeLessThan(claudeModelRank('claude-opus-5-5')!);
-    expect(claudeModelRank('opus')!).toBeLessThan(claudeModelRank('claude-fable-5-1')!);
-    expect(claudeModelRank('inherit')).toBeNull();
-    expect(claudeModelRank(undefined)).toBeNull();
-  });
-
   it('asks when the requested model is stronger than the session', () => {
     const v = decideClaudeAgentCall({ model: 'opus' }, 'claude-sonnet-5-5');
     expect(v?.decision).toBe('ask');
@@ -66,11 +57,30 @@ describe('Claude Code ceiling', () => {
     expect(decideClaudeAgentCall({}, 'claude-sonnet-5-5')).toBeNull();
   });
 
-  it('fails closed for strong models when the session model is unknown', () => {
+  it('asks for any model when the session model is unknown, but not for inherit', () => {
     expect(decideClaudeAgentCall({ model: 'opus' }, null)?.decision).toBe('ask');
-    expect(decideClaudeAgentCall({ model: 'fable' }, null)?.decision).toBe('ask');
-    expect(decideClaudeAgentCall({ model: 'sonnet' }, null)).toBeNull();
-    expect(decideClaudeAgentCall({ model: 'haiku' }, null)).toBeNull();
+    expect(decideClaudeAgentCall({ model: 'sonnet' }, null)?.decision).toBe('ask');
+    expect(decideClaudeAgentCall({ model: 'haiku' }, null)?.decision).toBe('ask');
+    expect(decideClaudeAgentCall({ model: 'inherit' }, null)).toBeNull();
+    expect(decideClaudeAgentCall({}, null)).toBeNull();
+  });
+
+  it('words every ask as a fluent sentence (no "uses model ... cannot be compared")', () => {
+    const reasons = [
+      decideClaudeAgentCall({ model: 'opus' }, null)?.reason, // session model unknown
+      decideClaudeAgentCall({ model: 'haiku' }, 'some-future-model')?.reason, // session model not rankable
+      decideClaudeAgentCall({ model: 'mystery' }, 'claude-sonnet-5-5')?.reason, // requested model unknown
+      decideClaudeAgentCall({ model: 'opus' }, 'claude-sonnet-5-5')?.reason // escalation
+    ];
+    for (const r of reasons) {
+      expect(r).toBeDefined();
+      expect(r).not.toMatch(/uses model/);
+      expect(r).toContain('needs approval: model "');
+    }
+    expect(reasons[0]).toContain('cannot be compared with the session model, which could not be determined.');
+    expect(reasons[1]).toContain('cannot be compared with the session model "some-future-model", which Jev cannot rank.');
+    expect(reasons[2]).toContain('is not a model Jev can rank.');
+    expect(reasons[3]).toContain('is stronger than the session model');
   });
 
   it('uses the subagent definition model when the call sets none', () => {
@@ -189,9 +199,9 @@ describe('hook entrypoint', () => {
     expect(JSON.parse(out!).decision).toBe('force_ask');
   });
 
-  it('stays silent in on-demand and off', async () => {
+  it('is active in on-demand and silent only in off', async () => {
     setMode('on-demand');
-    expect(await run('antigravity', pro)).toBeNull();
+    expect(JSON.parse((await run('antigravity', pro))!).decision).toBe('force_ask');
     setMode('off');
     expect(await run('antigravity', pro)).toBeNull();
   });

@@ -7,6 +7,52 @@
           {
             "type": "command",
             "command": "bun \"$COGNITIVE_ENGINE_HOME/packages/jev/src/hook.ts\" claude",
+            "timeout": 5,
+            "onFailure": "block"
+          }
+        ]
+      },
+      {
+        "matcher": "Workflow",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun \"$COGNITIVE_ENGINE_HOME/packages/jev/src/hook.ts\" claude",
+            "timeout": 5,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Workflow",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun \"$COGNITIVE_ENGINE_HOME/packages/jev/src/record-hook.ts\" PostToolUse",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun \"$COGNITIVE_ENGINE_HOME/packages/jev/src/record-hook.ts\" SessionStart",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostModelSwitch": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun \"$COGNITIVE_ENGINE_HOME/packages/jev/src/record-hook.ts\" PostModelSwitch",
             "timeout": 5
           }
         ]
