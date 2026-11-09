@@ -53,7 +53,7 @@ Set `JEV_LIVE_TEST=1` to include tests that call OpenRouter.
 
 ## Lineage
 
-Ported from `agentic-hub/plugins/jev` v2.3.0. Of the Claude Code hooks, only the subagent-ceiling check was kept (see below); the session-start, model-switch and prompt-advice hooks were not ported in Track 1 because nothing in it needed them. Hooks are not prohibited: add one wherever a workflow or process needs it.
+Ported from `agentic-hub/plugins/jev` v2.3.0. Track 1 kept only the subagent-ceiling check (see below) from the Claude Code hooks; the session-start and model-switch recorders followed with the guard, and the `UserPromptSubmit` advisor is ported in [Prompt advisor hook](#prompt-advisor-hook-claude-code). Hooks are not prohibited: add one wherever a workflow or process needs it.
 
 ## Subagent guard hook
 
@@ -128,3 +128,12 @@ The model can change with no `PostModelSwitch` event: a session resumed with ano
 - With no usable evidence the model is unknown and the guard asks. After a resume this means the first subagent call asks until the first assistant turn of the resumed session lands in the transcript (or a `PostModelSwitch` fires), which is the point where the model is known again.
 
 Limits: this depends on the `SessionStart` recorder being registered (it is, in `adapters/claude/hooks/hooks.json`); without it a resume cannot be seen. The transcript is only read from its last 256 KiB.
+
+## Prompt advisor hook (Claude Code)
+
+`bun src/advisor-hook.ts user-prompt-submit` is the `UserPromptSubmit` hook (`src/advisor-hook.ts`, logic in `src/advisor-logic.ts`), ported from `agentic-hub/plugins/jev/claude/`. In Jev mode `on` it asks Jev for a subagent, tier and effort for the prompt and injects one `[JEV]` line as `additionalContext`.
+
+- **Advice only.** It never asks, denies or blocks; the `PreToolUse` guard above stays the only enforcement point. The agentic-hub `PreToolUse` check was not ported because the guard already does it (with a version-aware ranking and a project ceiling).
+- **Fail-safe.** Mode other than `on`, a prompt under 8 characters, an egress denial, a Jev call that fails or exceeds its 1.5 s budget, malformed stdin, or any exception: the hook prints nothing and exits 0. It carries no `onFailure: block`.
+- **Session model.** It reads the model from the same evidence as the guard (`resolveSessionModel`, see below); it writes no session state of its own.
+- **Log.** Each advice is appended to `~/.config/jev/claude_decisions.jsonl` as an `advice` record (recommendation and model names only, never prompt text) and to the shared telemetry file.

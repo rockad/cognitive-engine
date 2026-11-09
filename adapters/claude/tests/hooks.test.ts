@@ -27,9 +27,16 @@ describe('hooks.json failure policy', () => {
     }
   });
 
-  it('only PreToolUse guards carry onFailure at all', () => {
+  it('the prompt advisor is advice only and stays fail-open', () => {
+    const advisors = handlers('UserPromptSubmit');
+    expect(advisors).toHaveLength(1);
+    expect(advisors[0].command).toContain('advisor-hook.ts" user-prompt-submit');
+    expect(advisors[0].onFailure).toBeUndefined();
+  });
+
+  it('only the guard entries carry onFailure at all', () => {
     for (const event of Object.keys(hooks)) {
-      for (const h of handlers(event)) expect('onFailure' in h).toBe(event === 'PreToolUse');
+      for (const h of handlers(event)) expect('onFailure' in h).toBe(h.command.includes('src/hook.ts" claude'));
     }
   });
 

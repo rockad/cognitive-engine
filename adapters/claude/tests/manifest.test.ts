@@ -18,7 +18,8 @@ describe('claude plugin bundle', () => {
   it('registers the PreToolUse subagent guard and the log-only recorders', () => {
     expect(manifest.hooks).toBe('./hooks/hooks.json');
     const { hooks } = readJson('hooks/hooks.json');
-    expect(Object.keys(hooks)).toEqual(['PreToolUse', 'PostToolUse', 'SessionStart', 'PostModelSwitch']);
+    expect(Object.keys(hooks)).toEqual(['PreToolUse', 'PostToolUse', 'SessionStart', 'PostModelSwitch', 'UserPromptSubmit']);
+    expect(hooks.UserPromptSubmit[0].hooks[0].command).toContain('advisor-hook.ts" user-prompt-submit');
     expect(hooks.PostToolUse[0].matcher).toBe('Workflow');
     expect(hooks.PostToolUse[0].hooks[0].command).toContain('record-hook.ts" PostToolUse');
     expect(hooks.SessionStart[0].hooks[0].command).toContain('record-hook.ts" SessionStart');

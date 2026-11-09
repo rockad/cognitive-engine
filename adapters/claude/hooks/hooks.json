@@ -57,6 +57,17 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun \"$COGNITIVE_ENGINE_HOME/packages/jev/src/advisor-hook.ts\" user-prompt-submit",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }
