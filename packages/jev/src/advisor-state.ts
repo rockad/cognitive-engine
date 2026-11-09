@@ -21,6 +21,8 @@ export interface LastAdvice {
   subagent: string;
   /** What set the tier: absent for the router, else the user's instruction. */
   by?: string;
+  /** The prompt named a workflow or workstreams. */
+  staged?: boolean;
   /** ISO time the advice was given. */
   at: string;
 }

@@ -35,6 +35,8 @@ import { hasRecentDispatch, readLastAdvice, recentAgentCalls, writeLastAdvice, t
 import {
   buildDirective,
   dispatchQuestions,
+  isStagedPrompt,
+  STAGE_PLAN_REMINDER,
   parseUserIntent,
   resolveModel,
   parseDispatch,
@@ -114,6 +116,7 @@ export async function onUserPromptSubmit(input: HookInput, deps: HookDeps): Prom
   const sessionModel = deps.readSessionModel(input);
   const { advised, rule } = resolveModel({ userIntent: intent, rec, sessionModel });
   const turn = turnId(prompt);
+  const staged = isStagedPrompt(prompt);
   deps.log({
     hook: 'UserPromptSubmit',
     session_id: sessionId,
@@ -135,10 +138,12 @@ export async function onUserPromptSubmit(input: HookInput, deps: HookDeps): Prom
     model: advised.model,
     subagent: advised.subagent,
     ...(advised.by ? { by: advised.by } : {}),
+    ...(staged ? { staged: true } : {}),
     at: new Date().toISOString()
   });
 
   let additionalContext = buildDirective(advised, sessionModel, quotaStrategy, intent);
+  if (staged) additionalContext += ` ${STAGE_PLAN_REMINDER}`;
   try {
     const memory = await withTimeout(fetchRecallMemory(), 600);
     if (memory && memory.activeGoal) {
@@ -176,7 +181,7 @@ export const STAGED_AGENT_CALLS = 2;
 export function preflightReminder(toolName: string): string {
   return (
     `[JEV] ${toolName} is about to delegate, and no jev_dispatch or jev_batch_dispatch call from Claude Code shows in the last 30 minutes. ` +
-    `For staged work, call jev_batch_dispatch with the streams first and follow its tiers. ${STAGE_RUBRIC_TEXT} ` +
+    `For staged work, call jev_batch_dispatch with one task per stream first (kind: mechanical | settled-edit | judgement; needsEdit: true when the stream edits files) and follow its tiers. ${STAGE_RUBRIC_TEXT} ` +
     'This is a reminder, not a block.'
   );
 }
@@ -185,8 +190,8 @@ export function preflightReminder(toolName: string): string {
  * Registered for Agent, Task and Workflow, next to the guard and independent of it. It never asks,
  * denies or blocks: its only outputs are an `agent_call` record (the model requested next to the
  * last recommendation, joined by `turn`) and, when it looks like staged work with no dispatch call,
- * one `additionalContext` reminder. Staged means a Workflow, or the third agent call of the session
- * in ten minutes. A reminder is sent once per ten minutes per session, so a long run is not nagged.
+ * one `additionalContext` reminder. Staged means a Workflow, the third agent call of the session
+ * in ten minutes, or a session whose last prompt named a workflow or workstreams. A reminder is sent once per ten minutes per session, so a long run is not nagged.
  */
 export async function onPreToolUse(input: HookInput, deps: PreToolDeps): Promise<HookOutput> {
   const tool = input.tool_name;
@@ -196,7 +201,7 @@ export async function onPreToolUse(input: HookInput, deps: PreToolDeps): Promise
   const call = input.tool_input || {};
   const advice = deps.lastAdvice(sessionId);
   const recent = deps.recentAgentCalls(sessionId);
-  const staged = tool === 'Workflow' || recent.count >= STAGED_AGENT_CALLS;
+  const staged = tool === 'Workflow' || recent.count >= STAGED_AGENT_CALLS || advice?.staged === true;
   const remind = staged && !recent.reminded && !deps.recentDispatch();
   deps.log({
     hook: 'PreToolUse',

@@ -38,3 +38,14 @@ export const STAGE_RUBRIC_TEXT = `Stage rubric, cheapest model that fits: ${STAG
 export function isStageKind(value: unknown): value is StageKind {
   return typeof value === 'string' && Object.hasOwn(STAGE_RUBRIC, value);
 }
+
+/** The tier descriptions the router sees on Claude Code: Jev's own, plus the rubric line for the tier. */
+export const TIER_CRITERIA: Readonly<Record<JevTier, string>> = {
+  openrouter_free: 'Lightweight summaries, drafts, syntax transforms, formatting, boilerplate ($0 cost)',
+  flash_lite: `Trivial triage, quick lookups, file moves, formatting; ${STAGE_RUBRIC.mechanical.rule}`,
+  flash: `Standard agentic steps, routine edits, content synthesis, local commands; ${STAGE_RUBRIC['settled-edit'].rule}`,
+  pro: `Deep reasoning, architecture, complex multi-file refactors, high-stakes writing; ${STAGE_RUBRIC.judgement.rule}`
+};
+
+/** Claude Code subagent types that have no Edit or Write tool: they cannot carry out an edit stage. */
+export const READ_ONLY_SUBAGENTS: ReadonlySet<string> = new Set(['Plan', 'Explore']);

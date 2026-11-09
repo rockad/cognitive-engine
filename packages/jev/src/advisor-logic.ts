@@ -9,8 +9,9 @@
  */
 import { defaultEffortForSubagent, applyEffortGovernance, discoverWorkspaceAgents, type ThinkingEffort } from './core/index.js';
 import { compareModels, parseModel } from './models.js';
-import { STAGE_RUBRIC, STAGE_RUBRIC_TEXT, type ClaudeModelAlias, type JevTier } from './stage-rubric.js';
+import { STAGE_RUBRIC_TEXT, TIER_CRITERIA, type ClaudeModelAlias, type JevTier } from './stage-rubric.js';
 
+export { TIER_CRITERIA };
 export type { JevTier, ClaudeModelAlias };
 
 /** Claude Code's built-in subagents (plus `self` for doing the work directly). */
@@ -59,12 +60,6 @@ export async function resolveClaudeSubagentCriteria(workspaceDir?: string): Prom
   return criteria;
 }
 
-export const TIER_CRITERIA: Readonly<Record<JevTier, string>> = {
-  openrouter_free: 'Lightweight summaries, drafts, syntax transforms, formatting, boilerplate ($0 cost)',
-  flash_lite: `Trivial triage, quick lookups, file moves, formatting; ${STAGE_RUBRIC.mechanical.rule}`,
-  flash: `Standard agentic steps, routine edits, content synthesis, local commands; ${STAGE_RUBRIC['settled-edit'].rule}`,
-  pro: `Deep reasoning, architecture, complex multi-file refactors, high-stakes writing; ${STAGE_RUBRIC.judgement.rule}`
-};
 
 /** Jev tiers mapped onto Claude model aliases accepted by the Agent tool's `model` field. */
 export const TIER_TO_CLAUDE: Readonly<Record<JevTier, ClaudeModelAlias>> = {
@@ -353,3 +348,20 @@ export function trimTask(task: string): string {
 export function turnId(prompt: string): string {
   return new Bun.CryptoHasher('sha256').update(prompt.trim()).digest('hex').slice(0, 12);
 }
+
+// ── Stage plans (5.4) ───────────────────────────────────────────────────────────────────────────
+
+/** A prompt that names a workflow or workstreams: staged work, where one tuple per turn is not enough. */
+export function isStagedPrompt(prompt: string): boolean {
+  return /\bwork-?flows?\b|\bwork-?streams?\b/i.test(prompt);
+}
+
+/**
+ * The reminder for staged work. The router sees one prompt and returns one tuple; a plan with
+ * several streams needs one tier per stream, which `jev_batch_dispatch` returns from the caller's own
+ * classification (`kind`, `needsEdit`) and the stage rubric.
+ */
+export const STAGE_PLAN_REMINDER =
+  'This looks like staged work. Before launching it, call jev_batch_dispatch with one task per stream ' +
+  '(kind: mechanical | settled-edit | judgement; needsEdit: true when the stream edits files) and follow its tiers per stream, ' +
+  'not the single recommendation above.';

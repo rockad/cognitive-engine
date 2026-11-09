@@ -101,6 +101,11 @@ The following rules apply when `mode == "on"` (Aggressive System 1). They are en
 - Upon plan approval or completion of `/grill-me` (`clarify`), the main orchestrator MUST immediately call `jev_batch_dispatch` and `manage_subagents(Action: "list")` to decompose and delegate independent workstreams in parallel rather than editing multiple files sequentially in the main context.
 - `PreToolUse` (`jev-pre-tool.sh`) checks `jev_telemetry.jsonl` and blocks consecutive direct edits (`>=2` files) in the session window if no recent `jev_dispatch`, `jev_batch_dispatch`, or subagent delegation occurred.
 
+#### Claude Code: stage plans
+- On Claude Code, `jev_batch_dispatch` takes two optional fields per task: `kind` (`mechanical` gives haiku, `settled-edit` sonnet, `judgement` opus) and `needsEdit` (`true` when the stream edits files). Pass your own classification: it is used instead of a guess, and a stage that edits files is never given a read-only subagent type (`Plan`, `Explore`) or the text-only free tier.
+- The output uses `Agent(subagent_type, model)` (or `agent({ agentType, model })` inside a Workflow), reports the real session model as `activeSessionModel`, and marks opus stages as above the session model instead of clamping them. Follow its tier per stream; a model above the session still goes through the guard's one approval prompt.
+- Without `kind` the tier is asked of the router under the stage rubric, with a whole-word keyword fallback offline. Other harnesses ignore both fields.
+
 ### 2. Free-Tier Offloading (`jev_execute_free`)
 - **Main agent**: Offload boilerplate scaffolding, markdown formatting, log distillations, and draft summaries to `openrouter/free` at **$0.00** cost and **zero Gemini quota**.
 - **Subagents**: Subagents performing bulk transformations, formatting, or log distillations must call `jev_execute_free` directly rather than consuming subscription quota on long text outputs.

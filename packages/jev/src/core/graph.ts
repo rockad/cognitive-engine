@@ -7,7 +7,7 @@ export interface SubTask {
   tier: string;
   cognitiveTier?: CognitiveTier;
   concreteModel?: string;
-  executionTool?: 'jev_execute_free' | 'jev_agent_free' | 'invoke_subagent';
+  executionTool?: 'jev_execute_free' | 'jev_agent_free' | 'invoke_subagent' | 'Agent';
   executionGuidance?: string;
   dependencies: string[];
   canRunParallel: boolean;
@@ -16,6 +16,10 @@ export interface SubTask {
   effort?: string;
   requiresUserApproval: boolean;
   estimatedCostUsd: number;
+  /** Claude Code only: the caller's classification, whether the stage edits files, and where the tier came from. */
+  kind?: string;
+  needsEdit?: boolean;
+  tierSource?: 'kind' | 'router' | 'keyword';
 }
 
 export interface BatchDispatchPlan {

@@ -23,6 +23,10 @@ import {
   type SubTask,
   type BatchDispatchPlan
 } from '../core/index.js';
+import { dispatchStyle } from './harness.js';
+import { activeClaudeSessionModel, claudeModelTier, sessionBelowOpus } from '../claude-active-session.js';
+import { CLAUDE_SUBAGENT_CRITERIA, resolveClaudeSubagentCriteria } from '../advisor-logic.js';
+import { READ_ONLY_SUBAGENTS, STAGE_RUBRIC, TIER_CRITERIA, isStageKind, type StageKind } from '../stage-rubric.js';
 
 const dispatchShape = {
   task: z.string().describe('The task, prompt, or sub-goal to dispatch'),
@@ -38,6 +42,39 @@ export function telemetryHarness(): { harness?: 'claude-code' } {
   return detectActiveHarness() === 'claude-code' ? { harness: 'claude-code' } : {};
 }
 
+/**
+ * The session ceiling on Claude Code. Unlike the Antigravity clamp it never lowers the tier: the
+ * user's standing rule lets an expensive judgement escalate to opus, and the PreToolUse guard (not
+ * this advice) is what asks the user before a model above the session runs. So the tool reports
+ * the ceiling (`sessionCeilingTier`, `activeSessionModel`) and flags the escalation, and
+ * `wasClamped` is always false. An unknown session model is reported as the top tier.
+ */
+export function claudeCeiling(
+  recommendedTier: string,
+  sessionModel: string | null
+): { clampedTier: string; wasClamped: boolean; ceilingTier: string } {
+  return { clampedTier: recommendedTier, wasClamped: false, ceilingTier: claudeModelTier(sessionModel) ?? 'pro' };
+}
+
+/** Extra guidance when the tier is opus and the session is below it: Claude Code will ask once. */
+export function escalationNote(isClaude: boolean, isPro: boolean, sessionModel: string | null): string {
+  if (!isClaude || !isPro || !sessionBelowOpus(sessionModel)) return '';
+  return ` Opus is above the session model${sessionModel ? ` (${sessionModel})` : ''}: the Jev guard will ask the user once before it runs.`;
+}
+
+type TierSource = 'kind' | 'router' | 'keyword';
+
+/**
+ * Tier from the wording of a stage, the offline fallback on Claude Code when the caller gave no
+ * `kind` and the router is unreachable. Whole words only: the old substring test sent "information"
+ * and "transformation" to the free tier because they contain "format".
+ */
+export function claudeKeywordTier(taskText: string): string {
+  if (/\b(?:deep reasoning|architecture overhaul)\b/i.test(taskText)) return 'pro';
+  if (/\b(?:scaffold(?:ing)?|boilerplate|format(?:ting)?)\b/i.test(taskText)) return 'openrouter_free';
+  return 'flash';
+}
+
 export const dispatchTool = defineTool({
   name: 'jev_dispatch',
   description: 'Intelligently route a task to the optimal subagent and model tier ("openrouter_free" | "flash_lite" | "flash" | "pro") in a single ~800ms decision call using TypeSafe Jev. "pro" tier models require explicit manual user approval before invocation.',
@@ -49,14 +86,20 @@ const batchDispatchShape = {
   tasks: z.array(strictObject({
     id: z.string().describe('Unique identifier for the task/phase'),
     task: z.string().describe('The description of the work'),
-    dependencies: z.array(z.string()).optional().describe('Optional array of task IDs that must complete before this task can start')
+    dependencies: z.array(z.string()).optional().describe('Optional array of task IDs that must complete before this task can start'),
+    kind: z.enum(['mechanical', 'settled-edit', 'judgement']).optional().describe(
+      'Claude Code only: the caller\'s own classification of the stage, used instead of guessing. mechanical (edit or checklist update) gives haiku, settled-edit (spec or plan edit with a decision already made) gives sonnet, judgement (an error is expensive) gives opus'
+    ),
+    needsEdit: z.boolean().optional().describe(
+      'Claude Code only: the stage edits files, so read-only subagent types (Plan, Explore) are never assigned and the free tier (text only) is not used'
+    )
   })).describe('Array of task descriptions or phase items to plan and dispatch in parallel'),
   availableSubagents: z.array(z.string()).optional().describe('Optional list of candidate subagents')
 };
 
 export const batchDispatchTool = defineTool({
   name: 'jev_batch_dispatch',
-  description: 'Decompose a multi-task roadmap or list of phases into a parallel DAG execution manifest with optimal tier assignments, dependency tracking, concurrency safety (max 10 for openrouter_free), and boilerplate pre-flight flags.',
+  description: 'Decompose a multi-task roadmap or list of phases into a parallel DAG execution manifest with optimal tier assignments, dependency tracking, concurrency safety (max 10 for openrouter_free), and boilerplate pre-flight flags. On Claude Code, classify each task with kind (mechanical, settled-edit, judgement) and needsEdit to get the model per stage (haiku, sonnet, opus), Agent() guidance and no read-only persona for an edit stage.',
   shape: batchDispatchShape,
   handler: handleBatchDispatchTool
 });
@@ -86,12 +129,17 @@ export async function handleDispatchTool(args: ToolInput<typeof dispatchShape>):
     subagentCriteria.self = 'Generalist tasks, direct code changes, orchestrator execution';
   }
 
-  const tierCriteria: Record<string, string> = {
-    openrouter_free: 'Lightweight summaries, drafts, syntax transformations, autonomous free agent tasks via jev_agent_free, and boilerplate ($0 cost, 0 Gemini quota)',
-    flash_lite: 'Trivial triage, fast simple lookups, file moves, quick formatting',
-    flash: 'Standard agentic steps, routine edits, content synthesis, local commands',
-    pro: 'Deep reasoning, architectural planning, complex multi-file refactoring, high-stakes writing'
-  };
+  const harness = detectActiveHarness();
+  const isClaude = harness === 'claude-code';
+  const style = dispatchStyle(harness);
+  const tierCriteria: Record<string, string> = isClaude
+    ? { ...TIER_CRITERIA, openrouter_free: style.freeTierCriteria }
+    : {
+        openrouter_free: style.freeTierCriteria,
+        flash_lite: 'Trivial triage, fast simple lookups, file moves, quick formatting',
+        flash: 'Standard agentic steps, routine edits, content synthesis, local commands',
+        pro: 'Deep reasoning, architectural planning, complex multi-file refactoring, high-stakes writing'
+      };
 
   let recommendedSubagent = 'self';
   let recommendedTier = 'flash';
@@ -187,8 +235,12 @@ export async function handleDispatchTool(args: ToolInput<typeof dispatchShape>):
   const rawEffort = defaultEffortForSubagent(recommendedSubagent, task);
   const recommendedEffort = applyEffortGovernance(rawEffort, quotaView.strategy, recommendedTier);
 
-  // Phase 5: Session Model Ceiling Clamping
-  const ceilingClamping = clampTierToSessionCeiling(recommendedTier, quotaView.active_model);
+  // Phase 5: Session Model Ceiling Clamping. On Claude Code the ceiling is the Claude session's own
+  // model, not Antigravity's quota file, and it is reported rather than clamped (see claudeCeiling).
+  const claudeModel = isClaude ? activeClaudeSessionModel() : null;
+  const ceilingClamping = isClaude
+    ? claudeCeiling(recommendedTier, claudeModel)
+    : clampTierToSessionCeiling(recommendedTier, quotaView.active_model);
   const effectiveTier = ceilingClamping.clampedTier;
   const cognitiveTier = normalizeTier(effectiveTier);
   const harnessModels = getHarnessModels();
@@ -196,10 +248,10 @@ export async function handleDispatchTool(args: ToolInput<typeof dispatchShape>):
   const isPro = effectiveTier === 'pro' || cognitiveTier === 'deep';
 
   const isFree = cognitiveTier === 'free' || effectiveTier === 'openrouter_free';
-  const executionTool = isFree ? 'jev_execute_free' : 'invoke_subagent';
+  const executionTool = isFree ? 'jev_execute_free' : style.delegationTool;
   const executionGuidance = isFree
-    ? 'CRITICAL QUOTA RULE: Jev evaluated this task as free-tier eligible. Do NOT call invoke_subagent. Execute directly via jev_execute_free or jev_agent_free at $0.00 cost (0 Gemini quota).'
-    : `Delegate to subagent via invoke_subagent(Role: "${recommendedSubagent}", Model: "${concreteModel}").`;
+    ? style.freeGuidance(true)
+    : style.delegateGuidance(recommendedSubagent, concreteModel) + escalationNote(isClaude, isPro, claudeModel);
 
   const scaffoldingCheck = detectScaffoldingTask(task);
   const result = {
@@ -212,6 +264,7 @@ export async function handleDispatchTool(args: ToolInput<typeof dispatchShape>):
     executionGuidance,
     sessionCeilingTier: ceilingClamping.ceilingTier,
     wasClampedByCeiling: ceilingClamping.wasClamped,
+    ...(isClaude ? { activeSessionModel: claudeModel ?? 'unknown' } : {}),
     scaffoldFirst: scaffoldingCheck.scaffoldFirst,
     boilerplateType: scaffoldingCheck.boilerplateType,
     recommendedEffort,
@@ -300,6 +353,9 @@ export async function handleBatchDispatchTool(args: ToolInput<typeof batchDispat
 
   const quotaView = await readQuotaView();
   const activeHarness = detectActiveHarness();
+  const isClaude = activeHarness === 'claude-code';
+  const style = dispatchStyle(activeHarness);
+  const claudeModel = isClaude ? activeClaudeSessionModel() : null;
   const cfg = loadJevConfigSync();
   const routingStrategy = cfg.routing?.strategy || 'router';
 
@@ -309,6 +365,9 @@ export async function handleBatchDispatchTool(args: ToolInput<typeof batchDispat
     for (const sa of availableSubagents) {
       workspaceAgents[sa] = discovered[sa] || `Agent specialized in ${sa.replace(/[-_]/g, ' ')}`;
     }
+  } else if (isClaude) {
+    // The real Claude Code subagent types: built-ins plus custom agents by their kebab-case name.
+    workspaceAgents = await resolveClaudeSubagentCriteria(process.cwd());
   } else {
     workspaceAgents = await discoverWorkspaceAgents(process.cwd(), activeHarness);
   }
@@ -320,6 +379,15 @@ export async function handleBatchDispatchTool(args: ToolInput<typeof batchDispat
     workspaceAgents.self = 'Generalist tasks, direct code changes, orchestrator execution';
   }
 
+  // Candidate subagents for a task. On Claude Code a stage that edits files never gets a read-only type.
+  const candidatesFor = (item: { needsEdit?: boolean }): Record<string, string> => {
+    if (!isClaude || !item.needsEdit) return workspaceAgents;
+    const editable = Object.fromEntries(Object.entries(workspaceAgents).filter(([name]) => !READ_ONLY_SUBAGENTS.has(name)));
+    return Object.keys(editable).length > 0 ? editable : { 'general-purpose': CLAUDE_SUBAGENT_CRITERIA['general-purpose'] };
+  };
+  // On Claude Code the tier is asked of the router per stage, with the rubric as criteria, unless the caller classified it.
+  const routerTiers: Record<string, string> = {};
+
   // Pre-route subagents via Decisions API in 'router' mode, or keyword fallback
   const subagentAssignments: Record<string, string> = {};
   if (routingStrategy === 'router') {
@@ -329,27 +397,37 @@ export async function handleBatchDispatchTool(args: ToolInput<typeof batchDispat
         questions[`sa_${item.id}`] = {
           type: 'choice',
           instructions: `Select the best specialized subagent for the task: ${item.task}`,
-          criteria: workspaceAgents
+          criteria: candidatesFor(item)
         };
+        if (isClaude && !item.kind) {
+          questions[`tier_${item.id}`] = {
+            type: 'choice',
+            instructions: `Determine the cheapest Claude model tier that fits this stage, using the rubric in the criteria: ${item.task}`,
+            criteria: { ...TIER_CRITERIA, openrouter_free: style.freeTierCriteria }
+          };
+        }
       }
       const data = await callJevDecision(`Batch routing for ${tasks.length} tasks`, questions);
       for (const item of tasks) {
+        const candidates = candidatesFor(item);
         const choice = data.answers?.[`sa_${item.id}`]?.choice;
-        if (choice && choice !== 'none' && workspaceAgents[choice]) {
+        if (choice && choice !== 'none' && candidates[choice]) {
           subagentAssignments[item.id] = choice;
         } else {
-          subagentAssignments[item.id] = matchSubagentByKeywords(item.task || '', workspaceAgents);
+          subagentAssignments[item.id] = matchSubagentByKeywords(item.task || '', candidates);
         }
+        const tierChoice = data.answers?.[`tier_${item.id}`]?.choice;
+        if (typeof tierChoice === 'string' && Object.hasOwn(TIER_CRITERIA, tierChoice)) routerTiers[item.id] = tierChoice;
       }
     } catch {
       // Fall back to keyword scoring on network / timeout error
       for (const item of tasks) {
-        subagentAssignments[item.id] = matchSubagentByKeywords(item.task || '', workspaceAgents);
+        subagentAssignments[item.id] = matchSubagentByKeywords(item.task || '', candidatesFor(item));
       }
     }
   } else {
     for (const item of tasks) {
-      subagentAssignments[item.id] = matchSubagentByKeywords(item.task || '', workspaceAgents);
+      subagentAssignments[item.id] = matchSubagentByKeywords(item.task || '', candidatesFor(item));
     }
   }
 
@@ -364,16 +442,33 @@ export async function handleBatchDispatchTool(args: ToolInput<typeof batchDispat
     const deps = Array.isArray(item.dependencies) ? item.dependencies : [];
     const scaffolding = detectScaffoldingTask(taskText);
 
-    const subagent = subagentAssignments[item.id] || 'self';
+    let subagent = subagentAssignments[item.id] || 'self';
+    // A read-only type cannot carry out an edit stage, whatever routed it there.
+    if (isClaude && item.needsEdit && READ_ONLY_SUBAGENTS.has(subagent)) subagent = 'general-purpose';
 
     let rawTier = 'flash';
-    if (tLower.includes('scaffold') || tLower.includes('format') || tLower.includes('boilerplate')) {
+    let tierSource: TierSource | undefined;
+    if (isClaude) {
+      // The caller's classification first, then the router's answer under the rubric, then whole words.
+      if (isStageKind(item.kind)) {
+        rawTier = STAGE_RUBRIC[item.kind].tier;
+        tierSource = 'kind';
+      } else if (routerTiers[item.id]) {
+        rawTier = routerTiers[item.id];
+        tierSource = 'router';
+      } else {
+        rawTier = claudeKeywordTier(taskText);
+        tierSource = 'keyword';
+      }
+      // The free tier returns text and cannot edit files.
+      if (item.needsEdit && rawTier === 'openrouter_free') rawTier = 'flash_lite';
+    } else if (tLower.includes('scaffold') || tLower.includes('format') || tLower.includes('boilerplate')) {
       rawTier = 'openrouter_free';
     } else if (tLower.includes('deep reasoning') || tLower.includes('architecture overhaul')) {
       rawTier = 'pro';
     }
 
-    const clamped = clampTierToSessionCeiling(rawTier, quotaView.active_model);
+    const clamped = isClaude ? claudeCeiling(rawTier, claudeModel) : clampTierToSessionCeiling(rawTier, quotaView.active_model);
     const tier = clamped.clampedTier;
     const cognitiveTier = normalizeTier(tier);
     const harnessModels = getHarnessModels();
@@ -392,10 +487,10 @@ export async function handleBatchDispatchTool(args: ToolInput<typeof batchDispat
     }
 
     const isTaskFree = tier === 'openrouter_free' || cognitiveTier === 'free';
-    const executionTool = isTaskFree ? 'jev_execute_free' : 'invoke_subagent';
+    const executionTool = isTaskFree ? 'jev_execute_free' : style.delegationTool;
     const executionGuidance = isTaskFree
-      ? 'CRITICAL QUOTA RULE: Free-tier eligible. Do NOT call invoke_subagent. Execute directly via jev_execute_free or jev_agent_free at $0.00 cost (0 Gemini quota).'
-      : `Delegate to subagent via invoke_subagent(Role: "${subagent}", Model: "${concreteModel}").`;
+      ? style.freeGuidance(false)
+      : style.delegateGuidance(subagent, concreteModel) + escalationNote(isClaude, requiresApproval, claudeModel);
 
     const rawEffort = defaultEffortForSubagent(subagent, taskText);
     const taskEffort = applyEffortGovernance(rawEffort, quotaView.strategy, tier);
@@ -415,7 +510,8 @@ export async function handleBatchDispatchTool(args: ToolInput<typeof batchDispat
       boilerplateType: scaffolding.boilerplateType,
       effort: taskEffort,
       requiresUserApproval: requiresApproval,
-      estimatedCostUsd: taskCost
+      estimatedCostUsd: taskCost,
+      ...(isClaude ? { kind: isStageKind(item.kind) ? item.kind : undefined, needsEdit: item.needsEdit === true, tierSource } : {})
     });
   }
 
@@ -426,7 +522,7 @@ export async function handleBatchDispatchTool(args: ToolInput<typeof batchDispat
     planName: 'Multi-Subagent Parallel DAG Execution Manifest',
     totalTasks: plannedTasks.length,
     freeTierTasks: freeTierCount,
-    activeSessionModel: quotaView.active_model || 'unknown',
+    activeSessionModel: (isClaude ? claudeModel : quotaView.active_model) || 'unknown',
     maxConcurrentFreeWorkers: concurrencyCap,
     tasks: plannedTasks,
     stages,

@@ -173,3 +173,43 @@ describe('pre-tool-use process', () => {
     }
   });
 });
+
+describe('stage plan reminder (5.4)', () => {
+  const baseDeps = (remembered: { advice?: LastAdvice }): HookDeps => ({
+    readMode: async () => 'on',
+    readSessionModel: () => 'claude-sonnet-5',
+    readQuotaStrategy: async () => 'unknown',
+    dispatch: async () => ({ subagent: 'Plan', tier: 'flash', model: 'sonnet', effort: 'medium', confidence: 0.9 }),
+    log: () => {},
+    remember: (_s, a) => (remembered.advice = a)
+  });
+
+  it('adds the batch-dispatch reminder when the prompt names a workflow or workstreams', async () => {
+    const remembered: { advice?: LastAdvice } = {};
+
+    const out = await onUserPromptSubmit({ session_id: 's1', prompt: 'go ahead with the workstreams in a workflow' }, baseDeps(remembered));
+
+    const text = String(out?.hookSpecificOutput.additionalContext);
+    expect(text).toContain('call jev_batch_dispatch with one task per stream');
+    expect(text).toContain('kind: mechanical | settled-edit | judgement');
+    expect(remembered.advice?.staged).toBe(true);
+  });
+
+  it('does not add it to an ordinary prompt', async () => {
+    const remembered: { advice?: LastAdvice } = {};
+
+    const out = await onUserPromptSubmit({ session_id: 's1', prompt: 'Find where the quota file is written' }, baseDeps(remembered));
+
+    expect(String(out?.hookSpecificOutput.additionalContext)).not.toContain('jev_batch_dispatch');
+    expect(remembered.advice?.staged).toBeUndefined();
+  });
+
+  it('treats a lone Agent call as staged when the last prompt named a workflow', async () => {
+    const out = await onPreToolUse(
+      { session_id: 's1', tool_name: 'Agent', tool_input: {} },
+      pre({ lastAdvice: () => ({ ...advice, staged: true }) })
+    );
+
+    expect(String(out?.hookSpecificOutput.additionalContext)).toContain('one task per stream');
+  });
+});
