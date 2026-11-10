@@ -76,6 +76,7 @@ Syntax from the Claude Code permissions docs ("Match by input parameter"): `Tool
 
 - It matches the alias `opus`. It does **not** match a full model id (`claude-opus-5-5`), a remapped alias (`ANTHROPIC_DEFAULT_*_MODEL`, see Jev's README, "Known limits (subagent guard)"), or a call that leaves `model` unset.
 - It does not see a `model:` in an agent definition's frontmatter: the rule only sees the `model` parameter Claude passes in the call.
+- **Effort has a native cap too: `maxEffortLevel`.** The Claude Code settings reference documents it (global, or per model in `modelSettings`), and the model-config page says it still limits the level a skill or subagent runs at, over `CLAUDE_CODE_EFFORT_LEVEL`. `"maxEffortLevel": "high"` in `~/.claude/settings.json` enforces the guards' interim effort threshold inside Claude Code itself, including the case the guards cannot see (suggested in review by @Doc-Cr; RFC 007 names it as a candidate).
 - It denies outright, with no ask and no session-ceiling logic, so it also blocks Opus when the session itself runs Opus. Use `ask` instead of `deny` (`"ask": ["Agent(model:opus)"]`) if you want a prompt, not a refusal.
 ## Validate
 
