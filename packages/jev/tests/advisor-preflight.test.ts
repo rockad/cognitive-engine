@@ -142,6 +142,24 @@ describe('reading the logs', () => {
     expect(hasRecentDispatch({ file, now: NOW })).toBe(false);
   });
 
+  it('ignores a failed dispatch call: it gave no tiers, so the reminder still applies', () => {
+    const file = write('t.jsonl', [
+      { timestamp: ago(5), tool: 'jev_dispatch', harness: 'claude-code', status: 'error', error: 'all dispatch tiers failed' },
+      { timestamp: ago(4), tool: 'jev_batch_dispatch', harness: 'claude-code', error: 'boom' }
+    ]);
+
+    expect(hasRecentDispatch({ file, now: NOW })).toBe(false);
+  });
+
+  it('a failed call does not hide an earlier or later successful one', () => {
+    const file = write('t.jsonl', [
+      { timestamp: ago(10), tool: 'jev_dispatch', harness: 'claude-code' },
+      { timestamp: ago(5), tool: 'jev_dispatch', harness: 'claude-code', status: 'error', error: 'x' }
+    ]);
+
+    expect(hasRecentDispatch({ file, now: NOW })).toBe(true);
+  });
+
   it('answers no for a missing file', () => {
     expect(hasRecentDispatch({ file: path.join(tmp, 'none.jsonl'), now: NOW })).toBe(false);
   });

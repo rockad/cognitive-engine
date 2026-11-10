@@ -114,6 +114,8 @@ export function hasRecentDispatch(opts: { file?: string; now?: number; windowMs?
   return tailJsonl(file).some((e) => {
     if (e.tool !== 'jev_dispatch' && e.tool !== 'jev_batch_dispatch') return false;
     if (e.harness !== 'claude-code') return false;
+    // A failed call (`status: 'error'`, tools/dispatch.ts) gave no tiers to follow: it does not silence the reminder.
+    if (e.status === 'error' || e.error !== undefined) return false;
     const at = stamp(e);
     return Number.isFinite(at) && now - at <= windowMs && at <= now + 60_000;
   });

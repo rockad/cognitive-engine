@@ -30,7 +30,7 @@ import {
 import { dispatchStyle } from './harness.js';
 import { activeClaudeSessionModel, claudeModelTier, sessionBelowOpus } from '../claude-active-session.js';
 import { CLAUDE_SUBAGENT_CRITERIA, resolveClaudeSubagentCriteria } from '../advisor-logic.js';
-import { STAGE_RUBRIC, TIER_CRITERIA, isStageKind, type StageKind } from '../stage-rubric.js';
+import { STAGE_RUBRIC, TIER_CRITERIA, isStageKind } from '../stage-rubric.js';
 
 const dispatchShape = {
   task: z.string().describe('The task, prompt, or sub-goal to dispatch'),
