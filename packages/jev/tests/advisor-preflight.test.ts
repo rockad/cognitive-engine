@@ -4,7 +4,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { onPreToolUse, onUserPromptSubmit, preflightReminder, type HookDeps, type PreToolDeps } from '../src/advisor-hook.ts';
 import { turnId } from '../src/advisor-logic.ts';
-import { hasRecentDispatch, recentAgentCalls, type LastAdvice } from '../src/advisor-state.ts';
+import { hasRecentDispatch, recentAgentCalls, type LastAdvice, type TurnState } from '../src/advisor-state.ts';
 import { STAGE_RUBRIC_TEXT } from '../src/stage-rubric.ts';
 
 const advice: LastAdvice = { turn: 'abc123abc123', tier: 'flash', model: 'sonnet', subagent: 'Explore', at: '2026-11-09T10:00:00Z' };
@@ -13,6 +13,7 @@ function pre(overrides: Partial<PreToolDeps> = {}, log: Record<string, unknown>[
   return {
     readMode: async () => 'on',
     lastAdvice: () => advice,
+    turnState: () => ({ turn: advice.turn, mode: 'on', intent: {}, at: advice.at }),
     recentDispatch: () => false,
     recentAgentCalls: () => ({ count: 0, reminded: false }),
     log: (e) => log.push(e),
@@ -77,14 +78,14 @@ describe('pre-flight reminder (5.10)', () => {
       recommended_model: 'sonnet',
       requested_model: 'opus',
       subagent_type: 'Explore',
-      reminded: false
+      preflight_reminder: false
     });
   });
 
   it('logs a null recommendation when no advice was given in the session', async () => {
     const log: Record<string, unknown>[] = [];
 
-    await onPreToolUse({ session_id: 's1', tool_name: 'Agent', tool_input: {} }, pre({ lastAdvice: () => null }, log));
+    await onPreToolUse({ session_id: 's1', tool_name: 'Agent', tool_input: {} }, pre({ lastAdvice: () => null, turnState: () => null }, log));
 
     expect(log[0]).toMatchObject({ turn: null, tier: null, recommended_model: null, requested_model: null });
   });
@@ -93,17 +94,19 @@ describe('pre-flight reminder (5.10)', () => {
     const prompt = 'Find where the quota file is written';
     const logged: Record<string, unknown>[] = [];
     let remembered: LastAdvice | null = null;
+    let marker: TurnState | null = null;
     const deps: HookDeps = {
       readMode: async () => 'on',
       readSessionModel: () => 'claude-sonnet-5',
       readQuotaStrategy: async () => 'unknown',
       dispatch: async () => ({ subagent: 'Explore', tier: 'flash', model: 'sonnet', effort: 'medium', confidence: 0.9 }),
       log: (e) => logged.push(e),
-      remember: (_s, a) => (remembered = a)
+      remember: (_s, a) => (remembered = a),
+      markTurn: (_s, m) => (marker = m)
     };
 
     await onUserPromptSubmit({ session_id: 's1', prompt }, deps);
-    await onPreToolUse({ session_id: 's1', tool_name: 'Agent', tool_input: {} }, pre({ lastAdvice: () => remembered }, logged));
+    await onPreToolUse({ session_id: 's1', tool_name: 'Agent', tool_input: {} }, pre({ lastAdvice: () => remembered, turnState: () => marker }, logged));
 
     expect(logged.map((e) => e.turn)).toEqual([turnId(prompt), turnId(prompt)]);
     expect(logged[1].tier).toBe('flash');
@@ -147,14 +150,17 @@ describe('reading the logs', () => {
     const file = write('d.jsonl', [
       { ts: ago(30), event: 'agent_call', session_id: 's1' },
       { ts: ago(8), event: 'agent_call', session_id: 's1' },
-      { ts: ago(3), event: 'agent_call', session_id: 's1', reminded: true },
+      { ts: ago(3), event: 'agent_call', session_id: 's1', preflight_reminder: true },
       { ts: ago(2), event: 'agent_call', session_id: 's2' },
+      { ts: ago(1), event: 'agent_call', session_id: 's3', reminded: true },
       { ts: ago(1), event: 'ask', session_id: 's1' }
     ]);
 
     expect(recentAgentCalls('s1', { file, now: NOW })).toEqual({ count: 2, reminded: true });
     expect(recentAgentCalls('s2', { file, now: NOW })).toEqual({ count: 1, reminded: false });
     expect(recentAgentCalls(null, { file, now: NOW })).toEqual({ count: 0, reminded: false });
+    // A record from before the key was renamed (reminded) still counts.
+    expect(recentAgentCalls('s3', { file, now: NOW })).toEqual({ count: 1, reminded: true });
   });
 });
 

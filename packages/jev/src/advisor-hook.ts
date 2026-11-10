@@ -31,7 +31,18 @@ import {
 import { appendClaudeDecision } from './claude-audit.js';
 import { resolveSessionModel } from './session-model.js';
 import { STAGE_RUBRIC_TEXT } from './stage-rubric.js';
-import { hasRecentDispatch, readLastAdvice, recentAgentCalls, writeLastAdvice, type LastAdvice } from './advisor-state.js';
+import {
+  clearTurnState,
+  currentTurn,
+  hasRecentDispatch,
+  readLastAdvice,
+  readTurnState,
+  recentAgentCalls,
+  writeLastAdvice,
+  writeTurnState,
+  type LastAdvice,
+  type TurnState
+} from './advisor-state.js';
 import {
   buildDirective,
   dispatchQuestions,
@@ -41,6 +52,7 @@ import {
   resolveModel,
   parseDispatch,
   resolveClaudeSubagentCriteria,
+  isHostInjectedPrompt,
   isNonTaskPrompt,
   isStatusTurn,
   trimTask,
@@ -71,6 +83,10 @@ export type HookDeps = {
   log: (entry: Record<string, unknown>) => void;
   /** Remember the advice for the session so a later hook can join it with what was used. */
   remember?: (sessionId: string | null, advice: LastAdvice) => void;
+  /** Store the turn marker (turn id, mode, intent) at the start of a real user turn. */
+  markTurn?: (sessionId: string | null, state: TurnState) => void;
+  /** Drop the turn marker when the turn runs with Jev off. */
+  forgetTurn?: (sessionId: string | null) => void;
   /** Egress policy for the hook's working directory; absent means no policy. */
   egressAllowed?: (cwd: string | undefined) => boolean;
 };
@@ -95,12 +111,28 @@ export function withTimeout<T>(
 }
 
 export async function onUserPromptSubmit(input: HookInput, deps: HookDeps): Promise<HookOutput> {
-  if ((await deps.readMode()) !== 'on') return null;
-  const prompt = (input.prompt || '').trim();
-  if (prompt.length < 8) return null;
-  // Host-injected turns and pasted blobs carry no task: no advice and no Jev call (5.5).
-  if (isNonTaskPrompt(prompt)) return null;
   const sessionId = typeof input.session_id === 'string' ? input.session_id : null;
+  if ((await deps.readMode()) !== 'on') {
+    // This turn runs without the advisor: nothing stored for an earlier turn may speak for it.
+    deps.forgetTurn?.(sessionId);
+    return null;
+  }
+  const prompt = (input.prompt || '').trim();
+  // A host-injected turn (a task notification) is not a new user turn: it keeps the turn marker of the prompt it belongs to.
+  if (isHostInjectedPrompt(prompt)) return null;
+  // The user's own words first: an explicit model or cost instruction changes what is advised. The marker is
+  // stored before anything can return early, so the PreToolUse hook of this turn never reads an earlier turn's.
+  const intent = parseUserIntent(prompt);
+  const turn = turnId(prompt);
+  deps.markTurn?.(sessionId, {
+    turn,
+    mode: 'on',
+    intent: { ...(intent.model ? { model: intent.model } : {}), ...(intent.cost ? { cost: intent.cost } : {}) },
+    at: new Date().toISOString()
+  });
+  if (prompt.length < 8) return null;
+  // Pasted blobs carry no task: no advice and no Jev call (5.5).
+  if (isNonTaskPrompt(prompt)) return null;
   if (deps.egressAllowed && !deps.egressAllowed(input.cwd)) {
     deps.log({ hook: 'UserPromptSubmit', session_id: sessionId, egress: 'blocked' });
     return null;
@@ -109,13 +141,10 @@ export async function onUserPromptSubmit(input: HookInput, deps: HookDeps): Prom
   const criteria = await resolveClaudeSubagentCriteria(input.cwd);
   const rec = await deps.dispatch(trimTask(prompt), quotaStrategy, criteria);
   if (!rec) return null;
-  // The user's own words first: an explicit model or cost instruction changes what is advised.
-  const intent = parseUserIntent(prompt);
   // A status turn ("A3 completed the run") gets no line. An instruction in the prompt always does.
   if (isStatusTurn(rec, prompt, intent)) return null;
   const sessionModel = deps.readSessionModel(input);
   const { advised, rule } = resolveModel({ userIntent: intent, rec, sessionModel });
-  const turn = turnId(prompt);
   const staged = isStagedPrompt(prompt);
   deps.log({
     hook: 'UserPromptSubmit',
@@ -167,6 +196,8 @@ export type PreToolDeps = {
   readMode: () => Promise<JevMode>;
   /** The last advice given in this session, to join with what is requested now. */
   lastAdvice: (sessionId: string | null) => LastAdvice | null;
+  /** The marker of the turn this call is in: advice or intent that does not belong to it is stale and ignored. */
+  turnState: (sessionId: string | null) => TurnState | null;
   /** A `jev_dispatch` or `jev_batch_dispatch` call from Claude Code shows in the shared telemetry. */
   recentDispatch: () => boolean;
   /** This session's recent agent calls, and whether one already carried a reminder. */
@@ -196,10 +227,13 @@ export function preflightReminder(toolName: string): string {
 export async function onPreToolUse(input: HookInput, deps: PreToolDeps): Promise<HookOutput> {
   const tool = input.tool_name;
   if (tool !== 'Agent' && tool !== 'Task' && tool !== 'Workflow') return null;
-  if ((await deps.readMode()) !== 'on') return null;
+  const mode = await deps.readMode();
+  if (mode !== 'on') return null;
   const sessionId = typeof input.session_id === 'string' ? input.session_id : null;
   const call = input.tool_input || {};
-  const advice = deps.lastAdvice(sessionId);
+  // Advice and intent from another turn, or from before a mode flip, are stale and ignored.
+  const now = currentTurn(deps.turnState(sessionId), deps.lastAdvice(sessionId), mode);
+  const advice = now.advice;
   const recent = deps.recentAgentCalls(sessionId);
   const staged = tool === 'Workflow' || recent.count >= STAGED_AGENT_CALLS || advice?.staged === true;
   const remind = staged && !recent.reminded && !deps.recentDispatch();
@@ -208,12 +242,13 @@ export async function onPreToolUse(input: HookInput, deps: PreToolDeps): Promise
     event: 'agent_call',
     session_id: sessionId,
     tool_name: tool,
-    turn: advice?.turn ?? null,
+    turn: now.turn,
     tier: advice?.tier ?? null,
     recommended_model: advice?.model ?? null,
     requested_model: typeof call.model === 'string' ? call.model : null,
     subagent_type: typeof call.subagent_type === 'string' ? call.subagent_type : null,
-    reminded: remind
+    user_intent: now.intent,
+    preflight_reminder: remind
   });
   if (!remind) return null;
   return { hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: preflightReminder(tool) } };
@@ -283,12 +318,15 @@ const liveDeps: HookDeps = {
   dispatch: liveDispatch,
   log: appendLog,
   remember: writeLastAdvice,
+  markTurn: writeTurnState,
+  forgetTurn: clearTurnState,
   egressAllowed: (cwd) => checkEgress(egressContextDirs([cwd])).allowed
 };
 
 const livePreToolDeps: PreToolDeps = {
   readMode: () => readJevMode('claude-code'),
   lastAdvice: readLastAdvice,
+  turnState: readTurnState,
   recentDispatch: () => hasRecentDispatch(),
   recentAgentCalls: (sessionId) => recentAgentCalls(sessionId),
   log: appendLog

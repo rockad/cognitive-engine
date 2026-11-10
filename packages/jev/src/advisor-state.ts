@@ -132,5 +132,87 @@ export function recentAgentCalls(
     const at = stamp(e);
     return e.event === 'agent_call' && e.session_id === sessionId && Number.isFinite(at) && now - at <= windowMs;
   });
-  return { count: mine.length, reminded: mine.some((e) => e.reminded === true) };
+  // `reminded` is the field name of 2.4.0 records written before the key was aligned with agentic-hub.
+  return { count: mine.length, reminded: mine.some((e) => e.preflight_reminder === true || e.reminded === true) };
+}
+
+// ── The turn marker: what was stored at UserPromptSubmit, and when it is stale ──────────────────
+
+/** What the user said about a model or cost, as stored: the choice only, never the matched words. */
+export interface StoredIntent {
+  model?: 'haiku' | 'sonnet' | 'opus';
+  cost?: 'minimal' | 'normal';
+}
+
+/**
+ * Written at the start of every real user turn (before any Jev call, so even a silent or failed turn
+ * replaces the previous one), and read by the PreToolUse hook of the same turn. It holds the turn
+ * id, the Jev mode the turn started in and the user's intent: no prompt text.
+ */
+export interface TurnState {
+  turn: string;
+  mode: string;
+  intent: StoredIntent;
+  at: string;
+}
+
+function turnFile(sessionId: unknown): string | null {
+  const id = safeSessionId(sessionId);
+  return id ? path.join(claudeStateDir(), `${id}.turn.json`) : null;
+}
+
+export function writeTurnState(sessionId: unknown, state: TurnState): boolean {
+  const file = turnFile(sessionId);
+  if (!file) return false;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(state));
+    fs.renameSync(tmp, file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function readTurnState(sessionId: unknown): TurnState | null {
+  const file = turnFile(sessionId);
+  if (!file) return null;
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const ok = ['turn', 'mode', 'at'].every((k) => typeof raw?.[k] === 'string') && raw?.intent && typeof raw.intent === 'object';
+    return ok ? (raw as TurnState) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Forget the turn marker, for a turn that ran with Jev off: whatever was stored before is no longer this turn's. */
+export function clearTurnState(sessionId: unknown): void {
+  const file = turnFile(sessionId);
+  if (!file) return;
+  try {
+    fs.rmSync(file, { force: true });
+  } catch {
+    // best effort
+  }
+}
+
+/**
+ * The advice and the intent that still belong to the turn the tool call is in. Both are discarded
+ * when the marker is missing, when the Jev mode now differs from the mode the turn started in (the
+ * mode was flipped mid-turn), or when the advice is from another turn than the marker: a turn that
+ * got no advice (silent, offline, a status turn) must not inherit the last one's.
+ */
+export function currentTurn(
+  marker: TurnState | null,
+  advice: LastAdvice | null,
+  mode: string
+): { advice: LastAdvice | null; intent: StoredIntent | null; turn: string | null } {
+  if (!marker || marker.mode !== mode) return { advice: null, intent: null, turn: null };
+  return {
+    advice: advice && advice.turn === marker.turn ? advice : null,
+    intent: marker.intent,
+    turn: marker.turn
+  };
 }

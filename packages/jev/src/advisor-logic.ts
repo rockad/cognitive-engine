@@ -79,6 +79,8 @@ export type Dispatch = {
   routerTier?: JevTier;
   /** What set `tier` and `model`: absent for the router, else the user's instruction. */
   by?: 'instruction-model' | 'instruction-cost';
+  /** The model the user named when the one-step cap kept the tier short of it. */
+  asked?: 'haiku' | 'sonnet' | 'opus';
 };
 
 /** Turn a Jev decision response into a dispatch, validating every choice against the offered keys. */
@@ -185,7 +187,9 @@ function directiveBody(rec: Dispatch, sessionModel: string | null, quotaStrategy
   const subagent = rec.subagent === 'self' ? 'general-purpose' : rec.subagent;
 
   if (rec.by === 'instruction-model') {
-    const asked = `You asked for ${rec.model} (explicit user request: "${intent.phrase ?? rec.model}"): delegate to ${subagent} with model "${rec.model}".`;
+    const asked = rec.asked
+      ? `You asked for ${rec.asked} (explicit user request: "${intent.phrase ?? rec.asked}"), but Jev moves at most one tier step from its own recommendation (${rec.routerTier}): delegate to ${subagent} with model "${rec.model}".`
+      : `You asked for ${rec.model} (explicit user request: "${intent.phrase ?? rec.model}"): delegate to ${subagent} with model "${rec.model}".`;
     // The PreToolUse guard cannot read the prompt, so above the ceiling it still shows its one prompt.
     // Tell the assistant not to ask first: that prompt is the user's confirmation.
     return rec.model === 'opus' && !sessionAllowsOpus(sessionModel)
@@ -228,15 +232,19 @@ export type UserIntent = {
   phrase?: string;
 };
 
-/** Longest prefix of a prompt that is scanned for an instruction. */
-export const INTENT_SCAN_CHARS = 2000;
+/** Longest prefix of a prompt that is scanned for an instruction (a model named further down is prose or a paste). */
+export const INTENT_SCAN_CHARS = 1500;
 
 // An imperative that selects a model. Prose that merely mentions a model ("sonnet is cheaper than
 // opus", "compare with opus") does not match: a verb of choosing must come right before the name.
+// "with sonnet" counts only as a clause opener ("With sonnet, please") or after a verb that sets
+// the work going ("run it with sonnet", "go with haiku"), never as "compare with opus".
 const MODEL_IMPERATIVE =
-  /\b(?:use|using|run|launch|spawn|start|delegate(?:\s+(?:it|this|that))?\s+to|dispatch(?:\s+(?:it|this|that))?\s+to|go\s+with|switch\s+to|want|need|prefer|choose|pick|select)\s+(?:an?\s+|the\s+|only\s+)?(haiku|sonnet|opus)\b/gi;
+  /\b(?:(?:use|using|run|launch|spawn|start|delegate(?:\s+(?:it|this|that|them))?\s+to|dispatch(?:\s+(?:it|this|that|them))?\s+to|go\s+with|switch\s+to|want|need|prefer|choose|pick|select)|(?:(?:do|run|launch|start|proceed|go)\s+(?:it|this|that|them|these)?\s*with)|(?<=^|[.!?\n,;:]\s*)with)\s+(?:an?\s+|the\s+|only\s+)?(haiku|sonnet|opus)\b/gi;
 const ALTERNATIVE_MODEL = /^\s*(?:,\s*)?(?:or|and|\/|vs\.?|versus)\s+(?:an?\s+|the\s+)?(haiku|sonnet|opus)\b/i;
-const NEGATION =/\b(?:don'?t|do\s+not|never|not|no|without|avoid|stop|instead\s+of)\b[^.!?\n]{0,25}$/i;
+// A negator within a couple of words before the instruction: "do not use opus", "not opus", "instead of",
+// "without". Anywhere further back ("I have no idea, use opus") it is a different clause.
+const NEGATION = /\b(?:don'?t|do\s+not|never|not|no|without|avoid|stop|instead\s+of|rather\s+than)\s+(?:[\w'-]+\s+){0,2}$/i;
 const MINIMAL_COST =
   /\b(?:minimal|minimum)[\s-]+viable\b|\b(?:minimal|minimum|smallest|lowest)[\s-]+(?:cost|tier|model)\b|\bcheapest\b|\bleast\s+expensive\b|\bas\s+cheap(?:ly)?\s+as\b/i;
 
@@ -279,15 +287,27 @@ function oneStepDown(tier: JevTier): JevTier {
 }
 
 /**
- * Apply the user's own words to Jev's recommendation. An explicit model replaces the tier; `minimal`
- * lowers it by one step, never below `flash_lite`. When both are present the explicit model wins
- * and `minimal` is ignored, so the effect is capped at one instruction. Returns the input when
- * there is nothing to apply.
+ * Apply the user's own words to Jev's recommendation, moving the tier by at most ONE step from the
+ * router's (a parser that misreads a prompt can then cost one tier, not three). An explicit model
+ * moves the tier towards that model's tier, `minimal` lowers it by one step, never below
+ * `flash_lite`. When both are present the explicit model wins and `minimal` is ignored, so the
+ * effect is capped at one instruction. Returns the input when there is nothing to apply.
  */
 export function applyUserIntent(rec: Dispatch, intent: UserIntent): Dispatch {
   if (intent.model) {
-    const tier = MODEL_TO_TIER[intent.model];
-    return { ...rec, tier, model: intent.model, routerTier: rec.routerTier ?? rec.tier, by: 'instruction-model' };
+    const wanted = MODEL_TO_TIER[intent.model];
+    const from = TIER_ORDER.indexOf(rec.routerTier ?? rec.tier);
+    const to = TIER_ORDER.indexOf(wanted);
+    const tier = TIER_ORDER[Math.max(from - 1, Math.min(from + 1, to))];
+    const model = tier === wanted ? intent.model : TIER_TO_CLAUDE[tier];
+    return {
+      ...rec,
+      tier,
+      model,
+      routerTier: rec.routerTier ?? rec.tier,
+      by: 'instruction-model',
+      ...(tier === wanted ? {} : { asked: intent.model })
+    };
   }
   if (intent.cost === 'minimal') {
     const tier = oneStepDown(rec.tier);
@@ -318,9 +338,14 @@ export const PASTE_SKIP_CHARS = 20_000;
 /** Prompts the host injects on the user's behalf, never a task of the user's. */
 const SYSTEM_TURN = /^\s*<(?:task-notification|local-command-[a-z]+|bash-(?:input|stdout|stderr)|system-reminder)\b/i;
 
+/** True for a turn the host injected on the user's behalf (a task notification, a local command): not a new user turn. */
+export function isHostInjectedPrompt(prompt: string): boolean {
+  return SYSTEM_TURN.test(prompt);
+}
+
 /** True for a prompt that carries no delegation intent by its shape alone, before any Jev call. */
 export function isNonTaskPrompt(prompt: string): boolean {
-  return SYSTEM_TURN.test(prompt) || prompt.length > PASTE_SKIP_CHARS;
+  return isHostInjectedPrompt(prompt) || prompt.length > PASTE_SKIP_CHARS;
 }
 
 /**
