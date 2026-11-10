@@ -9,8 +9,13 @@
  * unexpected event shape no-ops instead of failing the turn. Only the deliberate `[jev]` approval
  * error is allowed to propagate.
  *
- * `opencode serve` caches plugin modules in memory; restart it (`pkill -f "opencode serve"`)
- * after changing this source.
+ * `opencode reload` reloads configuration; whether it re-imports plugin modules is unverified.
+ *
+ * Event shapes (checked against the opencode v2.0.25 binary, which is the only source for them:
+ * the public plugin docs describe the V1 API): `tool.hook("execute.before", handler)` calls
+ * `handler(event)` with ONE argument, `{ tool, sessionID, agent, messageID, id, input }`, where
+ * `input` holds the tool arguments. The delegation tool is `subagent`, whose input is
+ * `{ agent, description, prompt, model?, sessionID?, background? }` (`background` is an optional boolean).
  */
 import { readJevMode } from '@cognitive-engine/jev/core';
 import { handleDispatchTool } from '@cognitive-engine/jev/tools';
@@ -20,7 +25,7 @@ export type PluginMode = 'off' | 'advisory' | 'enforce';
 
 export interface PluginOptions {
   mode?: PluginMode;
-  /** Tool name that spawns subagents. */
+  /** Tool name that spawns subagents (OpenCode V2: `subagent`). */
   delegationTool?: string;
   /** Skip the Pro approval gate in `enforce` mode. */
   allowPro?: boolean;
@@ -63,7 +68,7 @@ export function createPlugin(deps: PluginDeps = defaultDeps) {
       if (mode === 'off') return () => {};
 
       const timeoutMs = Number.isFinite(options.timeoutMs) ? (options.timeoutMs as number) : 1500;
-      const delegationTool = options.delegationTool ?? 'task';
+      const delegationTool = options.delegationTool ?? 'subagent';
       const advised = new Map<string, number>();
 
       const dispatch = async (task: string): Promise<Dispatch | null> => {
@@ -91,13 +96,20 @@ export function createPlugin(deps: PluginDeps = defaultDeps) {
       }
 
       if (mode === 'enforce' && !options.allowPro && typeof ctx?.tool?.hook === 'function') {
-        await ctx.tool.hook('execute.before', async (a: any, b: any) => {
-          const event = a ?? {};
-          const out = b ?? event;
-          if ((event.tool ?? event.name ?? out.tool) !== delegationTool) return;
-          const args = out.args ?? event.args ?? {};
-          const task = String(args.prompt ?? args.description ?? args.task ?? '');
-          const block = delegationBlock(await dispatch(task), task);
+        await ctx.tool.hook('execute.before', async (event: any) => {
+          if (event?.tool !== delegationTool) return;
+          // Fail open on internal errors, as the context hook does: only the deliberate `[jev]`
+          // approval error is thrown, and it is thrown outside the try.
+          let block: Error | null = null;
+          try {
+            // The tool arguments are `event.input` (not `args`); the task is the subagent's `prompt`,
+            // or its `description` when the prompt is empty.
+            const input = event.input ?? {};
+            const task = String(input.prompt || input.description || '');
+            block = delegationBlock(await dispatch(task), task);
+          } catch {
+            return;
+          }
           if (block) throw block;
         });
       }

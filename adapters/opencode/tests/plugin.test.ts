@@ -17,6 +17,15 @@ function makeCtx() {
 }
 
 const deps = (d: Dispatch | null, mode = 'on'): PluginDeps => ({ dispatch: async () => d, readMode: async () => mode });
+/** An OpenCode V2 `tool.execute.before` event for the `subagent` tool (shape from the opencode v2.0.25 binary). */
+const subagentCall = (prompt: string) => ({
+  tool: 'subagent',
+  sessionID: 'ses_1',
+  agent: 'build',
+  messageID: 'msg_1',
+  id: 'call_1',
+  input: { agent: 'general', description: 'Delegated work', prompt }
+});
 const contextEvent = (text: string) => ({ messages: [{ content: text }], system: [] as any[] });
 
 describe('opencode logic', () => {
@@ -106,17 +115,97 @@ describe('opencode plugin', () => {
     await createPlugin(deps(pro)).setup(ctx, { mode: 'enforce' });
     expect(Object.keys(hooks).sort()).toEqual(['session.context', 'tool.execute.before']);
 
-    const call = { tool: 'task', args: { prompt: 'Redesign the whole storage layer' } };
-    await expect(hooks['tool.execute.before'](call, call)).rejects.toThrow(/^\[jev\]/);
-    const other = { tool: 'read', args: { prompt: 'Redesign the whole storage layer' } };
-    await expect(hooks['tool.execute.before'](other, other)).resolves.toBeUndefined();
+    await expect(hooks['tool.execute.before'](subagentCall('Redesign the whole storage layer'))).rejects.toThrow(/^\[jev\]/);
+    const other = { ...subagentCall('Redesign the whole storage layer'), tool: 'read' };
+    await expect(hooks['tool.execute.before'](other)).resolves.toBeUndefined();
+  });
+
+  it('guards the `subagent` tool by default, not `task`', async () => {
+    const { ctx, hooks } = makeCtx();
+    await createPlugin(deps(pro)).setup(ctx, { mode: 'enforce' });
+    const legacy = { ...subagentCall('Redesign the whole storage layer'), tool: 'task' };
+    await expect(hooks['tool.execute.before'](legacy)).resolves.toBeUndefined();
+    await expect(hooks['tool.execute.before'](subagentCall('Redesign the whole storage layer'))).rejects.toThrow(/^\[jev\]/);
+  });
+
+  it('honours a delegationTool override', async () => {
+    const { ctx, hooks } = makeCtx();
+    await createPlugin(deps(pro)).setup(ctx, { mode: 'enforce', delegationTool: 'task' });
+    const call = { ...subagentCall('Redesign the whole storage layer'), tool: 'task' };
+    await expect(hooks['tool.execute.before'](call)).rejects.toThrow(/^\[jev\]/);
+    await expect(hooks['tool.execute.before'](subagentCall('Redesign the whole storage layer'))).resolves.toBeUndefined();
+  });
+
+  it('reads the task from event.input.prompt, falling back to description', async () => {
+    const seen: string[] = [];
+    const spy: PluginDeps = { readMode: async () => 'on', dispatch: async (task) => (seen.push(task), flash) };
+    const { ctx, hooks } = makeCtx();
+    await createPlugin(spy).setup(ctx, { mode: 'enforce' });
+    await hooks['tool.execute.before'](subagentCall('Find the config loader'));
+    await hooks['tool.execute.before']({ tool: 'subagent', input: { agent: 'explore', description: 'Locate the config loader' } });
+    expect(seen).toEqual(['Find the config loader', 'Locate the config loader']);
+  });
+
+  it('falls back to description when the prompt is an empty string', async () => {
+    const seen: string[] = [];
+    const spy: PluginDeps = { readMode: async () => 'on', dispatch: async (task) => (seen.push(task), flash) };
+    const { ctx, hooks } = makeCtx();
+    await createPlugin(spy).setup(ctx, { mode: 'enforce' });
+    await hooks['tool.execute.before']({ tool: 'subagent', input: { agent: 'explore', description: 'Locate the config loader', prompt: '' } });
+    expect(seen).toEqual(['Locate the config loader']);
+  });
+
+  it('fails open when reading the mode throws, and still throws the deliberate [jev] error', async () => {
+    const broken: PluginDeps = {
+      readMode: async () => {
+        throw new Error('config exploded');
+      },
+      dispatch: async () => pro
+    };
+    const a = makeCtx();
+    await createPlugin(broken).setup(a.ctx, { mode: 'enforce' });
+    await expect(a.hooks['tool.execute.before'](subagentCall('Redesign the whole storage layer'))).resolves.toBeUndefined();
+
+    // a throwing dispatch dependency is also contained
+    const brokenDispatch: PluginDeps = {
+      readMode: async () => 'on',
+      dispatch: async () => {
+        throw new Error('dispatch exploded');
+      }
+    };
+    const b = makeCtx();
+    await createPlugin(brokenDispatch).setup(b.ctx, { mode: 'enforce' });
+    await expect(b.hooks['tool.execute.before'](subagentCall('Redesign the whole storage layer'))).resolves.toBeUndefined();
+
+    // the approval error still propagates when nothing is broken
+    const c = makeCtx();
+    await createPlugin(deps(pro)).setup(c.ctx, { mode: 'enforce' });
+    await expect(c.hooks['tool.execute.before'](subagentCall('Redesign the whole storage layer'))).rejects.toThrow(/^\[jev\]/);
+  });
+
+  it('does not read the V1 `args` shape or a second hook argument', async () => {
+    const seen: string[] = [];
+    const spy: PluginDeps = { readMode: async () => 'on', dispatch: async (task) => (seen.push(task), pro) };
+    const { ctx, hooks } = makeCtx();
+    await createPlugin(spy).setup(ctx, { mode: 'enforce' });
+    const v1 = { tool: 'subagent', args: { prompt: 'Redesign the whole storage layer' } };
+    await expect(hooks['tool.execute.before'](v1, v1)).resolves.toBeUndefined();
+    await expect(hooks['tool.execute.before']({ tool: 'subagent' }, { args: { prompt: 'Redesign the whole storage layer' } })).resolves.toBeUndefined();
+    expect(seen).toEqual([]);
+  });
+
+  it('no-ops on an unreadable event', async () => {
+    const { ctx, hooks } = makeCtx();
+    await createPlugin(deps(pro)).setup(ctx, { mode: 'enforce' });
+    for (const event of [undefined, null, {}, { tool: 'subagent' }, { tool: 'subagent', input: null }]) {
+      await expect(hooks['tool.execute.before'](event)).resolves.toBeUndefined();
+    }
   });
 
   it('lets delegation through when the route is not pro or allowPro is set', async () => {
     const a = makeCtx();
     await createPlugin(deps(flash)).setup(a.ctx, { mode: 'enforce' });
-    const call = { tool: 'task', args: { prompt: 'Find the config loader' } };
-    await expect(a.hooks['tool.execute.before'](call, call)).resolves.toBeUndefined();
+    await expect(a.hooks['tool.execute.before'](subagentCall('Find the config loader'))).resolves.toBeUndefined();
 
     const b = makeCtx();
     await createPlugin(deps(pro)).setup(b.ctx, { mode: 'enforce', allowPro: true });
