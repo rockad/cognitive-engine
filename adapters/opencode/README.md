@@ -33,3 +33,7 @@ Add the stdio server to `~/.config/opencode/opencode.json`:
 ```
 
 No credentials go in the config; Jev reads its key from `~/.config/zsh/secrets.env` or `~/.config/jev/env`.
+
+## Model tiers bill per token by default
+
+Jev's OpenCode tier map defaults to `~anthropic/claude-{haiku,sonnet,opus}-latest` on OpenRouter, which is pay-per-token. If OpenCode runs on a subscription, override the tiers in `~/.config/jev/config.json` under `harnesses.opencode.models` with model ids your provider lists. The package keeps the default on purpose (decided 2026-11-10); see Jev's README, "Model tiers per harness". Never use `claude-agent/*`.

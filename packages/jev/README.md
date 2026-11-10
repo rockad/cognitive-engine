@@ -41,6 +41,26 @@ With no config file the mode resolves to `off` and the guard is silent, so a fre
 
 Harness detection reads `JEV_HARNESS` first (`antigravity`, `claude-code`, `opencode`, `cli`), then falls back to each harness's own environment markers.
 
+### Model tiers per harness (OpenCode bills per token by default)
+
+Each harness maps the four tiers (`free`, `cheap`, `standard`, `deep`) to model names in `harnesses.<harness>.models`; the built-in defaults are in `DEFAULT_JEV_CONFIG` (`src/core/config.ts`). The `opencode` defaults are `~anthropic/claude-haiku-latest`, `~anthropic/claude-sonnet-latest` and `~anthropic/claude-opus-latest` on OpenRouter, **which is pay-per-token**. If you run OpenCode on a subscription, those defaults spend money the subscription would not. Decided 2026-11-10: the package keeps these defaults (the right replacement depends on the plan, and a model id baked into the package goes stale), and you override them in your own config. Never point a tier at `claude-agent/*`.
+
+```json
+{
+  "harnesses": {
+    "opencode": {
+      "models": {
+        "cheap": "<provider>/<small model>",
+        "standard": "<provider>/<mid model>",
+        "deep": "<provider>/<largest model>"
+      }
+    }
+  }
+}
+```
+
+Use model ids your OpenCode provider lists (for example `github-copilot/…` or `openai/…`). User config merges over the defaults key by key, so only the tiers you set change.
+
 ## Development
 
 ```sh
@@ -129,6 +149,22 @@ The model can change with no `PostModelSwitch` event: a session resumed with ano
 
 Limits: this depends on the `SessionStart` recorder being registered (it is, in `adapters/claude/hooks/hooks.json`); without it a resume cannot be seen. The transcript is only read from its last 256 KiB.
 
+### Known limits (subagent guard): environment remaps and the effort default
+
+The guard classifies the model a call names (`sonnet`, `opus`, a full id) by its name. Two sets of Claude Code environment variables change what that name means or what effort it runs at, and the guard does not read them. **Decided 2026-11-10 (warn only, never block):** the guard stays advisory about these. What follows is a documented, known bypass, not an oversight.
+
+- **Alias remaps.** `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL` and `ANTHROPIC_DEFAULT_HAIKU_MODEL` set the model an alias resolves to (Claude Code docs, model configuration). With `ANTHROPIC_DEFAULT_SONNET_MODEL` set to an Opus id, a subagent requested as `sonnet` runs on Opus; the guard sees `sonnet` and allows it.
+- **Effort default.** `CLAUDE_CODE_EFFORT_LEVEL` outranks every other effort source: per the Claude Code docs, when it is set "that level applies instead" of a subagent's own `effort`. The guard's effort check reads the call and the agent definition, not this variable, so a subagent that declares a low effort can still run at the level the variable names.
+- **Who can set them.** Any settings file's `env` block, which includes a repository's shared `.claude/settings.json`. A repository you clone can therefore change what an alias means without a prompt from Jev. Claude Code applies most project `env` values only after the folder is trusted; its docs list no exception for these variables.
+- **The native deny rule does not close this.** `Agent(model:opus)` compares the literal input Claude sends: it matches the alias `opus`, not a full model id, not a remapped alias, and never a call that leaves `model` unset or a `model:` in an agent definition (see the Claude adapter README, "Defence in depth").
+
+**Non-silent, planned (not implemented yet).** The follow-up to this release makes these variables visible without blocking anything: when the guard evaluates a call and any of the three remap variables or `CLAUDE_CODE_EFFORT_LEVEL` is set, it adds one line to its note naming the variable (never the value) and records the variable names in the decisions-log entry. Until that ships, check by hand in each repository you work in:
+
+```sh
+env | rg 'ANTHROPIC_DEFAULT_|CLAUDE_CODE_EFFORT_LEVEL'
+rg -n 'ANTHROPIC_DEFAULT_|CLAUDE_CODE_EFFORT_LEVEL' .claude/settings.json .claude/settings.local.json ~/.claude/settings.json
+```
+
 ## Prompt advisor hook (Claude Code)
 
 `bun src/advisor-hook.ts user-prompt-submit` is the `UserPromptSubmit` hook (`src/advisor-hook.ts`, logic in `src/advisor-logic.ts`), ported from `agentic-hub/plugins/jev/claude/`. In Jev mode `on` it asks Jev for a subagent, tier and effort for the prompt and injects one `[JEV]` line as `additionalContext`. The numbers below (5.1 to 5.11) are the section 5 items of the [case study](docs/case-studies/2026-11-09-model-tier-for-multi-stream-workflow.md) that drove this port; its opening note says where each fix lives.
@@ -168,7 +204,7 @@ Finding: no hook event can intercept a `Workflow`'s inner `agent()` call to advi
 
 ### Known limits (advisor and its logs)
 
-- **The logs are unbounded.** `~/.config/jev/claude_decisions.jsonl` and the shared telemetry file only grow: there is no rotation or size cap. Readers look at the last 128 KiB only, so this costs disk, not speed.
+- **The logs are unbounded.** `~/.config/jev/claude_decisions.jsonl` and the shared telemetry file only grow: there is no rotation or size cap. Readers look at the last 128 KiB only, so this costs disk, not speed. Rotation is deliberately deferred (decided 2026-11-10): several processes append concurrently (hooks, the MCP server, the adapters), so a rename-based rotation needs locking or tolerates lost lines, and the measured growth does not justify that. Measured on one machine on 2026-11-10: `claude_decisions.jsonl` was 264 KB after about two weeks (roughly 20 KB a day, 7 MB a year) and `~/.config/jev/claude-sessions/` held 304 KB, one small state file per session. Revisit when any of these files passes about 10 MB, or when you run many parallel sessions or an agent loop. To prune by hand with no Claude Code session running: `tail -n 5000 ~/.config/jev/claude_decisions.jsonl > ~/.config/jev/claude_decisions.jsonl.new && mv ~/.config/jev/claude_decisions.jsonl.new ~/.config/jev/claude_decisions.jsonl`, and delete old files in `claude-sessions/` (for example `fd -t f --changed-before 30d . ~/.config/jev/claude-sessions -X rm`).
 - **A short turn hash can be guessed.** `turn` is the first 12 hex characters of a SHA-256 of the prompt. For a short or common prompt ("continue", "yes") anyone who can read the log can confirm a guess against it, so it is a join key, not an anonymiser. The log never holds the prompt text itself.
 - **Harness detection order.** `detectActiveHarness()` checks the Claude Code markers (`CLAUDE_CODE`, `CLAUDE_PROJECT_DIR`, `CLAUDECODE`) before the OpenCode ones, so an OpenCode launched from a Claude Code shell is detected as `claude-code` unless `JEV_HARNESS` is set. Follow-up: set `JEV_HARNESS` in the OpenCode and Antigravity adapters.
 - **Two harness labels.** The advisor hook's telemetry says `harness: "claude"` while the MCP dispatch tools say `harness: "claude-code"`. The reminder's `hasRecentDispatch` reads the second; a consumer that joins the two files by harness has to treat them as the same.

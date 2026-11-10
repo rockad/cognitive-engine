@@ -60,6 +60,23 @@ The hook is active in `on` and `on-demand`. Run `/jev on-demand` (or `/jev on`),
 
 A config that exists but cannot be trusted is not treated as `off`. Unreadable, a broken symlink, over 1 MB, invalid JSON, not an object, an unknown mode, a wrong type for a key Jev reads, a stray top-level `"mode"` (the mistake `{"mode":"on"}`; the mode belongs at `defaults.mode`), a near-miss key that Jev would silently ignore (`"default"` for `defaults`, `"claude"` or `"antigravty"` under `harnesses`; the message says which key was probably meant), a `mode` under a harness name that matches nothing, or `JEV_CONFIG_FILE` pointing at a file that does not exist makes the guard ask on **every** `Agent`, `Task` and `Workflow` call. The prompt names the file and the problems, a one-line message goes to stderr, and a `config_malformed` event (path and problem list only) is appended to the decisions log. Fix the file to `{"defaults":{"mode":"on-demand"}}`, run `/jev status` to see what Jev reads, or set `/jev off` explicitly.
 
+## Defence in depth (optional): a native deny rule
+
+The guard hook is the enforcement point. On Claude Code 2.1.295 and later it fails closed (`"onFailure": "block"`), so a crashing, timing-out or missing hook blocks the call. For older versions, or for a session where the plugin is disabled, you can add Claude Code's own permission rule as a second layer. This plugin does not write it for you (decided 2026-11-10: no installer, because it would be a new write path into your user settings for a mostly redundant layer). Add it to `~/.claude/settings.json` yourself:
+
+```json
+{
+  "permissions": {
+    "deny": ["Agent(model:opus)"]
+  }
+}
+```
+
+Syntax from the Claude Code permissions docs ("Match by input parameter"): `Tool(param:value)` on a deny or ask rule compares the literal input Claude sends. What that means here:
+
+- It matches the alias `opus`. It does **not** match a full model id (`claude-opus-5-5`), a remapped alias (`ANTHROPIC_DEFAULT_*_MODEL`, see Jev's README, "Known limits (subagent guard)"), or a call that leaves `model` unset.
+- It does not see a `model:` in an agent definition's frontmatter: the rule only sees the `model` parameter Claude passes in the call.
+- It denies outright, with no ask and no session-ceiling logic, so it also blocks Opus when the session itself runs Opus. Use `ask` instead of `deny` (`"ask": ["Agent(model:opus)"]`) if you want a prompt, not a refusal.
 ## Validate
 
 ```sh
