@@ -7,6 +7,9 @@ import {
   clampTierToSessionCeiling,
   detectScaffoldingTask,
   isFreeTierMechanicalTask,
+  isReadOnlySubagent,
+  taskNeedsEdit,
+  editCapableSubagent,
   topologicalSortStages,
   estimateTierCost,
   defaultEffortForSubagent,
@@ -27,7 +30,7 @@ import {
 import { dispatchStyle } from './harness.js';
 import { activeClaudeSessionModel, claudeModelTier, sessionBelowOpus } from '../claude-active-session.js';
 import { CLAUDE_SUBAGENT_CRITERIA, resolveClaudeSubagentCriteria } from '../advisor-logic.js';
-import { READ_ONLY_SUBAGENTS, STAGE_RUBRIC, TIER_CRITERIA, isStageKind, type StageKind } from '../stage-rubric.js';
+import { STAGE_RUBRIC, TIER_CRITERIA, isStageKind, type StageKind } from '../stage-rubric.js';
 
 const dispatchShape = {
   task: z.string().describe('The task, prompt, or sub-goal to dispatch'),
@@ -84,6 +87,15 @@ export function classifyBatchTier(taskText: string): 'openrouter_free' | 'flash'
   if (isFreeTierMechanicalTask(taskText)) return 'openrouter_free';
   if (/\b(?:deep reasoning|architecture overhaul)\b/i.test(taskText || '')) return 'pro';
   return 'flash';
+}
+
+/**
+ * Read-only personas (Plan, Explore) never own an editing task. Claude Code gets general-purpose.
+ * Other harnesses are left as they were: their persona names are not Claude's, and their output
+ * is unchanged from 2.3.x (agentic-hub 2.3.1 swaps to `self` there; this port keeps them identical).
+ */
+export function resolveEditCapableSubagent(harness: string, subagent: string, taskText: string): string {
+  return harness === 'claude-code' ? editCapableSubagent(subagent, taskText, 'general-purpose') : subagent;
 }
 
 export const dispatchTool = defineTool({
@@ -231,6 +243,9 @@ export async function handleDispatchTool(args: ToolInput<typeof dispatchShape>):
       );
     }
   }
+
+  // Plan and Explore have no Edit or Write tool: an editing task never goes to them on Claude Code.
+  recommendedSubagent = resolveEditCapableSubagent(harness, recommendedSubagent, task);
 
   const latencyMs = Math.round(performance.now() - start);
   const telemetry = {
@@ -391,9 +406,11 @@ export async function handleBatchDispatchTool(args: ToolInput<typeof batchDispat
   }
 
   // Candidate subagents for a task. On Claude Code a stage that edits files never gets a read-only type.
-  const candidatesFor = (item: { needsEdit?: boolean }): Record<string, string> => {
-    if (!isClaude || !item.needsEdit) return workspaceAgents;
-    const editable = Object.fromEntries(Object.entries(workspaceAgents).filter(([name]) => !READ_ONLY_SUBAGENTS.has(name)));
+  // The caller's `needsEdit` wins when given; otherwise the task wording decides (taskNeedsEdit, a narrow verb list).
+  const editsFiles = (item: { needsEdit?: boolean; task?: string }): boolean => item.needsEdit ?? taskNeedsEdit(item.task || '');
+  const candidatesFor = (item: { needsEdit?: boolean; task?: string }): Record<string, string> => {
+    if (!isClaude || !editsFiles(item)) return workspaceAgents;
+    const editable = Object.fromEntries(Object.entries(workspaceAgents).filter(([name]) => !isReadOnlySubagent(name)));
     return Object.keys(editable).length > 0 ? editable : { 'general-purpose': CLAUDE_SUBAGENT_CRITERIA['general-purpose'] };
   };
   // On Claude Code the tier is asked of the router per stage, with the rubric as criteria, unless the caller classified it.
@@ -454,7 +471,7 @@ export async function handleBatchDispatchTool(args: ToolInput<typeof batchDispat
 
     let subagent = subagentAssignments[item.id] || 'self';
     // A read-only type cannot carry out an edit stage, whatever routed it there.
-    if (isClaude && item.needsEdit && READ_ONLY_SUBAGENTS.has(subagent)) subagent = 'general-purpose';
+    if (isClaude && editsFiles(item) && isReadOnlySubagent(subagent)) subagent = 'general-purpose';
 
     let rawTier = 'flash';
     let tierSource: TierSource | undefined;

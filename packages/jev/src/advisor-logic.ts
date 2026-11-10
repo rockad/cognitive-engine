@@ -7,7 +7,7 @@
  * advice only. The enforcement point for the model ceiling is the PreToolUse guard (guard.ts),
  * which this module neither replaces nor imports. A Jev failure never fails a turn.
  */
-import { defaultEffortForSubagent, applyEffortGovernance, discoverWorkspaceAgents, type ThinkingEffort } from './core/index.js';
+import { defaultEffortForSubagent, applyEffortGovernance, discoverWorkspaceAgents, editCapableSubagent, type ThinkingEffort } from './core/index.js';
 import { compareModels, parseModel } from './models.js';
 import { STAGE_RUBRIC_TEXT, TIER_CRITERIA, type ClaudeModelAlias, type JevTier } from './stage-rubric.js';
 
@@ -96,8 +96,9 @@ export function parseDispatch(
   const saChoice = sa?.choice;
   const tier: JevTier =
     typeof tierChoice === 'string' && tierChoice in TIER_CRITERIA ? (tierChoice as JevTier) : 'flash';
-  const subagent =
-    typeof saChoice === 'string' && saChoice in criteria ? saChoice : 'self';
+  const chosen = typeof saChoice === 'string' && saChoice in criteria ? saChoice : 'self';
+  // Plan and Explore have no Edit or Write tool: an editing task goes to general-purpose instead.
+  const subagent = editCapableSubagent(chosen, task, 'general-purpose');
   const confidence = Math.min(
     typeof sa?.confidence === 'number' ? sa.confidence : 0.9,
     typeof tierAnswer?.confidence === 'number' ? tierAnswer.confidence : 0.9

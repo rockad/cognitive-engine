@@ -120,3 +120,36 @@ export function isFreeTierMechanicalTask(taskText: string): boolean {
   const text = taskText || '';
   return SCAFFOLD_PATTERNS.some((p) => p.test(text)) || isFormattingTask(text);
 }
+
+/** Claude Code subagent types that cannot edit files (no Edit or Write tool), compared case-insensitively. */
+const READ_ONLY_PERSONAS: ReadonlySet<string> = new Set(['plan', 'explore']);
+
+export function isReadOnlySubagent(name: string): boolean {
+  return READ_ONLY_PERSONAS.has((name || '').trim().toLowerCase());
+}
+
+/**
+ * True when the task text asks for a change to files. Deliberately narrow (the 2.3.1 review found
+ * agentic-hub's list too broad): clear editing verbs only, in their imperative, third-person and
+ * gerund forms. Not "review", "check", "find", "explain", "create", "commit" or "port", which are
+ * as often about reading as about writing.
+ */
+const EDIT_VERB =
+  /\b(?:edit|edits|editing|implement|implements|implementing|fix|fixes|fixing|refactor|refactors|refactoring|write|writes|writing|rewrite|rewrites|rewriting|add|adds|adding|update|updates|updating|rename|renames|renaming|migrate|migrates|migrating|delete|deletes|deleting|apply|applies|applying)\b/i;
+
+/** "no edits", "without writing", "do not update": the verb is named to rule it out. */
+const NEGATED_EDIT = /\b(?:no|not|never|without|don'?t|avoid)\s+(?:\w+\s+)?$/i;
+
+export function taskNeedsEdit(taskText: string): boolean {
+  const text = taskText || '';
+  const verb = new RegExp(EDIT_VERB.source, 'gi');
+  for (const m of text.matchAll(verb)) {
+    if (!NEGATED_EDIT.test(text.slice(Math.max(0, m.index! - 20), m.index!))) return true;
+  }
+  return false;
+}
+
+/** A read-only persona never owns an editing task: fall back to the named editing-capable agent. */
+export function editCapableSubagent(subagent: string, taskText: string, fallback: string): string {
+  return isReadOnlySubagent(subagent) && taskNeedsEdit(taskText) ? fallback : subagent;
+}

@@ -46,6 +46,3 @@ export const TIER_CRITERIA: Readonly<Record<JevTier, string>> = {
   flash: `Standard agentic steps, routine edits, content synthesis, local commands; ${STAGE_RUBRIC['settled-edit'].rule}`,
   pro: `Deep reasoning, architecture, complex multi-file refactors, high-stakes writing; ${STAGE_RUBRIC.judgement.rule}`
 };
-
-/** Claude Code subagent types that have no Edit or Write tool: they cannot carry out an edit stage. */
-export const READ_ONLY_SUBAGENTS: ReadonlySet<string> = new Set(['Plan', 'Explore']);

@@ -2,8 +2,18 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { defaultEffortForSubagent, detectScaffoldingTask, evaluateLocalHeuristic, isFormattingTask, isFreeTierMechanicalTask } from '../src/core/index.ts';
-import { classifyBatchTier } from '../src/tools/dispatch.ts';
+import {
+  defaultEffortForSubagent,
+  detectScaffoldingTask,
+  editCapableSubagent,
+  evaluateLocalHeuristic,
+  isFormattingTask,
+  isFreeTierMechanicalTask,
+  isReadOnlySubagent,
+  taskNeedsEdit
+} from '../src/core/index.ts';
+import { parseDispatch } from '../src/advisor-logic.ts';
+import { classifyBatchTier, resolveEditCapableSubagent } from '../src/tools/dispatch.ts';
 
 const RUNNER = path.join(import.meta.dir, 'fixtures', 'run-dispatch.ts');
 const MARKERS = ['JEV_HARNESS', 'ANTIGRAVITY_CLI', 'GEMINI_CLI', 'CORTEX_SESSION', 'CLAUDE_CODE', 'CLAUDECODE', 'CLAUDE_PROJECT_DIR', 'CLAUDE_CODE_SESSION_ID', 'OPENCODE_SESSION', 'OPENCODE_HOME'];
@@ -89,13 +99,13 @@ beforeEach(() => {
 });
 afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-/** Batch dispatch end to end in a child process with its own HOME and keyword routing (no network). */
-function runBatch(harness: string, tasks: unknown[], availableSubagents: string[] = []): any {
+/** A dispatch handler end to end in a child process with its own HOME and a stubbed Decisions API (no network). */
+function runHandler(harness: string, input: { tool: 'batch' | 'single'; args: unknown; answers?: Record<string, string>; offline?: boolean }): any {
   fs.writeFileSync(path.join(tmp, 'config.json'), JSON.stringify({ routing: { strategy: 'keyword' } }));
   const clean: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) if (v !== undefined && !MARKERS.includes(k) && !/KEY|TOKEN|SECRET/.test(k)) clean[k] = v;
   const proc = Bun.spawnSync(['bun', RUNNER], {
-    stdin: new TextEncoder().encode(JSON.stringify({ tool: 'batch', args: { tasks, availableSubagents }, offline: true })),
+    stdin: new TextEncoder().encode(JSON.stringify(input)),
     env: {
       ...clean,
       HOME: tmp,
@@ -110,6 +120,10 @@ function runBatch(harness: string, tasks: unknown[], availableSubagents: string[
   return JSON.parse(proc.stdout.toString());
 }
 
+const runBatch = (harness: string, tasks: unknown[], availableSubagents: string[] = []): any =>
+  runHandler(harness, { tool: 'batch', args: { tasks, availableSubagents }, offline: true });
+const runSingle = (harness: string, args: { task: string }, answers: Record<string, string>): any => runHandler(harness, { tool: 'single', args, answers });
+
 describe('jev_batch_dispatch tier rule end to end', () => {
   it.each(['claude-code', 'antigravity', 'opencode', 'cli'])('%s: the dump-format sentence is flash and the scaffold sentence is free', (harness) => {
     const plan = runBatch(harness, [
@@ -119,5 +133,98 @@ describe('jev_batch_dispatch tier rule end to end', () => {
     ]);
 
     expect(plan.tasks.map((t: any) => t.tier)).toEqual(['flash', 'openrouter_free', 'flash']);
+  });
+});
+
+describe('read-only personas never own an editing task', () => {
+  it('knows Plan and Explore are read-only, whatever the case', () => {
+    expect([isReadOnlySubagent('Plan'), isReadOnlySubagent('explore'), isReadOnlySubagent('general-purpose'), isReadOnlySubagent('code-engineer')]).toEqual([true, true, false, false]);
+  });
+
+  it.each([
+    ['Edit the tasklist'],
+    ['Implement the parser'],
+    ['Fix the quota bug'],
+    ['Refactor the module'],
+    ['Write the changelog entry'],
+    ['Add a test for it'],
+    ['Update the README'],
+    ['Rename the field'],
+    ['Migrate the table'],
+    ['Delete the stale file'],
+    ['Apply the patch'],
+    ['Rewrite the intro']
+  ])('%j is an editing task', (task) => {
+    expect(taskNeedsEdit(task)).toBe(true);
+  });
+
+  it.each([
+    ['Review the design'],
+    ['Check the quota file'],
+    ['Find where the quota file is read'],
+    ['Explain how the guard works'],
+    ['Summarise the plan'],
+    ['Look at the written notes'],
+    ['Create a picture of the flow'],
+    ['Commit to a direction'],
+    ['Outline the approach, no edits'],
+    ['Plan it without writing anything'],
+    ['Do not update the files, just read them']
+  ])('%j is not an editing task (the verb list stays narrow)', (task) => {
+    expect(taskNeedsEdit(task)).toBe(false);
+  });
+
+  it('swaps Plan for the fallback on an editing task and keeps it on a planning task', () => {
+    expect([editCapableSubagent('Plan', 'Edit the plan document', 'general-purpose'), editCapableSubagent('Plan', 'Design the storage approach', 'general-purpose')]).toEqual(['general-purpose', 'Plan']);
+  });
+
+  it('leaves an editing-capable persona alone', () => {
+    expect(editCapableSubagent('code-engineer', 'Edit the plan document', 'general-purpose')).toBe('code-engineer');
+  });
+
+  it('resolveEditCapableSubagent swaps on Claude Code only', () => {
+    const out = [
+      resolveEditCapableSubagent('claude-code', 'Explore', 'Rewrite the notes'),
+      resolveEditCapableSubagent('antigravity', 'Explore', 'Rewrite the notes')
+    ];
+
+    expect(out).toEqual(['general-purpose', 'Explore']);
+  });
+
+  it('parseDispatch never returns Plan or Explore for an editing task', () => {
+    const answer = (sa: string) => ({ answers: { recommendedSubagent: { choice: sa, confidence: 0.9 }, recommendedTier: { choice: 'flash', confidence: 0.9 } } });
+
+    const out = [
+      parseDispatch(answer('Plan'), 'Edit the tasklist and update the plan', 'unknown')?.subagent,
+      parseDispatch(answer('Explore'), 'Find where the quota file is read', 'unknown')?.subagent
+    ];
+
+    expect(out).toEqual(['general-purpose', 'Explore']);
+  });
+
+  it('batch dispatch on Claude Code gives Plan no editing task, even without needsEdit', () => {
+    const plan = runBatch('claude-code', [{ id: 'a', task: 'Plan: edit the tasklist and update the plan' }], ['Plan']);
+
+    // No editable candidate matches the wording, so it falls to self (handled directly), never Plan.
+    expect(['general-purpose', 'self']).toContain(plan.tasks[0].subagent);
+  });
+
+  it('batch dispatch honours needsEdit: false over the wording', () => {
+    const plan = runBatch('claude-code', [{ id: 'a', task: 'Plan how to update the tasklist', needsEdit: false }], ['Plan']);
+
+    expect(plan.tasks[0].subagent).toBe('Plan');
+  });
+
+  it('single dispatch on Claude Code swaps Plan for general-purpose on an editing task', () => {
+    const res = runSingle('claude-code', { task: 'Edit the plan document' }, { recommendedSubagent: 'Plan', recommendedTier: 'flash' });
+
+    expect(res.recommendedSubagent).toBe('general-purpose');
+    expect(res.executionGuidance).toContain('Agent(subagent_type: "general-purpose", model: "sonnet")');
+  });
+
+  it('single dispatch outside Claude Code is unchanged', () => {
+    const res = runSingle('antigravity', { task: 'Edit the plan document' }, { recommendedSubagent: 'Plan', recommendedTier: 'flash' });
+
+    expect(res.recommendedSubagent).toBe('Plan');
   });
 });
