@@ -14,7 +14,7 @@
  */
 import { modelTierRank } from './core/governance.js';
 import { BUILTIN_AGENT_TYPES, describeAgentLookup, effortReason, missingAgentDetail, readAgentDefinition } from './agent-definitions.js';
-import { assessInherited, assessModelRequest, callSetsModel, inheritsSessionModel, modelSourceNote, readSubagentModelEnv, subagentModelCandidates, type InheritCheck, type ModelSource, type SubagentModelEnv } from './models.js';
+import { assessInherited, assessModelRequest, inheritsSessionModel, modelSourceNote, readSubagentModelEnv, subagentModelCandidates, type InheritCheck, type ModelSource, type SubagentModelEnv } from './models.js';
 import { evaluateWorkflowInput, type ScriptFact } from './workflow-guard.js';
 import { resolveSessionModel, sessionModelFromTranscript, type SessionModel, type SessionModelSource } from './session-model.js';
 import { lowerModel } from './project-config.js';
