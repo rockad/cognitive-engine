@@ -9,7 +9,10 @@ export function evaluateLocalHeuristic(text: string): { route?: string; tier?: s
 
   // Very short mechanical tasks (<40 tokens) matching routine transformation patterns
   if (tokenEst < 40) {
-    const isFormatting = /\b(format|indent|organize imports|sort|prettier|clean whitespace|tabs to spaces)\b/i.test(trimmed);
+    // Bare "format" is not enough ("dump format"); isFreeTierMechanicalTask lists the forms that count.
+    const isFormatting =
+      /\b(indent|organize imports|sort|prettier|clean whitespace|tabs to spaces)\b/i.test(trimmed) ||
+      isFreeTierMechanicalTask(trimmed);
     const isBoilerplate = /\b(scaffold boilerplate|empty template|stub function|skeleton)\b/i.test(trimmed);
     if (isFormatting || isBoilerplate) {
       return {
@@ -70,10 +73,10 @@ export function detectScaffoldingTask(taskText: string): { scaffoldFirst: boolea
   if (
     text.includes('cargo.toml') ||
     text.includes('package.json') ||
-    text.includes('scaffold') ||
+    /\bscaffold(?:s|ed|ing)?\b/.test(text) ||
     text.includes('create crate') ||
     text.includes('new crate') ||
-    text.includes('boilerplate') ||
+    /\bboilerplate\b/.test(text) ||
     text.includes('clap struct')
   ) {
     let bpType = 'boilerplate';
@@ -82,4 +85,38 @@ export function detectScaffoldingTask(taskText: string): { scaffoldFirst: boolea
     return { scaffoldFirst: true, boilerplateType: bpType };
   }
   return { scaffoldFirst: false, boilerplateType: null };
+}
+
+/**
+ * Free-tier keyword rule (whole words and a small documented phrase list), ported from the
+ * agentic-hub Jev 2.3.1 release. Used by the Claude batch rule, the non-Claude batch rule, the
+ * local pre-filter and the effort heuristic, so one rule decides everywhere.
+ *
+ * The old rule used substring `includes('format')`, which also fired on "information",
+ * "transformation" and on "format" used as a noun ("apply a dump format decision"). The keyword
+ * here means formatting WORK, so the bare word "format" is deliberately not enough: only these
+ * forms count.
+ *   - scaffold, scaffolds, scaffolded, scaffolding
+ *   - boilerplate
+ *   - formatting, reformat, reformats, reformatted, reformatting, auto-format
+ *   - "format" followed by an object word: the, this, these, those, all, every, each, my, our,
+ *     code, file, files, json, yaml, markdown
+ */
+const FORMATTING_PATTERNS: ReadonlyArray<RegExp> = [
+  /\bformatting\b/i,
+  /\b(?:re|auto-)format(?:s|ted|ting)?\b/i,
+  /\bformat\s+(?:the|this|these|those|all|every|each|my|our|code|files?|json|yaml|markdown)\b/i
+];
+
+const SCAFFOLD_PATTERNS: ReadonlyArray<RegExp> = [/\bscaffold(?:s|ed|ing)?\b/i, /\bboilerplate\b/i];
+
+/** Formatting work only (the formatting forms above), for the effort heuristic. */
+export function isFormattingTask(taskText: string): boolean {
+  const text = taskText || '';
+  return FORMATTING_PATTERNS.some((p) => p.test(text));
+}
+
+export function isFreeTierMechanicalTask(taskText: string): boolean {
+  const text = taskText || '';
+  return SCAFFOLD_PATTERNS.some((p) => p.test(text)) || isFormattingTask(text);
 }

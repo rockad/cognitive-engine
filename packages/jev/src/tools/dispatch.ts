@@ -6,6 +6,7 @@ import {
   readQuotaView,
   clampTierToSessionCeiling,
   detectScaffoldingTask,
+  isFreeTierMechanicalTask,
   topologicalSortStages,
   estimateTierCost,
   defaultEffortForSubagent,
@@ -71,7 +72,17 @@ type TierSource = 'kind' | 'router' | 'keyword';
  */
 export function claudeKeywordTier(taskText: string): string {
   if (/\b(?:deep reasoning|architecture overhaul)\b/i.test(taskText)) return 'pro';
-  if (/\b(?:scaffold(?:ing)?|boilerplate|format(?:ting)?)\b/i.test(taskText)) return 'openrouter_free';
+  if (isFreeTierMechanicalTask(taskText)) return 'openrouter_free';
+  return 'flash';
+}
+
+/**
+ * Batch tier rule for the other harnesses: the same whole-word free-tier rule (see
+ * isFreeTierMechanicalTask), then pro only on the explicit phrases, else flash.
+ */
+export function classifyBatchTier(taskText: string): 'openrouter_free' | 'flash' | 'pro' {
+  if (isFreeTierMechanicalTask(taskText)) return 'openrouter_free';
+  if (/\b(?:deep reasoning|architecture overhaul)\b/i.test(taskText || '')) return 'pro';
   return 'flash';
 }
 
@@ -438,7 +449,6 @@ export async function handleBatchDispatchTool(args: ToolInput<typeof batchDispat
 
   for (const item of tasks) {
     const taskText = item.task || '';
-    const tLower = taskText.toLowerCase();
     const deps = Array.isArray(item.dependencies) ? item.dependencies : [];
     const scaffolding = detectScaffoldingTask(taskText);
 
@@ -462,10 +472,8 @@ export async function handleBatchDispatchTool(args: ToolInput<typeof batchDispat
       }
       // The free tier returns text and cannot edit files.
       if (item.needsEdit && rawTier === 'openrouter_free') rawTier = 'flash_lite';
-    } else if (tLower.includes('scaffold') || tLower.includes('format') || tLower.includes('boilerplate')) {
-      rawTier = 'openrouter_free';
-    } else if (tLower.includes('deep reasoning') || tLower.includes('architecture overhaul')) {
-      rawTier = 'pro';
+    } else {
+      rawTier = classifyBatchTier(taskText);
     }
 
     const clamped = isClaude ? claudeCeiling(rawTier, claudeModel) : clampTierToSessionCeiling(rawTier, quotaView.active_model);

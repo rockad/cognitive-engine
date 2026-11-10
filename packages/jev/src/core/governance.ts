@@ -12,6 +12,7 @@ import {
   setCachedDecision
 } from './cache.js';
 import { JEV_CONFIG_FILE } from './config.js';
+import { isFormattingTask } from './heuristics.js';
 import { getTracer } from '../tracing.js';
 
 // ── Antigravity quota view ───────────────────────────────────────────────────
@@ -373,9 +374,10 @@ export function defaultEffortForSubagent(subagent: string, promptText: string = 
   if (
     sa.includes('inbox') ||
     sa.includes('processor') ||
-    sa.includes('format') ||
+    // A role named for formatting ("formatter", "doc-formatter"), not any name that merely contains the letters ("information-architect").
+    /(?:^|[^a-z])(?:re|auto-)?format(?:ter|ters|ting)?(?:$|[^a-z])/.test(sa) ||
     sa.includes('scribe') ||
-    hasWord(/\b(re)?format(s|ted|ting|ter|ters)?\b/) ||
+    isFormattingTask(promptText) ||
     hasWord(/\bfile into\b/) ||
     hasWord(/\bcommit message\b/)
   ) {

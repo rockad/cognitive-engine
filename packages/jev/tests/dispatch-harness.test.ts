@@ -238,7 +238,7 @@ describe('Antigravity and OpenCode are unchanged (5.11)', () => {
   it.each(['antigravity', 'opencode', 'cli'])('%s batch keeps invoke_subagent, the keyword tier and no Claude fields', (harness) => {
     const args = {
       tasks: [
-        { id: 'a', task: 'Collect the information notes', kind: 'judgement', needsEdit: true },
+        { id: 'a', task: 'Scaffold the notes', kind: 'judgement', needsEdit: true },
         { id: 'b', task: 'Tidy the rest' }
       ]
     };
@@ -246,7 +246,7 @@ describe('Antigravity and OpenCode are unchanged (5.11)', () => {
     const plan = runTool(harness, { tool: 'batch', args, answers: { sa_a: 'Plan', sa_b: 'self' } }, claudeEnv());
 
     const [a, b] = plan.tasks;
-    // "information" contains "format": the legacy substring rule routes it to the free tier, and kind is ignored.
+    // "Scaffold" is on the whole-word free-tier list, and kind is ignored outside Claude Code.
     expect([a.tier, a.executionTool]).toEqual(['openrouter_free', 'jev_execute_free']);
     expect(a.executionGuidance).toBe(
       'CRITICAL QUOTA RULE: Free-tier eligible. Do NOT call invoke_subagent. Execute directly via jev_execute_free or jev_agent_free at $0.00 cost (0 Gemini quota).'
@@ -298,6 +298,7 @@ describe('claudeKeywordTier', () => {
   it.each([
     ['Scaffold the project', 'openrouter_free'],
     ['Format the table', 'openrouter_free'],
+    ['Apply a dump format decision', 'flash'],
     ['Collect the information', 'flash'],
     ['A transformation of the data', 'flash'],
     ['Deep reasoning about the schema', 'pro']
