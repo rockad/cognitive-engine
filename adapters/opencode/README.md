@@ -11,11 +11,11 @@ OpenCode V2 plugin for Jev, plus the MCP registration.
 
 Options: `mode` (`off`, `advisory` default, `enforce`), `delegationTool` (default `subagent`), `allowPro`, `timeoutMs` (default 1500).
 
-The V2 plugin API is beta, so every hook is defensive. A Jev failure, a timeout or an unexpected event shape no-ops instead of failing the turn; only the deliberate `[jev]` approval error propagates. Jev mode `off` silences both hooks.
+The V2 plugin API is beta, so every hook is defensive. A Jev failure, a timeout, an unexpected event shape or an unexpected error in the delegation guard (for example while reading the Jev mode) no-ops instead of failing the turn; only the deliberate `[jev]` approval error propagates. Jev mode `off` silences both hooks.
 
-OpenCode caches plugin modules in memory. Run `opencode reload` after changing this source (the command exists in opencode v2.0.25; that it re-imports plugin modules, and not only the configuration, is unverified).
+`opencode reload` reloads configuration; whether it re-imports plugin modules is unverified.
 
-The hook shapes were checked against the opencode v2.0.25 binary, because the public docs at opencode.ai describe the V1 plugin API (`tool.execute.before(input, output)` with `output.args`). In V2, `tool.hook("execute.before", handler)` calls `handler(event)` with one argument, `{ tool, sessionID, agent, messageID, id, input }`; the delegation tool is `subagent` and its input is `{ agent, description, prompt, model?, sessionID? }`, so the guard reads the task from `event.input.prompt`. There is still no published V2 reference, so this stays unverified against the plugin loader itself.
+The hook shapes were checked against the opencode v2.0.25 binary, because the public docs at opencode.ai describe the V1 plugin API (`tool.execute.before(input, output)` with `output.args`). In V2, `tool.hook("execute.before", handler)` calls `handler(event)` with one argument, `{ tool, sessionID, agent, messageID, id, input }`; the delegation tool is `subagent` and its input is `{ agent, description, prompt, model?, sessionID?, background? }` (`background` is an optional boolean), so the guard reads the task from `event.input.prompt`, falling back to `description` when the prompt is empty. There is still no published V2 reference, so this stays unverified against the plugin loader itself.
 
 ## MCP registration
 

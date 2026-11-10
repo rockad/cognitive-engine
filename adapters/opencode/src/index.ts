@@ -9,13 +9,13 @@
  * unexpected event shape no-ops instead of failing the turn. Only the deliberate `[jev]` approval
  * error is allowed to propagate.
  *
- * OpenCode caches plugin modules in memory; run `opencode reload` after changing this source.
+ * `opencode reload` reloads configuration; whether it re-imports plugin modules is unverified.
  *
  * Event shapes (checked against the opencode v2.0.25 binary, which is the only source for them:
  * the public plugin docs describe the V1 API): `tool.hook("execute.before", handler)` calls
  * `handler(event)` with ONE argument, `{ tool, sessionID, agent, messageID, id, input }`, where
  * `input` holds the tool arguments. The delegation tool is `subagent`, whose input is
- * `{ agent, description, prompt, model?, sessionID? }`.
+ * `{ agent, description, prompt, model?, sessionID?, background? }` (`background` is an optional boolean).
  */
 import { readJevMode } from '@cognitive-engine/jev/core';
 import { handleDispatchTool } from '@cognitive-engine/jev/tools';
@@ -98,10 +98,18 @@ export function createPlugin(deps: PluginDeps = defaultDeps) {
       if (mode === 'enforce' && !options.allowPro && typeof ctx?.tool?.hook === 'function') {
         await ctx.tool.hook('execute.before', async (event: any) => {
           if (event?.tool !== delegationTool) return;
-          // The tool arguments are `event.input` (not `args`); the task is the subagent's `prompt`.
-          const input = event.input ?? {};
-          const task = String(input.prompt ?? input.description ?? '');
-          const block = delegationBlock(await dispatch(task), task);
+          // Fail open on internal errors, as the context hook does: only the deliberate `[jev]`
+          // approval error is thrown, and it is thrown outside the try.
+          let block: Error | null = null;
+          try {
+            // The tool arguments are `event.input` (not `args`); the task is the subagent's `prompt`,
+            // or its `description` when the prompt is empty.
+            const input = event.input ?? {};
+            const task = String(input.prompt || input.description || '');
+            block = delegationBlock(await dispatch(task), task);
+          } catch {
+            return;
+          }
           if (block) throw block;
         });
       }

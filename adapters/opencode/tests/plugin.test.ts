@@ -146,6 +146,43 @@ describe('opencode plugin', () => {
     expect(seen).toEqual(['Find the config loader', 'Locate the config loader']);
   });
 
+  it('falls back to description when the prompt is an empty string', async () => {
+    const seen: string[] = [];
+    const spy: PluginDeps = { readMode: async () => 'on', dispatch: async (task) => (seen.push(task), flash) };
+    const { ctx, hooks } = makeCtx();
+    await createPlugin(spy).setup(ctx, { mode: 'enforce' });
+    await hooks['tool.execute.before']({ tool: 'subagent', input: { agent: 'explore', description: 'Locate the config loader', prompt: '' } });
+    expect(seen).toEqual(['Locate the config loader']);
+  });
+
+  it('fails open when reading the mode throws, and still throws the deliberate [jev] error', async () => {
+    const broken: PluginDeps = {
+      readMode: async () => {
+        throw new Error('config exploded');
+      },
+      dispatch: async () => pro
+    };
+    const a = makeCtx();
+    await createPlugin(broken).setup(a.ctx, { mode: 'enforce' });
+    await expect(a.hooks['tool.execute.before'](subagentCall('Redesign the whole storage layer'))).resolves.toBeUndefined();
+
+    // a throwing dispatch dependency is also contained
+    const brokenDispatch: PluginDeps = {
+      readMode: async () => 'on',
+      dispatch: async () => {
+        throw new Error('dispatch exploded');
+      }
+    };
+    const b = makeCtx();
+    await createPlugin(brokenDispatch).setup(b.ctx, { mode: 'enforce' });
+    await expect(b.hooks['tool.execute.before'](subagentCall('Redesign the whole storage layer'))).resolves.toBeUndefined();
+
+    // the approval error still propagates when nothing is broken
+    const c = makeCtx();
+    await createPlugin(deps(pro)).setup(c.ctx, { mode: 'enforce' });
+    await expect(c.hooks['tool.execute.before'](subagentCall('Redesign the whole storage layer'))).rejects.toThrow(/^\[jev\]/);
+  });
+
   it('does not read the V1 `args` shape or a second hook argument', async () => {
     const seen: string[] = [];
     const spy: PluginDeps = { readMode: async () => 'on', dispatch: async (task) => (seen.push(task), pro) };
