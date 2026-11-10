@@ -295,11 +295,26 @@ export function adviceTelemetry(entry: Record<string, unknown>): JevTelemetryEve
   };
 }
 
+/** Telemetry appends in flight: the process must wait for them before it exits, or the lines are lost. */
+const pendingLogs: Promise<unknown>[] = [];
+
+/** How long the process waits for the pending telemetry appends before it exits anyway. */
+export const LOG_FLUSH_TIMEOUT_MS = 1000;
+
+/** Wait for every telemetry append started so far. Never throws and never waits longer than the budget. */
+export async function flushPendingLogs(ms: number = LOG_FLUSH_TIMEOUT_MS): Promise<void> {
+  try {
+    await withTimeout(Promise.allSettled(pendingLogs.splice(0)), ms);
+  } catch {
+    // best-effort
+  }
+}
+
 function appendLog(entry: Record<string, unknown>): void {
   try {
     // Never prompt text: the entry holds the recommendation, model names and a prompt hash only.
     appendClaudeDecision({ event: 'advice', ...entry });
-    void logJevTelemetry(adviceTelemetry(entry));
+    pendingLogs.push(logJevTelemetry(adviceTelemetry(entry)));
   } catch {
     // logging is best-effort
   }
@@ -350,5 +365,7 @@ if (import.meta.main) {
   } catch {
     // never fail the host turn on Jev
   }
+  // process.exit would drop the async telemetry appends still in flight.
+  await flushPendingLogs();
   process.exit(0);
 }

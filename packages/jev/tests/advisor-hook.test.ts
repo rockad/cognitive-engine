@@ -134,6 +134,26 @@ describe('hook process', () => {
     expect([proc.exitCode, proc.stdout.toString()]).toEqual([0, '']);
   });
 
+  it('keeps one telemetry line per PreToolUse run: the process waits for the async append before it exits', () => {
+    const telemetry = path.join(tmp, '.gemini', 'antigravity-cli', 'jev_telemetry.jsonl');
+    const decisions = path.join(tmp, 'decisions.jsonl');
+    const input = JSON.stringify({ session_id: 'sess-flush', tool_name: 'Agent', tool_input: { model: 'sonnet' } });
+
+    for (let i = 0; i < 5; i++) {
+      const proc = Bun.spawnSync(['bun', HOOK, 'pre-tool-use'], {
+        stdin: new TextEncoder().encode(input),
+        env: { ...process.env, HOME: tmp, JEV_CONFIG_FILE: path.join(tmp, 'config.json'), JEV_CLAUDE_DECISIONS_FILE: decisions }
+      });
+      expect(proc.exitCode).toBe(0);
+    }
+
+    const lines = (file: string) => fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+    expect(lines(decisions).length).toBe(5);
+    const records = lines(telemetry).map((l) => JSON.parse(l));
+    expect(records.length).toBe(5);
+    expect(records.every((r) => r.toolOrHook === 'PreToolUse' && r.sessionId === 'sess-flush')).toBe(true);
+  });
+
   it('exits 0 and prints nothing for an unknown event', () => {
     const proc = Bun.spawnSync(['bun', HOOK, 'nonsense'], {
       stdin: new TextEncoder().encode('{"prompt":"Find where the quota file is written"}'),
