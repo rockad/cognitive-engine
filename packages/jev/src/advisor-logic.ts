@@ -9,6 +9,7 @@
  */
 import { defaultEffortForSubagent, applyEffortGovernance, discoverWorkspaceAgents, editCapableSubagent, type ThinkingEffort } from './core/index.js';
 import { compareModels, parseModel } from './models.js';
+import { lowerModel } from './project-config.js';
 import { STAGE_RUBRIC_TEXT, TIER_CRITERIA, type ClaudeModelAlias, type JevTier } from './stage-rubric.js';
 
 export { TIER_CRITERIA };
@@ -144,7 +145,21 @@ export const RULE_LABEL: Readonly<Record<AppliedRule, string>> = {
   standing: 'rule: per standing rule'
 };
 
-/** The rule that decided an already-resolved recommendation. */
+/**
+ * The model the guard compares a delegation against: the lower of the session model and the project
+ * ceiling (the same `lowerModel` the guard uses, guard.ts). No ceiling, an unknown session model or
+ * one Jev cannot rank leaves the session model as it is.
+ */
+export function effectiveSessionModel(sessionModel: string | null, ceiling?: string | null): string | null {
+  if (!ceiling) return sessionModel;
+  try {
+    return lowerModel(sessionModel, ceiling);
+  } catch {
+    return sessionModel;
+  }
+}
+
+/** The rule that decided an already-resolved recommendation. `sessionModel` is the effective one (ceiling applied). */
 export function appliedRule(rec: Dispatch, sessionModel: string | null): AppliedRule {
   if (rec.by) return 'instruction';
   return rec.tier === 'pro' && !sessionAllowsOpus(sessionModel) ? 'guard' : 'standing';
@@ -164,9 +179,15 @@ export interface Resolution {
  * changed by this: above the session model it still shows its one prompt, and that prompt is the
  * user's approval, so the advice says not to ask a second time.
  */
-export function resolveModel(args: { userIntent: UserIntent; rec: Dispatch; sessionModel: string | null }): Resolution {
+export function resolveModel(args: {
+  userIntent: UserIntent;
+  rec: Dispatch;
+  sessionModel: string | null;
+  /** A project's `guard.ceiling`: the model the guard compares against is the lower of it and the session model. */
+  ceiling?: string | null;
+}): Resolution {
   const advised = applyUserIntent(args.rec, args.userIntent);
-  const rule = appliedRule(advised, args.sessionModel);
+  const rule = appliedRule(advised, effectiveSessionModel(args.sessionModel, args.ceiling));
   return { advised, rule, needsApproval: rule === 'guard' };
 }
 
@@ -177,12 +198,23 @@ function sessionAllowsOpus(sessionModel: string | null): boolean {
   return session !== 'unknown' && opus !== 'unknown' && compareModels(session, opus) >= 0;
 }
 
-function directiveBody(rec: Dispatch, sessionModel: string | null, quotaStrategy: string, intent: UserIntent = {}): string {
+/** `sessionModel` is the effective one (project ceiling applied); `lowered` says what the ceiling lowered it from. */
+function directiveBody(
+  rec: Dispatch,
+  sessionModel: string | null,
+  quotaStrategy: string,
+  intent: UserIntent = {},
+  lowered?: { session: string | null }
+): string {
   const head =
     `[JEV] cost-tiered recommendation (quota=${quotaStrategy}; ${RULE_LABEL[appliedRule(rec, sessionModel)]}): subagent="${rec.subagent}", ` +
     `tier="${rec.tier}", model="${rec.model}", effort="${rec.effort}".`;
+  // The limit as the user knows it: the session model, or the project ceiling when that is the lower of the two.
+  const limit = lowered
+    ? `The project ceiling "${sessionModel}" (below the session model "${lowered.session}")`
+    : `The session model${sessionModel ? ` "${sessionModel}"` : ''}`;
   const ceiling = sessionModel
-    ? `The session model "${sessionModel}" is the hard ceiling: never delegate to a stronger model without explicit user approval.`
+    ? `${limit} is the hard ceiling: never delegate to a stronger model without explicit user approval.`
     : 'Never delegate to a stronger model than the current session without explicit user approval.';
   const subagent = rec.subagent === 'self' ? 'general-purpose' : rec.subagent;
 
@@ -197,7 +229,7 @@ function directiveBody(rec: Dispatch, sessionModel: string | null, quotaStrategy
       : `${head} ${ceiling} ${asked}`;
   }
 
-  const lowered =
+  const costNote =
     rec.by === 'instruction-cost' && rec.routerTier && rec.routerTier !== rec.tier
       ? `You asked for the minimal viable model (explicit user request: "${intent.phrase ?? 'minimal viable'}"): Jev lowered the tier from ${rec.routerTier} to ${rec.tier}. `
       : '';
@@ -207,7 +239,7 @@ function directiveBody(rec: Dispatch, sessionModel: string | null, quotaStrategy
     // One sentence, never the ceiling line plus an ask line that contradict each other (case study 5.2).
     const pro = sessionAllowsOpus(sessionModel)
       ? `Jev rates this opus-level and the session model "${sessionModel}" allows it: delegate to ${subagent} with model "opus".`
-      : `Jev rates this opus-level; the session model${sessionModel ? ` "${sessionModel}"` : ''} is the hard ceiling, so ask the user before delegating on opus: offer the cheaper option and let the user choose.`;
+      : `Jev rates this opus-level; ${limit.replace(/^The/, 'the')} is the hard ceiling, so ask the user before delegating on opus: offer the cheaper option and let the user choose.`;
     return `${head} ${pro}`;
   }
 
@@ -219,7 +251,7 @@ function directiveBody(rec: Dispatch, sessionModel: string | null, quotaStrategy
         : isCustom
           ? `Action: Delegate to custom persona via Agent(subagent_type: "${rec.subagent}", model: "${rec.model}").`
           : `Delegate to the ${rec.subagent} subagent with model "${rec.model}".`;
-  return `${head} ${lowered}${ceiling} ${action}`;
+  return `${head} ${costNote}${ceiling} ${action}`;
 }
 
 /** What the user said about the model or the cost in the current prompt (case study 5.1). */
@@ -323,8 +355,15 @@ function isDelegationTurn(rec: Dispatch): boolean {
 }
 
 /** The context line injected before the turn, with the stage rubric on delegation turns (5.3). */
-export function buildDirective(rec: Dispatch, sessionModel: string | null, quotaStrategy: string, intent: UserIntent = {}): string {
-  const body = directiveBody(rec, sessionModel, quotaStrategy, intent);
+export function buildDirective(
+  rec: Dispatch,
+  sessionModel: string | null,
+  quotaStrategy: string,
+  intent: UserIntent = {},
+  ceiling?: string | null
+): string {
+  const effective = effectiveSessionModel(sessionModel, ceiling);
+  const body = directiveBody(rec, effective, quotaStrategy, intent, effective !== sessionModel ? { session: sessionModel } : undefined);
   return isDelegationTurn(rec) ? `${body} ${STAGE_RUBRIC_TEXT}` : body;
 }
 

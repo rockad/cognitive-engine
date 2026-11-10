@@ -30,6 +30,7 @@ import {
 } from './core/index.js';
 import { appendClaudeDecision } from './claude-audit.js';
 import { resolveSessionModel } from './session-model.js';
+import { inspectProjectConfig } from './project-config.js';
 import { STAGE_RUBRIC_TEXT } from './stage-rubric.js';
 import {
   clearTurnState,
@@ -89,7 +90,28 @@ export type HookDeps = {
   forgetTurn?: (sessionId: string | null) => void;
   /** Egress policy for the hook's working directory; absent means no policy. */
   egressAllowed?: (cwd: string | undefined) => boolean;
+  /** The project's valid `guard.ceiling` for the working directory, or null. Absent means no ceiling. */
+  readCeiling?: (cwd: string | undefined) => string | null;
 };
+
+/** The project ceiling, or null: on any failure the advice falls back to the session model and never throws. */
+function readCeilingSafely(deps: HookDeps, cwd: string | undefined): string | null {
+  try {
+    return deps.readCeiling?.(cwd) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** The ceiling of a valid project config (project-config.ts); none, or a malformed file (the guard asks about it), is null. */
+export function projectCeiling(cwd: string | undefined): string | null {
+  try {
+    const project = inspectProjectConfig(cwd, 'claude-code');
+    return project.state === 'valid' ? project.ceiling : null;
+  } catch {
+    return null;
+  }
+}
 
 export function withTimeout<T>(
   pOrFn: Promise<T> | ((signal: AbortSignal) => Promise<T>),
@@ -144,7 +166,9 @@ export async function onUserPromptSubmit(input: HookInput, deps: HookDeps): Prom
   // A status turn ("A3 completed the run") gets no line. An instruction in the prompt always does.
   if (isStatusTurn(rec, prompt, intent)) return null;
   const sessionModel = deps.readSessionModel(input);
-  const { advised, rule } = resolveModel({ userIntent: intent, rec, sessionModel });
+  // The guard compares against the lower of the session model and the project ceiling; so does the advice.
+  const ceiling = readCeilingSafely(deps, input.cwd);
+  const { advised, rule } = resolveModel({ userIntent: intent, rec, sessionModel, ceiling });
   const staged = isStagedPrompt(prompt);
   deps.log({
     hook: 'UserPromptSubmit',
@@ -159,7 +183,8 @@ export async function onUserPromptSubmit(input: HookInput, deps: HookDeps): Prom
     recommended_model: advised.model,
     rule,
     quota: quotaStrategy,
-    sessionModel
+    sessionModel,
+    ...(ceiling ? { projectCeiling: ceiling } : {})
   });
   deps.remember?.(sessionId, {
     turn,
@@ -171,7 +196,7 @@ export async function onUserPromptSubmit(input: HookInput, deps: HookDeps): Prom
     at: new Date().toISOString()
   });
 
-  let additionalContext = buildDirective(advised, sessionModel, quotaStrategy, intent);
+  let additionalContext = buildDirective(advised, sessionModel, quotaStrategy, intent, ceiling);
   if (staged) additionalContext += ` ${STAGE_PLAN_REMINDER}`;
   try {
     const memory = await withTimeout(fetchRecallMemory(), 600);
@@ -335,7 +360,8 @@ const liveDeps: HookDeps = {
   remember: writeLastAdvice,
   markTurn: writeTurnState,
   forgetTurn: clearTurnState,
-  egressAllowed: (cwd) => checkEgress(egressContextDirs([cwd])).allowed
+  egressAllowed: (cwd) => checkEgress(egressContextDirs([cwd])).allowed,
+  readCeiling: projectCeiling
 };
 
 const livePreToolDeps: PreToolDeps = {
