@@ -36,6 +36,8 @@ Known limits of what the guards see (follow-ups, not implemented here):
 
 This threshold is an interim choice made by the user. There is no specification behind it. `CLAUDE_CODE_SUBAGENT_EFFORT` (the environment default for subagent effort) is not read, and the precedence between the call's effort, the definition's and the environment's is not modelled: the guard asks when either the call's or the definition's effort is above the threshold.
 
+**Candidate for the non-interim answer: `maxEffortLevel`.** Claude Code documents a native effort cap, `maxEffortLevel` (global, or per model in `modelSettings`), that "still limits the level the skill or subagent runs at" and applies over `CLAUDE_CODE_EFFORT_LEVEL`. Setting `"maxEffortLevel": "high"` enforces the interim threshold inside Claude Code itself, including the `CLAUDE_CODE_EFFORT_LEVEL` case the guards cannot see. It could sit beside the `Agent(model:opus)` deny rule as defence in depth (suggested in review by @Doc-Cr); this RFC does not decide it.
+
 ## 3. What a proper plan must decide
 
 - **What effort levels rank as.** Whether levels form an ordered scale like model tiers, and where `xhigh` and `max` sit on it, rather than a fixed two-level cut-off.

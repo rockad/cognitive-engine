@@ -77,7 +77,7 @@ export function effortReason(effort: unknown, what: string, relative = false): s
   return `${what}: effort ${JSON.stringify(effort)} is not a level Jev recognises (low, medium, high, xhigh, max), so it cannot be checked.`;
 }
 
-const SEGMENT =/^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/;
+const SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/;
 
 /** Parse `name` or `plugin:name` into its parts, or null for anything else. */
 function parseAgentName(subagentType: unknown): { plugin: string | null; agent: string } | null {

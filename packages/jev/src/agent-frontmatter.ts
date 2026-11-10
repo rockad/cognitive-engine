@@ -431,5 +431,5 @@ export function unreadableModelValue(reason: string): string {
 
 /** The effort value an agent definition reports when its frontmatter is present but its `effort` cannot be established; it is no effort level, so `effortReason` asks. */
 export function unreadableEffortValue(reason: string): string {
-  return `<unreadable agent frontmatter: ${reason}>`;
+  return unreadableModelValue(reason); // one wording for both: the value is deliberately unrankable
 }

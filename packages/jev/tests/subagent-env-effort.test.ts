@@ -71,9 +71,8 @@ describe('subagent model environment: reading', () => {
     expect(subagentModelCandidates({}, env)).toEqual([{ model: 'opus', source: 'env' }]);
     expect(subagentModelCandidates({}, { ...env, model: null })).toEqual([{ model: null, source: 'session' }]);
     expect(subagentModelCandidates({ call: 'haiku', definition: 'sonnet' }, { ...env, force: true })).toEqual([{ model: 'opus', source: 'env-forced' }]);
-    expect(subagentModelCandidates({ call: 'inherit' }, { ...env, force: true })).toEqual([{ model: null, source: 'call' }]);
-    // only the exact string, and only outside a workflow
-    for (const call of ['Inherit', 'INHERIT', ' inherit ']) {
+    // FORCE replaces the call's model, `inherit` included (the stricter reading of the sub-agents docs)
+    for (const call of ['inherit', 'Inherit', 'INHERIT', ' inherit ']) {
       expect(subagentModelCandidates({ call }, { ...env, force: true })).toEqual([{ model: 'opus', source: 'env-forced' }]);
     }
     for (const call of ['inherit', 'INHERIT']) {
@@ -158,16 +157,10 @@ describe('Agent guard: CLAUDE_CODE_SUBAGENT_MODEL and CLAUDE_CODE_SUBAGENT_MODEL
     expect(ask({ prompt: 'p', subagent_type: 'not-installed', model: 'haiku' })?.audit).toMatchObject({ kind: 'unknown-agent' });
   });
 
-  it('FORCE still lets the exact model "inherit" run on the session model', () => {
+  it('FORCE does not treat any spelling of "inherit" as inherit: the forced model is ranked', () => {
     process.env.CLAUDE_CODE_SUBAGENT_MODEL = 'opus';
     process.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE = '1';
-    expect(ask({ prompt: 'p', model: 'inherit' })).toBeNull();
-  });
-
-  it('FORCE does not treat "Inherit" or " inherit " as inherit: the forced model is ranked', () => {
-    process.env.CLAUDE_CODE_SUBAGENT_MODEL = 'opus';
-    process.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE = '1';
-    for (const model of ['Inherit', ' inherit ']) {
+    for (const model of ['inherit', 'Inherit', ' inherit ']) {
       const v = ask({ prompt: 'p', model });
       expect(v?.decision).toBe('ask');
       expect(v?.audit).toMatchObject({ requested: 'opus', modelSource: 'env-forced' });
