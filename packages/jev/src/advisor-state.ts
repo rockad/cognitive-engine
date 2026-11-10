@@ -199,10 +199,24 @@ export function clearTurnState(sessionId: unknown): void {
 }
 
 /**
+ * The turn id is a hash of the prompt, so a repeated prompt ("continue") has the same id in every
+ * turn. The advice belongs to the marker only when it is the same id AND was written at or after the
+ * marker (the marker is written first in the turn, the advice later): advice older than the marker
+ * is from an earlier turn that said the same words. A timestamp that cannot be read is no match.
+ */
+function belongsToMarker(advice: LastAdvice, marker: TurnState): boolean {
+  if (advice.turn !== marker.turn) return false;
+  const adviceAt = Date.parse(advice.at);
+  const markerAt = Date.parse(marker.at);
+  return Number.isFinite(adviceAt) && Number.isFinite(markerAt) && adviceAt >= markerAt;
+}
+
+/**
  * The advice and the intent that still belong to the turn the tool call is in. Both are discarded
  * when the marker is missing, when the Jev mode now differs from the mode the turn started in (the
- * mode was flipped mid-turn), or when the advice is from another turn than the marker: a turn that
- * got no advice (silent, offline, a status turn) must not inherit the last one's.
+ * mode was flipped mid-turn), or when the advice is from another turn than the marker (a different id,
+ * or the same id from before the marker: a repeated prompt): a turn that got no advice (silent,
+ * offline, a status turn) must not inherit the last one's.
  */
 export function currentTurn(
   marker: TurnState | null,
@@ -211,7 +225,7 @@ export function currentTurn(
 ): { advice: LastAdvice | null; intent: StoredIntent | null; turn: string | null } {
   if (!marker || marker.mode !== mode) return { advice: null, intent: null, turn: null };
   return {
-    advice: advice && advice.turn === marker.turn ? advice : null,
+    advice: advice && belongsToMarker(advice, marker) ? advice : null,
     intent: marker.intent,
     turn: marker.turn
   };
