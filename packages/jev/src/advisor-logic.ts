@@ -289,41 +289,111 @@ export const INTENT_SCAN_CHARS = 1500;
 // An imperative that selects a model. Prose that merely mentions a model ("sonnet is cheaper than
 // opus", "compare with opus") does not match: a verb of choosing must come right before the name.
 // "with sonnet" counts only as a clause opener ("With sonnet, please") or after a verb that sets
-// the work going ("run it with sonnet", "go with haiku"), never as "compare with opus".
+// the work going ("run it with sonnet", "go with haiku"), never as "compare with opus". A full id
+// ("use claude-opus-5-5") names its family.
 const MODEL_IMPERATIVE =
-  /\b(?:(?:use|using|run|launch|spawn|start|delegate(?:\s+(?:it|this|that|them))?\s+to|dispatch(?:\s+(?:it|this|that|them))?\s+to|go\s+with|switch\s+to|want|need|prefer|choose|pick|select)|(?:(?:do|run|launch|start|proceed|go)\s+(?:it|this|that|them|these)?\s*with)|(?<=^|[.!?\n,;:]\s*)with)\s+(?:an?\s+|the\s+|only\s+)?(haiku|sonnet|opus)\b/gi;
-const ALTERNATIVE_MODEL = /^\s*(?:,\s*)?(?:or|and|\/|vs\.?|versus)\s+(?:an?\s+|the\s+)?(haiku|sonnet|opus)\b/i;
+  /\b(?:(?:use|using|run|launch|spawn|start|delegate(?:\s+(?:it|this|that|them))?\s+to|dispatch(?:\s+(?:it|this|that|them))?\s+to|go\s+with|switch\s+to|want|need|prefer|choose|pick|select)|(?:(?:do|run|launch|start|proceed|go)\s+(?:it|this|that|them|these)?\s*with)|(?<=^|[.!?\n,;:]\s*)with)\s+(?:an?\s+|the\s+|only\s+)?(?:claude-)?(haiku|sonnet|opus)(?:-\d+(?:-\d+)?)?(?:-\d{8})?\b/gi;
+// `--model opus` is an instruction only in an imperative clause ("run with --model opus"), never in prose about the flag.
+const MODEL_FLAG = /(?<![\w-])--model(?:=|\s+)(?:claude-)?(haiku|sonnet|opus)(?:-\d+(?:-\d+)?)?(?:-\d{8})?\b/gi;
+const FLAG_VERB = /\b(?:use|using|run|launch|start|spawn|invoke|execute|pass|call|go)\b[^.!?\n]{0,40}$/i;
+const ANY_MODEL = /\b(?:claude-)?(haiku|sonnet|opus)\b/gi;
 // A negator within a couple of words before the instruction: "do not use opus", "not opus", "instead of",
 // "without". Anywhere further back ("I have no idea, use opus") it is a different clause.
 const NEGATION = /\b(?:don'?t|do\s+not|never|not|no|without|avoid|stop|instead\s+of|rather\s+than)\s+(?:[\w'-]+\s+){0,2}$/i;
+// A second model named after the first only replaces it ("use sonnet instead of opus", "opus over sonnet").
+const REPLACED = /\b(?:over|instead\s+of|rather\s+than)\s+(?:[\w'-]+\s+){0,2}$/i;
+// A statement about what someone will do, not an instruction to do it ("I will use opus", "the agent can use haiku").
+const STATEMENT_SUBJECT =
+  /\b(?:i|we|you|he|she|they|it|agent|assistant|claude)\s*(?:'ll|'d|\s+(?:will|would|shall|can|could|might|may|did|does|had|has|have|am\s+going\s+to|are\s+going\s+to|is\s+going\s+to|was\s+going\s+to|'m\s+going\s+to))\s+(?:\w+\s+){0,1}$/i;
+// A line a speaker label or a quote marker says was said by someone else (a pasted log or reply).
+const PASTED_LINE = /^\s*(?:>|(?:[-*]\s*)?(?:agent|assistant|claude|ai|bot|model|jev|system|tool|log|output|stdout|stderr)\s*[:>])/i;
+// A sentence that asks or supposes rather than instructs.
+const NON_INSTRUCTION_SENTENCE = /^\W*(?:if|should|what|why|how)\s/i;
+// Literary uses of the two model names that are poetic forms: "a haiku about spring", "use haiku format", "sonnet 130".
+const LITERARY_TAIL = /^(?:[-\s]*(?:about|by|format|formats|style|styled|poem|poems|poetry|form|stanza|stanzas|syllable|syllables|contest|collection|sequence|cycle|writing|verse)\b|\s+\d{2,}\b(?!\.\d))/i;
 const MINIMAL_COST =
-  /\b(?:minimal|minimum)[\s-]+viable\b|\b(?:minimal|minimum|smallest|lowest)[\s-]+(?:cost|tier|model)\b|\bcheapest\b|\bleast\s+expensive\b|\bas\s+cheap(?:ly)?\s+as\b/i;
+  /\b(?:minimal|minimum)[\s-]+viable\b(?![\s-]+products?\b)|\b(?:minimal|minimum|smallest|lowest)[\s-]+(?:cost|tier|model)\b|\bcheapest\b|\bleast\s+expensive\b|\bas\s+cheap(?:ly)?\s+as\b/gi;
+
+/** Blank out `re` matches with spaces, keeping every index and newline where it was. */
+function blank(text: string, re: RegExp): string {
+  return text.replace(re, (m) => m.replace(/[^\n]/g, ' '));
+}
+
+/**
+ * The prompt with what is not the user's own instruction blanked out, index for index: fenced code
+ * blocks, inline code spans and quoted strings ("..." and '...': a quote after a letter is an
+ * apostrophe, not an opening quote).
+ */
+function withoutQuotedText(text: string): string {
+  let out = blank(text, /(```|~~~)[\s\S]*?(?:\1|$)/g);
+  out = blank(out, /`[^`\n]*`/g);
+  out = blank(out, /"[^"\n]{0,300}"|“[^”\n]{0,300}”/g);
+  return blank(out, /(?<![\w])'[^'\n]{1,300}'(?![\w])/g);
+}
+
+/** The sentence around `index`: from after the previous sentence end or newline to the next one, terminator included. */
+function sentenceAround(text: string, index: number): string {
+  const before = text.slice(0, index);
+  let start = 0;
+  for (const b of before.matchAll(/[.!?]+\s|\n/g)) start = b.index! + b[0].length;
+  const rest = text.slice(index);
+  const end = /[.!?]+(?=\s|$)|\n/.exec(rest);
+  return text.slice(start, end ? index + end.index + end[0].length : text.length);
+}
+
+/** Whether a match at `index` is the user's own instruction, going by where it sits: not in a question, a supposition or a pasted line. */
+function instructive(text: string, index: number): boolean {
+  const sentence = sentenceAround(text, index).trim();
+  if (sentence.endsWith('?') || NON_INSTRUCTION_SENTENCE.test(sentence)) return false;
+  const lineStart = text.lastIndexOf('\n', index - 1) + 1;
+  if (PASTED_LINE.test(text.slice(lineStart, index + 1))) return false;
+  return true;
+}
 
 /**
  * Read an explicit model or cost instruction from the prompt. Conservative by design: imperative
- * patterns only, a negated or contradictory mention yields nothing, and two different models in
- * one prompt are ambiguous. It is pure and offline.
+ * patterns only; nothing inside code, a quotation or a pasted line; nothing in a question or a
+ * supposition; a negated or contradictory mention yields nothing, and two different models in one
+ * clause are ambiguous. It is pure and offline.
  */
 export function parseUserIntent(prompt: string | undefined | null): UserIntent {
-  const text = (prompt ?? '').slice(0, INTENT_SCAN_CHARS);
+  const text = withoutQuotedText((prompt ?? '').slice(0, INTENT_SCAN_CHARS));
   const intent: UserIntent = {};
   const named = new Map<string, string>();
-  for (const m of text.matchAll(MODEL_IMPERATIVE)) {
-    if (NEGATION.test(text.slice(Math.max(0, m.index! - 30), m.index!))) continue;
-    named.set(m[1].toLowerCase(), m[0].trim());
-    // "use opus or sonnet" is a choice left open, not an instruction.
-    const alt = ALTERNATIVE_MODEL.exec(text.slice(m.index! + m[0].length));
-    if (alt) named.set(alt[1].toLowerCase(), alt[0].trim());
+  const candidates = [
+    ...[...text.matchAll(MODEL_IMPERATIVE)].map((m) => ({ m, flag: false })),
+    ...[...text.matchAll(MODEL_FLAG)].map((m) => ({ m, flag: true }))
+  ];
+  for (const { m, flag } of candidates) {
+    const at = m.index!;
+    const family = m[1].toLowerCase();
+    const after = text.slice(at + m[0].length);
+    if (!instructive(text, at)) continue;
+    if (NEGATION.test(text.slice(Math.max(0, at - 30), at))) continue;
+    if (STATEMENT_SUBJECT.test(text.slice(Math.max(0, at - 40), at))) continue;
+    if (flag && !FLAG_VERB.test(text.slice(Math.max(0, at - 60), at))) continue;
+    if ((family === 'haiku' || family === 'sonnet') && LITERARY_TAIL.test(after)) continue;
+    named.set(family, m[0].trim());
+    // Another model named later in the same clause ("use opus or sonnet", "sonnet for A and opus for B") leaves the choice open.
+    const clause = /^[^.!?;\n]{0,80}/.exec(after)![0];
+    for (const other of clause.matchAll(ANY_MODEL)) {
+      const o = other[1].toLowerCase();
+      if (o === family) continue;
+      const lead = text.slice(Math.max(0, at + m[0].length + other.index! - 30), at + m[0].length + other.index!);
+      if (NEGATION.test(lead) || REPLACED.test(lead)) continue;
+      named.set(o, other[0].trim());
+    }
   }
   if (named.size === 1) {
     const [model, phrase] = [...named][0];
     intent.model = model as 'haiku' | 'sonnet' | 'opus';
     intent.phrase = phrase;
   }
-  const cost = MINIMAL_COST.exec(text);
-  if (cost && !NEGATION.test(text.slice(Math.max(0, cost.index - 30), cost.index))) {
+  for (const cost of text.matchAll(MINIMAL_COST)) {
+    if (!instructive(text, cost.index!) || NEGATION.test(text.slice(Math.max(0, cost.index! - 30), cost.index!))) continue;
     intent.cost = 'minimal';
     intent.phrase ??= cost[0];
+    break;
   }
   return intent;
 }
