@@ -148,9 +148,11 @@ export function assessInherited(check: InheritCheck): ModelAssessment {
 // Claude Code lets the environment set the model of a subagent: `CLAUDE_CODE_SUBAGENT_MODEL` (the
 // default for subagents that name no model), `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` (that model replaces
 // the call's and the definition's) and, for agents spawned inside a Workflow,
-// `CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL`. The guard reads the hook process's environment, which is the
-// one Claude Code runs with. Precedence below was read from the Claude Code 2.1.321 binary; the public
-// documentation may order the plain (unforced) variable differently, so treat it as version-bound.
+// `CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL`. The guard reads the hook process's environment, which is
+// assumed to match the one Claude Code runs with. The public documentation (https://code.claude.com/docs/en/sub-agents)
+// orders the model as call > definition > CLAUDE_CODE_SUBAGENT_MODEL > session, and says FORCE alone
+// gives the session model; the FORCE details below (workflow agents, the exact `inherit`) were read
+// from the Claude Code 2.1.321 binary, so treat them as version-bound.
 
 /** The subagent-model variables as the hook process sees them. `null` means unset, empty or `inherit`. */
 export interface SubagentModelEnv {
@@ -196,8 +198,8 @@ export function callSetsModel(model: unknown): boolean {
  * - Workflow agents: `CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL` replaces the call's and the definition's
  *   model.
  * - `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` on: the forced model replaces the call's and the definition's;
- *   only an explicit `model: "inherit"` on the call still gives the session model. With no model
- *   set, the session model.
+ *   only the exact string `model: "inherit"` on an Agent-tool call (not in a workflow) still gives the
+ *   session model. With no model set, the session model.
  * - Otherwise: the call's model, else the definition's (an explicit `inherit` there is the session
  *   model, not the variable), else `CLAUDE_CODE_SUBAGENT_MODEL`, else the session model.
  */
@@ -211,7 +213,9 @@ export function subagentModelCandidates(
     return out;
   }
   if (env.force) {
-    if (typeof input.call === 'string' && input.call.trim().toLowerCase() === 'inherit') return [{ model: null, source: 'call' }];
+    // Claude Code checks the exact string 'inherit' (no trim, no case folding), and only on the Agent
+    // tool: a Workflow agent() drops its model under FORCE, `inherit` included, and gets the forced one.
+    if (!input.workflow && input.call === 'inherit') return [{ model: null, source: 'call' }];
     return env.model ? [{ model: env.model, source: 'env-forced' }] : [{ model: null, source: 'session' }];
   }
   if (callSetsModel(input.call)) return [{ model: input.call as string, source: 'call' }];

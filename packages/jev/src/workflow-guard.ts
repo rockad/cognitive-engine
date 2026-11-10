@@ -919,8 +919,8 @@ export function checkScriptText(
         const looked = resolver.agentDefinition(f.agentType);
         const def: AgentDefinition = !looked.found && BUILTIN_AGENT_TYPES.has(f.agentType) ? { found: true, model: null } : looked;
         if (!def.found) {
-          // An explicit model decides the model; without a definition there is no effort to read either.
-          if (f.modelSet) break;
+          // Asked whatever model the call names: without a definition its `effort:` cannot be read, and it
+          // may come from `--agents <json>`, which Jev cannot see.
           const lookup = resolver.describeLookup?.() ?? 'no agent definition directory (nothing is searched)';
           sites.push({ file: label, line: f.line, col: f.col, reason: `agentType ${JSON.stringify(f.agentType)} is not an agent Jev can read: ${missingAgentDetail(lookup)}` });
         } else {

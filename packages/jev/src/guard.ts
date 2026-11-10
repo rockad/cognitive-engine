@@ -158,10 +158,10 @@ export function decideClaudeAgentCall(
 }
 
 /**
- * A call with no `model` runs on its subagent's definition (or, with CLAUDE_CODE_SUBAGENT_MODEL_FORCE
- * on, on the forced model, so the definition is moot and nothing is asked). When the type is not a
- * built-in and no definition can be found, its model cannot be read, so ask (the Workflow guard does
- * the same). No `subagent_type` is the general-purpose default and passes.
+ * When the type is not a built-in and no definition can be found, its model and its `effort:` cannot
+ * be read (it may come from `--agents <json>`, which Jev cannot see), so ask whatever model the call
+ * names and whether or not CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on (the Workflow guard does the same).
+ * No `subagent_type` is the general-purpose default and passes.
  */
 function unknownAgentVerdict(call: AgentCall, cwd: string | undefined): Verdict | null {
   const type: unknown = call.subagent_type;
@@ -174,7 +174,7 @@ function unknownAgentVerdict(call: AgentCall, cwd: string | undefined): Verdict 
     decision: 'ask',
     reason:
       `[jev] The subagent type ${label} is not a built-in agent and ${missingAgentDetail(describeAgentLookup(cwd))} ` +
-      'Approve only if that agent is trusted to run on the session model or a cheaper one, or deny and re-run with an explicit model.',
+      'Approve only if that agent is trusted to run on the session model or a cheaper one and not at a high effort, or deny and use an agent type Jev can read.',
     audit: { kind: 'unknown-agent', subagent_type: typeof type === 'string' ? type : null }
   };
 }
@@ -254,10 +254,10 @@ export function evaluateClaude(input: any, sink?: GuardContext): Verdict | null 
   const effective = ceilingFor(session, sink);
   const facts = { tool_name: input.tool_name, session_id: input.session_id, ...(sink?.projectCeiling ? { projectCeiling: sink.projectCeiling } : {}) };
   const env = readSubagentModelEnv();
-  if (!callSetsModel(call.model) && !env.force) {
-    const unknown = unknownAgentVerdict(call, input.cwd);
-    if (unknown) return { ...unknown, audit: { ...unknown.audit, ...facts } };
-  }
+  // Asked whatever the call's model or FORCE: the definition's `effort:` applies either way and Claude
+  // Code also loads agents from `--agents <json>`, which the guard cannot see.
+  const unknown = unknownAgentVerdict(call, input.cwd);
+  if (unknown) return { ...unknown, audit: { ...unknown.audit, ...facts } };
   // The definition is read whatever the call's model: its `effort:` applies either way.
   const definition = readAgentDefinition(call.subagent_type, input.cwd);
   const verdict = decideClaudeAgentCall(call, effective.model, definition.model, session.source, effective.inherit, { definitionEffort: definition.effort, env });

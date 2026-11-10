@@ -72,6 +72,13 @@ describe('subagent model environment: reading', () => {
     expect(subagentModelCandidates({}, { ...env, model: null })).toEqual([{ model: null, source: 'session' }]);
     expect(subagentModelCandidates({ call: 'haiku', definition: 'sonnet' }, { ...env, force: true })).toEqual([{ model: 'opus', source: 'env-forced' }]);
     expect(subagentModelCandidates({ call: 'inherit' }, { ...env, force: true })).toEqual([{ model: null, source: 'call' }]);
+    // only the exact string, and only outside a workflow
+    for (const call of ['Inherit', 'INHERIT', ' inherit ']) {
+      expect(subagentModelCandidates({ call }, { ...env, force: true })).toEqual([{ model: 'opus', source: 'env-forced' }]);
+    }
+    for (const call of ['inherit', 'INHERIT']) {
+      expect(subagentModelCandidates({ call, workflow: true }, { ...env, force: true })).toEqual([{ model: 'opus', source: 'env-forced' }]);
+    }
     expect(subagentModelCandidates({ call: 'haiku' }, { ...env, workflowModel: 'opus' }, )).toEqual([{ model: 'haiku', source: 'call' }]);
     expect(subagentModelCandidates({ call: 'haiku', workflow: true }, { ...env, workflowModel: 'opus' })).toEqual([{ model: 'opus', source: 'workflow-env' }]);
     // a workflow model and a forced model that differ: both are ranked
@@ -141,18 +148,30 @@ describe('Agent guard: CLAUDE_CODE_SUBAGENT_MODEL and CLAUDE_CODE_SUBAGENT_MODEL
     expect(ask({ prompt: 'p' })).toBeNull();
   });
 
-  it('FORCE with no environment model leaves every call on the session model; an unknown agent type is not asked about', () => {
+  it('FORCE with no environment model leaves every call on the session model; an unknown agent type still asks (its effort and a --agents definition cannot be read)', () => {
     process.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE = '1';
     expect(ask({ prompt: 'p', model: 'opus' })).toBeNull();
-    expect(ask({ prompt: 'p', subagent_type: 'not-installed' })).toBeNull();
+    expect(ask({ prompt: 'p', subagent_type: 'not-installed' })?.audit).toMatchObject({ kind: 'unknown-agent' });
     delete process.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE;
     expect(ask({ prompt: 'p', subagent_type: 'not-installed' })?.audit).toMatchObject({ kind: 'unknown-agent' });
+    // whatever model the call names
+    expect(ask({ prompt: 'p', subagent_type: 'not-installed', model: 'haiku' })?.audit).toMatchObject({ kind: 'unknown-agent' });
   });
 
-  it('FORCE still lets an explicit model "inherit" run on the session model', () => {
+  it('FORCE still lets the exact model "inherit" run on the session model', () => {
     process.env.CLAUDE_CODE_SUBAGENT_MODEL = 'opus';
     process.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE = '1';
     expect(ask({ prompt: 'p', model: 'inherit' })).toBeNull();
+  });
+
+  it('FORCE does not treat "Inherit" or " inherit " as inherit: the forced model is ranked', () => {
+    process.env.CLAUDE_CODE_SUBAGENT_MODEL = 'opus';
+    process.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE = '1';
+    for (const model of ['Inherit', ' inherit ']) {
+      const v = ask({ prompt: 'p', model });
+      expect(v?.decision).toBe('ask');
+      expect(v?.audit).toMatchObject({ requested: 'opus', modelSource: 'env-forced' });
+    }
   });
 
   it('FORCE off values leave the call model in charge', () => {
@@ -241,10 +260,10 @@ describe('agent definitions: effort', () => {
     expect(ask({ prompt: 'p', subagent_type: 'thinker', model: 'haiku' })?.audit).toMatchObject({ kind: 'effort' });
   });
 
-  it('a definition without an effort, and an unknown agent with a call model, add nothing', () => {
+  it('a definition without an effort adds nothing, and an unknown agent with a call model still asks', () => {
     agentFile('calm', 'name: calm\nmodel: haiku');
     expect(ask({ prompt: 'p', subagent_type: 'calm' })).toBeNull();
-    expect(ask({ prompt: 'p', subagent_type: 'not-installed', model: 'haiku' })).toBeNull();
+    expect(ask({ prompt: 'p', subagent_type: 'not-installed', model: 'haiku' })?.audit).toMatchObject({ kind: 'unknown-agent' });
   });
 
   it('project definitions that disagree on effort ask', () => {
@@ -309,9 +328,11 @@ describe('Workflow guard: effort and the environment model', () => {
     expect(check(`await agent('p', {agentType: 'general-purpose', effort: 'max'})`, r)).toHaveLength(1);
   });
 
-  it('an unknown agentType with an explicit model still passes, and without one still asks', () => {
-    expect(check(`await agent('p', {agentType: 'ghost', model: 'haiku'})`)).toEqual([]);
+  it('an unknown agentType asks whether or not the call names a model (its effort cannot be read)', () => {
+    expect(check(`await agent('p', {agentType: 'ghost', model: 'haiku'})`)[0].reason).toContain('not an agent Jev can read');
     expect(check(`await agent('p', {agentType: 'ghost'})`)[0].reason).toContain('not an agent Jev can read');
+    // a built-in type still passes
+    expect(check(`await agent('p', {agentType: 'general-purpose', model: 'haiku'})`)).toEqual([]);
   });
 
   it('CLAUDE_CODE_SUBAGENT_MODEL applies to an agent() that names no model', () => {
@@ -330,7 +351,12 @@ describe('Workflow guard: effort and the environment model', () => {
     process.env.CLAUDE_CODE_SUBAGENT_MODEL = 'opus';
     process.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE = 'yes';
     expect(check(`await agent('p', {model: 'haiku'})`)[0].reason).toContain('CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on');
-    expect(check(`await agent('p', {model: 'inherit'})`)).toEqual([]);
+    // a workflow agent() drops its model under FORCE, `inherit` included, so the forced model is ranked
+    for (const m of ['inherit', 'INHERIT']) {
+      const sites = check(`await agent('p', {model: '${m}'})`);
+      expect(sites).toHaveLength(1);
+      expect(sites[0].reason).toContain('CLAUDE_CODE_SUBAGENT_MODEL_FORCE');
+    }
     process.env.CLAUDE_CODE_SUBAGENT_MODEL = 'haiku';
     expect(check(`await agent('p', {model: 'opus'})`)).toEqual([]);
   });

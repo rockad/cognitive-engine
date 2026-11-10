@@ -86,8 +86,8 @@ describe('unknown subagent types ask instead of passing as inherit', () => {
     expect(call('', tmp)?.decision).toBe('ask');
   });
 
-  it('does not look the agent up when the call sets its own model', () => {
-    expect(call('ghost', tmp, { model: 'haiku' })).toBeNull();
+  it('asks about an unfindable agent whatever model the call sets (its effort cannot be read)', () => {
+    expect(call('ghost', tmp, { model: 'haiku' })?.audit).toMatchObject({ kind: 'unknown-agent' });
     expect(call('ghost', tmp, { model: 'opus' })?.decision).toBe('ask');
   });
 

@@ -27,6 +27,13 @@ The threshold:
 - On the Agent tool only, `lower` passes (one step below an effort the agent would otherwise run at, so it cannot raise it) and `higher` asks (one step above the session effort, which the guard does not read).
 - Any other literal, a value that is not a string (including an integer in a definition), or a non-literal value in a workflow (variable, expression, spread), is unverifiable and asks, as `model` is treated.
 
+Known limits of what the guards see (follow-ups, not implemented here):
+
+- `CLAUDE_CODE_EFFORT_LEVEL` is documented to take precedence over a per-call effort and a definition's effort. The guards do not read it, so the effort they check may not be the one that runs.
+- `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL` alias remaps are not read, so the model an alias ranks as may differ from the model it runs on.
+- Agent definitions passed as `--agents <json>` are not seen. A `subagent_type` that is not built-in and has no definition file Jev can read therefore asks whatever model the call names, because its `effort:` cannot be read.
+- The settings `env` block is documented to apply to every session and its subprocesses; that the guard's process sees the same environment Claude Code runs with has not been verified end to end.
+
 This threshold is an interim choice made by the user. There is no specification behind it. `CLAUDE_CODE_SUBAGENT_EFFORT` (the environment default for subagent effort) is not read, and the precedence between the call's effort, the definition's and the environment's is not modelled: the guard asks when either the call's or the definition's effort is above the threshold.
 
 ## 3. What a proper plan must decide
