@@ -93,7 +93,7 @@ describe('the advisor honours the project ceiling', () => {
   });
 
   it('buildDirective takes the ceiling as the limit', () => {
-    const text = buildDirective(flashRec, 'claude-opus-5-5', 'unknown', {}, 'haiku');
+    const text = buildDirective({ ...flashRec, tier: 'flash_lite', model: 'haiku' }, 'claude-opus-5-5', 'unknown', {}, 'haiku');
 
     expect(text).toContain('The project ceiling "haiku" (below the session model "claude-opus-5-5") is the hard ceiling');
   });

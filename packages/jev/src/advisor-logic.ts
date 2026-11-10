@@ -198,6 +198,19 @@ function sessionAllowsOpus(sessionModel: string | null): boolean {
   return session !== 'unknown' && opus !== 'unknown' && compareModels(session, opus) >= 0;
 }
 
+/**
+ * Whether `model` is stronger than the (effective) session model, so the guard would ask about it.
+ * An unknown or unrankable session model counts as "stronger" for opus only, as before: it is what
+ * the opus-only branches did, and a cheaper model is not called an escalation on no evidence.
+ */
+function exceedsSession(model: string, sessionModel: string | null): boolean {
+  const wanted = parseModel(model);
+  if (wanted === 'unknown') return false;
+  const session = parseModel(sessionModel);
+  if (session === 'unknown') return model === 'opus' && !sessionAllowsOpus(sessionModel);
+  return compareModels(wanted, session) > 0;
+}
+
 /** `sessionModel` is the effective one (project ceiling applied); `lowered` says what the ceiling lowered it from. */
 function directiveBody(
   rec: Dispatch,
@@ -224,7 +237,7 @@ function directiveBody(
       : `You asked for ${rec.model} (explicit user request: "${intent.phrase ?? rec.model}"): delegate to ${subagent} with model "${rec.model}".`;
     // The PreToolUse guard cannot read the prompt, so above the ceiling it still shows its one prompt.
     // Tell the assistant not to ask first: that prompt is the user's confirmation.
-    return rec.model === 'opus' && !sessionAllowsOpus(sessionModel)
+    return exceedsSession(rec.model, sessionModel)
       ? `${head} ${asked} The Jev guard shows the user one approval prompt for a model above the session model; do not ask separately before it.`
       : `${head} ${ceiling} ${asked}`;
   }
@@ -241,6 +254,12 @@ function directiveBody(
       ? `Jev rates this opus-level and the session model "${sessionModel}" allows it: delegate to ${subagent} with model "opus".`
       : `Jev rates this opus-level; ${limit.replace(/^The/, 'the')} is the hard ceiling, so ask the user before delegating on opus: offer the cheaper option and let the user choose.`;
     return `${head} ${pro}`;
+  }
+
+  // A paid delegation on a model above the session model: one ceiling sentence, not the hard-ceiling
+  // line followed by a "delegate to <stronger model>" action that contradicts it.
+  if (rec.tier !== 'openrouter_free' && rec.subagent !== 'self' && exceedsSession(rec.model, sessionModel)) {
+    return `${head} ${costNote}Jev rates this ${rec.model}-level; ${limit.replace(/^The/, 'the')} is the hard ceiling, so ask the user before delegating on ${rec.model}: offer a model within the ceiling and let the user choose.`;
   }
 
   const action =

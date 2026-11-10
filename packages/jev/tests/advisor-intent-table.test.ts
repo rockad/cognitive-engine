@@ -114,7 +114,8 @@ describe('the effect is capped at one tier step from the recommendation (table)'
   it('says in the directive that the cap held the tier short of the named model', () => {
     const capped = applyUserIntent(rec('flash_lite', 'haiku'), { model: 'opus' });
 
-    const text = buildDirective(capped, 'claude-sonnet-5', 'unknown', { model: 'opus', phrase: 'use opus' });
+    // The alias "sonnet" is 5.5: a session on 5.5 allows it (a session on 5 would not, and the guard would ask).
+    const text = buildDirective(capped, 'claude-sonnet-5-5', 'unknown', { model: 'opus', phrase: 'use opus' });
 
     expect(text).toContain('You asked for opus');
     expect(text).toContain('at most one tier step');

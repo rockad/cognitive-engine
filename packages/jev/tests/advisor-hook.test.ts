@@ -210,7 +210,7 @@ describe('custom agent discovery and dispatch in Claude Code', () => {
   it('formats custom agent action directive with Agent(subagent_type, model)', () => {
     const customRec: Dispatch = { subagent: 'code_engineer', tier: 'flash', model: 'sonnet', effort: 'medium', confidence: 0.95 };
 
-    const directive = buildDirective(customRec, 'claude-sonnet-5', 'normal');
+    const directive = buildDirective(customRec, 'claude-sonnet-5-5', 'normal');
 
     expect(directive).toContain('Action: Delegate to custom persona via Agent(subagent_type: "code_engineer", model: "sonnet").');
   });
