@@ -22,8 +22,9 @@ export function claudeDecisionsFile(): string {
 export function appendClaudeDecision(record: ClaudeDecisionRecord): boolean {
   try {
     const file = claudeDecisionsFile();
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.appendFileSync(file, `${JSON.stringify({ ts: new Date().toISOString(), ...record })}\n`);
+    // Owner-only when this call creates them; an existing directory or file keeps the mode the user gave it.
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    fs.appendFileSync(file, `${JSON.stringify({ ts: new Date().toISOString(), ...record })}\n`, { mode: 0o600 });
     return true;
   } catch {
     return false;

@@ -12,6 +12,10 @@ import { TELEMETRY_FILE } from './core/index.js';
 import { claudeDecisionsFile } from './claude-audit.js';
 import { claudeStateDir, safeSessionId } from './session-model.js';
 
+/** Owner-only modes for what the advisor creates under `~/.config/jev`; an existing directory or file keeps its mode. */
+const PRIVATE_DIR_MODE = 0o700;
+const PRIVATE_FILE_MODE = 0o600;
+
 export interface LastAdvice {
   /** `turnId` of the prompt the advice was given for. */
   turn: string;
@@ -36,9 +40,9 @@ export function writeLastAdvice(sessionId: unknown, advice: LastAdvice): boolean
   const file = adviceFile(sessionId);
   if (!file) return false;
   try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: PRIVATE_DIR_MODE });
     const tmp = `${file}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(advice));
+    fs.writeFileSync(tmp, JSON.stringify(advice), { mode: PRIVATE_FILE_MODE });
     fs.renameSync(tmp, file);
     return true;
   } catch {
@@ -167,9 +171,9 @@ export function writeTurnState(sessionId: unknown, state: TurnState): boolean {
   const file = turnFile(sessionId);
   if (!file) return false;
   try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: PRIVATE_DIR_MODE });
     const tmp = `${file}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(state));
+    fs.writeFileSync(tmp, JSON.stringify(state), { mode: PRIVATE_FILE_MODE });
     fs.renameSync(tmp, file);
     return true;
   } catch {
