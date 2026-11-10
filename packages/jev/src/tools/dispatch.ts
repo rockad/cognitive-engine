@@ -487,8 +487,10 @@ export async function handleBatchDispatchTool(args: ToolInput<typeof batchDispat
         rawTier = claudeKeywordTier(taskText);
         tierSource = 'keyword';
       }
-      // The free tier returns text and cannot edit files.
-      if (item.needsEdit && rawTier === 'openrouter_free') rawTier = 'flash_lite';
+      // The free tier returns text and cannot edit files. Use the same test as the persona
+      // (`editsFiles`: the caller's flag, else the task wording), so a stage the wording marks as
+      // editing never gets a tool that cannot edit (review by @Doc-Cr).
+      if (editsFiles(item) && rawTier === 'openrouter_free') rawTier = 'flash_lite';
     } else {
       rawTier = classifyBatchTier(taskText);
     }

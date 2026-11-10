@@ -225,6 +225,16 @@ describe('jev_batch_dispatch on Claude Code (5.4, 5.11)', () => {
     expect(plan.tasks[1].executionGuidance).not.toContain('Gemini');
   });
 
+  it('keeps a stage whose wording says it edits off the free tier, unless needsEdit is false', () => {
+    const task = 'Scaffold the boilerplate files and update the README';
+    const args = { tasks: [{ id: 'a', task }, { id: 'b', task, needsEdit: false }] };
+
+    const plan = runTool('claude-code', { tool: 'batch', args, offline: true }, claudeEnv());
+
+    expect(plan.tasks.map((t: any) => t.tier)).toEqual(['flash_lite', 'openrouter_free']);
+    expect(plan.tasks[0].executionTool).not.toBe('jev_execute_free');
+  });
+
   it('offers the router only real subagent types', () => {
     const args = { tasks: [{ id: 'a', task: 'Write it', kind: 'mechanical' }] };
 
