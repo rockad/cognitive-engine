@@ -67,7 +67,7 @@ Plan Phase 0 items 1 and 5 are done (agentic-hub PR #19, below). `agentic-hub-cp
 
 ### plugins/coordination
 
-- [x] Handle grammar: `card/name~sid8` (revised 2026-11-10); the spec, SP2 docs and SP5b are updated by `agentic-hub-cp` (round 4, commit 74f6c0e, unpushed). Nothing in ax or cognitive-engine builds or parses coordination handles yet (checked 2026-11-10); any future code must use `~`, not `#`.
+- [x] Handle grammar: `card/name~sid8` (revised 2026-11-10); the spec, SP2 docs and SP5b are updated by `agentic-hub-cp` (round 4, commit 74f6c0e, on agentic-hub `main`). Nothing in ax or cognitive-engine builds or parses coordination handles yet (checked 2026-11-10); any future code must use `~`, not `#`.
   - S1 entry gate is not open: SP5b passed, SP3 and SP4 are still open
   - R8 is approved: the 8121 listener binds `127.0.0.1` from s2 (task S2-LISTEN); the tunnel route is the exposure gate, with no route before the S3 gate; the AGENTS.md rule is updated in the same commit
 - [ ] Coordination S1 grew: Postgres from S1, the SP5b gate, a `pg_dump` sidecar to a backup directory on the storage host, and S2-LISTEN. Track in the coordination plan, not here.
@@ -104,7 +104,7 @@ Order and decisions in [pr-plan-2026-11-08.md](pr-plan-2026-11-08.md). The remai
   - update the plugin README and the Claude marketplace entry
   - reply to `@Doc-Cr` on issue #13
 - [x] **basic-memory 0.24.1** (be32593, 2026-11-09, owner): the `plugins/memory` compose pin moved from 0.23.2 to 0.24.1 (`BASIC_MEMORY_TAG`, default 0.24.1); drop-in compatible, tool names unchanged, adds POSIX verbs, FastMCP 4.1.3 stateless (needs `FASTMCP_STATELESS_HTTP=true`, already set). It matches cognitive-engine `packages/memory`, which pins `basic-memory==0.24.1` (RFC 003). Plan: [`plugins/memory/docs/v1-migration-plan.md`](../plugins/memory/docs/v1-migration-plan.md) (phase 1 = this upgrade, done).
-- [ ] **Installed memory plugin refresh.** The Claude plugin cache keeps `memory@agentic-hub` at 1.0.0 and the marketplace entry still says 1.0.0, so installed copies will not pick up the 0.24.1 compose pin or the loopback bind until the version is bumped (1.0.1). Owner's call; the stack is not running on the workstation.
+- [ ] **Installed memory plugin refresh.** The Claude plugin cache keeps `memory@agentic-hub` at 1.0.0 and the marketplace entry still says 1.0.0, so installed copies will not pick up the 0.24.1 compose pin until the version is bumped (1.0.1). The loopback bind needs no bump: the installed cache already binds `127.0.0.1` (that half of the idea was refuted, see the memory compose item below). Owner's call; the stack is not running on the workstation.
 - [ ] **basic-memory 1.0.0 breaking contract** (from the migration plan): all MCP tools renamed with a `bm_` prefix (`read_note` to `bm_read`, `write_note` to `bm_write`, `search_notes` to `bm_search`, `edit_note` to `bm_edit`, `delete_note` to `bm_delete`, `list_directory` to `bm_list`, `build_context` to `bm_context`), changed argument schemas (path-based reads and writes), and FastMCP 4 session statefulness by default. Consumers to adapt: `scripts/memory.sh` (dual-compatibility: detect `bm_read` versus `read_note` via `tools/list`), the `recall` skill docs, and cognitive-engine's `packages/memory`, whose RFC 001 promises the upstream tool names the `recall` skill uses. Do not move `packages/memory` past `==0.24.1` until the decision below is made.
 - [x] Memory compose: bind 8110 and 8100 to `127.0.0.1`. Done in PR #19 (main 58420e1), which also shipped plan PR 1, so plan Phase 0 items 1 and 5 are done. The memory 1.0.1 bump idea was refuted: the installed cache already binds `127.0.0.1`. Takes effect after `docker compose up -d`.
 - [ ] RFC 005 Phase A deprecation notices on `plugins/jev` and `plugins/memory`. The scope decision is made (see above); word the `jev` notice as "relocating to cognitive-engine", not "retired".
@@ -123,7 +123,7 @@ Order and decisions in [pr-plan-2026-11-08.md](pr-plan-2026-11-08.md). The remai
   - pin the tag plus digest
   - drop the `:latest` default
   - trigger only on `lookup-v*` tags and manual dispatch
-  - check the package visibility against the private-registry-first line in RFC 001 section 8 item 2
+  - package visibility: **decided public** (owner, 2026-11-10; the image pulls anonymously). Amend the private-registry-first line in RFC 001 section 8 item 2 in the RFC 005 amendment PRs (#7, #11); consider deleting the old `:latest` tag in the package settings
 - [ ] **RFC 005 Phase C checklist:** add an entry to remove `.github/workflows/publish-plugins.yml` and `ghcr.io/rockad/lookup` together with `plugins/memory`.
 - [x] No sudo step on the storage host: round 3 of the coordination plan moved the dumps to a backup directory on the storage host (user-writable), created at S2-DEPLOY.
 - [ ] **Close the stale remote branches** superseded by main:
