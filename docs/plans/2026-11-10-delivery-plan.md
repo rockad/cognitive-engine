@@ -3,6 +3,7 @@
 - **Date**: 2026-11-10
 - **Owner**: Aleksandr Korolev ([@rockad](https://github.com/rockad)); reviewer [@Doc-Cr](https://github.com/Doc-Cr)
 - **Companion to**: [Multi-Track Implementation Plan](2026-10-26-multi-track-implementation-plan.md) (the design); this file is the delivery state: which PRs, in which order, what waits for what, and the decisions taken on the way.
+- **Resume here:** [`../handoffs/2026-11-11-delivery-handoff.md`](../handoffs/2026-11-11-delivery-handoff.md) has the exact state, next steps and traps.
 - **Moved here** from `rockad/agentic-hub` (`docs/pr-plan-2026-11-08.md` Phase 2 and the cognitive-engine sections of `docs/backlog.md`), because the PR queue is cognitive-engine's. What stays there: coordination, ax, the memory/lookup plugins and subagents, the cross-project adoption review and the [port map](https://github.com/rockad/agentic-hub/blob/main/docs/port-map.md).
 
 ## Why some work waits
@@ -13,8 +14,8 @@ Coordination (`plugins/coordination` in agentic-hub, S0 close and S1) comes befo
 
 | Stack | PRs, in merge order | State |
 |---|---|---|
-| **J (Jev)** | #20 guard hardening (includes advisory CI and the OpenCode V2 guard), then #22 advisor port (jev 2.4.0) | ready for review; they merge cleanly with each other. Doc-Cr's collaborator invite is pending, so formal review requests follow its acceptance |
-| **J follow-up** | `feat/jev-followup`, stacked on #22 | documentation committed; code still to write (see below) |
+| **J (Jev)** | #20 guard hardening (includes advisory CI and the OpenCode V2 guard), then #22 advisor port (jev 2.4.0) | ready for review; they merge cleanly with each other. Doc-Cr reviewed both on 2026-11-10 (comment-style); the findings are fixed and answered (#20 `b971956`, #22 `4a79643`). Doc-Cr's collaborator invite is still pending, so formal review requests fail until it is accepted |
+| **J follow-up** | `feat/jev-followup`, stacked on #22 | documentation done and pushed (`e431d02`); code still to write (see below) |
 | **Track 2** | #8 Memory and Lookup (RFC 003), then #9 MCP conformance, then #10 SMB reads | #8 conflicts with `main`; restack after S1 |
 | **Harness²** | #5 pipeline, then #6 benchmark, then #13 BuildSlot | #5 conflicts with `main`; restack after S1 |
 | **Docs** | #7 stage-1 findings, then #11 RFC 006 and plans | #7 after #10; both ride the RFC 005 amendment |
@@ -72,4 +73,4 @@ Merged: #3, #4, #18 earlier; #19 and #21 were folded into #20 and closed. Rules 
 
 - cognitive-engine roles: symmetric peers instead of Orchestrator and Builder.
 - Doc-Cr accepting the collaborator invite (then formal review requests on #20 and #22).
-- Whether to start a GitHub Project for this repo (see the conversation that produced this file).
+- Whether to start a GitHub Project board for this repo (proposed: fields Stack and Gate, auto-add PRs; needs the `project` token scope).
