@@ -30,7 +30,7 @@ From [adoption review 2026-11](adoption-review-2026-11.md), section 9.
 - [?] **Third coordination peer.** Codex or OpenCode needs a ChatGPT plan; OpenCode or Copilot CLI needs a Copilot plan. Without one, stay at Claude Code plus agy.
 - [?] **`codex queue` stub wake for Codex.** Is it allowed under the "no external driver" stance?
 - [?] **DDR-003a.** Extend never-launch, never-drive to Google-account-authenticated Gemini CLI?
-- [x] **RFC 005 scope.** Decided 2026-11-08, refined 2026-11-09: agentic-hub keeps coordination and subagents; `memory` retires; `jev` relocates to cognitive-engine instead of retiring (decision 15 in pr-plan-2026-11-08.md). The edit rides on a cognitive-engine docs PR (#7 or #11).
+- [x] **RFC 005 scope.** Decided 2026-11-08, refined 2026-11-09: agentic-hub keeps coordination and subagents; `memory` retires; `jev` is not retired (decision 15 in pr-plan-2026-11-08.md). **Revised 2026-11-12:** the live line stays in the agentic-hub plugin and `packages/jev` is the frozen reference (delivery plan, decisions 14, 15, 19); the earlier "relocates to cognitive-engine" wording is superseded. The edit rides on a cognitive-engine docs PR (#7 or #11).
 - [?] **cognitive-engine roles.** Replace the fixed Orchestrator and Builder roles with symmetric peers once the bridge moves onto A2A?
 - [?] **Blocked research hosts.** Allow these in the environment's network settings to re-check the remaining unverified points:
   - `antigravity.google`
@@ -68,7 +68,7 @@ Plan Phase 0 items 1 and 5 are done (agentic-hub PR #19, below). `agentic-hub-cp
 ### plugins/coordination
 
 - [x] Handle grammar: `card/name~sid8` (revised 2026-11-10); the spec, SP2 docs and SP5b are updated by `agentic-hub-cp` (round 4, commit 74f6c0e, on agentic-hub `main`). Nothing in ax or cognitive-engine builds or parses coordination handles yet (checked 2026-11-10); any future code must use `~`, not `#`.
-  - S1 entry gate is not open: SP5b passed, SP3 and SP4 are still open
+  - S1 entry gate: closed 2026-11-11 (SP3 and SP4 recorded in agentic-hub `1213787`; the S1 kickoff needs the owner's go; S1-PG is agentic-hub PR #37). Earlier text: "not open: SP5b passed, SP3 and SP4 still open"
   - R8 is approved: the 8121 listener binds `127.0.0.1` from s2 (task S2-LISTEN); the tunnel route is the exposure gate, with no route before the S3 gate; the AGENTS.md rule is updated in the same commit
 - [ ] Coordination S1 grew: Postgres from S1, the SP5b gate, a `pg_dump` sidecar to a backup directory on the storage host, and S2-LISTEN. Track in the coordination plan, not here.
 - [ ] Fix `server-api.md` 11.2 to agy's named-group flat hooks.json form.
@@ -107,7 +107,7 @@ Order and decisions in [pr-plan-2026-11-08.md](pr-plan-2026-11-08.md). The remai
 - [ ] **Installed memory plugin refresh.** The Claude plugin cache keeps `memory@agentic-hub` at 1.0.0 and the marketplace entry still says 1.0.0, so installed copies will not pick up the 0.24.1 compose pin until the version is bumped (1.0.1). The loopback bind needs no bump: the installed cache already binds `127.0.0.1` (that half of the idea was refuted, see the memory compose item below). Owner's call; the stack is not running on the workstation.
 - [ ] **basic-memory 1.0.0 breaking contract** (from the migration plan): all MCP tools renamed with a `bm_` prefix (`read_note` to `bm_read`, `write_note` to `bm_write`, `search_notes` to `bm_search`, `edit_note` to `bm_edit`, `delete_note` to `bm_delete`, `list_directory` to `bm_list`, `build_context` to `bm_context`), changed argument schemas (path-based reads and writes), and FastMCP 4 session statefulness by default. Consumers to adapt: `scripts/memory.sh` (dual-compatibility: detect `bm_read` versus `read_note` via `tools/list`), the `recall` skill docs, and cognitive-engine's `packages/memory`, whose RFC 001 promises the upstream tool names the `recall` skill uses. Do not move `packages/memory` past `==0.24.1` until the decision below is made.
 - [x] Memory compose: bind 8110 and 8100 to `127.0.0.1`. Done in PR #19 (main 58420e1), which also shipped plan PR 1, so plan Phase 0 items 1 and 5 are done. The memory 1.0.1 bump idea was refuted: the installed cache already binds `127.0.0.1`. Takes effect after `docker compose up -d`.
-- [ ] RFC 005 Phase A deprecation notices on `plugins/jev` and `plugins/memory`. The scope decision is made (see above); word the `jev` notice as "relocating to cognitive-engine", not "retired".
+- [ ] RFC 005 Phase A deprecation notices on `plugins/jev` and `plugins/memory`. The scope decision is made (see above); do not word the `jev` notice as "retired". As of 2026-11-12 it is also not "relocating": the agentic-hub plugin stays the live line (decision 19), so it needs no deprecation notice until the owner decides Jev's single home (evidence audit, decision 1).
 - [x] **Port map doc** [`port-map.md`](port-map.md) (single doc, production ports authoritative), added 2026-11-09. Production ports:
   - 8100 lookup (legacy, then native after cutover)
   - 8101 native lookup staging (cognitive-engine RFC 003)
@@ -173,7 +173,7 @@ Status 2026-11-10: **Stack J (Jev) is two PRs on cognitive-engine, both open and
   | `ANTHROPIC_DEFAULT_*_MODEL` remaps and `CLAUDE_CODE_EFFORT_LEVEL` | **warn only, never block**; the bypass is documented (**docs done**), and the non-silent warning is still to build: one guard-note line naming the variable (never the value) plus the variable names in the decisions-log entry |
   | `JEV_HARNESS` | each adapter sets it (OpenCode plugin at init, Antigravity launcher or MCP env), one test each |
   | Log rotation | deferred: about 20 KB a day measured, documentation and a manual prune only (**docs done**); revisit past about 10 MB |
-  | #12 restack | once, after #20 and #22 merge |
+  | #12 restack | **superseded 2026-11-12:** #12 merges cleanly with `main` and is Jev code, so it moves to the agentic-hub plugin work or closes (delivery plan, decision 19) |
 
   Code still to write in the follow-up: `JEV_RECALL_URL`, the warn-only note and log field, `JEV_HARNESS` in the adapters. The documentation commit does not depend on them.
 - [ ] Any future Codex adapter must return `deny` (Codex fails open on `ask`). Any Copilot guard fails open on hook timeout.
@@ -189,7 +189,7 @@ Decision 18, 2026-11-09. Order in [pr-plan-2026-11-08.md](pr-plan-2026-11-08.md)
 - [ ] Move the cognitive-engine bridge onto coordination.
 - [ ] **#7 and #11 with the RFC 005 amendment.** Content:
   - agentic-hub keeps coordination and subagents (decision 2026-11-08)
-  - `jev` relocates to cognitive-engine `packages/jev` and adapters instead of retiring; the main decision engine when plugged in (decision 15)
+  - `jev` is not retired; 2026-11-12: the live line stays in the agentic-hub plugin and cognitive-engine `packages/jev` is the frozen reference (decisions 14, 15, 19; was "relocates to cognitive-engine")
   - the GHCR lookup image and `publish-plugins.yml` are interim, removed in Phase C (decision 12)
   - standalone `lookup` and `recall` are legacy after cognitive-engine is done (decision 13)
 - [ ] Record the coordination status-client contract and "sbx never reaches the coordination server" in RFC 001/004.

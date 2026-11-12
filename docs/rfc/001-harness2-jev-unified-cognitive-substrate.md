@@ -2,7 +2,7 @@
 
 - **Document Type**: Architecture RFC & Unified Implementation Plan
 - **RFC Number**: 001
-- **Status**: Formally Clarified / Implementation Blueprint (Incorporating [@Doc-Cr](https://github.com/Doc-Cr) Review #1)
+- **Status**: Formally Clarified / Implementation Blueprint (Incorporating [@Doc-Cr](https://github.com/Doc-Cr) Review #1). **Note 2026-11-12:** statements here that retire `plugins/jev` (section 7 and the migration plan) are superseded: Jev is not retired, and until cognitive-engine work resumes the live Jev line is the agentic-hub plugin while `packages/jev` is the frozen reference (delivery plan, decisions 14, 15, 19). The status of the rest is checked claim by claim in the [evidence audit](../plans/2026-11-12-evidence-audit.md).
 - **Authors**: Aleksandr Korolev ([@rockad](https://github.com/rockad)), Antigravity Pair Architect
 - **Target Reviewers**: [@doc-cr](https://github.com/doc-cr), Aleksandr Korolev
 - **Target Runtimes**: Google Antigravity, Claude Code, OpenCode
@@ -112,7 +112,7 @@ flowchart TB
 | **11** | **CLI Tooling & Multiplexing** | **Unified `engine` CLI Multiplexer (Compiled Bun Binary)** | A single `engine <command>` CLI entrypoint built via `bun build --compile` yields a standalone zero-dependency executable (`engine memory`, `engine jev`, `engine up`, `engine status`). |
 | **12** | **SQLite Schema & Migrations** | **Superseded by decision 21** | Under Path A, upstream `basic-memory` owns its schema and migrations; the TypeScript/Zod migration runner no longer applies to `packages/memory`. |
 | **13** | **Cross-Platform Supervision** | **`engine install-services` Installer** | Generates platform-native user-level daemons: systemd user units (`~/.config/systemd/user/`) with `loginctl enable-linger` on Linux/WSL2, launchd agent plists on macOS, and Windows/Docker configurations. |
-| **14** | **Subpackage Distribution & Registry Staging** | **Staged Monorepo Packages (Internal -> Gitea -> Public)** | Build pipelines and versioning configured in `packages/jev` (npm) and `packages/memory` (uv/PyPI). Public registry publishing held during development; private Gitea package registry (`git.bigrockad.com`) used for staging. |
+| **14** | **Subpackage Distribution & Registry Staging** | **Staged Monorepo Packages (Internal -> Gitea -> Public)** | Build pipelines and versioning configured in `packages/jev` (npm) and `packages/memory` (uv/PyPI). Public registry publishing held during development; private Gitea package registry used for staging. |
 | **15** | **Client Harness MCP Registration** | **Discrete Standalone MCP Servers with Engine Supervisor** | Client harnesses register discrete FastMCP servers (`memory` at `:8105/mcp`, `jev` at `:8115/mcp`) supervised by `engine up`. Ensures isolated failure domains, zero proxy overhead, and granular `mcp-toggle` context preservation. |
 | **16** | **Memory Backward Compatibility** | **Upstream Tool Names + Lookup Tools** | Under Path A, the ten `basic-memory` tools used by the `recall` skill keep their names natively (`read_note`, `write_note`, `search_notes`, `edit_note`, `view_note`, `move_note`, `delete_note`, `build_context`, `recent_activity`, `list_memory_projects`). The four Lookup tools used by the `lookup` and `memory` skills (`search_archive`, `get_document`, `refresh_index`, `archive_stats`) need a backend before they can be served or aliased. |
 | **17** | **TypeScript SQLite & Query Engine** | **Superseded by decision 21** | Under Path A, memory storage and queries are handled by upstream `basic-memory` in Python; the `bun:sqlite` engine no longer applies to `packages/memory`. |
@@ -310,7 +310,7 @@ We specifically invite [@Doc-Cr](https://github.com/Doc-Cr)'s architectural feed
    Confirming our adoption of your recommendation: fail closed by default if the `sbx` runtime is unavailable; `mkdtemp` worktrees are an explicit opt-in that only generate inspection diffs and **never execute code**.
 2. **Pluggable & Standalone Subpackages (Zero Docker Bloat & Isolated MCP Registration)**:
    We refined the architecture so both `packages/jev` and `packages/memory` are decoupled, standalone-capable libraries within the monorepo:
-   - *Packaging*: Standalone package definitions (`package.json` for npm and `pyproject.toml` for uv/PyPI) with versioning and build pipelines, staged to private Gitea registry (`git.bigrockad.com`) during active development before any public registry publishing.
+   - *Packaging*: Standalone package definitions (`package.json` for npm and `pyproject.toml` for uv/PyPI) with versioning and build pipelines, staged to private Gitea registry during active development before any public registry publishing.
    - *Client MCP Registration*: Agent harnesses register discrete standalone FastMCP servers (`memory` at `:8105/mcp`, `jev` at `:8115/mcp`) supervised by `engine up`, ensuring isolated failure domains, direct communication without proxy overhead, and granular `mcp-toggle` token control.
    - *Compatibility*: `packages/memory` keeps the upstream `basic-memory` tool names used by the `recall` skill; the four Lookup tools need a backend first (decision 16).
 3. **Daily Quota Pre-Flight**:
@@ -334,4 +334,4 @@ We specifically invite [@Doc-Cr](https://github.com/Doc-Cr)'s architectural feed
 12. **Strict Local-Only Sandboxing**:
     Formalizing that microVM execution runs strictly locally via the standalone `sbx` CLI; zero cloud sandboxing or off-host code movement.
 13. **Empirical Measurement Provenance**:
-    Documenting that memory and retrieval figures originate from empirical profiling in `/home/rockad/projects/recall/docs/memory-footprint.md` and `eval/past-context-test.md`.
+    Documenting that memory and retrieval figures originate from empirical profiling in `~/projects/recall/docs/memory-footprint.md` and `eval/past-context-test.md`.

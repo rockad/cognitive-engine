@@ -2,7 +2,7 @@
 
 - **RFC Number**: 005
 - **Track**: Track 4
-- **Status**: Proposed
+- **Status**: Proposed. **Note 2026-11-12:** out of date, and exists as four different texts (main, #5/#8, #7, #11). It still retires Jev, omits coordination and subagents, puts lookup on 8100 (staging is 8101) and cites paths and a branch that do not exist. Amendment pending: agentic-hub keeps coordination and subagents, Jev is not retired (delivery plan, decisions 14, 15, 19; evidence audit finding 14).
 - **Runtime**: Polyglot (TypeScript / Bun + Python 3.12 / uv + Shell)
 - **License**: MIT
 - **Target Subsystem**: Cross-runtime egress guards, client configs, and migration cutover tooling

@@ -11,7 +11,7 @@ Written so a fresh Claude Code session (any subscription) can continue without t
 | #20 `[jev 1/2]` guard hardening (includes advisory CI and the OpenCode V2 guard) | `feat/guard-claude-followup` | `b971956` | open, ready, clean. Review by @Doc-Cr (comment-style) answered and pushed |
 | #22 `[jev 2/2]` advisor port, jev 2.4.0 | `feat/jev-advisor-port` | `4a79643` | open, ready, clean. Review by @Doc-Cr answered and pushed |
 | (no PR yet) Jev follow-up | `feat/jev-followup`, stacked on #22 | `e431d02` | documentation done and pushed; **code not written** |
-| #12 Argon hardening | `feat/argon-hardening` | | open, clean on `main`; restack once after #20 and #22 merge |
+| #12 Argon hardening | `feat/argon-hardening` | | open, merges cleanly with `main`; Jev code, so move or close (decision 19), no restack |
 | #5, #7, #8 and children #6, #9, #10, #11, #13 | | | conflict with `main`; wait for the Stage-1 gate (coordination), then restack |
 
 Closed and folded: #19 (CI) and #21 (OpenCode V2 guard) are inside #20 (merge commit `dd6ae2a`). Merged earlier: #3, #4, #18.
@@ -26,7 +26,7 @@ Docs: the planning docs and the adoption research moved here from `agentic-hub` 
    - `JEV_RECALL_URL` env override in `packages/jev/src/core/telemetry.ts`: default `http://127.0.0.1:8110/mcp`, empty value disables, a test pins the `read_note` tool name (basic-memory 1.0.0 renames it `bm_read`).
    - Warn-only note: when any of `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL` or `CLAUDE_CODE_EFFORT_LEVEL` is set, the guard adds one line to its note naming the variable (never its value) and records the variable names in the decisions-log entry. It never blocks. The bypass itself is already documented in the Jev README ("Known limits (subagent guard)"), which says this warning is planned: update that sentence when it ships.
    - `JEV_HARNESS`: the OpenCode plugin sets it at init, the Antigravity adapter in its launcher or MCP env; one test each.
-4. After the Stage-1 gate opens: restack #12, then #5, #7, #8 and their children, per the delivery plan (`git rebase --onto main`, a `range-diff` comment, `--force-with-lease`, always confirm force-pushes first).
+4. (Superseded 2026-11-12: the gate closed on 2026-11-11, #12 needs no restack, and the order is being reset in the evidence audit, `../plans/2026-11-12-evidence-audit.md`.) After the Stage-1 gate opens: restack #12, then #5, #7, #8 and their children, per the delivery plan (`git rebase --onto main`, a `range-diff` comment, `--force-with-lease`, always confirm force-pushes first).
 
 ## Decisions already taken (do not re-ask)
 

@@ -4,11 +4,11 @@
 - **Owner**: Aleksandr Korolev ([@rockad](https://github.com/rockad)); reviewer [@Doc-Cr](https://github.com/Doc-Cr)
 - **Companion to**: [Multi-Track Implementation Plan](2026-10-26-multi-track-implementation-plan.md) (the design); this file is the delivery state: which PRs, in which order, what waits for what, and the decisions taken on the way.
 - **Resume here:** [`../handoffs/2026-11-11-delivery-handoff.md`](../handoffs/2026-11-11-delivery-handoff.md) has the exact state, next steps and traps.
-- **Moved here** from `rockad/agentic-hub` (`docs/pr-plan-2026-11-08.md` Phase 2 and the cognitive-engine sections of `docs/backlog.md`), because the PR queue is cognitive-engine's. What stays there: coordination, ax, the memory/lookup plugins and subagents, the cross-project adoption review and the [port map](https://github.com/rockad/agentic-hub/blob/main/docs/port-map.md).
+- **Moved here** from `rockad/agentic-hub` (`docs/pr-plan-2026-11-08.md` Phase 2 and the cognitive-engine sections of `docs/backlog.md`), because the PR queue is cognitive-engine's. What stays there: coordination, ax, the memory/lookup plugins and subagents, and the cross-project adoption review (both of which now live here too, since agentic-hub's `docs/` was removed on 2026-11-10). The [port map](../port-map.md) is here.
 
 ## Why some work waits
 
-Coordination (`plugins/coordination` in agentic-hub, S0 close and S1) comes before the PRs that restack or move the bridge. Its Stage-1 entry gate is not open yet. Work that does not touch the bridge, the restacked PRs or the RFC 005 amendment runs alongside it.
+Coordination (`plugins/coordination` in agentic-hub, S0 close and S1) comes before the PRs that restack or move the bridge. Its Stage-1 entry gate closed on 2026-11-11 (agentic-hub `1213787`, SP3 and SP4 recorded; the S1 kickoff still needs the owner's go) and S1-PG is in review as agentic-hub PR #37. What the restacks actually depend on in coordination is unproven: the evidence audit ([2026-11-12-evidence-audit.md](2026-11-12-evidence-audit.md)) found only docs-file conflicts, so "after S1" needs a definition before it gates anything (audit decision 3). Work that does not touch the bridge, the restacked PRs or the RFC 005 amendment runs alongside it.
 
 ## Open PRs and stacks (2026-11-10)
 
@@ -19,7 +19,7 @@ Coordination (`plugins/coordination` in agentic-hub, S0 close and S1) comes befo
 | **Track 2** | #8 Memory and Lookup (RFC 003), then #9 MCP conformance, then #10 SMB reads | #8 conflicts with `main`; restack after S1 |
 | **Harness²** | #5 pipeline, then #6 benchmark, then #13 BuildSlot | #5 conflicts with `main`; restack after S1 |
 | **Docs** | #7 stage-1 findings, then #11 RFC 006 and plans | #7 after #10; both ride the RFC 005 amendment |
-| standalone | #12 Argon hardening | conflicts with `main` and with Stack J; restack once, after #20 and #22 merge |
+| standalone | #12 Argon hardening | merges cleanly with `main` (trial merge 2026-11-12, GitHub MERGEABLE; the earlier "conflicts" note was wrong). It is Jev code, so decision 19 applies: move it to the agentic-hub plugin work or close it, do not restack it here |
 
 Merged: #3, #4, #18 earlier; #19 and #21 were folded into #20 and closed. Rules for all stacks: merge commits (no squash); `git rebase --onto main` per stack with a `range-diff` comment; force-pushes are confirmed with the owner first.
 
@@ -59,9 +59,9 @@ Status 2026-11-12: these decisions stand, but the code they describe is built in
 - [x] Review and merge Stack J (#20, #22), then tell the coordination session so it swaps its case-study copy in agentic-hub for a pointer. Done 2026-11-12; the agentic-hub copy of the 2026-11-09 study is already a pointer.
 - [x] Jev follow-up code (`JEV_RECALL_URL`; the warn-only note and log field for remaps and effort; `JEV_HARNESS` in the OpenCode and Antigravity adapters): moved to agentic-hub plugin work on 2026-11-12 (decision 19), sent to its session as text.
 - [ ] Check whether a model set in `define_subagent` front matter bypasses the Antigravity `invoke_subagent` guard. Code read 2026-11-12: the hook matcher is `invoke_subagent` only and the guard reads only `Subagents[].Model`, so `define_subagent` is never seen. Whether Antigravity applies the definition's model when `Model` is empty or `inherit` is **unverified** and needs a live run. Sent to the agentic-hub session.
-- [ ] Copy the 2026-11-11 case study (PreToolUse dialog on a pinned model) into `packages/jev/docs/case-studies/` (decision 19: docs only).
+- [x] Copy the 2026-11-11 case study (PreToolUse dialog on a pinned model) into `packages/jev/docs/case-studies/` (decision 19: docs only). Done 2026-11-12.
 - [ ] Any future Codex adapter must return `deny` (Codex fails open on `ask`); any Copilot guard fails open on hook timeout.
-- [ ] Restack #12 after Stack J merges.
+- [ ] #12 (Jev code, mergeable as is): decide whether it moves to the agentic-hub plugin work or closes (decision 19). No restack needed.
 
 ### After coordination S1
 
@@ -69,7 +69,7 @@ Status 2026-11-12: these decisions stand, but the code they describe is built in
 - [ ] Review: slices of #5 and #8 for Doc-Cr with an Opus pre-pass (decision 6).
 - [ ] Merge #13 after #5 and #6 (decision 9).
 - [ ] Move the cognitive-engine bridge onto coordination. The roles question stays open (symmetric peers instead of Orchestrator and Builder). Do this before #7, which removes the hand-relayed handoff.
-- [ ] #7 and #11 with the RFC 005 amendment: agentic-hub keeps coordination and subagents; `jev` relocates here instead of retiring; the GHCR lookup image and its publish workflow are interim and removed in Phase C; the standalone repos are legacy after cognitive-engine is done. Also record the coordination status-client contract and "sbx never reaches the coordination server" in RFC 001 and RFC 004.
+- [ ] #7 and #11 with the RFC 005 amendment: agentic-hub keeps coordination and subagents; Jev is **not retired** and the live line stays in the agentic-hub plugin while `packages/jev` is the frozen reference (decisions 14, 15, 19; this supersedes the earlier "`jev` relocates here"); the GHCR lookup image and its publish workflow are interim and removed in Phase C; the standalone repos are legacy after cognitive-engine is done. Also record the coordination status-client contract and "sbx never reaches the coordination server" in RFC 001 and RFC 004.
 - [ ] Converge the standalone `lookup` and `recall` repos (decision 13).
 - [ ] basic-memory 1.0.0: one cutover decision, taken once for native `packages/memory` at Track 4 (`bm_` tool names, stateful sessions); `packages/memory` stays on `basic-memory==0.24.1` until then.
 

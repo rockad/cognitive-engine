@@ -2,7 +2,7 @@
 
 - **RFC Number**: 002
 - **Track**: Track 1
-- **Status**: Proposed  
+- **Status**: Proposed. Note 2026-11-12: `packages/jev` 2.4.0 is merged here (#3, #4, #18, #20, #22) as the frozen reference; the live Jev line is the agentic-hub plugin until cognitive-engine work resumes (delivery plan, decisions 14, 15, 19). Claims about shipped hooks below predate #4, #18 and #20 and are checked in the [evidence audit](../plans/2026-11-12-evidence-audit.md).  
 - **Runtime**: TypeScript / Bun  
 - **License**: MIT  
 - **Target Subsystem**: `packages/jev/`, `adapters/`, `cli/`  

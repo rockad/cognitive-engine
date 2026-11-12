@@ -334,7 +334,7 @@ Where things are:
 - This document: `packages/jev/docs/case-studies/2026-11-09-model-tier-for-multi-stream-workflow.md` in the `cognitive-engine` repo, linked from `packages/jev/README.md` (it was `plugins/jev/docs/case-studies/` in `agentic-hub`, where only a pointer remains).
 - Jev plugin source cited here: `plugins/jev/` in `agentic-hub` at 2.3.0 (hook `claude/hook.ts`, logic `claude/logic.ts`, hook registration `claude/hooks.json`, governance `src/core/governance.ts`, dispatch `src/tools/dispatch.ts`, tests `tests/claude-hook.test.ts`).
 - Jev's decision log: `~/.config/jev/claude_decisions.jsonl`; mode config `~/.config/jev/config.json` (mode `on` for all harnesses on 2026-11-09).
-- Source session transcript (large JSONL, search with `rg`, never print whole): `/home/rockad/.claude/projects/-home-rockad-projects-doppelganger/09b30315-6696-4462-a75e-6f14304fd694.jsonl`. Workflow script and journal: `/home/rockad/.claude/projects/-home-rockad-projects-doppelganger/09b30315-6696-4462-a75e-6f14304fd694/workflows/scripts/fold-postgres-and-clarify-decisions-wf_461d006e-32d.js` and `.../subagents/workflows/wf_461d006e-32d/journal.jsonl`.
+- Source session transcript (large JSONL, search with `rg`, never print whole): a Claude Code session transcript on the author's workstation (not published); the workflow script was `fold-postgres-and-clarify-decisions` (run `wf_461d006e-32d`).
 
 Where the fixes go (verified 2026-11-09 against `cognitive-engine` `origin/main` at `9fd9af1` after a fetch; confirmed by the owner of the cognitive-engine plan):
 

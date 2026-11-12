@@ -118,7 +118,7 @@ Outcomes from building and reviewing `feat/track1-jev-adapters`; they refine the
 
 #### 3.1.2 PR #3 Review Findings & Remediation Plan (from @Doc-Cr, 2026-10-28)
 
-Adopted from [@Doc-Cr's PR #3 review](https://github.com/rockad/cognitive-engine/pull/3#issuecomment-3456382024):
+Adopted from [@Doc-Cr's PR #3 review](https://github.com/rockad/cognitive-engine/pull/3#issuecomment-6464620383):
 
 1. **Remediate Hook Fail-Open on Launch Failure** (`adapters/claude/hooks/hooks.json`):
    - Wrap hook invocation in a shell check: if `$COGNITIVE_ENGINE_HOME` is unset, invalid, or the entrypoint file does not exist, echo an explicit JSON `ask` (`[jev] guard not found: COGNITIVE_ENGINE_HOME is unset or wrong`) instead of letting `bun` exit 1 (which Claude Code treats as non-blocking fail-open). Add a manifest unit test asserting this behavior.
@@ -272,7 +272,7 @@ To ensure seamless peer review with collaborator [@Doc-Cr](https://github.com/Do
 1. **Branch & Dedicated Worktree Hygiene**:
    - Feature branches must branch directly from `origin/main` (or stacked base branch when explicitly specified).
    - **Mandatory Git Worktree Isolation**:
-     - When multiple agent harnesses (Antigravity and Claude Code) operate concurrently on the repository, each harness **MUST** execute strictly inside its own dedicated git worktree (e.g. `/home/rockad/projects/cognitive-engine-track1`, etc.).
+     - When multiple agent harnesses (Antigravity and Claude Code) operate concurrently on the repository, each harness **MUST** execute strictly inside its own dedicated git worktree (e.g. `~/projects/cognitive-engine-track1`, etc.).
      - Prevents index locking (`.git/index.lock`), dirty state interference, and branch checkout collisions.
      - Never run `git checkout` across active branches in a worktree owned by another harness.
    - Keep commits atomic and semantic (`feat:`, `fix:`, `refactor:`, `docs:`, `test:`).
@@ -307,7 +307,7 @@ Following the approved architectural clarification, work is partitioned by speci
 | Subsystem / Concern | Primary Harness | Model Tier | Working Directory / Worktree | Rationale & Active Scope |
 |---|---|---|---|---|
 | **Deep Algorithmic Coding & AST Parsers** | **Claude Code** | Claude Sonnet 5.5 | Dedicated Worktree (`feat/track3-harness2` or Track 1) | Implements Workflow Guard static AST inspector (WS7) and Track 3 Slice 2 Docker fallback + triggers (WS8). Burns zero Gemini quota. |
-| **Architectural Governance & PR Remediation** | **Antigravity** | Gemini 3.8 Flash | Dedicated Worktree (`/home/rockad/projects/cognitive-engine-track1`) | Coordinates PR #3 review remediations (WS9), multi-track dependency tracking, RFC alignment. |
+| **Architectural Governance & PR Remediation** | **Antigravity** | Gemini 3.8 Flash | Dedicated Worktree (`~/projects/cognitive-engine-track1`) | Coordinates PR #3 review remediations (WS9), multi-track dependency tracking, RFC alignment. |
 | **Verification Gates & Quality Acceptance** | **Antigravity** | Gemini 3.8 Flash + `jev_judge` | Assigned Worktree | Runs test suites (`bun test`, `uv run pytest`), diff validation, and binary quality gating. |
 | **Git, PRs & Review Coordination with @Doc-Cr** | **Antigravity** | Gemini 3.8 Flash | Assigned Worktree | Branch checkout, semantic commits, PR management, and GitHub review updates. |
 | **Session State & Cross-Harness Continuity** | **Unified Memory** | Recall (:8110) & Lookup (:8100) | Bridge Document | Synchronizes state via `docs/handoffs/antigravity-claude-bridge.md` across both harnesses. |
@@ -316,7 +316,7 @@ Following the approved architectural clarification, work is partitioned by speci
 
 To guarantee zero race conditions between Antigravity and Claude Code:
 - **Dedicated Directory Assignment**: Each harness works in an isolated worktree path on disk:
-  - Antigravity Track 1 Worktree: `/home/rockad/projects/cognitive-engine-track1`
+  - Antigravity Track 1 Worktree: `~/projects/cognitive-engine-track1`
   - Claude Code Working Directory: Dedicated worktree created via `git worktree add ../cognitive-engine-<track> <branch>`
 - **No Shared Working Trees**: Never run parallel edits or branch switches in the same worktree directory.
 - **Git Push Coordination**: Push feature branches cleanly and notify the other harness via `antigravity-claude-bridge.md` before initiating dependent work.
@@ -325,7 +325,7 @@ To guarantee zero race conditions between Antigravity and Claude Code:
 
 #### Mode A: Concurrent Track Ownership (Parallel Worktrees)
 - **Claude Code**: Implements WS7 (Workflow Guard) and WS8 (Track 3 Slice 2) in its dedicated worktree.
-- **Antigravity**: Implements WS9 (Track 1 PR #3 review remediation) in `/home/rockad/projects/cognitive-engine-track1`.
+- **Antigravity**: Implements WS9 (Track 1 PR #3 review remediation) in `~/projects/cognitive-engine-track1`.
 - **Independence**: Both run simultaneously on disjoint feature branches without merge conflicts or context collisions.
 
 #### Mode B: Dual-Harness Ping-Pong (Implement in Claude Code, Verify in Antigravity)
