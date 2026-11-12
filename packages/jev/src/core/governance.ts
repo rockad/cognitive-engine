@@ -194,7 +194,7 @@ export function normaliseBucket(nowSec: number, raw: any): QuotaBucket | null {
 /**
  * Read the multi-bucket quota state. Prefers schema v2, falls back to legacy single-bucket.
  */
-export async function readQuotaView(): Promise<QuotaView> {
+export async function readQuotaView(homeDir?: string): Promise<QuotaView> {
   const nowSec = Math.floor(Date.now() / 1000);
   let source = 'none';
   let schema = 0;
@@ -212,21 +212,24 @@ export async function readQuotaView(): Promise<QuotaView> {
     return null;
   };
 
-  const v2 = tryParse(QUOTA_STATE_FILE);
+  const stateFile = homeDir ? path.join(homeDir, '.gemini', 'antigravity-cli', 'quota-state.json') : QUOTA_STATE_FILE;
+  const legacyFile = homeDir ? path.join(homeDir, 'antigravity-quota.json') : QUOTA_LEGACY_FILE;
+
+  const v2 = tryParse(stateFile);
   if (v2 && typeof v2 === 'object') {
     if (v2.buckets && typeof v2.buckets === 'object') {
-      source = QUOTA_STATE_FILE; schema = Number(v2.schema || 2); updatedAt = v2.updated_at ?? null;
+      source = stateFile; schema = Number(v2.schema || 2); updatedAt = v2.updated_at ?? null;
       planTier = v2.plan_tier; activeModel = v2.active_model; rawBuckets = v2.buckets;
     } else if (typeof v2.remaining_fraction === 'number') {
-      source = QUOTA_STATE_FILE; schema = 1; updatedAt = v2.updated_at ?? null;
+      source = stateFile; schema = 1; updatedAt = v2.updated_at ?? null;
       rawBuckets = { 'gemini-5h': v2 };
     }
   }
 
   if (schema === 0) {
-    const legacy = tryParse(QUOTA_LEGACY_FILE);
+    const legacy = tryParse(legacyFile);
     if (legacy && typeof legacy.remaining_fraction === 'number') {
-      source = QUOTA_LEGACY_FILE; schema = 1; updatedAt = legacy.updated_at ?? null;
+      source = legacyFile; schema = 1; updatedAt = legacy.updated_at ?? null;
       rawBuckets = { 'gemini-5h': legacy };
     }
   }
@@ -242,7 +245,22 @@ export async function readQuotaView(): Promise<QuotaView> {
   const p3Five = buckets['3p-5h']?.effective_remaining_fraction ?? null;
   const p3Weekly = buckets['3p-weekly']?.effective_remaining_fraction ?? null;
 
-  const geminiCandidates = [geminiFive, geminiWeekly].filter((x): x is number => typeof x === 'number');
+  const isArgonActive = Boolean(activeModel && /argon/i.test(activeModel));
+  let argonWeekly: number | null = null;
+  if (isArgonActive) {
+    if (buckets['gemini-argon-wtu-weekly']) {
+      argonWeekly = buckets['gemini-argon-wtu-weekly'].effective_remaining_fraction ?? null;
+    } else {
+      const argonKey = Object.keys(buckets).find(k => /argon/i.test(k) && (/week/i.test(k) || /7d/i.test(k)));
+      if (argonKey && buckets[argonKey]) {
+        argonWeekly = buckets[argonKey].effective_remaining_fraction ?? null;
+      }
+    }
+  }
+
+  const effectiveGeminiWeekly = (isArgonActive && argonWeekly !== null) ? argonWeekly : geminiWeekly;
+
+  const geminiCandidates = [geminiFive, effectiveGeminiWeekly].filter((x): x is number => typeof x === 'number');
   const p3Candidates = [p3Five, p3Weekly].filter((x): x is number => typeof x === 'number');
   const geminiMin = geminiCandidates.length ? Math.min(...geminiCandidates) : null;
   const p3Min = p3Candidates.length ? Math.min(...p3Candidates) : null;
@@ -251,7 +269,7 @@ export async function readQuotaView(): Promise<QuotaView> {
   const minRemaining = availablePools.length ? Math.max(...availablePools) : null;
 
   const thresholds = getQuotaThresholds();
-  const geminiStrategy = evaluatePoolStrategy(geminiFive, geminiWeekly, thresholds);
+  const geminiStrategy = evaluatePoolStrategy(geminiFive, effectiveGeminiWeekly, thresholds);
   const p3Strategy = evaluatePoolStrategy(p3Five, p3Weekly, thresholds);
 
   let strategy: QuotaStrategy = 'unknown';
@@ -267,9 +285,9 @@ export async function readQuotaView(): Promise<QuotaView> {
   const stale = updatedAt === null || nowSec - updatedAt > QUOTA_STALE_SECONDS;
 
   // The selected model decides which pool is spent: non-Gemini models draw on the 3p buckets.
-  const isGeminiActive = !activeModel || /gemini/i.test(activeModel) || p3Min === null;
+  const isGeminiActive = !activeModel || /gemini/i.test(activeModel) || /argon/i.test(activeModel) || p3Min === null;
   const active = isGeminiActive
-    ? { pool: 'gemini' as const, five_hour: geminiFive, weekly: geminiWeekly, min_remaining: geminiMin ?? minRemaining, strategy: geminiStrategy }
+    ? { pool: 'gemini' as const, five_hour: geminiFive, weekly: effectiveGeminiWeekly, min_remaining: geminiMin ?? minRemaining, strategy: geminiStrategy }
     : { pool: '3p' as const, five_hour: p3Five, weekly: p3Weekly, min_remaining: p3Min, strategy: p3Strategy };
 
   return {
@@ -280,7 +298,7 @@ export async function readQuotaView(): Promise<QuotaView> {
     plan_tier: planTier,
     active_model: activeModel,
     buckets,
-    gemini: { five_hour: geminiFive, weekly: geminiWeekly, min_remaining: geminiMin ?? minRemaining },
+    gemini: { five_hour: geminiFive, weekly: effectiveGeminiWeekly, min_remaining: geminiMin ?? minRemaining },
     strategy,
     thresholds,
     geminiRemainingFraction: geminiMin ?? minRemaining,
@@ -307,7 +325,7 @@ export function modelTierRank(tierOrModel: string): number {
   if (t.includes('free') || t === 'openrouter_free') return 0;
   if (t.includes('flash_lite') || t.includes('flash-lite')) return 1;
   if (t.includes('flash') || t.includes('cheap') || t.includes('standard')) return 2;
-  if (t.includes('pro') || t.includes('opus') || t.includes('expensive')) return 3;
+  if (t.includes('pro') || t.includes('argon') || t.includes('opus') || t.includes('fable') || t.includes('expensive') || t === 'deep') return 3;
   return 2;
 }
 
@@ -325,7 +343,8 @@ export function rankToTierName(rank: number): 'openrouter_free' | 'flash_lite' |
  */
 export function clampTierToSessionCeiling(
   recommendedTier: string,
-  activeModel?: string
+  activeModel?: string,
+  promptText: string = ''
 ): { clampedTier: string; wasClamped: boolean; ceilingTier: string } {
   if (!activeModel) {
     return { clampedTier: recommendedTier, wasClamped: false, ceilingTier: 'pro' };
@@ -335,7 +354,20 @@ export function clampTierToSessionCeiling(
   const ceilingTier = rankToTierName(ceilingRank);
   const recRank = modelTierRank(recommendedTier);
 
-  if (recRank > ceilingRank) {
+  const lowerPrompt = (promptText || '').toLowerCase();
+  const explicitProOverride = [
+    'deep reasoning',
+    'cross-system architecture',
+    'manual pro approval',
+    'claude opus',
+    'gemini pro',
+    'gemini argon',
+    'argon',
+    'claude fable',
+    'fable'
+  ].some((kw) => lowerPrompt.includes(kw));
+
+  if (recRank > ceilingRank && !explicitProOverride) {
     return {
       clampedTier: ceilingTier,
       wasClamped: true,

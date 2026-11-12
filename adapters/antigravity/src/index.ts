@@ -81,12 +81,21 @@ export interface HooksConfig {
 }
 
 /**
- * The narrow PreToolUse guard: Antigravity asks the user before any `invoke_subagent` call that
- * requests the Pro tier. Quota lockouts and write guards stay with the consumer workspace.
+ * The Antigravity hook configuration:
+ * - PreInvocation: Runs the pre-flight hook (with 3.5s timeout guard) to inject quota/mode directives,
+ *   run pre-flight dispatch, and record telemetry to .agents/memory/jev_telemetry.jsonl.
+ * - PreToolUse: Antigravity asks the user before any `invoke_subagent` call that requests the Pro tier.
  */
 export function jevHooksEntry(engineRoot: string, bunBin = 'bun'): Record<string, unknown> {
   return {
     enabled: true,
+    PreInvocation: [
+      {
+        type: 'command',
+        command: `timeout 3.5 ${bunBin} "${path.join(engineRoot, 'packages', 'jev', 'src', 'pre-invocation.ts')}" antigravity || exit 0`,
+        timeout: 5
+      }
+    ],
     PreToolUse: [
       {
         matcher: 'invoke_subagent',
