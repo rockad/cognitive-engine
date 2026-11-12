@@ -162,7 +162,7 @@ Status 2026-11-10: **Stack J (Jev) is two PRs on cognitive-engine, both open and
 - [ ] **#20, guard hardening** (open). Advisory CI (`tsc`, `bun test`, `pytest`, from #19); Claude guard reads `CLAUDE_CODE_SUBAGENT_MODEL` and `_FORCE`, resolves agent definitions or fails closed, bounds subagent effort (RFC 007); OpenCode guard for the V2 `subagent` tool reading `event.input` (from #21). Still to check: whether a model set in `define_subagent` front matter bypasses the Antigravity `invoke_subagent` guard.
 - [ ] **#22, advisor port** (open). The Claude `UserPromptSubmit` advisor ported to the cognitive-engine Claude adapter with the case-study improvements 5.1 to 5.11, packaged as `packages/jev` 2.4.0, case study moved into cognitive-engine docs (agentic-hub keeps a pointer). Includes the 2.3.1 open items (5.3, 5.4, 5.5, 5.8, session ceiling for 5.11). When it merges, tell the coordination session so it swaps its case-study copy for a pointer.
 - [x] **Jev 2.3.1 released 2026-11-10** (`57d2f88`, tag `jev-v2.3.1`): 4.11, 5.1, 5.2, 5.6, 5.7, 5.9, 5.10 and the wording half of 5.11. Further 2.3.x patches continue until RFC 005 Phase C, keeping the live plugin aligned with the cognitive-engine port.
-- [ ] **Jev follow-up PR, stacked on #22** (base `feat/jev-advisor-port`, retarget to `main` after #22 merges). Decided 2026-11-10 (/clarify, 8 forks):
+- [x] **Jev follow-up: moved to the agentic-hub plugin, 2026-11-12** (owner; delivery plan decision 19). #20 and #22 merged 2026-11-12; the code items below are built as agentic-hub 2.3.x patches, not in a cognitive-engine PR. The decisions stand. Original plan (stacked PR on #22), decided 2026-11-10 (/clarify, 8 forks):
 
   | Item | Decision |
   |---|---|

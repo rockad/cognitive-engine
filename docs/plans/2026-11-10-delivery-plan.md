@@ -14,8 +14,8 @@ Coordination (`plugins/coordination` in agentic-hub, S0 close and S1) comes befo
 
 | Stack | PRs, in merge order | State |
 |---|---|---|
-| **J (Jev)** | #20 guard hardening (includes advisory CI and the OpenCode V2 guard), then #22 advisor port (jev 2.4.0) | ready for review; they merge cleanly with each other. Doc-Cr reviewed both on 2026-11-10 (comment-style); the findings are fixed and answered (#20 `b971956`, #22 `4a79643`). Doc-Cr's collaborator invite is still pending, so formal review requests fail until it is accepted |
-| **J follow-up** | `feat/jev-followup`, stacked on #22 | documentation done and pushed (`e431d02`); code still to write (see below) |
+| **J (Jev)** | #20 guard hardening (includes advisory CI and the OpenCode V2 guard), then #22 advisor port (jev 2.4.0) | **merged 2026-11-12** (`0f58554`, `c260bf5`; CI green; Doc-Cr approved both on 2026-11-11). Earlier state: ready for review; they merge cleanly with each other. Doc-Cr reviewed both on 2026-11-10 (comment-style); the findings are fixed and answered (#20 `b971956`, #22 `4a79643`). Doc-Cr's collaborator invite is still pending, so formal review requests fail until it is accepted |
+| **J follow-up** | `feat/jev-followup`, stacked on #22 | **Code dropped here (2026-11-12, decision 19):** its items move to the agentic-hub plugin as 2.3.x work. The three documentation commits (`e431d02` and earlier) are kept on the branch; their "planned" wording is to be repointed at agentic-hub before any docs PR |
 | **Track 2** | #8 Memory and Lookup (RFC 003), then #9 MCP conformance, then #10 SMB reads | #8 conflicts with `main`; restack after S1 |
 | **Harness²** | #5 pipeline, then #6 benchmark, then #13 BuildSlot | #5 conflicts with `main`; restack after S1 |
 | **Docs** | #7 stage-1 findings, then #11 RFC 006 and plans | #7 after #10; both ride the RFC 005 amendment |
@@ -32,11 +32,14 @@ Merged: #3, #4, #18 earlier; #19 and #21 were folded into #20 and closed. Rules 
 | 8 | CI | Advisory workflow (`tsc`, `bun test`, `pytest`), now inside #20 |
 | 9 | #13 BuildSlot | Merge after #5 and #6, retargeted to `main`; link the spec at agentic-hub `plugins/coordination/docs/specs/buildslot-spec.md`, do not copy it |
 | 13 | Standalone `lookup` and `recall` repos | Converge on #8 `packages/lookup` and `packages/memory`; port the unique fixes; freeze as legacy only after cognitive-engine is done (issues are tracked in each standalone repo) |
-| 14 | Jev version line | Continues here at 2.4.0; the agentic-hub plugin also gets 2.3.x patches until RFC 005 Phase C |
-| 15 | Jev is not retired | Only the agentic-hub copy retires. The `UserPromptSubmit` advisor is ported here with the case-study improvements 5.1 to 5.11 (#22) |
+| 14 | Jev version line | **Revised 2026-11-12 (owner):** the live line is the agentic-hub plugin (2.3.x patches); all Jev fixes and changes go there. `packages/jev` 2.4.0 here (merged as #20 and #22 on 2026-11-12) stays as it is and gets no further code until cognitive-engine work resumes |
+| 15 | Jev is not retired | **Revised 2026-11-12 (owner):** cognitive-engine keeps the Jev docs only (RFCs, case-study copies, pointers) until then. The advisor port 5.1 to 5.11 (#22) stays merged here as the reference implementation; improvements are sent to the agentic-hub session as text with evidence and land as agentic-hub 2.3.x patches |
+| 19 | Plugins first | Owner, 2026-11-12: cognitive-engine does not go ahead of the plugins and hosts fixes only for its own project (Harness², Memory, Lookup). Plugin fixes (Jev, coordination, memory, subagents) are made in agentic-hub. Real cognitive-engine work restarts from a grounded, evidence-based plan |
 | 18 | Sequencing | Independent items run alongside coordination S1; restacks, the bridge move and #7 and #11 wait for S1 |
 
 ### The 2026-11-10 /clarify pass (Jev follow-up)
+
+Status 2026-11-12: these decisions stand, but the code they describe is built in the agentic-hub plugin, not here (decision 19).
 
 | Item | Decision |
 |---|---|
@@ -53,9 +56,10 @@ Merged: #3, #4, #18 earlier; #19 and #21 were folded into #20 and closed. Rules 
 
 ### Alongside coordination S1
 
-- [ ] Review and merge Stack J (#20, #22), then tell the coordination session so it swaps its case-study copy in agentic-hub for a pointer.
-- [ ] Jev follow-up code: `JEV_RECALL_URL`; the warn-only note and log field for remaps and effort; `JEV_HARNESS` in the OpenCode and Antigravity adapters. Open a draft PR stacked on #22.
-- [ ] Check whether a model set in `define_subagent` front matter bypasses the Antigravity `invoke_subagent` guard.
+- [x] Review and merge Stack J (#20, #22), then tell the coordination session so it swaps its case-study copy in agentic-hub for a pointer. Done 2026-11-12; the agentic-hub copy of the 2026-11-09 study is already a pointer.
+- [x] Jev follow-up code (`JEV_RECALL_URL`; the warn-only note and log field for remaps and effort; `JEV_HARNESS` in the OpenCode and Antigravity adapters): moved to agentic-hub plugin work on 2026-11-12 (decision 19), sent to its session as text.
+- [ ] Check whether a model set in `define_subagent` front matter bypasses the Antigravity `invoke_subagent` guard. Code read 2026-11-12: the hook matcher is `invoke_subagent` only and the guard reads only `Subagents[].Model`, so `define_subagent` is never seen. Whether Antigravity applies the definition's model when `Model` is empty or `inherit` is **unverified** and needs a live run. Sent to the agentic-hub session.
+- [ ] Copy the 2026-11-11 case study (PreToolUse dialog on a pinned model) into `packages/jev/docs/case-studies/` (decision 19: docs only).
 - [ ] Any future Codex adapter must return `deny` (Codex fails open on `ask`); any Copilot guard fails open on hook timeout.
 - [ ] Restack #12 after Stack J merges.
 

@@ -1,5 +1,7 @@
 # Session handoff: delivery state on 2026-11-11
 
+> **Update 2026-11-12.** #20 and #22 are merged (`0f58554`, `c260bf5`). The owner decided that all Jev fixes and changes go to the agentic-hub plugin until cognitive-engine work resumes, and that cognitive-engine hosts fixes only for its own project (delivery plan, decision 19). The Jev follow-up code (next step 3 below) is therefore not built here, and the "wait for Doc-Cr" and "merge #20, #22" steps are done. The rest of this file is the 2026-11-11 state and is otherwise unchanged.
+
 Written so a fresh Claude Code session (any subscription) can continue without the previous conversation. The standing plan is [`../plans/2026-11-10-delivery-plan.md`](../plans/2026-11-10-delivery-plan.md); this note adds the exact state, the next steps in order and the traps already hit.
 
 ## State in one table
