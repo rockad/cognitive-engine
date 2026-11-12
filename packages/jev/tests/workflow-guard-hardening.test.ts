@@ -8,6 +8,7 @@
  * Static analysis is not sound. The `STILL_SLIPS` table at the bottom records, as executable
  * documentation, idioms known to pass; if one starts asking, the table is out of date.
  */
+import './clear-subagent-env.ts';
 import { describe, it, expect } from 'bun:test';
 import * as fs from 'node:fs';
 import * as path from 'node:path';

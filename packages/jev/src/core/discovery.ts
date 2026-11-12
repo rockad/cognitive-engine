@@ -3,6 +3,7 @@ import * as fsSync from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { loadJevConfig, detectActiveHarness, type JevHarness } from './config.js';
+import { userClaudeDir } from '../agent-definitions.js';
 
 interface AgentCacheEntry {
   timestamp: number;
@@ -125,7 +126,8 @@ function registerAgent(
  * 2. Harness-specific config paths (config.harnesses?.[activeHarness]?.agentPaths)
  * 3. Global default config paths (config.defaults?.agentPaths)
  * 4. Generic env override (process.env.JEV_AGENTS_DIR)
- * 5. Standard global harness locations (~/.gemini/config/agents, ~/.claude/agents, ~/.config/opencode/agents)
+ * 5. Standard global harness locations (~/.gemini/config/agents, <Claude config dir>/agents, ~/.config/opencode/agents),
+ *    where the Claude config dir is `CLAUDE_CONFIG_DIR` when set (a relative value resolved against `cwd`), else `~/.claude`
  *
  * For each existing candidate directory, subdirectories with agent.md take precedence
  * over standalone .md files. First encountered agent name takes precedence.
@@ -161,7 +163,7 @@ export async function discoverWorkspaceAgents(
     } else if (targetHarness === 'claude-code') {
       rawCandidates.push(
         path.join(root, '.claude', 'agents'),
-        path.join(os.homedir(), '.claude', 'agents')
+        path.join(userClaudeDir(cwd), 'agents')
       );
     } else if (targetHarness === 'opencode') {
       rawCandidates.push(
@@ -176,7 +178,7 @@ export async function discoverWorkspaceAgents(
         path.join(root, '.claude', 'agents'),
         path.join(root, '.opencode', 'agents'),
         path.join(os.homedir(), '.gemini', 'config', 'agents'),
-        path.join(os.homedir(), '.claude', 'agents'),
+        path.join(userClaudeDir(cwd), 'agents'),
         path.join(os.homedir(), '.config', 'opencode', 'agents')
       );
     }

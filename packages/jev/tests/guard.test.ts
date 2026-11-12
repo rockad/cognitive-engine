@@ -17,7 +17,7 @@ import { clearConfigCacheForTesting } from '../src/core/config.ts';
 let tmp = '';
 let savedEnv: NodeJS.ProcessEnv = {};
 
-const HARNESS_ENV_VARS = ['JEV_HARNESS', 'ANTIGRAVITY_CLI', 'GEMINI_CLI', 'CLAUDE_CODE', 'CLAUDECODE', 'CLAUDE_PROJECT_DIR', 'OPENCODE_SESSION', 'OPENCODE_HOME', 'CORTEX_SESSION', 'CLAUDE_CONFIG_DIR'];
+const HARNESS_ENV_VARS = ['JEV_HARNESS', 'ANTIGRAVITY_CLI', 'GEMINI_CLI', 'CLAUDE_CODE', 'CLAUDECODE', 'CLAUDE_PROJECT_DIR', 'OPENCODE_SESSION', 'OPENCODE_HOME', 'CORTEX_SESSION', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_SUBAGENT_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL_FORCE', 'CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL'];
 
 function transcript(...models: Array<string | null>): string {
   const file = path.join(tmp, 't.jsonl');

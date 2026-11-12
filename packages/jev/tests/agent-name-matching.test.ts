@@ -19,7 +19,7 @@ let savedEnv: NodeJS.ProcessEnv = {};
 
 beforeEach(() => {
   savedEnv = { ...process.env };
-  for (const v of ['JEV_HARNESS', 'ANTIGRAVITY_CLI', 'GEMINI_CLI', 'CLAUDE_CODE', 'CLAUDECODE', 'CLAUDE_PROJECT_DIR', 'OPENCODE_SESSION', 'OPENCODE_HOME', 'CORTEX_SESSION']) delete process.env[v];
+  for (const v of ['JEV_HARNESS', 'ANTIGRAVITY_CLI', 'GEMINI_CLI', 'CLAUDE_CODE', 'CLAUDECODE', 'CLAUDE_PROJECT_DIR', 'OPENCODE_SESSION', 'OPENCODE_HOME', 'CORTEX_SESSION', 'CLAUDE_CODE_SUBAGENT_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL_FORCE', 'CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL']) delete process.env[v];
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'jev-name-'));
   proj = path.join(tmp, 'proj');
   fs.mkdirSync(path.join(proj, '.git'), { recursive: true });
