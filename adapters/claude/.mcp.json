@@ -2,7 +2,8 @@
   "mcpServers": {
     "jev": {
       "command": "bun",
-      "args": ["run", "${COGNITIVE_ENGINE_HOME}/packages/jev/src/index.ts"]
+      "args": ["run", "${COGNITIVE_ENGINE_HOME}/packages/jev/src/index.ts"],
+      "env": { "JEV_HARNESS": "claude-code" }
     }
   }
 }

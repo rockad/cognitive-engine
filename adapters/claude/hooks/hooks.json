@@ -22,6 +22,16 @@
             "onFailure": "block"
           }
         ]
+      },
+      {
+        "matcher": "Agent|Task|Workflow",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun \"$COGNITIVE_ENGINE_HOME/packages/jev/src/advisor-hook.ts\" pre-tool-use",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -53,6 +63,17 @@
           {
             "type": "command",
             "command": "bun \"$COGNITIVE_ENGINE_HOME/packages/jev/src/record-hook.ts\" PostModelSwitch",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun \"$COGNITIVE_ENGINE_HOME/packages/jev/src/advisor-hook.ts\" user-prompt-submit",
             "timeout": 5
           }
         ]

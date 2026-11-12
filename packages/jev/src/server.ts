@@ -11,7 +11,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { jevTools, registerTools } from './tools/index.js';
 
-export const JEV_VERSION = '1.0.0';
+export const JEV_VERSION = '2.4.0';
 export const HTTP_HOST = '127.0.0.1';
 export const HTTP_PORT = 8115;
 export const HTTP_PATH = '/mcp';

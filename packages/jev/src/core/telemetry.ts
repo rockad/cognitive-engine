@@ -15,7 +15,12 @@ export interface JevTelemetryEvent {
   sessionId?: string | null;
   taskSummary?: string;
   tierRecommended?: string;
+  /** The model a hook recommended (UserPromptSubmit) or the recommendation joined to a delegation (PreToolUse). */
+  modelRecommended?: string;
+  /** The model a delegation requested (PreToolUse). On UserPromptSubmit records a DEPRECATED alias of modelRecommended, dropped in 2.5. */
   modelUsed?: string;
+  /** Hash of the prompt, shared by the UserPromptSubmit and PreToolUse records of one turn. */
+  turn?: string;
   latencyMs?: number;
   costUsd?: number;
   tokensSaved?: number;

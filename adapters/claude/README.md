@@ -1,6 +1,6 @@
 # Claude Code adapter
 
-Native Claude Code plugin bundle for Jev: `.claude-plugin/plugin.json` plus `.mcp.json`. It registers the `jev_*` MCP tools and one narrow `PreToolUse` hook. The session-start, model-switch and prompt-advice hooks from `agentic-hub` were not ported because Track 1 had no need for them; hooks are not prohibited and can be added where a workflow requires one.
+Native Claude Code plugin bundle for Jev: `.claude-plugin/plugin.json` plus `.mcp.json`. It registers the `jev_*` MCP tools, the narrow `PreToolUse` guard, the log-only session recorders and the `UserPromptSubmit` prompt advisor (advice only, see `packages/jev/README.md`, "Prompt advisor hook"). Hooks are not prohibited and can be added where a workflow requires one.
 
 ## The subagent guard
 
