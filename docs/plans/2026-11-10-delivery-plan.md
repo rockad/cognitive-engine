@@ -62,6 +62,7 @@ Status 2026-11-12: these decisions stand, but the code they describe is built in
 - [x] Copy the 2026-11-11 case study (PreToolUse dialog on a pinned model) into `packages/jev/docs/case-studies/` (decision 19: docs only). Done 2026-11-12.
 - [ ] Any future Codex adapter must return `deny` (Codex fails open on `ask`); any Copilot guard fails open on hook timeout.
 - [ ] #12 (Jev code, mergeable as is): decide whether it moves to the agentic-hub plugin work or closes (decision 19). No restack needed.
+- [ ] Jev in the agentic-hub plugin, state 2026-11-12 (reported by its session, not checked here): 2.3.3 is open as agentic-hub PR #38 (backports of 5.1, 5.2, 5.5, 5.6, 5.7, 5.9, 5.10, the whole-word sites and more; an executable parity audit ran this repo's #22 tests against 2.3.2 and 114 of 289 failed), then 2.3.4 (elevation clamp) and 2.3.5 (5.3, 5.4, 5.11). Four findings it raised were checked against `packages/jev` the same day and three apply here, with no code change (decision 19): the intent parser reads "Users who use opus see errors" and "We use haiku for the classifier" as instructions; `core/telemetry.ts` creates its files with default modes (0644 in 0755 dirs), and the other state files get 0600/0700 only when created; `taskNeedsEdit` treats remove, modify, patch and amend as non-editing verbs, which matters outside `jev_batch_dispatch`. The fourth (the "one approval prompt" sentence) holds in #22 only because its guard has no intent bypass.
 
 ### After coordination S1
 
